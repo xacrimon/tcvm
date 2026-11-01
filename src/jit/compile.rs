@@ -355,6 +355,8 @@ pub(crate) fn compile<'gc>(
         ],
         native_act: crate::vm::native::native_act as *const () as usize,
         dead_entry: crate::jit::jit_dead_entry as *const () as usize,
+        level_enter: abi::level_enter as *const () as usize,
+        call_miss: abi::call_miss as *const () as usize,
         trampolines,
         direct: f
             .protos
@@ -397,14 +399,20 @@ pub(crate) fn compile<'gc>(
     let fast_entry = em.fast.map_or(std::ptr::null(), |l| {
         start.wrapping_add(em.asm.label_offset(l))
     });
-    let site_keys: Vec<Vec<(u32, bool)>> = em
+    // A fast callee's return address is its fast resume's when the resume
+    // block follows the call: one key.
+    let site_keys: Vec<(Vec<(u32, bool)>, u32)> = em
         .sites
         .iter()
         .map(|s| {
-            s.keys
+            let mut keys: Vec<(u32, bool)> = s
+                .keys
                 .iter()
                 .map(|&(k, level)| (em.asm.label_offset(k) as u32, level))
-                .collect()
+                .collect();
+            keys.sort_unstable();
+            keys.dedup();
+            (keys, em.asm.label_offset(s.miss) as u32)
         })
         .collect();
     let direct: Vec<(u32, u64)> = em
@@ -534,7 +542,7 @@ pub(crate) fn compile<'gc>(
     }
     // The sites, their snapshots after the exits'.
     let mut sites: Vec<crate::jit::region::Site> = Vec::new();
-    for (site, keys) in em.sites.iter_mut().zip(&site_keys) {
+    for (site, (keys, miss)) in em.sites.iter_mut().zip(&site_keys) {
         for s in &mut site.entries {
             if let crate::jit::region::Loc::Const(c) = s.loc {
                 let w = site.consts[c as usize];
@@ -559,6 +567,7 @@ pub(crate) fn compile<'gc>(
             hdr: site.hdr,
             pc_after: site.pc_after,
             level,
+            miss: *miss,
         }));
     }
     sites.sort_unstable_by_key(|s| s.key);

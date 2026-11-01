@@ -130,9 +130,11 @@ pub(crate) struct JitRuntime {
     pub(crate) exhausted: Cell<bool>,
     /// The register allocator's buffers, kept between compiles.
     pub(crate) ra: RefCell<regalloc2::Ctx>,
-    /// Where handlers return in a level (`abi::level_return`): a region
-    /// whose return address is this was entered from dispatch.
+    /// Where handlers return in a level (`abi::level_return`).
     pub(crate) level_ret: usize,
+    /// The return address of a region dispatch entered (`abi::level_land`):
+    /// its `ret` lands there and goes on in the level.
+    pub(crate) level_land: usize,
     /// What `abi::level_jump` branches to.
     pub(crate) jump_target: Cell<usize>,
 }
@@ -168,6 +170,7 @@ impl JitRuntime {
             level_ret: crate::jit::backend::aarch64::abi::level_return_addr(),
             #[cfg(not(target_arch = "aarch64"))]
             level_ret: 0,
+            level_land: crate::vm::stack::level_land(),
             jump_target: Cell::new(0),
         };
         rt.grow_table(16);

@@ -267,6 +267,9 @@ pub(crate) struct Site {
     /// The return address is a level's (`jit_level`): `BASE` there is this
     /// frame's. Otherwise it is a fast callee's, and `BASE` the callee's.
     pub(crate) level: bool,
+    /// The code offset of the call's slow path, where a fast callee whose
+    /// entry checks failed goes (`abi::call_miss`).
+    pub(crate) miss: u32,
 }
 
 impl<'gc> Region<'gc> {
@@ -286,6 +289,15 @@ impl<'gc> Region<'gc> {
         for &(off, w) in &self.lazy {
             self.code.patch_u32(off as usize, w);
         }
+    }
+
+    /// The region whose code holds the return address `ra`: its pointer is
+    /// the code block's first word.
+    ///
+    /// # Safety
+    /// `ra` points into a live region's code.
+    pub(crate) unsafe fn of_return(ra: usize) -> *const Region<'static> {
+        unsafe { *(crate::jit::backend::alloc::block_start(ra) as *const *const Region<'static>) }
     }
 
     /// The site whose return address is `ra`, and its snapshot.

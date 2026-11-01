@@ -31,10 +31,10 @@ use crate::vm::frame;
 
 const PTR_MASK: u64 = (1 << 48) - 1;
 
-/// Where a compiled frame records its region, from its frame pointer.
-pub(crate) const FRAME_REGION: usize = 16;
-/// Its spill slots, from its frame pointer.
-pub(crate) const FRAME_SPILLS: usize = 24;
+/// A compiled frame's spill slots, from its frame pointer: past the frame
+/// record. Its region is found from return addresses into it
+/// (`Region::of_return`).
+pub(crate) const FRAME_SPILLS: usize = 16;
 
 /// A hash map with a fast, unkeyed hasher, for compile-time tables.
 pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::FixedState>;
@@ -557,6 +557,15 @@ pub(crate) fn direct_target(fast: usize) -> usize {
     }
     #[cfg(not(target_arch = "aarch64"))]
     fast
+}
+
+/// Where the fast call whose return address is `ra` goes when its callee's
+/// entry checks fail (`abi::call_miss`): the call's slow path.
+pub(crate) extern "C" fn jit_call_miss(ra: usize) -> usize {
+    // SAFETY: a fast call's return address lies in its region's code.
+    let region = unsafe { &*crate::jit::region::Region::of_return(ra) };
+    let (site, _) = region.site(ra).expect("a fast call's site");
+    region.code.rx() as usize + site.miss as usize
 }
 
 fn write_code(closure: LuaFn<'_>, at: u32, word: Instruction) {

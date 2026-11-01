@@ -2008,6 +2008,22 @@ fn panicker<'gc>(
     Ok(())
 }
 
+/// Fast calls deep enough to go in tagged (`deep_path`), whose callees miss
+/// as the value stack grows: each miss finds its caller's slow path through
+/// the site its return address names (`abi::call_miss`), and every return,
+/// tagged or not, lands in the resume block.
+#[test]
+fn deep_misses_find_their_sites() {
+    let src = "local function depth(n) if n == 0 then return 0 end return depth(n - 1) + 1 end
+        local function sum(n) if n == 0 then return 0 end local r = sum(n - 1) return r + n end
+        local s = 0
+        for i = 1, 20 do s = s + depth(i * 500) + sum(i * 400) end
+        return tostring(s)";
+    // Reference Lua 5.5 prints 229747000.
+    assert_eq!(result(src, true), "229747000");
+    agrees(src);
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]

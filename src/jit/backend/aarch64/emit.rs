@@ -55,6 +55,8 @@ pub(crate) struct Emitted {
 /// header slot and the `pc` after it.
 pub(crate) struct SiteOut {
     pub(crate) keys: Vec<(Label, bool)>,
+    /// The call's slow path, where a fast callee that missed goes.
+    pub(crate) miss: Label,
     pub(crate) entries: Vec<SnapEntry>,
     pub(crate) consts: Vec<u64>,
     pub(crate) hdr: u16,
@@ -131,13 +133,13 @@ struct Em<'a> {
     forced: Vec<bool>,
     /// Per resume block, where a fast callee's `ret` lands.
     fast_resume: Vec<Label>,
-    /// Per resume block, its call's miss path (`miss_path`), branched to
-    /// from just before `fast_resume`.
+    /// Per resume block, its call's miss path (`miss_path`), which its site
+    /// names (`abi::call_miss`).
     miss: Vec<Label>,
     /// Per resume block, past the fast resume's `BASE` and `CLOSURE`, which
     /// a native call keeps and a level's return restores.
     resume_based: Vec<Label>,
-    /// The word holding the region pointer, which each frame records.
+    /// The code's first word, the region pointer (`Region::of_return`).
     region_word: Label,
     sites: Vec<SiteOut>,
     sites_of: &'a [(usize, crate::jit::backend::aarch64::lower::LSite)],
@@ -150,6 +152,10 @@ struct Em<'a> {
     /// `FMod`'s out-of-line paths: (entry, return, d, a, b).
     fmods: Vec<(Label, Label, Fpr, Fpr, Fpr)>,
     lazy: Vec<(Label, Label)>,
+    /// Code out of the way of the fast paths, emitted after the blocks: a
+    /// call's paths besides its fast one, so its callee returns into the
+    /// resume block.
+    ool: Vec<Box<dyn FnOnce(&mut Em<'a>) + 'a>>,
 }
 
 /// A function region's fast entry: what `enter` would check of the callee.
@@ -185,6 +191,9 @@ pub(crate) struct Helpers {
     pub(crate) native_act: usize,
     /// `jit::jit_dead_entry`, where an invalidated region's entry goes.
     pub(crate) dead_entry: usize,
+    /// `abi::level_enter` and `abi::call_miss`.
+    pub(crate) level_enter: usize,
+    pub(crate) call_miss: usize,
     /// The trampolines of the helpers cold arms call: (helper, trampoline).
     pub(crate) trampolines: Vec<(usize, usize)>,
     /// Known callees' prototypes (their boxes) and where a direct call of
@@ -263,8 +272,7 @@ fn fpr(p: PReg) -> Fpr {
     Fpr(p.hw_enc() as u8)
 }
 
-/// The frame: the frame record, the region word, then the spill slots.
-pub(crate) const FRAME_REGION: i32 = crate::jit::FRAME_REGION as i32;
+/// The frame: the frame record, then the spill slots.
 pub(crate) const FRAME_SPILLS: i32 = crate::jit::FRAME_SPILLS as i32;
 
 fn spill_off(slot: usize) -> i32 {
@@ -317,7 +325,11 @@ pub(crate) fn emit(
         own_entry: None,
         direct: Vec::new(),
         lazy: Vec::new(),
+        ool: Vec::new(),
     };
+    em.a.bind(em.region_word);
+    em.a.emit(0);
+    em.a.emit(0);
     // A compiled caller has written the header, set base, closure and `insn`
     // (the argument count) as `enter` would, and its `blr` left the return
     // address in x30; what `enter` would check of a Lua callee is checked
@@ -375,6 +387,14 @@ pub(crate) fn emit(
             }
         }
     }
+    for f in std::mem::take(&mut em.ool) {
+        f(&mut em);
+    }
+    // Dispatch enters through `level_enter`, which returns to `level_land`.
+    let dispatch = em.a.new_label();
+    em.a.bind(dispatch);
+    em.a.adr(X16, em.labels[0]);
+    em.a.b_far(em.helpers.level_enter);
     // Cold section: one stub per exit, the trampoline, and the prologue's
     // entry-fail stub, which needs no register image (6.4).
     for (k, _) in l.exits.iter().enumerate() {
@@ -451,42 +471,32 @@ pub(crate) fn emit(
         em.a.b(budget);
     }
     if fast_label.is_some() {
-        // Back to the caller's slow path (`miss_path`): 4 bytes past its
-        // return address, or before its fast resume, which a tagged one
-        // names (`deep_path`). A tail call from a frame dispatch entered has
-        // the level's return address instead: `enter` runs the call from the
-        // header the tail call wrote.
+        // Back to the caller's slow path, which its site names by the return
+        // address (`abi::call_miss`). A tail call from a frame dispatch
+        // entered has `level_land` for one instead: `enter` runs the call
+        // from the header the tail call wrote.
         em.a.bind(fast_miss);
-        let (tagged, dispatched) = (em.a.new_label(), em.a.new_label());
-        em.a.ldr(X17, RT, layout::LEVEL_RET as i32);
+        let dispatched = em.a.new_label();
+        em.a.ldr(X17, RT, layout::LEVEL_LAND as i32);
         em.a.cmp(Sz::X, LR, X17);
         em.a.b_cond(Cond::Eq, dispatched);
-        em.a.tbnz(LR, 0, tagged);
-        em.a.add_imm(Sz::X, LR, LR, 4);
-        em.a.ret();
-        em.a.bind(tagged);
-        em.a.and_imm(Sz::X, LR, LR, !1u64);
-        em.a.sub_imm(Sz::X, LR, LR, 4);
-        em.a.br(LR);
+        em.a.b_far(em.helpers.call_miss);
         em.a.bind(dispatched);
         em.a.movz(Sz::X, X16, FUNCTION_TAG, 3);
         em.a.orr(Sz::X, X16, X16, CLOSURE);
         em.a.str(X16, BASE, -32);
         em.a.sub_imm(Sz::X, PC, BASE, 32);
         em.a.mov(BASE, ZR);
+        em.a.ldr(LR, RT, layout::LEVEL_RET as i32);
         em.a.b_far(em.helpers.enter);
     }
-    em.a.align(8);
-    em.a.bind(region_word);
-    em.a.emit(0);
-    em.a.emit(0);
     let exits = l
         .exits
         .iter()
         .enumerate()
         .map(|(k, e)| exit_out(l, out, e, k))
         .collect();
-    let entry = em.labels[0];
+    let entry = dispatch;
     let frame_size = em.frame;
     Ok(Emitted {
         asm: em.a,
@@ -583,8 +593,6 @@ impl Em<'_> {
         self.a.sub_imm(Sz::X, SP, SP, self.frame as u64);
         self.a.stp(FP, LR, SP, 0);
         self.a.mov_sp(FP, SP);
-        self.a.ldr_label(X16, self.region_word);
-        self.a.str(X16, FP, FRAME_REGION);
     }
 
     fn close_frame(&mut self) {
@@ -599,7 +607,7 @@ impl Em<'_> {
     /// (`native_path`), anything else to `slow`. Every register is free
     /// here: what lives across the call is in the frame. Returns
     /// `fast_enter`'s labels.
-    fn fast_call(&mut self, hdr: i32, block: usize, slow: Label, native: Label) -> (Label, Label) {
+    fn fast_call(&mut self, hdr: i32, slow: Label, native: Label) -> (Label, Label) {
         self.a.ldr(X16, BASE, hdr);
         self.a.lsr_imm(Sz::X, X17, X16, 48);
         self.a.movz(Sz::W, Gpr(9), FUNCTION_TAG, 0);
@@ -611,7 +619,7 @@ impl Em<'_> {
         self.a.ldr(X17, X16, layout::FN_PROTO as i32);
         self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
         self.a.cbz(Sz::X, X17, slow);
-        self.fast_enter(hdr, block, Target::Reg)
+        self.fast_enter(hdr, Target::Reg)
     }
 
     /// `fast_call` for a known callee (D2), word 0 its closure word: the
@@ -624,7 +632,6 @@ impl Em<'_> {
     fn known_call(
         &mut self,
         hdr: i32,
-        block: usize,
         slow: Label,
         (closure, proto, nparams): (Option<u64>, u64, u8),
         nargs: u8,
@@ -657,7 +664,7 @@ impl Em<'_> {
                 self.a.and_imm(Sz::X, X16, X16, PTR_MASK);
             }
         }
-        let (ret, deep) = self.fast_enter(hdr, block, target);
+        let (ret, deep) = self.fast_enter(hdr, target);
         (ret, deep, known, target)
     }
 
@@ -699,11 +706,10 @@ impl Em<'_> {
 
     /// Enter `target` (`Target::Reg`: the fast entry in x17) with the
     /// closure in x16 (`fast_call`). Returns the return address the call
-    /// leaves, where a branch to the fast resume sits; a callee whose entry
-    /// checks fail returns 4 bytes past it, where `miss_path` must follow.
-    /// Also returns the deep path's label, for `deep_path`.
-    fn fast_enter(&mut self, hdr: i32, block: usize, target: Target) -> (Label, Label) {
-        let fast_resume = self.fast_resume[self.v.succs(block)[0].index()];
+    /// leaves, where the fast resume is when the resume block is laid out
+    /// next (else a branch to it, `fall_into_resume`), and the deep path's
+    /// label, for `deep_path`.
+    fn fast_enter(&mut self, hdr: i32, target: Target) -> (Label, Label) {
         // Word 1 zero: the frame's flags, which helpers set there (a closure
         // capturing a register, `HAS_OPEN`) and `HasFlag` reads. Left stale,
         // a flag would land on a value of the caller's that the collector
@@ -724,14 +730,22 @@ impl Em<'_> {
         self.branch_to(target, true);
         let ret = self.a.new_label();
         self.a.bind(ret);
-        self.a.b(fast_resume);
         (ret, deep)
     }
 
-    /// Where a fast callee whose entry checks failed returns (4 bytes past
-    /// `fast_enter`'s return address, or from before the fast resume): the
-    /// caller's `BASE` and `CLOSURE` and word 0's callee value back, then
-    /// its slow path at `slow`, whose level keeps that `CLOSURE`.
+    /// After a fast call's `bl`: on into the fast resume, which is there
+    /// unless the resume block is laid out elsewhere.
+    fn fall_into_resume(&mut self, block: usize, next: Option<Label>) {
+        let r = self.v.succs(block)[0].index();
+        if Some(self.labels[r]) != next {
+            self.a.b(self.fast_resume[r]);
+        }
+    }
+
+    /// Where a fast callee whose entry checks failed goes (its site's
+    /// `miss`): the caller's `BASE` and `CLOSURE` and word 0's callee value
+    /// back, then its slow path at `slow`, whose level keeps that
+    /// `CLOSURE`.
     fn miss_path(&mut self, hdr: i32, block: usize, slow: Label) {
         self.a.bind(self.miss[self.v.succs(block)[0].index()]);
         self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
@@ -899,9 +913,10 @@ impl Em<'_> {
     /// level returning to its caller, its header made to return through it.
     fn tail_level(&mut self) {
         let level = self.a.new_label();
-        self.a.ldr(X17, RT, layout::LEVEL_RET as i32);
+        self.a.ldr(X17, RT, layout::LEVEL_LAND as i32);
         self.a.cmp(Sz::X, LR, X17);
         self.a.b_cond(Cond::Ne, level);
+        self.a.ldr(LR, RT, layout::LEVEL_RET as i32);
         self.a.br(X16);
         self.a.bind(level);
         self.a.ldr(Gpr(9), BASE, -24);
@@ -925,8 +940,10 @@ impl Em<'_> {
         pc_after: usize,
     ) {
         let (entries, consts) = self.site_entries(i, block, hdr);
+        let miss = self.miss[self.v.succs(block)[0].index()];
         self.sites.push(SiteOut {
             keys,
+            miss,
             entries,
             consts,
             hdr,
@@ -1903,7 +1920,7 @@ impl Em<'_> {
                 }
                 if let Some(Known::Native(nc)) = known {
                     let keys = self.native_path(hdr, block, Err(nc));
-                    // Nothing returns past the resume block's branch to it.
+                    // No fast callee misses to a native's site.
                     self.a.bind(self.miss[self.v.succs(block)[0].index()]);
                     self.a.brk(0xf2);
                     self.call_site(keys, i, block, a as u16, pc_after);
@@ -1916,36 +1933,39 @@ impl Em<'_> {
                         closure,
                         proto,
                         nparams,
-                    }) => self.known_call(hdr, block, slow, (closure, proto, nparams), nargs),
+                    }) => self.known_call(hdr, slow, (closure, proto, nparams), nargs),
                     _ => {
-                        let (r, d) = self.fast_call(hdr, block, slow, native);
+                        let (r, d) = self.fast_call(hdr, slow, native);
                         (r, d, false, Target::Reg)
                     }
                 };
-                self.miss_path(hdr, block, common);
-                self.deep_path(deep, block, entered_known, target);
-                let mut keys = vec![(ret, false)];
-                if known.is_none() {
-                    keys.extend(self.native_path(hdr, block, Ok((native, slow))));
-                }
-                self.a.bind(slow);
-                // Only a call through the loaded fast entry branches here
-                // before writing word 0.
-                if let (
-                    Some(Known::Lua {
-                        closure: Some(f), ..
-                    }),
-                    Target::Reg,
-                ) = (known, target)
-                {
-                    self.a.mov_imm(X16, f);
-                    self.a.str(X16, BASE, hdr);
-                }
-                self.a.bind(common);
-                let back = self.level_call(hdr, block, pc_after);
-                let fast = self.fast_resume[self.v.succs(block)[0].index()];
-                keys.extend([(fast, false), (back, true)]);
-                self.call_site(keys, i, block, a as u16, pc_after);
+                self.fall_into_resume(block, next);
+                self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                    em.miss_path(hdr, block, common);
+                    em.deep_path(deep, block, entered_known, target);
+                    let mut keys = vec![(ret, false)];
+                    if known.is_none() {
+                        keys.extend(em.native_path(hdr, block, Ok((native, slow))));
+                    }
+                    em.a.bind(slow);
+                    // Only a call through the loaded fast entry branches here
+                    // before writing word 0.
+                    if let (
+                        Some(Known::Lua {
+                            closure: Some(f), ..
+                        }),
+                        Target::Reg,
+                    ) = (known, target)
+                    {
+                        em.a.mov_imm(X16, f);
+                        em.a.str(X16, BASE, hdr);
+                    }
+                    em.a.bind(common);
+                    let back = em.level_call(hdr, block, pc_after);
+                    let fast = em.fast_resume[em.v.succs(block)[0].index()];
+                    keys.extend([(fast, false), (back, true)]);
+                    em.call_site(keys, i, block, a as u16, pc_after);
+                }));
             }
             Dispatch { op, word, pc_after } => {
                 self.close_frame();
@@ -2017,10 +2037,7 @@ impl Em<'_> {
                 self.tail_level();
             }
             Resume { wanted, c, a, hdr } => {
-                // Nothing falls through into a resume block: its call's
-                // tagged return address names the fast resume, 4 bytes past
-                // the way to the miss path (`fast_miss`).
-                self.a.b(self.miss[block]);
+                // A fast callee returns here (`fall_into_resume`).
                 self.a.bind(self.fast_resume[block]);
                 // The callee's base is past the header at `hdr`; our header's
                 // word 0 is our closure.
@@ -2103,16 +2120,19 @@ impl Em<'_> {
                 }
                 self.a.movz(Sz::X, INSN, nargs as u16, 0);
                 let (slow, native) = (self.a.new_label(), self.a.new_label());
-                let (ret, deep) = self.fast_call(h, block, slow, native);
-                self.miss_path(h, block, slow);
-                self.deep_path(deep, block, false, Target::Reg);
-                let mut keys = vec![(ret, false)];
-                keys.extend(self.native_path(h, block, Ok((native, slow))));
-                self.a.bind(slow);
-                let back = self.level_call(h, block, pc_after);
-                let fast = self.fast_resume[self.v.succs(block)[0].index()];
-                keys.extend([(fast, false), (back, true)]);
-                self.call_site(keys, i, block, hdr, pc_after);
+                let (ret, deep) = self.fast_call(h, slow, native);
+                self.fall_into_resume(block, next);
+                self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                    em.miss_path(h, block, slow);
+                    em.deep_path(deep, block, false, Target::Reg);
+                    let mut keys = vec![(ret, false)];
+                    keys.extend(em.native_path(h, block, Ok((native, slow))));
+                    em.a.bind(slow);
+                    let back = em.level_call(h, block, pc_after);
+                    let fast = em.fast_resume[em.v.succs(block)[0].index()];
+                    keys.extend([(fast, false), (back, true)]);
+                    em.call_site(keys, i, block, hdr, pc_after);
+                }));
             }
             GuardFits { end, exit } => {
                 self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
@@ -2122,9 +2142,9 @@ impl Em<'_> {
                 self.a.b_cond(Cond::Hi, l);
             }
             Return { a, n, x0 } => {
-                // A frame a compiled caller entered holds that caller's
-                // return address, one dispatch entered its level's.
-                let slow = self.a.new_label();
+                // To a compiled caller, or to `level_land` for a frame
+                // dispatch entered; a tagged return address is a deep one's
+                // (`deep_path`).
                 if n == 0 {
                     self.a.mov_imm(Gpr(0), NIL);
                 } else if !x0 {
@@ -2133,19 +2153,12 @@ impl Em<'_> {
                 self.close_frame();
                 self.a.movz(Sz::X, INSN, n as u16, 0);
                 self.a.add_imm(Sz::X, PC, BASE, a as u64 * 8);
-                self.a.ldr(X17, RT, layout::LEVEL_RET as i32);
-                self.a.cmp(Sz::X, LR, X17);
-                self.a.b_cond(Cond::Eq, slow);
                 let deep = self.a.new_label();
                 self.a.tbnz(LR, 0, deep);
                 self.a.ret();
                 self.a.bind(deep);
                 self.a.and_imm(Sz::X, LR, LR, !1u64);
                 self.a.br(LR);
-                self.a.bind(slow);
-                self.a.ldr(X16, BASE, -24);
-                self.a.and_imm(Sz::X, X16, X16, !31u64);
-                self.a.br(X16);
             }
             Deopt { exit } => {
                 let l = self.exit(exit);

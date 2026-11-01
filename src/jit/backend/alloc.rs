@@ -2,7 +2,10 @@
 //! 64-byte units by a bitmap in the segment's own first units. A block's
 //! writable address masks back to its segment's header, so a `CodeBlock`
 //! frees itself without a pointer to the allocator; the allocator outlives
-//! every block (regions hold an `Rc` of it).
+//! every block (regions hold an `Rc` of it). The executable alias is
+//! aligned too, and a second bitmap marks where blocks start, so an address
+//! in a block finds the block's first word (`block_start`), where a region
+//! keeps its pointer.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -14,7 +17,7 @@ pub(crate) const SEG_SIZE: usize = 64 * 1024;
 const UNIT: usize = 64;
 const TOTAL_UNITS: usize = SEG_SIZE / UNIT;
 const BITMAP_WORDS: usize = TOTAL_UNITS / 64;
-const HEADER_UNITS: usize = 3;
+const HEADER_UNITS: usize = 5;
 const DATA_UNITS: usize = TOTAL_UNITS - HEADER_UNITS;
 
 #[repr(C)]
@@ -22,6 +25,8 @@ struct SegHeader {
     rx_base: *mut u8,
     used_units: Cell<u16>,
     bitmap: [Cell<u64>; BITMAP_WORDS],
+    /// The first unit of each block.
+    starts: [Cell<u64>; BITMAP_WORDS],
 }
 
 const _: () = assert!(size_of::<SegHeader>() <= HEADER_UNITS * UNIT);
@@ -64,6 +69,8 @@ impl SegHeader {
             self.set(i);
         }
         self.used_units.set(self.used_units.get() + len as u16);
+        let w = &self.starts[start / 64];
+        w.set(w.get() | 1 << (start % 64));
     }
 
     fn free(&self, start: usize, len: usize) {
@@ -72,7 +79,32 @@ impl SegHeader {
             self.clear(i);
         }
         self.used_units.set(self.used_units.get() - len as u16);
+        let w = &self.starts[start / 64];
+        w.set(w.get() & !(1 << (start % 64)));
     }
+
+    /// The first unit of the block holding unit `i`.
+    fn start_of(&self, i: usize) -> usize {
+        let mut k = i / 64;
+        let mut w = self.starts[k].get() & (u64::MAX >> (63 - i % 64));
+        while w == 0 {
+            k -= 1;
+            w = self.starts[k].get();
+        }
+        k * 64 + 63 - w.leading_zeros() as usize
+    }
+}
+
+/// The executable address of the first byte of the code block holding
+/// `addr`.
+///
+/// # Safety
+/// `addr` lies in a live block's executable alias.
+pub(crate) unsafe fn block_start(addr: usize) -> usize {
+    let seg = addr & !(SEG_SIZE - 1);
+    // SAFETY: the alias maps the header too, readable.
+    let h = unsafe { &*(seg as *const SegHeader) };
+    seg + h.start_of((addr - seg) / UNIT) * UNIT
 }
 
 struct Segment {
@@ -239,6 +271,11 @@ impl Inner {
                 return Err(e);
             }
         };
+        // `block_start` masks executable addresses to their segment.
+        assert!(
+            rx.as_ptr() as usize & (SEG_SIZE - 1) == 0,
+            "an unaligned code segment"
+        );
         let h = unsafe { &mut *(rw.as_ptr() as *mut SegHeader) };
         h.rx_base = rx.as_ptr();
         for i in 0..HEADER_UNITS {

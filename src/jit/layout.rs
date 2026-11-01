@@ -24,8 +24,9 @@ pub(crate) const NATIVE_DEEP: usize =
     offset_of!(crate::env::thread::ThreadState<'static>, native_deep);
 /// `ThreadState::shim`, from the `thread` register.
 pub(crate) const SHIM: usize = offset_of!(crate::env::thread::ThreadState<'static>, shim);
-/// `JitRuntime::level_ret` and `jump_target`, from `rt`.
+/// `JitRuntime::level_ret`, `level_land` and `jump_target`, from `rt`.
 pub(crate) const LEVEL_RET: usize = JIT + offset_of!(JitRuntime, level_ret);
+pub(crate) const LEVEL_LAND: usize = JIT + offset_of!(JitRuntime, level_land);
 pub(crate) const JUMP_TARGET: usize = JIT + offset_of!(JitRuntime, jump_target);
 /// The pointer to the arena's `Metrics`.
 pub(crate) const METRICS: usize =

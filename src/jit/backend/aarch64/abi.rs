@@ -165,19 +165,22 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "ldp x29, x30, [x29]",
         "mov sp, x10",
         "mov x20, x16",
-        "ldr x11, [x23, #{level_ret}]",
+        "ldr x11, [x23, #{level_land}]",
         "cmp x30, x11",
         "b.eq 3f",
-        "adr x16, 3f",
+        "adr x16, 4f",
         "mov x17, x22",
         "b {jit_level}",
         "3:",
+        "ldr x30, [x23, #{level_ret}]",
+        "4:",
         "b {jit_exit}",
         regs = const crate::jit::layout::EXIT_REGS,
         num_spills = const crate::jit::region::layout::NUM_SPILLS,
         frame_size = const crate::jit::region::layout::FRAME_SIZE,
         spills = const IMAGE_SPILLS * 8,
         level_ret = const crate::jit::layout::LEVEL_RET,
+        level_land = const crate::jit::layout::LEVEL_LAND,
         frame_spills = const crate::jit::backend::aarch64::emit::FRAME_SPILLS,
         jit_level = sym jit_level,
         jit_exit = sym crate::jit::jit_exit,
@@ -324,39 +327,94 @@ pub(crate) unsafe extern "C" fn level_return() {
 
 /// Where a direct call goes while its callee's prototype has no fast entry
 /// (`jit::direct_target`): what a fast entry's failed check does (`emit`'s
-/// `fast_miss`). Back to the caller's slow path 4 bytes past its return
-/// address, or before its fast resume, which a tagged one names; a tail
-/// call from a frame dispatch entered has the level's return address, and
-/// `enter` runs the call from the header the tail call wrote.
+/// `fast_miss`). A tail call from a frame dispatch entered has its landing
+/// for a return address: `enter` runs the call from the header the tail
+/// call wrote, in the level. Otherwise on to the caller's slow path.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn direct_miss() {
     core::arch::naked_asm!(
-        "ldr x17, [x23, #{level_ret}]",
+        "ldr x17, [x23, #{level_land}]",
         "cmp x30, x17",
-        "b.eq 2f",
-        "tbnz x30, #0, 1f",
-        "add x30, x30, #4",
-        "ret",
+        "b.eq 1f",
+        "b {call_miss}",
         "1:",
-        "and x30, x30, #~1",
-        "sub x30, x30, #4",
-        "br x30",
-        "2:",
         "movz x16, #{tag}, lsl #48",
         "orr x16, x16, x24",
         "str x16, [x22, #-32]",
         "sub x21, x22, #32",
         "mov x22, xzr",
+        "ldr x30, [x23, #{level_ret}]",
         "b {enter}",
+        level_land = const crate::jit::layout::LEVEL_LAND,
         level_ret = const crate::jit::layout::LEVEL_RET,
         tag = const crate::jit::layout::FUNCTION_TAG,
+        call_miss = sym call_miss,
         enter = sym crate::vm::ops::call::enter,
+    )
+}
+
+/// A fast callee's entry checks failed: on to its caller's slow path, which
+/// the caller's site table names by the return address in x30 (tagged or
+/// not). Every allocatable register is free across a call, and the pinned
+/// ones and `insn` are callee-saved.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn call_miss() {
+    core::arch::naked_asm!(
+        "stp x29, x30, [sp, #-16]!",
+        "mov x29, sp",
+        "and x0, x30, #~1",
+        "bl {target}",
+        "mov x16, x0",
+        "ldp x29, x30, [sp], #16",
+        "br x16",
+        target = sym crate::jit::jit_call_miss,
     )
 }
 
 /// The address handlers in a level return to: past `level_return`'s `nop`.
 pub(crate) fn level_return_addr() -> usize {
     level_return as *const () as usize + 4
+}
+
+/// Enter the region whose entry is in x16 from dispatch, its return address
+/// `level_land` (the address past the `blr`), so the region returns with a
+/// plain `ret` the return address stack predicts. Dispatch runs with `sp` at
+/// the level's record, so the unwind rule is `level_return`'s: an unwinder
+/// at a return address of `level_land` reads the caller's frame there.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn level_enter() {
+    core::arch::naked_asm!(
+        ".cfi_startproc",
+        ".cfi_def_cfa sp, {size}",
+        ".cfi_offset x29, -{size}",
+        ".cfi_offset x30, -{size} + 8",
+        ".cfi_offset x19, -{size} + {x}",
+        ".cfi_offset x20, -{size} + {x} + 8",
+        ".cfi_offset x21, -{size} + {x} + 16",
+        ".cfi_offset x22, -{size} + {x} + 24",
+        ".cfi_offset x23, -{size} + {x} + 32",
+        ".cfi_offset x24, -{size} + {x} + 40",
+        ".cfi_offset x25, -{size} + {x} + 48",
+        ".cfi_offset x26, -{size} + {x} + 56",
+        ".cfi_offset x27, -{size} + {x} + 64",
+        ".cfi_offset x28, -{size} + {x} + 72",
+        "blr x16",
+        "ldr x30, [x23, #{level_ret}]",
+        "ldr x16, [x22, #-24]",
+        "and x16, x16, #~31",
+        "br x16",
+        ".cfi_endproc",
+        size = const crate::vm::stack::rec::SIZE,
+        x = const crate::vm::stack::rec::X,
+        level_ret = const crate::jit::layout::LEVEL_RET,
+    )
+}
+
+/// Where a region dispatch entered returns: on in its level through the
+/// frame's continuation, as an interpreted callee returns (the results'
+/// count in `insn`, the values at `pc`).
+pub(crate) fn level_land() -> usize {
+    level_enter as *const () as usize + 4
 }
 
 /// The continuation of a level's first frame: its results go back to the

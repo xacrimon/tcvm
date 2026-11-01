@@ -205,13 +205,13 @@ pub(crate) mod rec {
     const _: () = assert!(SIZE == 192 && PREV == 16 && X == 48 && D == 128);
 }
 
-/// Where handlers in a level return to (`abi::level_return`), 0 where
-/// there are no levels.
+/// The return address of a compiled frame dispatch entered
+/// (`abi::level_land`), 0 where there are no levels.
 #[inline]
-pub(crate) fn level_ret() -> usize {
+pub(crate) fn level_land() -> usize {
     #[cfg(target_arch = "aarch64")]
     {
-        crate::jit::backend::aarch64::abi::level_return_addr()
+        crate::jit::backend::aarch64::abi::level_land()
     }
     #[cfg(not(target_arch = "aarch64"))]
     {

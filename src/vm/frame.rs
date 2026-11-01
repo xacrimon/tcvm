@@ -356,7 +356,7 @@ impl<'gc> Frame<'gc> {
             || ret == crate::vm::stack::ret_shim_bits()
             || self.compiled.is_some_and(|(fp, ..)| {
                 // SAFETY: a compiled frame's saved return address is at `fp + 8`.
-                unsafe { *((fp + 8) as *const usize) != crate::vm::stack::level_ret() }
+                unsafe { *((fp + 8) as *const usize) != crate::vm::stack::level_land() }
             })
     }
 
@@ -438,12 +438,10 @@ impl<'gc> Iterator for Walk<'gc> {
         }
         loop {
             if let Some((fp, ra, child, first)) = self.compiled {
-                // SAFETY: a compiled frame records its region at
-                // `fp + FRAME_REGION`, and the return address into it names
-                // one of its call sites.
+                // SAFETY: the return address into a compiled frame names its
+                // region and one of its call sites.
                 let (f, next) = unsafe {
-                    let region =
-                        *((fp + crate::jit::FRAME_REGION) as *const *const Region<'static>);
+                    let region = Region::of_return(ra);
                     let (site, _) = (*region)
                         .site(ra)
                         .expect("a return address without its site");
@@ -461,7 +459,7 @@ impl<'gc> Iterator for Walk<'gc> {
                         compiled: Some((fp, site as *const Site, region)),
                     };
                     let lr = *((fp + 8) as *const usize);
-                    let next = (lr != crate::vm::stack::level_ret())
+                    let next = (lr != crate::vm::stack::level_land())
                         .then(|| (*(fp as *const usize), lr & !1, base, false));
                     (f, next)
                 };
