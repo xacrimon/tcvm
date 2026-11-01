@@ -400,8 +400,13 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         RETURN => emit_return(b, a, rb - 1),
         TAILCALL => {
             let callee = callee_at(b, pc, a);
-            // The frame before the TAILCALL, for the return's exit.
+            // The frame before the TAILCALL, for the return's exit, which is
+            // tested before an intrinsic runs: the frame would run it again.
             let before = b.snap_before();
+            let intrinsic = intrinsics::has_intrinsic(b, pc, callee);
+            if intrinsic {
+                return_guard(b, before);
+            }
             let slow = match intrinsics::emit(b, pc, insn, callee) {
                 Emitted::No => Some(b.cur),
                 Emitted::Done => None,
@@ -410,7 +415,8 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             // `return error(...)` left already.
             if slow != Some(b.cur) && !b.terminated() {
                 b.flush();
-                emit_return_from(b, a, 1, before);
+                debug_assert!(intrinsic);
+                return_tested(b, a, 1);
             }
             if let Some(slow) = slow {
                 b.switch_to(slow);
@@ -591,11 +597,13 @@ fn emit_tailcall(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8) {
 /// cells first, from the captured registers' slots.
 fn emit_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
     let s = b.snap_before();
-    emit_return_from(b, a, n, s);
+    return_guard(b, s);
+    return_tested(b, a, n);
 }
 
-/// `emit_return` exiting with the frame `s`.
-fn emit_return_from(b: &mut Builder<'_, '_>, a: u8, n: u8, s: crate::jit::ir::Snap) {
+/// The exit (with the frame `s`) of a return whose frame has to-be-closed
+/// variables, or open upvalues without captured registers to close them.
+fn return_guard(b: &mut Builder<'_, '_>, s: crate::jit::ir::Snap) {
     let captures = b.cfg.captured.iter().next().is_some();
     let mask = if captures {
         flag::HAS_TBC
@@ -603,6 +611,11 @@ fn emit_return_from(b: &mut Builder<'_, '_>, a: u8, n: u8, s: crate::jit::ir::Sn
         flag::HAS_OPEN | flag::HAS_TBC
     };
     b.ins_snap(Op::GuardNoFlag(mask as u8), &[], s, ExitTag::Unsupported);
+}
+
+/// The return of `R[a..a+n]` once [`return_guard`] passed.
+fn return_tested(b: &mut Builder<'_, '_>, a: u8, n: u8) {
+    let captures = b.cfg.captured.iter().next().is_some();
     if captures {
         // Results may overwrite captured slots, as in the interpreter.
         let regs: Vec<usize> = b.cfg.captured.iter().collect();

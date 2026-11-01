@@ -126,6 +126,8 @@ struct Em<'a> {
     helpers: Helpers,
     /// The `TCVM_JIT_DEOPT_ALL` flags of the exits, by address.
     fired: Option<usize>,
+    /// The exits that mode may take where first reached (`LExit::forced`).
+    forced: Vec<bool>,
     /// Per resume block, where a fast callee's `ret` lands.
     fast_resume: Vec<Label>,
     /// Per resume block, its call's miss path (`miss_path`), branched to
@@ -301,6 +303,7 @@ pub(crate) fn emit(
         entry_fail,
         helpers,
         fired,
+        forced: l.exits.iter().map(|e| e.forced).collect(),
         fast_resume,
         miss,
         resume_based,
@@ -1143,6 +1146,7 @@ impl Em<'_> {
         let inst = self.v.insts[i].clone();
         if let Some(fired) = self.fired
             && let Some(k) = inst.exit_id()
+            && self.forced[k as usize]
         {
             // An exit that never fired fires now.
             let l = self.exit(k);

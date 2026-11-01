@@ -255,6 +255,12 @@ pub(super) enum Emitted {
     Fallback(Block, Val),
 }
 
+/// Whether the callee the CALL at `pc` is known to call has an intrinsic
+/// ([`emit`] may still decline the call's shape).
+pub(super) fn has_intrinsic(b: &Builder<'_, '_>, pc: u32, callee: Val) -> bool {
+    known_callee(b, pc, callee).and_then(intrinsic_of).is_some()
+}
+
 /// Compile the CALL at `pc` as its callee's intrinsic, if it has one that
 /// covers the call's shape.
 pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> Emitted {

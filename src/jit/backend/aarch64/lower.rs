@@ -29,6 +29,10 @@ pub(crate) struct LExit {
     pub(crate) entries: Vec<(u8, SRep, Src)>,
     /// The VCode instruction that exits, once lowered.
     pub(crate) inst: Option<usize>,
+    /// Whether `TCVM_JIT_DEOPT_ALL` may take it where it is first reached:
+    /// not a test that a helper that writes failed (and did nothing), as
+    /// the exit's frame would do the helper's work again.
+    pub(crate) forced: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -527,6 +531,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             fr = x.parent;
         }
         frames.reverse();
+        let f = self.f;
+        let store_failed = d.op == Op::GuardFalse
+            && f.def_inst(f.args(i)[0]).is_some_and(|c| {
+                f.op(c) == Op::SameBits
+                    && f.args(c).iter().any(|&a| {
+                        matches!(f.def_op(a), Some(Op::Helper(h)) if h.sig().effects.writes())
+                    })
+            });
         self.exits.push(LExit {
             pc,
             frames,
@@ -535,6 +547,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             tag,
             entries,
             inst: None,
+            forced: !store_failed,
         });
         (self.exits.len() as u32 - 1, ops)
     }
