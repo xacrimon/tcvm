@@ -312,21 +312,17 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
 }
 
 /// Whether a callee's instruction needs its frame on the stack: closures
-/// over it, cells, varargs, metamethod calls, a constructor (whose helper
-/// finds the template through the frame).
+/// over it, cells, varargs, metamethod calls.
 fn needs_frame(op: BcOp) -> bool {
     use BcOp::*;
     matches!(
         op.unquickened(),
         TAILCALL
-            | CONCAT
             | CLOSE
             | TBC
             | TFORPREP
             | TFORCALL
             | TFORLOOP
-            | NEWTABLE
-            | SETLIST
             | CLOSURE
             | VARARG
             | VARARGGET

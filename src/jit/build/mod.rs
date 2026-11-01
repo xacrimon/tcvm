@@ -452,7 +452,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// An inlined body cannot hold what needs its frame on the stack (its
     /// closure's upvalues, a tail-out, a frame-relative helper) or a
     /// metamethod call, whose frame goes past the region's registers and
-    /// so may overlap the body's. Its slots and calls are the region's.
+    /// so may overlap the body's. Its slots, calls and `SETLIST` are the
+    /// region's.
     fn inline_check(&mut self, op: Op) {
         use crate::jit::ir::ops::{Ctx, HelperId, Mem};
         let Some(i) = &mut self.inline else {
@@ -464,7 +465,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 | Op::Store(_)
                 | Op::Call { .. }
                 | Op::Resume { .. }
-                | Op::Helper(HelperId::TopArgs(_))
+                | Op::Helper(HelperId::TopArgs(_) | HelperId::SetList { .. })
         ) {
             return;
         }

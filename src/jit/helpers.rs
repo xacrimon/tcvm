@@ -38,7 +38,7 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::UpvalBarrier(_) => jit_upval_barrier as *const () as usize,
         HelperId::Closure { .. } => jit_closure as *const () as usize,
         HelperId::Close(_) => jit_close as *const () as usize,
-        HelperId::NewTable(_) => jit_newtable as *const () as usize,
+        HelperId::NewTable => jit_newtable as *const () as usize,
         HelperId::SetList { .. } => jit_setlist as *const () as usize,
         HelperId::VarargGet => jit_varargget as *const () as usize,
         HelperId::VarargTable(_) => jit_vararg_table as *const () as usize,
@@ -297,14 +297,10 @@ pub(crate) extern "C" fn jit_tfor_ipairs(_rt: *const State<'static>, t: u64, k: 
 }
 
 /// `NEWTABLE` from template `t` of the running prototype.
-pub(crate) extern "C" fn jit_newtable(
-    rt: *const State<'static>,
-    base: *mut Value<'static>,
-    t: u64,
-) -> u64 {
+pub(crate) extern "C" fn jit_newtable(rt: *const State<'static>, t: u64) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
-    let closure = unsafe { frame::closure(base) };
-    let t = &closure.proto.templates[t as usize];
+    // SAFETY: a template of a prototype the region keeps.
+    let t = unsafe { &*(t as *const crate::env::function::Template<'static>) };
     Value::table(Table::from_template(ctx.mutation(), t)).to_raw()
 }
 

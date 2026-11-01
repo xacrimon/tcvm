@@ -2308,6 +2308,30 @@ fn kept_values_need_no_dead_register() {
     compiles_cleanly(src, true);
 }
 
+/// Constructors and concatenation in inlined bodies (W3 step 3): a table
+/// from its prototype's template, positional items from the body's slots,
+/// a list ending in a call's results (to `top`), and `..`.
+#[test]
+fn bodies_build_tables_and_strings() {
+    agrees(
+        "local function point(x, y) return {x = x, y = y, tag = 'p'} end
+        local function triple(a) return {a, a + 1, a + 2} end
+        local function copy(t) return {0, table.unpack(t)} end
+        local function name(i) return 'n' .. i end
+        local src = {7, 8, 9}
+        local s, n, l = 0, 0, 0
+        for i = 1, 3000 do
+          local p = point(i, i * 2)
+          local t = triple(i)
+          local c = copy(src)
+          s = s + p.x + p.y + t[1] + t[3] + #t + c[2] + c[4] + #c
+          if p.tag == 'p' then n = n + 1 end
+          l = l + #name(i)
+        end
+        return s .. ' ' .. n .. ' ' .. l",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]

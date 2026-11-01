@@ -253,7 +253,9 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.note_def(&[v], None);
         }
         NEWTABLE => {
-            let t = b.ins(Op::Helper(HelperId::NewTable(insn.d())), &[]);
+            let t = &b.proto.templates[insn.d() as usize] as *const _ as i64;
+            let k = b.ins(Op::KI64(t), &[]);
+            let t = b.ins(Op::Helper(HelperId::NewTable), &[k]);
             b.set(a, t);
         }
         SETLIST => {
@@ -266,6 +268,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             };
             b.store_regs(a as usize..=end);
             let off = insn.d() as u32;
+            let a = b.slot_of(a);
             b.push(Op::Helper(HelperId::SetList { a, n: rb, off }), &[]);
         }
         JMP | JMP_BACK => b.jump(succs[0]),

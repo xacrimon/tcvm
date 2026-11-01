@@ -577,7 +577,7 @@ fn lazy_exits_need_dependencies() {
 
 /// A write changing a class's bits invalidates the region that folded
 /// them: its frame leaves at the lazy exit past the call it is in, and its
-/// entry is retired.
+/// entry is retired. `hook` stays a call: inlining is off.
 #[test]
 fn class_writes_invalidate_dependent_regions() {
     let src = "mt = {}
@@ -598,6 +598,7 @@ fn class_writes_invalidate_dependent_regions() {
     r = f()";
     let mut lua = Lua::new();
     lua.set_jit(true);
+    lua.set_jit_inline(false);
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {
@@ -818,11 +819,40 @@ fn float_keys_index_arrays() {
     assert!(ir.contains("ftoiexact"), "{ir}");
 }
 
+/// Constructors and concatenation inline (W3 step 3): `NEWTABLE` takes its
+/// template by address, `SETLIST` stores from the body's slots, and the
+/// only call left is `table.unpack`, made from `copy`'s body.
+#[test]
+fn constructors_inline() {
+    let src = "local function point(x, y) return {x = x, y = y} end
+    local function triple(a) return {a, a + 1, a + 2} end
+    local function copy(t) return {0, table.unpack(t)} end
+    local function name(i) return 'n' .. i end
+    local src = {7, 8, 9}
+    function f(n)
+        local s = 0
+        for i = 1, n do
+            s = s + point(i, i).x + #triple(i) + #copy(src) + #name(i)
+        end
+        return s
+    end
+    for k = 1, 300 do f(10) end";
+    let ir = ir_of(src, "f", 0);
+    for op in ["newtable", "setlist", "concat"] {
+        assert!(ir.contains(op), "{op}: {ir}");
+    }
+    assert!(
+        ir.lines()
+            .filter(|l| l.contains("call r"))
+            .all(|l| l.contains(" after f")),
+        "{ir}"
+    );
+}
+
 /// Callees storing through the table helpers inline (W2.7): `rawset`,
 /// `table.insert`, `table.remove`, `setmetatable` and a generic store touch
 /// table memory alone; the builtins' fallbacks are calls from the bodies.
-/// (A tail call or a constructor still keeps a callee out,
-/// `inline::needs_frame`.)
+/// (A tail call still keeps a callee out, `inline::needs_frame`.)
 #[test]
 fn table_helpers_inline() {
     let src = "local mt = {}

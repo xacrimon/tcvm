@@ -95,8 +95,9 @@ pub(crate) enum HelperId {
     /// `->`: close this frame's open upvalues from `R[a]` up, from the
     /// captured registers' home slots.
     Close(u8),
-    /// `-> Val`: `NEWTABLE` from the prototype's template.
-    NewTable(u16),
+    /// `I64 -> Val`: `NEWTABLE` from the template at that address, a constant
+    /// of the frame's prototype (W3 §6), which the region keeps.
+    NewTable,
     /// `->`: `SETLIST` of `R[a+1..=a+n]`, in their slots, into the table in
     /// `R[a]` from index `off + 1`.
     SetList {
@@ -216,7 +217,6 @@ impl HelperId {
             HelperId::UpvalBarrier(i) => format!("upval_barrier u{i}"),
             HelperId::Closure { proto, dst } => format!("closure p{proto} r{dst}"),
             HelperId::Close(a) => format!("close r{a}"),
-            HelperId::NewTable(t) => format!("newtable t{t}"),
             HelperId::SetList { a, n, off } => format!("setlist r{a} n={n} off={off}"),
             HelperId::VarargGet => "varargget".into(),
             HelperId::VarargTable(np) => format!("varargtable r{np}"),
@@ -287,7 +287,7 @@ impl HelperId {
                 None,
                 e(NO, Mem::SLOT | Mem::FRAME, Mem::UPVAL | Mem::FRAME),
             ),
-            HelperId::NewTable(t) => (BASE, Some(t as u64), &[], Some(Val), e(ALLOC, NONE, NONE)),
+            HelperId::NewTable => (RT, None, &[I64], Some(Val), e(ALLOC, NONE, NONE)),
             HelperId::SetList { a, n, off } => (
                 FRAME,
                 Some(a as u64 | (n as u64) << 8 | (off as u64) << 16),
@@ -1024,7 +1024,7 @@ impl Op {
             }
             Helper(HelperId::Concat | HelperId::Type) => Ty::val(TypeSet::STR),
             Helper(HelperId::Closure { .. }) => Ty::val(TypeSet::FUN),
-            Helper(HelperId::NewTable(_) | HelperId::VarargTable(_)) => Ty::val(TypeSet::TAB),
+            Helper(HelperId::NewTable | HelperId::VarargTable(_)) => Ty::val(TypeSet::TAB),
             Helper(h) => Ty::of_rep(h.sig().ret.unwrap_or(Rep::Val)),
             _ => Ty::ANY,
         }
