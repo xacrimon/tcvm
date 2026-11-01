@@ -1280,6 +1280,54 @@ fn float_modulo_edges() {
     );
 }
 
+/// String keys of table accesses (W2.5): counting into a dictionary, a
+/// small table, `__index` tables and functions, `__newindex` from the start
+/// and gained later, other keys and receivers at a string site.
+#[test]
+fn string_table_keys() {
+    agrees(
+        r##"
+        local function get(t, k) return t[k] end
+        local function put(t, k, v) t[k] = v end
+        local function count(t, s, n)
+          for i = 1, #s - n + 1 do
+            local k = string.sub(s, i, i + n - 1)
+            t[k] = (t[k] or 0) + 1
+          end
+        end
+        local seq = string.rep("ACGTTGCAAGCT", 40)
+        local freq = {}
+        for r = 1, 50 do count(freq, seq, 3) end
+        local keys = {}
+        for k in pairs(freq) do keys[#keys + 1] = k end
+        table.sort(keys)
+        local out = {#keys, freq.ACG, freq.TGC}
+        local small = {}
+        for r = 1, 300 do put(small, "k" .. (r % 5), r); out[4] = get(small, "k3") end
+        local base = {inherited = "yes"}
+        local obj = setmetatable({}, {__index = base})
+        for r = 1, 300 do out[5] = get(obj, "inherited"); out[6] = tostring(get(obj, "missing")) end
+        local fn = setmetatable({}, {__index = function(t, k) return k .. "!" end})
+        for r = 1, 300 do out[7] = get(fn, "hi") end
+        local log = {}
+        local guarded = setmetatable({}, {__newindex = function(t, k, v) log[#log + 1] = k; rawset(t, k, v) end})
+        for r = 1, 300 do put(guarded, "a" .. (r % 3), r) end
+        out[8] = #log
+        local mt = {}
+        local late = setmetatable({}, mt)
+        for r = 1, 300 do put(late, "x", r) end
+        mt.__newindex = function(t, k, v) log[#log + 1] = "late:" .. k end
+        put(late, "y", 1); put(late, "x", 2)
+        out[9] = #log .. ":" .. tostring(rawget(late, "y")) .. ":" .. late.x
+        out[10] = tostring(get(freq, 1)); put(freq, 2, "two"); out[11] = freq[2]
+        out[12] = tostring(select(2, pcall(get, nil, "x")) ~= nil)
+        local s = setmetatable({}, {__index = string})
+        out[13] = get(s, "upper")("ok")
+        return table.concat(out, " ")
+"##,
+    );
+}
+
 /// Float keys of array accesses (W2.6): integral floats as the integers'
 /// keys, then fractions, -0.0, floats past i32 and NaN, read and written,
 /// at sites that saw only integral floats before.

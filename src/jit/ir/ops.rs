@@ -135,6 +135,12 @@ pub(crate) enum HelperId {
     /// `(Val, Val) -> Val`: `recv[key]` through `__index` tables, or
     /// `HELPER_FAIL_VAL` (an `__index` function, an error).
     Index,
+    /// `(Val, Val) -> Val`: `t[k]` for a table and a string (W2.5), or
+    /// `HELPER_FAIL_VAL` where `__index` may answer.
+    GetStr,
+    /// `(Val, Val, Val) -> Val`: `t[k] = v` for a table and a string as
+    /// `t[k] = v` stores, 0, or `HELPER_FAIL_VAL` where `__newindex` may run.
+    SetStr,
     /// Builtins (12), each `-> Val` with `HELPER_FAIL_VAL` where the builtin
     /// must run: `type(v)`, `getmetatable(v)`, `setmetatable(t, mt)` on a
     /// table without one, `rawget(t, k)`, `rawset(t, k, v)`, `rawequal(a,
@@ -339,6 +345,14 @@ impl HelperId {
                 Some(Val),
                 Effects::reads(Mem::TAB | Mem::ARR | Mem::SHAPE | Mem::META),
             ),
+            HelperId::GetStr => (
+                &[][..],
+                None,
+                &[Val, Val],
+                Some(Val),
+                Effects::reads(Mem::TAB | Mem::SHAPE | Mem::META),
+            ),
+            HelperId::SetStr => (RT, None, &[Val, Val, Val], Some(Val), table_store),
             // `raw_set` may grow the table.
             HelperId::NewIndex { keyed } => (
                 RT,

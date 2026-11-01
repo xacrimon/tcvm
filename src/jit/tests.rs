@@ -648,6 +648,34 @@ fn field_loads_take_their_slot_kinds() {
     assert!(ir.contains("val:tab@s"), "{ir}");
 }
 
+/// String keys of a table access read and write its string part directly
+/// (W2.5), the generic walk only in a cold arm.
+#[test]
+fn string_keys_take_the_string_helpers() {
+    let src = "function f(t, s, n)
+        for i = 1, #s - n + 1 do
+            local k = string.sub(s, i, i + n - 1)
+            t[k] = (t[k] or 0) + 1
+        end
+    end
+    keep = {}
+    for r = 1, 300 do f(keep, 'ACGTTGCAAGCT', 3) end";
+    let ir = ir_of(src, "f", 0);
+    let mut cold = false;
+    let hot: Vec<&str> = ir
+        .lines()
+        .filter(|l| {
+            if !l.starts_with(' ') {
+                cold = l.contains(" cold");
+            }
+            !cold
+        })
+        .collect();
+    let has = |s: &str| hot.iter().any(|l| l.contains(s));
+    assert!(has("call.getstr") && has("call.setstr"), "{ir}");
+    assert!(!has("call.index") && !has("call.newindex"), "{ir}");
+}
+
 /// Float keys with integral values index the array part (W2.6): no generic
 /// helper where the site saw only numbers.
 #[test]

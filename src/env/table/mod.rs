@@ -254,6 +254,25 @@ impl<'gc> Table<'gc> {
         }
     }
 
+    /// [`raw_get`](Self::raw_get) of a string key.
+    #[inline]
+    pub(crate) fn raw_get_str(self, key: LuaString<'gc>) -> Value<'gc> {
+        self.0.borrow().get_string_key(key)
+    }
+
+    /// [`raw_set_keyed`](Self::raw_set_keyed) of a string key.
+    #[inline]
+    pub(crate) fn raw_set_str_keyed(
+        self,
+        ctx: Context<'gc>,
+        key: LuaString<'gc>,
+        value: Value<'gc>,
+    ) {
+        self.0
+            .borrow_mut(ctx.mutation())
+            .set_string_key(ctx, key, value, MAX_KEYED_PROPERTIES);
+    }
+
     /// See [`TableState::raw_set_keyed`].
     pub fn raw_set_keyed(self, ctx: Context<'gc>, key: Value<'gc>, value: Value<'gc>) {
         self.0

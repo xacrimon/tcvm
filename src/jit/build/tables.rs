@@ -1313,6 +1313,58 @@ fn int_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Result<Val, (Val,
     Some(Err((conv(b, kb), other)))
 }
 
+/// The string key of a table access, boxed: a string, or guarded one where
+/// the site saw only strings (W2.5).
+fn str_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Val> {
+    let ty = b.ty(k);
+    if !ty.set.is_empty() && ty.within(TypeSet::STR) {
+        return Some(b.boxed(k));
+    }
+    if b.feedback(pc) & fb::KINDS != fb::STR || b.kind_exited(pc) {
+        return None;
+    }
+    let g = b.guard(k, TypeSet::STR);
+    Some(b.boxed(g))
+}
+
+/// `R[dst] = recv[key]` for the table `recv` and the string `k`: its string
+/// part read directly; where `__index` may answer, the walk in a cold arm.
+fn get_str(b: &mut Builder<'_, '_>, dst: u8, recv: Val, key: Val, k: Val) -> Val {
+    let tv = b.guard(recv, TypeSet::TAB);
+    let r = b.ins(Op::Helper(HelperId::GetStr), &[tv, k]);
+    let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
+    let failed = b.ins(Op::SameBits, &[r, fail]);
+    let join = b.new_block();
+    let ok = branch_arm(b, failed);
+    cold(b, |b| {
+        let w = index(b, dst, recv, key);
+        arm_end(b, join, dst, w);
+    });
+    b.switch_to(ok);
+    arm_end(b, join, dst, r);
+    enter_join(b, join);
+    b.reg(dst)
+}
+
+/// `recv[key] = v` for the table `recv` and the string `k`: into its string
+/// part directly; where `__newindex` may run, the walk in a cold arm.
+fn set_str(b: &mut Builder<'_, '_>, recv: Val, key: Val, k: Val, v: Val) {
+    let tv = b.guard(recv, TypeSet::TAB);
+    let r = b.ins(Op::Helper(HelperId::SetStr), &[tv, k, v]);
+    let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
+    let failed = b.ins(Op::SameBits, &[r, fail]);
+    let join = b.new_block();
+    let ok = branch_arm(b, failed);
+    cold(b, |b| {
+        newindex(b, recv, key, v, true);
+        b.jump(join);
+    });
+    b.switch_to(ok);
+    // The store may change a class (`MtCache::member_write`).
+    call_arm_end(b, join, None);
+    enter_join(b, join);
+}
+
 /// The array part's cell, where the site's feedback never saw a miss: `i`
 /// below the size, guarded (`Bounds`). `None` after a miss: the caller
 /// tests it.
@@ -1356,6 +1408,11 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
         b.set(dst, v);
         return;
     };
+    if let Some(k) = str_key(b, pc, key) {
+        let v = get_str(b, dst, recv, key, k);
+        b.set(dst, v);
+        return;
+    }
     let (i, other) = match int_key(b, pc, key) {
         None => {
             let v = index(b, dst, recv, key);
@@ -1425,6 +1482,10 @@ pub(super) fn emit_settable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
         newindex(b, recv, key, v, true);
         return;
     };
+    if let Some(k) = str_key(b, pc, key) {
+        set_str(b, recv, key, k, v);
+        return;
+    }
     let (i, other) = match int_key(b, pc, key) {
         None => {
             newindex(b, recv, key, v, true);

@@ -47,6 +47,8 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::TopArgs(_) => jit_top_args as *const () as usize,
         HelperId::VarargAll(_) => jit_vararg_all as *const () as usize,
         HelperId::Index => jit_index as *const () as usize,
+        HelperId::GetStr => jit_get_str as *const () as usize,
+        HelperId::SetStr => jit_set_str as *const () as usize,
         HelperId::Mm(_) => jit_mm as *const () as usize,
         HelperId::IndexFn => jit_index_fn as *const () as usize,
         HelperId::NewIndexFn => jit_newindex_fn as *const () as usize,
@@ -435,6 +437,42 @@ pub(crate) extern "C" fn jit_mm(rt: *const State<'static>, bit: u64, a: u64, b: 
     let ctx = unsafe { Context::from_state(rt) };
     let (a, b) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
     binop_metamethod(ctx, a, b, MetamethodBits::from_bits_retain(bit as u32)).to_raw()
+}
+
+/// `t[k]` for a table `t` and a string `k`, or `HELPER_FAIL_VAL` where
+/// `__index` may answer: an absent key under a class with it, or stale.
+pub(crate) extern "C" fn jit_get_str(t: u64, k: u64) -> u64 {
+    let (t, k) = unsafe { (Value::from_raw(t), Value::from_raw(k)) };
+    let (Some(t), Some(k)) = (t.get_table(), k.get_string()) else {
+        return HELPER_FAIL_VAL;
+    };
+    let v = t.raw_get_str(k);
+    if !v.is_nil() {
+        return v.to_raw();
+    }
+    match t.shape().mt_cache() {
+        Some(c) if c.is_stale() || !c.mm(MetamethodBits::INDEX).is_nil() => HELPER_FAIL_VAL,
+        _ => Value::nil().to_raw(),
+    }
+}
+
+/// `t[k] = v` for a table `t` and a string `k`, as `t[k] = v` stores it: 0,
+/// or `HELPER_FAIL_VAL` where `__newindex` may run (a key without a value
+/// under a class with it, or a stale class).
+pub(crate) extern "C" fn jit_set_str(rt: *const State<'static>, t: u64, k: u64, v: u64) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let (t, k, v) = unsafe { (Value::from_raw(t), Value::from_raw(k), Value::from_raw(v)) };
+    let (Some(t), Some(k)) = (t.get_table(), k.get_string()) else {
+        return HELPER_FAIL_VAL;
+    };
+    if let Some(c) = t.shape().mt_cache()
+        && (c.is_stale() || !c.mm(MetamethodBits::NEWINDEX).is_nil())
+        && t.raw_get_str(k).is_nil()
+    {
+        return HELPER_FAIL_VAL;
+    }
+    t.raw_set_str_keyed(ctx, k, v);
+    0
 }
 
 /// The `__index` function `recv[key]` calls with `recv` itself, or nil: a
