@@ -138,14 +138,17 @@ pub(crate) fn expand(f: &mut Func<'_>) -> Option<Vec<Inst>> {
             let n = f.make_inst(Op::IsType(TypeSet::NIL), &[v], None, ExitTag::Type);
             f.append(fail, n);
             branch(f, fail, f.result(n), mm, other);
+            // A nil the class does not answer fails the use's guard too: one
+            // exit for both.
             guard(f, mm);
-            for arm in [mm, other] {
-                let d = f.make_inst(Op::Deopt, &[], Some(kind), tag);
-                if let Some(s) = kind_site {
-                    f.exit_sites.insert(d, s);
-                }
-                f.append(arm, d);
+            let j = f.make_inst(Op::Jump, &[], None, ExitTag::Type);
+            f.append(mm, j);
+            f.set_edges(j, &[edge(other)]);
+            let d = f.make_inst(Op::Deopt, &[], Some(kind), tag);
+            if let Some(s) = kind_site {
+                f.exit_sites.insert(d, s);
             }
+            f.append(other, d);
         } else if hot.contains(&has) {
             let x = f.make_inst(Op::GuardFalse, &[has], Some(miss), ExitTag::Bounds);
             f.exit_sites.insert(x, site);
