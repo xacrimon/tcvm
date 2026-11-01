@@ -204,6 +204,10 @@ pub(crate) struct RegionMeta {
     pub(crate) entry_pc: u32,
     pub(crate) loop_entry: bool,
     pub(crate) max_stack: u8,
+    /// The parameters every entry passes in registers (`Op::Param`): a
+    /// function region's first eight, none for a loop entry or a vararg
+    /// function (W4 §2).
+    pub(crate) params: u8,
 }
 
 /// The control-flow facts passes share, computed on demand and dropped by

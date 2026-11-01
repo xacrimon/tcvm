@@ -377,19 +377,63 @@ pub(crate) unsafe extern "C" fn direct_miss() {
     )
 }
 
+/// `direct_miss` for a call passing its arguments in registers (W4 §2):
+/// the slow path finds them in the callee's slots (x22 its base, x20 their
+/// count). A tail call's own branch goes to `direct_miss`, its arguments in
+/// the slots already.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn direct_miss_regs() {
+    core::arch::naked_asm!(
+        "cbz x20, 1f",
+        "str x0, [x22]",
+        "cmp x20, #1",
+        "b.ls 1f",
+        "str x1, [x22, #8]",
+        "cmp x20, #2",
+        "b.ls 1f",
+        "str x2, [x22, #16]",
+        "cmp x20, #3",
+        "b.ls 1f",
+        "str x3, [x22, #24]",
+        "cmp x20, #4",
+        "b.ls 1f",
+        "str x4, [x22, #32]",
+        "cmp x20, #5",
+        "b.ls 1f",
+        "str x5, [x22, #40]",
+        "cmp x20, #6",
+        "b.ls 1f",
+        "str x6, [x22, #48]",
+        "cmp x20, #7",
+        "b.ls 1f",
+        "str x7, [x22, #56]",
+        "1:",
+        "b {direct_miss}",
+        direct_miss = sym direct_miss,
+    )
+}
+
 /// A fast callee's entry checks failed: on to its caller's slow path, which
 /// the caller's site table names by the return address in x30 (tagged or
-/// not). Every allocatable register is free across a call, and the pinned
-/// ones and `insn` are callee-saved.
+/// not), the arguments a register call passed in x0-x7 kept for it to
+/// store (W4 §2). The pinned registers and `insn` are callee-saved.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn call_miss() {
     core::arch::naked_asm!(
-        "stp x29, x30, [sp, #-16]!",
-        "mov x29, sp",
+        "stp x0, x1, [sp, #-80]!",
+        "stp x2, x3, [sp, #16]",
+        "stp x4, x5, [sp, #32]",
+        "stp x6, x7, [sp, #48]",
+        "stp x29, x30, [sp, #64]",
+        "add x29, sp, #64",
         "and x0, x30, #~1",
         "bl {target}",
         "mov x16, x0",
-        "ldp x29, x30, [sp], #16",
+        "ldp x29, x30, [sp, #64]",
+        "ldp x6, x7, [sp, #48]",
+        "ldp x4, x5, [sp, #32]",
+        "ldp x2, x3, [sp, #16]",
+        "ldp x0, x1, [sp], #80",
         "br x16",
         target = sym crate::jit::jit_call_miss,
     )
@@ -423,6 +467,10 @@ pub(crate) unsafe extern "C" fn level_enter() {
         ".cfi_offset x27, -{size} + {x} + 64",
         ".cfi_offset x28, -{size} + {x} + 72",
         "blr x16",
+        // A compiled callee returns its one result in x0 alone.
+        "cbz x20, 1f",
+        "str x0, [x21]",
+        "1:",
         "ldr x23, [sp, #{x} + 32]",
         "ldr x24, [x22, #-32]",
         "and x24, x24, #{ptr_mask}",

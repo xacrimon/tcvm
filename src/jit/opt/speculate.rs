@@ -42,7 +42,7 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
             continue;
         }
         if block == f.entry
-            && let Op::Load(r) = f.op(i)
+            && let Op::Load(r) | Op::Param(r) = f.op(i)
         {
             if let Some(set) = entry_set(f, kinds, r, e)
                 && t.set.intersects(set)
@@ -132,7 +132,16 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
         };
         let g = f.make_inst(Op::Guard(c.set), &[c.v], None, tag);
         match at {
-            None if c.entry.is_some() => f.insert_before_term(f.entry, g),
+            // After the entry's loads, before anything a snapshot of which
+            // may name them (the parameters a register entry passes, W4 §2).
+            None if c.entry.is_some() => {
+                let k = f
+                    .insts_of(f.entry)
+                    .iter()
+                    .position(|&i| !matches!(f.op(i), Op::Load(_) | Op::Param(_)))
+                    .unwrap_or(0);
+                f.insert(f.entry, k, g)
+            }
             None => {
                 // After the last definition the snapshot names: one bytecode
                 // instruction may define its results one IR instruction each.

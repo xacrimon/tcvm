@@ -368,12 +368,7 @@ pub(crate) fn compile<'gc>(
         direct: f
             .protos
             .iter()
-            .map(|&p| {
-                (
-                    p.ptr.as_ptr() as u64,
-                    crate::jit::direct_target(p.jit_fast.get()),
-                )
-            })
+            .map(|&p| (p.ptr.as_ptr() as u64, p.num_params, p.jit_fast.get()))
             .collect(),
     };
     // Allocated now, moved into the region after: the code embeds its address.
@@ -422,10 +417,10 @@ pub(crate) fn compile<'gc>(
             (keys, em.asm.label_offset(s.miss) as u32)
         })
         .collect();
-    let direct: Vec<(u32, u64)> = em
+    let direct: Vec<(u32, u64, bool)> = em
         .direct
         .iter()
-        .map(|&(l, p)| (em.asm.label_offset(l) as u32, p))
+        .map(|&(l, p, regs)| (em.asm.label_offset(l) as u32, p, regs))
         .collect();
     // Each patch as the `b` it writes.
     let lazy: Box<[(u32, u32)]> = em
@@ -611,7 +606,7 @@ pub(crate) fn compile<'gc>(
         .code
         .patch_u64(region_word, crate::dmm::Gc::as_ptr(region) as u64);
     // The callees repoint the direct calls as their fast entries change.
-    for (off, p) in direct {
+    for (off, p, regs) in direct {
         let proto = *f
             .protos
             .iter()
@@ -619,7 +614,10 @@ pub(crate) fn compile<'gc>(
             .unwrap();
         let state = crate::jit::state::jit_state(ctx.mutation(), proto);
         let weak = crate::dmm::Gc::downgrade(region);
-        state.borrow_mut(ctx.mutation()).callers.push((weak, off));
+        state
+            .borrow_mut(ctx.mutation())
+            .callers
+            .push((weak, off, regs));
     }
     for &(on, groups) in &f.deps {
         match on {

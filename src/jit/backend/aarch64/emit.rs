@@ -43,8 +43,9 @@ pub(crate) struct Emitted {
     /// The calls, for walks of the frame (H7).
     pub(crate) sites: Vec<SiteOut>,
     /// The direct branches to other regions' known entries, by the callee's
-    /// prototype (its box), which `jit::set_fast` repoints.
-    pub(crate) direct: Vec<(Label, u64)>,
+    /// prototype (its box), which `jit::set_fast` repoints: to the register
+    /// entry for a call passing arguments there, else the slot one.
+    pub(crate) direct: Vec<(Label, u64, bool)>,
     /// What `Region::invalidate` patches: each place and the branch target
     /// written there, the entry's first (ws2 §5.4).
     pub(crate) lazy: Vec<(Label, Label)>,
@@ -145,10 +146,11 @@ struct Em<'a> {
     sites_of: &'a [(usize, crate::jit::backend::aarch64::lower::LSite)],
     snap_ops: &'a [u32],
     shape_sets: &'a [Vec<u64>],
-    /// This region's prototype and its known entry, when it has one.
-    own_entry: Option<(u64, Label)>,
+    /// This region's prototype and its known entries, when it has them:
+    /// arguments in slots, and in registers (W4 §2).
+    own_entry: Option<(u64, Label, Label)>,
     /// The direct branches to known entries, by the callee's prototype.
-    direct: Vec<(Label, u64)>,
+    direct: Vec<(Label, u64, bool)>,
     /// `FMod`'s out-of-line paths: (entry, return, d, a, b).
     fmods: Vec<(Label, Label, Fpr, Fpr, Fpr)>,
     lazy: Vec<(Label, Label)>,
@@ -204,9 +206,9 @@ pub(crate) struct Helpers {
     pub(crate) level_land: u64,
     /// The trampolines of the helpers cold arms call: (helper, trampoline).
     pub(crate) trampolines: Vec<(usize, usize)>,
-    /// Known callees' prototypes (their boxes) and where a direct call of
-    /// each branches now (`jit::direct_target`).
-    pub(crate) direct: Vec<(u64, usize)>,
+    /// Known callees' prototypes (their boxes), their parameter counts and
+    /// fast entries now (0 for none; `jit::direct_target`).
+    pub(crate) direct: Vec<(u64, u8, usize)>,
 }
 
 /// Where a known call enters its callee (D2).
@@ -214,10 +216,10 @@ pub(crate) struct Helpers {
 enum Target {
     /// This region's own entry.
     Own(Label),
-    /// The known entry of the prototype's fast entry, by a branch that
-    /// `jit::set_fast` repoints (`Emitted::direct`): the prototype's box
-    /// and the branch's first target.
-    Direct(u64, usize),
+    /// A known entry of the prototype's fast entry, by a branch that
+    /// `jit::set_fast` repoints (`Emitted::direct`): the prototype's box,
+    /// the branch's first target, and whether it is the register entry.
+    Direct(u64, usize, bool),
     /// The fast entry in x17.
     Reg,
 }
@@ -345,6 +347,8 @@ pub(crate) fn emit(
     // arguments are filled in (`arity_fixup`, I3).
     let fast_miss = em.a.new_label();
     let (fixup, budget) = (em.a.new_label(), em.a.new_label());
+    let nreg = l.params;
+    let param_miss = em.a.new_label();
     let fast_label = fast.map(|fe| {
         let l = em.a.new_label();
         em.a.bind(l);
@@ -355,17 +359,29 @@ pub(crate) fn emit(
         em.a.ldr(X17, THREAD, layout::NATIVE_LIMIT as i32);
         em.a.cmp(Sz::X, X16, X17);
         em.a.b_cond(Cond::Lo, fast_miss);
-        let known = em.a.new_label();
+        let (known, regs) = (em.a.new_label(), em.a.new_label());
         em.a.bind(known);
         assert_eq!(
             (em.a.label_offset(known) - em.a.label_offset(l)) as u64,
             KNOWN_ENTRY
         );
-        em.own_entry = Some((fe.proto, known));
+        // The parameters a caller left in slots to their registers, where
+        // a call passing them there enters (W4 §2).
+        for k in 0..nreg {
+            em.a.ldr(Gpr(k), BASE, 8 * k as i32);
+        }
+        em.a.bind(regs);
+        assert_eq!(
+            (em.a.label_offset(regs) - em.a.label_offset(l)) as usize,
+            crate::jit::known_offset(true, fe.num_params)
+        );
+        em.own_entry = Some((fe.proto, known, regs));
         em.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
         em.a.add_imm(Sz::X, X17, BASE, fe.max_stack as u64 * 8);
         em.a.cmp(Sz::X, X17, X16);
-        em.a.b_cond(Cond::Hi, fast_miss);
+        // A miss from the register entry leaves the parameters in their
+        // slots for the caller's slow path (from the slot one, again).
+        em.a.b_cond(Cond::Hi, if nreg > 0 { param_miss } else { fast_miss });
         l
     });
     let laid: Vec<usize> = l
@@ -401,6 +417,9 @@ pub(crate) fn emit(
     // Dispatch enters through `level_enter`, which returns to `level_land`.
     let dispatch = em.a.new_label();
     em.a.bind(dispatch);
+    for k in 0..l.params {
+        em.a.ldr(Gpr(k), BASE, 8 * k as i32);
+    }
     em.a.adr(X16, em.labels[0]);
     em.a.b_far(em.helpers.level_enter);
     // Cold section: one stub per exit, the trampoline, and the prologue's
@@ -444,16 +463,25 @@ pub(crate) fn emit(
     em.a.b_far(em.helpers.exit_common);
     if l.invalidable {
         // An invalidated region's entry, its frame not open yet: on to
-        // `jit_dead_entry` as the entry-fail stub goes on (ws2 §5.4).
+        // `jit_dead_entry` as the entry-fail stub goes on (ws2 §5.4), the
+        // parameters a register call passed stored for the interpreter.
         let dead = em.a.new_label();
         em.a.bind(dead);
+        for k in 0..l.params {
+            em.a.str(Gpr(k), BASE, 8 * k as i32);
+        }
         em.a.ldr_label(INSN, region_word);
         em.a.ldr_lit(X16, em.helpers.dead_entry as u64);
         em.tail_level();
         em.lazy.insert(0, (em.labels[0], dead));
     }
     if !l.entry_regs.is_empty() {
+        // The interpreter runs the function from its slots, which a call
+        // passing the parameters in registers did not write.
         em.a.bind(em.entry_fail);
+        for k in 0..l.params {
+            em.a.str(Gpr(k), BASE, 8 * k as i32);
+        }
         em.close_frame();
         em.a.ldr_label(INSN, region_word);
         em.a.ldr_lit(X16, em.helpers.entry_fail as u64);
@@ -477,6 +505,13 @@ pub(crate) fn emit(
         em.a.cmp(Sz::X, X17, Gpr(9));
         em.a.b_cond(Cond::Lo, fill);
         em.a.b(budget);
+    }
+    if fast_label.is_some() && nreg > 0 {
+        em.a.bind(param_miss);
+        for k in 0..nreg {
+            em.a.str(Gpr(k), BASE, 8 * k as i32);
+        }
+        em.a.b(fast_miss);
     }
     if fast_label.is_some() {
         // Back to the caller's slow path, which its site names by the return
@@ -646,23 +681,43 @@ impl Em<'_> {
         (closure, proto, nparams): (Option<u64>, u64, u8),
         nargs: u8,
     ) -> (Label, Label, bool, Target) {
+        // A static count passes the first arguments in x0.. (W4 §2), the
+        // parameters left out nil; past eight they are in the callee's slots,
+        // inside its window, which its known entry checks (the value stack's
+        // mapping runs past any window that fits).
         let known = nargs != u8::MAX;
         if known && nargs < nparams {
-            // Inside the callee's window, which its known entry checks; the
-            // value stack's mapping runs past any window that fits.
             self.a.mov_imm(Gpr(9), NIL);
             for k in nargs..nparams {
-                self.a.str(Gpr(9), BASE, hdr + 32 + 8 * k as i32);
+                if k < 8 {
+                    self.a.mov(Gpr(k), Gpr(9));
+                } else {
+                    self.a.str(Gpr(9), BASE, hdr + 32 + 8 * k as i32);
+                }
             }
         }
-        let target = match self.direct_target(proto) {
+        let target = match self.direct_target(proto, nparams, known) {
             Some(t) if known => t,
             _ => {
                 self.a.mov_imm(X17, proto);
                 self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
-                self.a.cbz(Sz::X, X17, slow);
+                // Without a fast entry, the slow path, which finds every
+                // argument in the callee's slots.
+                let to = if known {
+                    let stores = self.a.new_label();
+                    self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                        em.a.bind(stores);
+                        em.store_args(hdr + 32, nargs);
+                        em.a.b(slow);
+                    }));
+                    stores
+                } else {
+                    slow
+                };
+                self.a.cbz(Sz::X, X17, to);
                 if known {
-                    self.a.add_imm(Sz::X, X17, X17, KNOWN_ENTRY);
+                    let off = crate::jit::known_offset(true, nparams);
+                    self.a.add_imm(Sz::X, X17, X17, off as u64);
                 }
                 Target::Reg
             }
@@ -678,18 +733,16 @@ impl Em<'_> {
         (ret, deep, known, target)
     }
 
-    /// A known entry of `proto` (its box) a branch can take: this region's
-    /// own, or one `jit::set_fast` keeps the branch pointed at.
-    fn direct_target(&self, proto: u64) -> Option<Target> {
+    /// A known entry of `proto` (its box, `nparams` parameters) a branch
+    /// can take, the register one when `regs`: this region's own, or one
+    /// `jit::set_fast` keeps the branch pointed at.
+    fn direct_target(&self, proto: u64, nparams: u8, regs: bool) -> Option<Target> {
         match self.own_entry {
             // The region cannot outlive itself (I4).
-            Some((p, l)) if p == proto => Some(Target::Own(l)),
-            _ => self
-                .helpers
-                .direct
-                .iter()
-                .find(|d| d.0 == proto)
-                .map(|&(p, t)| Target::Direct(p, t)),
+            Some((p, slots, r)) if p == proto => Some(Target::Own(if regs { r } else { slots })),
+            _ => (self.helpers.direct.iter().find(|d| d.0 == proto)).map(|&(p, _, fast)| {
+                Target::Direct(p, crate::jit::direct_target(fast, regs, nparams), regs)
+            }),
         }
     }
 
@@ -699,10 +752,10 @@ impl Em<'_> {
         match (target, link) {
             (Target::Own(l), true) => self.a.bl(l),
             (Target::Own(l), false) => self.a.b(l),
-            (Target::Direct(proto, t), _) => {
+            (Target::Direct(proto, t, regs), _) => {
                 let at = self.a.new_label();
                 self.a.bind(at);
-                self.direct.push((at, proto));
+                self.direct.push((at, proto, regs));
                 if link {
                     self.a.bl_far(t);
                 } else {
@@ -864,34 +917,57 @@ impl Em<'_> {
     /// callee returns with `br` and the return address stack stays as it
     /// was, right for the shallower frames' `ret`s. It names the fast resume
     /// itself, before which a branch to the miss path sits.
-    fn deep_path(&mut self, deep: Label, block: usize, known: bool, target: Target) {
+    fn deep_path(
+        &mut self,
+        deep: Label,
+        block: usize,
+        known: Option<u8>,
+        nargs: u8,
+        target: Target,
+    ) {
         self.a.bind(deep);
+        // A register call misses with its arguments in the callee's slots.
+        let miss = match known {
+            Some(_) => self.a.new_label(),
+            None => self.miss[self.v.succs(block)[0].index()],
+        };
         match target {
             Target::Own(l) => self.a.adr(X17, l),
-            Target::Direct(proto, _) => {
+            Target::Direct(proto, _, regs) => {
                 // The fast entry, or the miss path without one.
-                let miss = self.miss[self.v.succs(block)[0].index()];
                 self.a.mov_imm(X17, proto);
                 self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
                 self.a.cbz(Sz::X, X17, miss);
-                self.a.add_imm(Sz::X, X17, X17, KNOWN_ENTRY);
+                let off = crate::jit::known_offset(regs, known.unwrap_or(0));
+                self.a.add_imm(Sz::X, X17, X17, off as u64);
             }
             Target::Reg => {}
         }
-        if known {
+        if known.is_some() {
             // The known entry trusts the native stack, which is deep enough
-            // here to check: below the limit the full entry misses.
-            let ok = self.a.new_label();
+            // here to check: below the limit the callee would miss, and its
+            // full entry read arguments from slots this call did not write.
             self.a.ldr(Gpr(10), THREAD, layout::NATIVE_LIMIT as i32);
             self.a.cmp(Sz::X, Gpr(9), Gpr(10));
-            self.a.b_cond(Cond::Hs, ok);
-            self.a.sub_imm(Sz::X, X17, X17, KNOWN_ENTRY);
-            self.a.bind(ok);
+            self.a.b_cond(Cond::Lo, miss);
         }
         self.a
             .adr(LR, self.fast_resume[self.v.succs(block)[0].index()]);
         self.a.orr_imm(Sz::X, LR, LR, 1);
         self.a.br(X17);
+        if known.is_some() {
+            self.a.bind(miss);
+            self.store_args(0, nargs);
+            self.a.b(self.miss[self.v.succs(block)[0].index()]);
+        }
+    }
+
+    /// A register call's arguments (W4 §2) to the callee's slots, the first
+    /// at `off` from `BASE`.
+    fn store_args(&mut self, off: i32, nargs: u8) {
+        for k in 0..nargs.min(8) {
+            self.a.str(Gpr(k), BASE, off + 8 * k as i32);
+        }
     }
 
     /// The slow path of a call whose header at `hdr` holds the callee's
@@ -1193,6 +1269,7 @@ impl Em<'_> {
         use MInst::*;
         match inst {
             Prologue => self.open_frame(),
+            Params => {}
             MovImm(v) => {
                 let d = self.r(i, 0);
                 self.a.mov_imm(d, v);
@@ -1961,9 +2038,13 @@ impl Em<'_> {
                     }
                 };
                 self.fall_into_resume(block, next);
+                let nparams = match known {
+                    Some(Known::Lua { nparams, .. }) if entered_known => Some(nparams),
+                    _ => None,
+                };
                 self.ool.push(Box::new(move |em: &mut Em<'_>| {
                     em.miss_path(hdr, block, common);
-                    em.deep_path(deep, block, entered_known, target);
+                    em.deep_path(deep, block, nparams, nargs, target);
                     let mut keys = vec![(ret, false)];
                     if known.is_none() {
                         keys.extend(em.native_path(hdr, block, Ok((native, slow))));
@@ -2001,8 +2082,9 @@ impl Em<'_> {
                 // `insn` and `pc` (allocatable in the body) as scratch.
                 let f = self.r(i, 0);
                 self.a.mov(CLOSURE, f);
-                let target =
-                    known.and_then(|(proto, nparams)| Some((self.direct_target(proto)?, nparams)));
+                let target = known.and_then(|(proto, nparams)| {
+                    Some((self.direct_target(proto, nparams, false)?, nparams))
+                });
                 if let Some((target, nparams)) = target {
                     // A known callee (D2): the parameters left out nil, then
                     // its entry past the arity and native stack checks, the
@@ -2073,6 +2155,8 @@ impl Em<'_> {
                         // three here, more through the helper. They come from
                         // at least a header above `R[a]`, so copying up is
                         // safe, and reading past them stays in the stack.
+                        // The first is in x0: a compiled callee returning one
+                        // stores none (W4 §4).
                         let (helper, top, done) =
                             (self.a.new_label(), self.a.new_label(), self.a.new_label());
                         let at = a as i32 * 8;
@@ -2082,8 +2166,12 @@ impl Em<'_> {
                             for k in 0..3 {
                                 self.a.cmp_imm(Sz::X, INSN, k);
                                 self.a.b_cond(Cond::Eq, top);
-                                self.a.ldr(X16, PC, 8 * k as i32);
-                                self.a.str(X16, BASE, at + 8 * k as i32);
+                                if k == 0 {
+                                    self.a.str(Gpr(0), BASE, at);
+                                } else {
+                                    self.a.ldr(X16, PC, 8 * k as i32);
+                                    self.a.str(X16, BASE, at + 8 * k as i32);
+                                }
                             }
                             self.a.bind(top);
                             self.a.ldr(X16, THREAD, layout::THREAD_STACK as i32);
@@ -2095,7 +2183,11 @@ impl Em<'_> {
                         } else if c <= 4 {
                             self.a.mov_imm(X17, NIL);
                             for k in 0..(c - 1) as u64 {
-                                self.a.ldr(X16, PC, 8 * k as i32);
+                                if k == 0 {
+                                    self.a.mov(X16, Gpr(0));
+                                } else {
+                                    self.a.ldr(X16, PC, 8 * k as i32);
+                                }
                                 self.a.cmp_imm(Sz::X, INSN, k);
                                 self.a.csel(Sz::X, X16, X16, X17, Cond::Hi);
                                 self.a.str(X16, BASE, at + 8 * k as i32);
@@ -2103,6 +2195,11 @@ impl Em<'_> {
                             self.a.b(done);
                         }
                         self.a.bind(helper);
+                        // The helper reads the first result from memory too.
+                        let first = self.a.new_label();
+                        self.a.cbz(Sz::X, INSN, first);
+                        self.a.str(Gpr(0), PC, 0);
+                        self.a.bind(first);
                         // Land through the helper: (rt, thread, base, a, values, nret, c).
                         self.a.ldr_lit(Gpr(0), self.helpers.rt);
                         self.a.mov(Gpr(1), THREAD);
@@ -2144,7 +2241,7 @@ impl Em<'_> {
                 self.fall_into_resume(block, next);
                 self.ool.push(Box::new(move |em: &mut Em<'_>| {
                     em.miss_path(h, block, slow);
-                    em.deep_path(deep, block, false, Target::Reg);
+                    em.deep_path(deep, block, None, 0, Target::Reg);
                     let mut keys = vec![(ret, false)];
                     keys.extend(em.native_path(h, block, Ok((native, slow))));
                     em.a.bind(slow);

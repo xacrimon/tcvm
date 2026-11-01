@@ -1910,15 +1910,23 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
         .unwrap_or_default();
     // The arguments in the callee's slots (up to `top`: those before the
     // ones a call or VARARG landed there), and the captured registers, which
-    // it may read through their cells.
+    // it may read through their cells. A fixed count's first eight are the
+    // call's operands instead: in registers to a known Lua callee, stored
+    // by the lowering for any other (W4 §2).
     let mut stored: Vec<usize> = b.cfg.captured.iter().collect();
-    let end = if nb != 0 {
-        a as usize + 4 + nb as usize - 1
+    let (end, in_regs) = if nb != 0 {
+        (a as usize + 4 + nb as usize - 1, (nb as usize - 1).min(8))
     } else {
-        b.cfg.nregs
+        (b.cfg.nregs, 0)
     };
-    stored.extend(a as usize + 4..end);
+    stored.extend(a as usize + 4 + in_regs..end);
     b.store_regs(stored);
+    let args: Vec<Val> = (0..in_regs as u8)
+        .map(|k| {
+            let v = b.reg(a + 4 + k);
+            b.boxed(v)
+        })
+        .collect();
     let cv = b.boxed(callee);
     b.push(Op::Store(a), &[cv]);
     // The callee's frame and its results take every register from `a` up.
@@ -1931,7 +1939,7 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
         let n = b.ins(Op::Helper(HelperId::TopArgs(a)), &[]);
         (u8::MAX, vec![n])
     } else {
-        (nb - 1, vec![])
+        (nb - 1, args)
     };
     let op = Op::Call {
         a,

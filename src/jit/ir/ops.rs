@@ -474,6 +474,9 @@ pub(crate) enum Op {
     // --- home slots -----------------------------------------------------------
     /// `R[r]` as a `Val`.
     Load(u8),
+    /// Parameter `k` of a function region, which every entry passes in
+    /// `x_k` (W4 §2): no slot holds it until an exit writes it.
+    Param(u8),
     /// `R[r] = v`, `v` a `Val`.
     Store(u8),
 
@@ -731,11 +734,12 @@ pub(crate) enum Op {
         nargs: u8,
         proto: u32,
     },
-    /// Call `R[a]` with `nargs` arguments in `R[a+4..]` (stored), `c` the
-    /// CALL's result operand; edge 0 is the resume block. `nargs` is
-    /// `u8::MAX` for arguments up to `top`, their count the operand.
-    /// `proto` is the callee's prototype when a guard proved it
-    /// (`Func::protos`), else `NO_PROTO`.
+    /// Call `R[a]` with `nargs` arguments in `R[a+4..]`, `c` the CALL's
+    /// result operand; edge 0 is the resume block. `nargs` is `u8::MAX`
+    /// for arguments up to `top` (stored), their count the operand; else
+    /// the first eight are the operands, the rest stored (W4 §2). `proto`
+    /// is the callee's prototype when a guard proved it (`Func::protos`),
+    /// else `NO_PROTO`.
     Call {
         a: u8,
         nargs: u8,
@@ -971,7 +975,9 @@ impl Op {
             KB1(_) => Ty::B1,
             KI64(_) => Ty::I64,
             KF64(_) => Ty::F64,
-            Load(_) | UpvalValue(_) | UpvalValueOf(_) | CellLoad | Resume { .. } => Ty::ANY,
+            Load(_) | Param(_) | UpvalValue(_) | UpvalValueOf(_) | CellLoad | Resume { .. } => {
+                Ty::ANY
+            }
             UpvalCell(_) => Ty::PTR,
             NumVarargs | ClassBits(_) | TabASize | ArrNext | TabMmBits | NamedNext => Ty::I32,
             NamedVal => Ty::ANY,
@@ -1031,6 +1037,7 @@ impl Op {
             KB1(v) => format!("kb1 {v}"),
             KF64(b) => format!("kf64 {:?}", f64::from_bits(b)),
             Load(r) => format!("load r{r}"),
+            Param(k) => format!("param {k}"),
             Store(r) => format!("store r{r}"),
             Box => "box".into(),
             Unbox(rep) => format!("unbox.{}", rep.name()),

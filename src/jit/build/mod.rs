@@ -330,10 +330,12 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         loop_entry: bool,
     ) -> Self {
         let proto = closure.proto;
+        let function = entry_pc == 0 && !loop_entry && !proto.is_vararg;
         let meta = RegionMeta {
             entry_pc,
             loop_entry,
             max_stack: proto.max_stack_size,
+            params: if function { proto.num_params.min(8) } else { 0 },
         };
         let mut f = Func::new(meta);
         f.captured = cfg.captured;
@@ -657,20 +659,26 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     }
 
     fn root_load(&mut self, b: Block, r: u8) -> Val {
-        self.inline_check(Op::Load(r));
+        // A parameter its entry passed in a register; its slot holds
+        // nothing until an exit writes it.
+        let param = b == self.f.entry && r < self.f.meta.params;
+        let op = if param { Op::Param(r) } else { Op::Load(r) };
+        self.inline_check(op);
         let set = self.bs[b.idx()]
             .root_ty
             .get(r as usize)
             .copied()
             .unwrap_or(TypeSet::ANY);
-        let inst = self.f.make_inst(Op::Load(r), &[], None, ExitTag::Type);
+        let inst = self.f.make_inst(op, &[], None, ExitTag::Type);
         let at = self.bs[b.idx()].root_at;
         self.f.insert(b, at, inst);
         self.bs[b.idx()].root_at += 1;
         let v = self.f.result(inst);
         self.f.vals[v.idx()].ty = Ty::val(if set.is_empty() { TypeSet::ANY } else { set });
         self.set_def(b, r, v);
-        self.set_slot(b, r as usize, SlotState::Holds(v));
+        if !param {
+            self.set_slot(b, r as usize, SlotState::Holds(v));
+        }
         if let Some(s) = self.bs[b.idx()].after {
             self.f.def_snaps.push((v, s));
         }
@@ -1836,6 +1844,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let entry_bc = self.cfg.block_of[entry_pc as usize];
         let prologue = self.new_root(vec![TypeSet::ANY; self.nregs]);
         self.f.entry = prologue;
+        for r in 0..self.f.meta.params as usize {
+            self.set_slot(prologue, r, SlotState::Unknown);
+        }
         let order = self.discover(entry_bc);
         let first = self.instances[order[0]].ir;
         self.switch_to(prologue);

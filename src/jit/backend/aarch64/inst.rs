@@ -80,6 +80,9 @@ pub(crate) enum Known {
 pub(crate) enum MInst {
     /// Open the native frame. The entry block's first instruction.
     Prologue,
+    /// `[def p0, def p1, ..]`, fixed in x0..: a function region's
+    /// parameters, as every entry passes them (W4 §2). No code.
+    Params,
     /// `[def d]`, int.
     MovImm(u64),
     /// `[def d]`, float.

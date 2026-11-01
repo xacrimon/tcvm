@@ -216,6 +216,13 @@ impl Lua {
             .mutate_root(|_, root| root.jit.config.enabled = on && cfg!(target_arch = "aarch64"));
     }
 
+    /// Turn inlining (E1) on or off for regions compiled from now on: tests
+    /// of the call protocol keep their calls real whatever the inliner takes.
+    pub fn set_jit_inline(&mut self, on: bool) {
+        self.arena
+            .mutate_root(|_, root| root.jit.config.inline = on);
+    }
+
     /// Force a full garbage-collection cycle (mark + sweep) to completion.
     /// Exposed mainly as a GC-soundness test/debug hook; a real
     /// `collectgarbage("collect")` would route here.

@@ -531,10 +531,10 @@ fn set_fast<'gc>(
     entry: usize,
 ) {
     proto.jit_fast.set(entry);
-    let target = direct_target(entry);
     st.callers
-        .retain(|&(r, off)| match r.upgrade(ctx.mutation()) {
+        .retain(|&(r, off, regs)| match r.upgrade(ctx.mutation()) {
             Some(r) => {
+                let target = direct_target(entry, regs, proto.num_params);
                 r.code.repoint_branch(off as usize, target);
                 true
             }
@@ -542,21 +542,34 @@ fn set_fast<'gc>(
         });
 }
 
-/// Where a direct call of a prototype whose fast entry is `fast` branches:
-/// past its arity and native stack checks, or without one to a miss
+/// Where a direct call of a prototype of `nparams` parameters whose fast
+/// entry is `fast` branches (`known_offset`), or without one to a miss
 /// (`abi::direct_miss`).
-pub(crate) fn direct_target(fast: usize) -> usize {
+pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> usize {
     #[cfg(target_arch = "aarch64")]
     {
-        use crate::jit::backend::aarch64::{abi::direct_miss, emit::KNOWN_ENTRY};
-        if fast == 0 {
+        use crate::jit::backend::aarch64::abi::{direct_miss, direct_miss_regs};
+        if fast == 0 && regs {
+            direct_miss_regs as *const () as usize
+        } else if fast == 0 {
             direct_miss as *const () as usize
         } else {
-            fast + KNOWN_ENTRY as usize
+            fast + known_offset(regs, nparams)
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
     fast
+}
+
+/// A fast entry's known entry, from it: past its arity and native stack
+/// checks, and past its parameters' loads from their slots for a call
+/// passing them in registers (W4 §2).
+pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    let known = crate::jit::backend::aarch64::emit::KNOWN_ENTRY as usize;
+    #[cfg(not(target_arch = "aarch64"))]
+    let known = 0;
+    known + if regs { 4 * nparams.min(8) as usize } else { 0 }
 }
 
 /// Where the fast call whose return address is `ra` goes when its callee's

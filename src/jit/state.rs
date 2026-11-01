@@ -327,9 +327,10 @@ pub(crate) struct JitState<'gc> {
     pub(crate) refused: Vec<u32>,
     pub(crate) age: u32,
     /// The direct branches of compiled code to the prototype's known entry
-    /// (D2): each region's, by its code offset, which `jit::set_fast`
-    /// repoints as the fast entry comes and goes.
-    pub(crate) callers: Vec<(crate::dmm::GcWeak<'gc, Region<'gc>>, u32)>,
+    /// (D2): each region's, by its code offset, and whether it is the
+    /// register entry, which `jit::set_fast` repoints as the fast entry
+    /// comes and goes.
+    pub(crate) callers: Vec<(crate::dmm::GcWeak<'gc, Region<'gc>>, u32, bool)>,
 }
 
 pub(crate) type JitStateRef<'gc> = Gc<'gc, RefLock<JitState<'gc>>>;

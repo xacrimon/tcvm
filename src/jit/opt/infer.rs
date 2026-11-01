@@ -12,6 +12,7 @@ fn keeps_type(op: Op) -> bool {
     matches!(
         op,
         Op::Load(_)
+            | Op::Param(_)
             | Op::TabLoad { .. }
             | Op::KObj(_)
             | Op::Resume { .. }

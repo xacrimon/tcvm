@@ -359,16 +359,17 @@ fn loop_carried_definitions_guard_only_down_safe() {
 }
 
 /// An exit does not restore a register whose slot still holds the value:
-/// the parameters here are only ever loaded, though inside the loop the
-/// snapshots name their guarded copies.
+/// the ninth and tenth parameters, which callers leave in slots (W4 §2:
+/// the first eight come in registers), are only ever loaded, though inside
+/// the loop the snapshots name their guarded copies.
 #[test]
 fn snapshots_leave_out_unchanged_slots() {
-    let src = "function h(a, b)
+    let src = "function h(_1, _2, _3, _4, _5, _6, _7, _8, a, b)
         local s = 0
         for i = 1, 10 do s = s + a.x * i + b end
         return s + a.y
     end
-    for i = 1, 300 do h({x = 1.5, y = 2}, i) end";
+    for i = 1, 300 do h(1, 2, 3, 4, 5, 6, 7, 8, {x = 1.5, y = 2}, i) end";
     let ir = ir_of(src, "h", 0);
     let snaps: Vec<&str> = ir
         .lines()
@@ -378,13 +379,14 @@ fn snapshots_leave_out_unchanged_slots() {
     assert!(
         snaps
             .iter()
-            .all(|s| !s.contains("r0=") && !s.contains("r1=")),
+            .all(|s| !s.contains("r8=") && !s.contains("r9=")),
         "{ir}"
     );
 }
 
-/// Registers a call does not write keep their values in their slots and
-/// their types after it: the entry guards cover the uses after each call.
+/// Registers a call does not write keep their values and their types after
+/// it: the entry guards cover the uses after each call. The parameters came
+/// in registers (W4 §2) and are never loaded from their slots.
 #[test]
 fn calls_keep_the_types_of_unwritten_registers() {
     let src = "local g
@@ -402,7 +404,8 @@ fn calls_keep_the_types_of_unwritten_registers() {
     let ir = ir_of(src, "f", 0);
     let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
     assert_eq!(count("guard val:tab"), 2, "{ir}");
-    assert_eq!(count("load r0"), 3, "{ir}");
+    assert_eq!(count("load r0"), 0, "{ir}");
+    assert_eq!(count("= param 0"), 1, "{ir}");
 }
 
 /// A branch on an equality with a constant makes the register that

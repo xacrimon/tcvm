@@ -25,6 +25,22 @@ fn agrees(src: &str) {
     assert_eq!(result(src, true), result(src, false), "{src}");
 }
 
+/// `agrees` with inlining off, for tests of real calls: what the inliner
+/// takes changes as it grows (W3).
+fn agrees_calling(src: &str) {
+    let mut lua = Lua::new();
+    lua.set_jit_inline(false);
+    lua.load_all();
+    let ex = start_on(&mut lua, src);
+    lua.finish(&ex)
+        .unwrap_or_else(|e| panic!("{src:?} failed: {e:?}"));
+    let got = lua.enter(|ctx| {
+        let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        String::from_utf8_lossy(v.get_string().expect("a string result").as_bytes()).into_owned()
+    });
+    assert_eq!(got, result(src, false), "{src}");
+}
+
 /// A constant shared by code before and after a call is defined again after
 /// it: the callee clobbers every register.
 #[test]
@@ -2021,7 +2037,7 @@ fn deep_misses_find_their_sites() {
         return tostring(s)";
     // Reference Lua 5.5 prints 229747000.
     assert_eq!(result(src, true), "229747000");
-    agrees(src);
+    agrees_calling(src);
 }
 
 /// More live values than the registers once allocatable, so x23 and x24
@@ -2049,6 +2065,75 @@ fn values_in_former_pinned_registers_survive_exits() {
         local out = f(2000, t)
         t[50] = 0.5
         return out .. ' / ' .. f(2000, t)",
+    );
+}
+
+/// Calls passing their arguments in registers (W4 §2): the parameters left
+/// out nil, past the eighth in slots, more arguments than parameters; a
+/// callee whose entry guard fails stores its parameters for the
+/// interpreter; one result returned in x0 alone, landed for `c = 0` and for
+/// more results than it gives.
+#[test]
+fn register_arguments_and_results() {
+    agrees_calling(
+        "local function f3(a, b, c) return (a or 0) + (b or 0) * 2 + (c or 0) * 3 end
+        local function f10(a, b, c, d, e, g, h, i, j, k)
+          return a + b + c + d + e + g + h + i + j * 10 + k * 100
+        end
+        local function typed(x) return x + 1 end
+        local function one(x) return x end
+        local s, t = 0, {}
+        for i = 1, 3000 do
+          s = s + f3(i) + f3(i, i) + f3(i, i, i, i, i)
+          s = s + f10(1, 2, 3, 4, 5, 6, 7, 8, i, i)
+          s = s + typed(i < 2900 and i or i + 0.5)
+          t = {one(i), one(i)}
+          local a, b, c, d = one(i)
+          s = s + #t + a + (b or 1) + (c or 2) + (d or 3)
+        end
+        return tostring(s) .. ' ' .. table.concat(t, ',') .. ' ' .. select('#', one(1))",
+    );
+}
+
+/// A tail call in a callee a call passed its arguments in registers, to a
+/// function that never compiles (an irreducible loop): its miss runs the
+/// caller's slow path with the tail call's arguments in the slots, where
+/// nothing may overwrite them with the registers the first call passed.
+#[test]
+fn tail_misses_keep_their_arguments() {
+    agrees_calling(
+        "local function g(m, h)
+          local i = 0
+          if m > 3 then goto b end
+          ::a:: i = i + 1
+          ::b:: i = i + 2
+          if i < 5 then goto a end
+          return m * 2 + h + i
+        end
+        local T = {} T.__index = T
+        function T:run(m) local msg = m + 1 return g(msg, self.handle) end
+        local objs = {}
+        for k = 1, 4 do objs[k] = setmetatable({handle = k}, T) end
+        local s = 0
+        for r = 1, 4000 do s = s + objs[r % 4 + 1]:run(r) end
+        return tostring(s)",
+    );
+}
+
+/// A region a dependency invalidated, called next through its register
+/// entry by a compiled caller (`h` changes the method `g` folded): its dead
+/// entry stores the parameters before the interpreter runs the function
+/// from its slots.
+#[test]
+fn invalidated_entries_store_register_parameters() {
+    agrees_calling(
+        "local C = {} C.__index = C
+        function C.val(self) return self.v end
+        local o = setmetatable({v = 2}, C)
+        local function g(t, k, m) return t:val() * k + m end
+        local function h(i) if i == 1500 then C.val = function(self) return self.v + 1 end end end
+        local function f(n) local s = 0 for i = 1, n do h(i) s = s + g(o, i, 3) end return s end
+        return tostring(f(3000))",
     );
 }
 

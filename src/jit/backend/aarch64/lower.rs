@@ -63,6 +63,9 @@ pub(crate) struct Lowered {
     pub(crate) snap_ops: Vec<u32>,
     /// The registers the entry guards test.
     pub(crate) entry_regs: Vec<u8>,
+    /// `RegionMeta::params`: an entry guard's failure stores them, as only
+    /// a caller using slots wrote them there.
+    pub(crate) params: u8,
     /// `Func::shape_sets` as the shapes' addresses.
     pub(crate) shape_sets: Vec<Vec<u64>>,
     /// The region has dependencies: its entry is patchable (ws2 §5.4).
@@ -95,6 +98,8 @@ struct Lower<'a, 'gc> {
     /// The frame's closure, defined in the entry block when the region
     /// reads its upvalues.
     closure: Option<VReg>,
+    /// The parameters entries pass in registers, by index (`Params`).
+    params: Vec<VReg>,
 }
 
 fn rep_class(rep: Rep) -> RegClass {
@@ -168,10 +173,12 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         absorbed: vec![false; f.insts.len()],
         known: Default::default(),
         closure: None,
+        params: Vec::new(),
     };
     let closure_at = closure_block(f, &cfg, order);
     lw.find_fusions(order);
     lw.find_known_callees(order);
+    lw.find_register_returns(order);
     // Float tests by block, then with those of the blocks entered from it
     // alone, which its `BOX` register reaches.
     let single = |s: Block| cfg.preds(s).len() == 1 && !f.blocks[s.idx()].cold;
@@ -208,6 +215,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         }
         if b == f.entry {
             lw.push(MInst::Prologue, &[], PRegSet::empty());
+            lw.entry_params();
         }
         // A resume block's first instruction is where a fast callee returns.
         let mut closure_due = closure_at == Some(b);
@@ -265,6 +273,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         sites: lw.sites,
         snap_ops: lw.snap_ops,
         entry_regs: lw.entry_regs,
+        params: f.meta.params,
         shape_sets: f
             .shape_sets
             .iter()
@@ -306,6 +315,46 @@ fn closure_block(f: &Func<'_>, cfg: &crate::jit::ir::CfgInfo, order: &[Block]) -
 }
 
 impl<'a, 'gc> Lower<'a, 'gc> {
+    /// `R[r] = v`; a float stores straight from its d register.
+    fn store_slot(&mut self, r: u8, v: Val) {
+        let f = self.f;
+        if let Some(Op::Box) = f.def_op(v)
+            && let x = f.args(f.def_inst(v).unwrap())[0]
+            && f.ty(x).rep == Rep::F64
+        {
+            let u = self.use_(x);
+            self.push(MInst::StoreSlotF(r), &[u], PRegSet::empty());
+        } else {
+            let u = self.use_(v);
+            self.push(MInst::StoreSlot(r), &[u], PRegSet::empty());
+        }
+    }
+
+    /// Every parameter entries pass in registers, used or not: an entry
+    /// guard's failure stores them all for the interpreter.
+    fn entry_params(&mut self) {
+        let f = self.f;
+        for k in 0..f.meta.params {
+            let p = f
+                .insts_of(f.entry)
+                .iter()
+                .find(|&&i| f.op(i) == Op::Param(k))
+                .map(|&i| f.result(i));
+            let r = match p {
+                Some(v) => self.vr(v),
+                None => self.v.new_vreg(RegClass::Int),
+            };
+            self.params.push(r);
+        }
+        if self.params.is_empty() {
+            return;
+        }
+        let ops: Vec<Operand> = (self.params.iter().enumerate())
+            .map(|(k, &r)| Operand::reg_fixed_def(r, preg_int(k as u8)))
+            .collect();
+        self.push(MInst::Params, &ops, PRegSet::empty());
+    }
+
     fn frame_closure(&mut self) {
         let c = self.v.new_vreg(RegClass::Int);
         self.push(
@@ -430,6 +479,53 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 }
             }
         }
+    }
+
+    /// A return of one result passes it in x0 alone (W4 §4): its store to
+    /// the result slot goes, when nothing between them can exit or read the
+    /// slot. A caller reads it from x0, `level_land` stores it for the
+    /// interpreter.
+    fn find_register_returns(&mut self, order: &[Block]) {
+        use crate::jit::ir::ops::Mem;
+        for &b in order {
+            let Some(t) = self.f.terminator(b) else {
+                continue;
+            };
+            let Op::Return { a, n: 1 } = self.f.op(t) else {
+                continue;
+            };
+            for &j in self.f.insts_of(b).iter().rev().skip(1) {
+                if self.f.insts[j.idx()].snap != crate::jit::ir::NO_SNAP {
+                    break;
+                }
+                match self.f.op(j) {
+                    Op::Store(r) if r == a => {
+                        if self.in_x0(self.f.args(j)[0]) {
+                            self.absorbed[j.idx()] = true;
+                        }
+                        break;
+                    }
+                    op if op.effects().reads.intersects(Mem::SLOT)
+                        || op.effects().writes.intersects(Mem::SLOT) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Whether a value stored as a result can be returned in x0: a boxed
+    /// value a register holds (a float's box exists only in its store).
+    fn in_x0(&self, v: Val) -> bool {
+        self.f.ty(v).rep == Rep::Val
+            && match self.f.def_op(v) {
+                Some(Op::Box) => {
+                    self.f.ty(self.f.args(self.f.def_inst(v).unwrap())[0]).rep != Rep::F64
+                }
+                _ => true,
+            }
     }
 
     fn find_fusions(&mut self, order: &[Block]) {
@@ -732,20 +828,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let d = self.def(res.unwrap());
                 self.push(MInst::LoadSlot(r), &[d], none);
             }
-            Op::Store(r) => {
-                let v = args[0];
-                // A float stores straight from its d register.
-                if let Some(Op::Box) = f.def_op(v)
-                    && let x = f.args(f.def_inst(v).unwrap())[0]
-                    && f.ty(x).rep == Rep::F64
-                {
-                    let u = self.use_(x);
-                    self.push(MInst::StoreSlotF(r), &[u], none);
-                } else {
-                    let u = self.use_(v);
-                    self.push(MInst::StoreSlot(r), &[u], none);
-                }
-            }
+            Op::Store(r) => self.store_slot(r, args[0]),
+            // Defined by the entry's `Params`.
+            Op::Param(_) => {}
             Op::UpvalValue(k) => {
                 let d = self.def(res.unwrap());
                 let c = Operand::reg_use(self.closure.expect("the frame's closure"));
@@ -840,18 +925,22 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::Select { float }, &ops, none);
             }
             Op::Guard(set) if f.insts[i.idx()].tag == ExitTag::Entry => {
-                let Some(Op::Load(r)) = f.def_op(args[0]) else {
+                let (Some(Op::Load(r)) | Some(Op::Param(r))) = f.def_op(args[0]) else {
                     return Err("an entry guard of no entry load".into());
                 };
                 self.entry_regs.push(r);
-                let u = self.use_(args[0]);
+                // The parameters stay where they came, for the failure.
+                let mut ops = vec![self.use_(args[0])];
+                for (k, &p) in self.params.iter().enumerate() {
+                    ops.push(Operand::reg_fixed_use(p, preg_int(k as u8)));
+                }
                 self.push(
                     MInst::Guard {
                         test: Test::Type(set),
                         cond: Cond::Eq,
                         exit: ENTRY_FAIL,
                     },
-                    &[u],
+                    &ops,
                     none,
                 );
             }
@@ -1419,8 +1508,21 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
             Op::Call { a, nargs, pc, .. } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
-                let ops: Vec<Operand> = args.iter().map(|&x| self.use_(x)).collect();
                 let known = self.known.get(&i).copied();
+                // A known Lua callee takes its first arguments in x0.. (W4
+                // §2); any other callee finds them in its slots.
+                let ops: Vec<Operand> = if nargs == u8::MAX {
+                    args.iter().map(|&x| self.use_(x)).collect()
+                } else if matches!(known, Some(Known::Lua { .. })) {
+                    (args.iter().enumerate())
+                        .map(|(k, &x)| Operand::reg_fixed_use(self.vr(x), preg_int(k as u8)))
+                        .collect()
+                } else {
+                    for (k, &x) in args.iter().enumerate() {
+                        self.store_slot(a + 4 + k as u8, x);
+                    }
+                    Vec::new()
+                };
                 self.push_call(
                     i,
                     MInst::Call {
@@ -1480,17 +1582,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         _ => {}
                     }
                 }
-                let v = stored.filter(|&v| {
-                    n > 0
-                        && f.ty(v).rep == Rep::Val
-                        && match f.def_op(v) {
-                            // A float's box is its store's: no register has it.
-                            Some(Op::Box) => {
-                                f.ty(f.args(f.def_inst(v).unwrap())[0]).rep != Rep::F64
-                            }
-                            _ => true,
-                        }
-                });
+                let v = stored.filter(|&v| n > 0 && self.in_x0(v));
                 match v {
                     Some(v) => {
                         let u = Operand::reg_fixed_use(self.vr(v), preg_int(0));
