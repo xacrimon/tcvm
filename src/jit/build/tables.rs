@@ -492,24 +492,35 @@ fn never(b: &Builder<'_, '_>, has: Val) -> bool {
     b.f.def_op(has) == Some(Op::KB1(false))
 }
 
+/// Whether the class of table `t` (a `Ptr`) has `bit`, when the shapes `t`
+/// may have are known and their classes agree.
+fn known_class_bit(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> Option<bool> {
+    let known = b.known_shapes(t)?;
+    let shapes: Vec<Shape<'_>> = known
+        .as_slice()
+        .iter()
+        .map(|&k| b.f.shapes[k as usize])
+        .collect();
+    let has = shapes.first().and_then(|&s| bit_now(s, bit))?;
+    if !shapes.iter().all(|&s| bit_now(s, bit) == Some(has)) {
+        return None;
+    }
+    for &s in &shapes {
+        known_bit(b, s, bit);
+    }
+    Some(has)
+}
+
 /// Whether the class of table `t` (a `Ptr`) has `bit`: a constant when the
 /// shapes `t` may have are known and their classes agree, else read live.
 pub(super) fn class_bit(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> Val {
-    if let Some(known) = b.known_shapes(t) {
-        let shapes: Vec<Shape<'_>> = known
-            .as_slice()
-            .iter()
-            .map(|&k| b.f.shapes[k as usize])
-            .collect();
-        if let Some(has) = shapes.first().and_then(|&s| bit_now(s, bit))
-            && shapes.iter().all(|&s| bit_now(s, bit) == Some(has))
-        {
-            for &s in &shapes {
-                known_bit(b, s, bit);
-            }
-            return b.ins(Op::KB1(has), &[]);
-        }
+    match known_class_bit(b, t, bit) {
+        Some(has) => b.ins(Op::KB1(has), &[]),
+        None => live_class_bit(b, t, bit),
     }
+}
+
+fn live_class_bit(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> Val {
     let bits = b.ins(Op::TabMmBits, &[t]);
     let mask = b.ki32(bit.bits() as i32);
     let has = b.ins(Op::IAnd, &[bits, mask]);
@@ -1278,27 +1289,36 @@ fn int_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Result<Val, (Val,
     Some(Err((b.ins(Op::Unbox(Rep::I32), &[kb]), other)))
 }
 
-/// The array part's cell and `i` inside it, where the site's feedback never
-/// saw a miss: the class without `bit` and `i` below the size, guarded
-/// (`Bounds`). `None` after a miss: the caller tests both.
-fn array_guards(
-    b: &mut Builder<'_, '_>,
-    pc: u32,
-    t: Val,
-    i: Val,
-    bit: MetamethodBits,
-) -> Option<Val> {
+/// The array part's cell, where the site's feedback never saw a miss: `i`
+/// below the size, guarded (`Bounds`). `None` after a miss: the caller
+/// tests it.
+fn array_guards(b: &mut Builder<'_, '_>, pc: u32, t: Val, i: Val) -> Option<Val> {
     if b.feedback(pc) & fb::ARR_MISS != 0 {
         return None;
     }
-    // Before the access: its class is the table's for the whole loop.
-    let has = class_bit(b, t, bit);
-    let s = b.snap_before();
-    b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Bounds);
     let n = b.ins(Op::TabASize, &[t]);
     let inside = b.ins(Op::ICmp(Cc::Lo), &[i, n]);
+    let s = b.snap_before();
     b.ins_snap(Op::GuardTrue, &[inside], s, ExitTag::Bounds);
     Some(b.ins(Op::TabArray, &[t]))
+}
+
+/// Where `v`, an element of table `t` at a site whose feedback never saw a
+/// miss, is nil: exit (`Bounds`) if the class has `bit` now. The class is
+/// read only for a nil (LuaJIT `lj_record.c:1597-1612`) unless it is read
+/// anyway (`opt::miss`): up front it costs a varying table three dependent
+/// loads per access.
+fn nil_guard(b: &mut Builder<'_, '_>, t: Val, v: Val, bit: MetamethodBits) {
+    let has = match known_class_bit(b, t, bit) {
+        Some(false) => return,
+        Some(true) => b.ins(Op::KB1(true), &[]),
+        None => live_class_bit(b, t, bit),
+    };
+    let s = b.snap_before();
+    let g = b.ins_snap(Op::GuardMiss, &[v, has], s, ExitTag::Bounds);
+    // Kept where LICM moves it.
+    let pc = b.f.snaps[s.0 as usize].pc;
+    b.f.exit_sites.insert(g, pc);
 }
 
 /// `R[a] = R[b][R[c]]`: a small integer key inside the array part loads
@@ -1321,8 +1341,9 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
         Some(Ok(i)) => (i, None),
         Some(Err((i, other))) => (i, Some(other)),
     };
-    if let Some(arr) = array_guards(b, pc, t, i, MetamethodBits::INDEX) {
+    if let Some(arr) = array_guards(b, pc, t, i) {
         let v = b.ins(Op::ArrLoad, &[arr, i]);
+        nil_guard(b, t, v, MetamethodBits::INDEX);
         match other {
             None => b.set(dst, v),
             Some(other) => {
@@ -1389,7 +1410,10 @@ pub(super) fn emit_settable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
         Some(Err((i, other))) => (i, Some(other)),
     };
     let join = b.new_block();
-    if let Some(arr) = array_guards(b, pc, t, i, MetamethodBits::NEWINDEX) {
+    if let Some(arr) = array_guards(b, pc, t, i) {
+        // Unused, so dropped, where the class lacks `__newindex` for good.
+        let old = b.ins(Op::ArrLoad, &[arr, i]);
+        nil_guard(b, t, old, MetamethodBits::NEWINDEX);
         barrier_for(b, t, v);
         b.push(Op::ArrStore, &[arr, i, v]);
         b.jump(join);

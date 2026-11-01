@@ -5,6 +5,7 @@ pub(crate) mod calls;
 pub(crate) mod gvn;
 pub(crate) mod infer;
 pub(crate) mod licm;
+pub(crate) mod miss;
 pub(crate) mod peel;
 pub(crate) mod range;
 pub(crate) mod simplify;

@@ -648,6 +648,43 @@ fn field_loads_take_their_slot_kinds() {
     assert!(ir.contains("val:tab@s"), "{ir}");
 }
 
+/// Array accesses read the class only for a nil element (W2.3): a read in
+/// the failing arm of its use's type guard, a varying table's store after
+/// testing the old value (none over an element read and typed already); an
+/// invariant table's store guards it once.
+#[test]
+fn array_classes_wait_for_nils() {
+    let src = "function f(m, n, j)
+        local s = 0
+        for i = 1, n do local row = m[i]; s = s + row[j]; row[j] = s; row[j + 1] = s end
+        return s
+    end
+    function g(t, n, v) for i = 1, n do t[i] = v end end
+    keep = {}
+    for i = 1, 20 do keep[i] = {1, 2, 3} end
+    for k = 1, 300 do f(keep, 20, 2); g(keep[1], 3, k) end";
+    // Lines with `s` outside the cold arms.
+    let hot = |ir: &str, s: &str| {
+        let mut cold = false;
+        ir.lines()
+            .filter(|l| {
+                if !l.starts_with(' ') {
+                    cold = l.contains(" cold");
+                }
+                !cold && l.contains(s)
+            })
+            .count()
+    };
+    let ir = ir_of(src, "f", 0);
+    assert_eq!(hot(&ir, "tabmmbits"), 0, "{ir}");
+    // `row[j + 1]`'s old value only.
+    assert_eq!(2 * hot(&ir, "istype val:nil"), hot(&ir, "arrstore"), "{ir}");
+    assert!(!ir.contains("guard.miss"), "{ir}");
+    let ir = ir_of(src, "g", 0);
+    assert_eq!(hot(&ir, "arrload"), 0, "{ir}");
+    assert_eq!(hot(&ir, "tabmmbits"), 1, "{ir}");
+}
+
 /// A table loaded from a slot that tracks its tables' stable shape needs no
 /// shape guard (ws2 §6.1-6.2), in a loop over a list too: only the list's
 /// head, a parameter, is guarded.

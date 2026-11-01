@@ -267,6 +267,13 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
+                Op::GuardMiss
+                    if konst_b1(f, args[1]) == Some(false)
+                        || !f.ty(args[0]).set.intersects(TypeSet::NIL) =>
+                {
+                    remove(i);
+                    changed = true;
+                }
                 Op::Select => {
                     if let Some(c) = konst_b1(f, args[0]) {
                         map[res(f).idx()] = if c { args[1] } else { args[2] };

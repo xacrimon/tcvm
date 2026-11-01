@@ -180,6 +180,11 @@ pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
             break;
         }
     }
+    if let Some(arms) = t.timed("misses", || opt::miss::expand(f)) {
+        t.timed("licm", || opt::licm::licm(f));
+        t.timed("gvn", || opt::gvn::gvn(f));
+        t.timed("misses", || opt::miss::recompute(f, &arms));
+    }
     t.timed("infer", || opt::infer::infer(f));
     t.timed("legalize", || opt::infer::legalize(f));
     t.timed("infer", || opt::infer::infer(f));

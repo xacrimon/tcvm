@@ -78,8 +78,9 @@ struct Lower<'a, 'gc> {
     entry_regs: Vec<u8>,
     block_of: Vec<u32>,
     pc_base: usize,
-    /// The float guards of the block being lowered, and a register holding
-    /// `BOX` they share when there are two or more (A7.4).
+    /// The float tests (guards, branches) of the block being lowered and the
+    /// blocks only it enters, and a register holding `BOX` they share when
+    /// there are two or more (A7.4).
     float_guards: u32,
     box_reg: Option<VReg>,
     /// Stores a known call writes itself, and its callee (D2).
@@ -160,6 +161,30 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
     };
     lw.find_fusions(order);
     lw.find_known_callees(order);
+    // Float tests by block, then with those of the blocks entered from it
+    // alone, which its `BOX` register reaches.
+    let single = |s: Block| cfg.preds(s).len() == 1 && !f.blocks[s.idx()].cold;
+    let mut floats = vec![0u32; f.blocks.len()];
+    for &b in order.iter().rev() {
+        let own = f
+            .insts_of(b)
+            .iter()
+            .filter(|&&i| match f.op(i) {
+                Op::Guard(TypeSet::FLOAT) => f.insts[i.idx()].tag != ExitTag::Entry,
+                Op::Br => {
+                    let c = f.args(i)[0];
+                    lw.fused[c.idx()] && f.def_op(c) == Some(Op::IsType(TypeSet::FLOAT))
+                }
+                _ => false,
+            })
+            .count() as u32;
+        floats[b.idx()] = own
+            + f.succs(b)
+                .filter(|&s| single(s))
+                .map(|s| floats[s.idx()])
+                .sum::<u32>();
+    }
+    let mut box_end: Vec<Option<VReg>> = vec![None; f.blocks.len()];
     let mut params: Vec<VReg> = Vec::new();
     let mut succs: Vec<RBlock> = Vec::new();
     let mut args: Vec<VReg> = Vec::new();
@@ -176,14 +201,11 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         succs.clear();
         args.clear();
         nargs.clear();
-        lw.box_reg = None;
-        lw.float_guards = f
-            .insts_of(b)
-            .iter()
-            .filter(|&&i| {
-                f.op(i) == Op::Guard(TypeSet::FLOAT) && f.insts[i.idx()].tag != ExitTag::Entry
-            })
-            .count() as u32;
+        lw.box_reg = match cfg.preds(b) {
+            &[p] if single(b) => box_end[p.idx()],
+            _ => None,
+        };
+        lw.float_guards = floats[b.idx()];
         for &i in f.insts_of(b) {
             lw.lower_inst(i)?;
             if f.op(i).is_terminator() {
@@ -199,6 +221,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
                 }
             }
         }
+        box_end[b.idx()] = lw.box_reg;
         let end = lw.v.insts.len() as u32;
         let preds = cfg
             .preds(b)
@@ -260,6 +283,22 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
         }
         v
+    }
+
+    /// The register holding `BOX` for the block's float tests.
+    fn box_reg(&mut self) -> VReg {
+        if let Some(k) = self.box_reg {
+            return k;
+        }
+        let k = self.v.new_vreg(RegClass::Int);
+        let box_ = crate::jit::backend::aarch64::emit::BOX;
+        self.push(
+            MInst::MovImm(box_),
+            &[Operand::reg_def(k)],
+            PRegSet::empty(),
+        );
+        self.box_reg = Some(k);
+        k
     }
 
     fn push(&mut self, inst: MInst, ops: &[Operand], clob: PRegSet) -> usize {
@@ -749,17 +788,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     none,
                 );
             }
-            Op::Guard(TypeSet::FLOAT) if self.float_guards >= 2 => {
-                let k = match self.box_reg {
-                    Some(k) => k,
-                    None => {
-                        let k = self.v.new_vreg(RegClass::Int);
-                        let box_ = crate::jit::backend::aarch64::emit::BOX;
-                        self.push(MInst::MovImm(box_), &[Operand::reg_def(k)], none);
-                        self.box_reg = Some(k);
-                        k
-                    }
-                };
+            Op::Guard(TypeSet::FLOAT) if self.float_guards >= 2 || self.box_reg.is_some() => {
+                let k = self.box_reg();
                 let ops = vec![self.use_(args[0]), Operand::reg_use(k)];
                 self.push_exit(
                     i,
@@ -785,6 +815,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     none,
                 );
             }
+            Op::GuardMiss => return Err("an unexpanded guard.miss".into()),
             Op::GuardTrue | Op::GuardFalse => {
                 let c = args[0];
                 let (test, cond, targs) = if self.fused[c.idx()] {
@@ -1306,7 +1337,16 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 } else {
                     (Test::B1, Cond::Ne, vec![c])
                 };
-                let ops: Vec<Operand> = targs.iter().map(|&a| self.use_(a)).collect();
+                let mut ops: Vec<Operand> = targs.iter().map(|&a| self.use_(a)).collect();
+                let (test, cond) = match test {
+                    Test::Type(TypeSet::FLOAT)
+                        if self.float_guards >= 2 || self.box_reg.is_some() =>
+                    {
+                        ops.push(Operand::reg_use(self.box_reg()));
+                        (Test::X { imm: None }, Cond::Lo)
+                    }
+                    _ => (test, cond),
+                };
                 self.push(MInst::Br { test, cond }, &ops, none);
             }
             Op::Call { a, nargs, pc, .. } => {

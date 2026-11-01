@@ -428,7 +428,7 @@ pub(crate) enum ExitTag {
     /// by-value upvalue): the exit records `CONST_MISS`, and the recompile
     /// takes only what is known for certain as constant.
     Const,
-    /// An array access left the array part, or met a class with
+    /// An array access left the array part, or met a nil under a class with
     /// `__index`/`__newindex`, where the site's feedback never saw one: the
     /// exit records `ARR_MISS`, and the recompile keeps the slow arm.
     Bounds,
@@ -503,6 +503,9 @@ pub(crate) enum Op {
     GuardTrue,
     /// Exits when the `B1` is true.
     GuardFalse,
+    /// Exits when the `Val` is nil and the `B1` true: an array element whose
+    /// table's class may have the metamethod (W2.3); `opt::miss` expands it.
+    GuardMiss,
     /// Exits when the two `Val`s are not the same word.
     GuardSame,
     /// Exits unless the `Val` is a Lua closure of `Func::protos[k]`.
@@ -859,9 +862,9 @@ impl Op {
         match self {
             Load(_) => Effects::reads(Mem::SLOT),
             Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
-            Guard(_) | GuardTrue | GuardFalse | GuardSame | GuardProto(_) | IAdd | ISub | IMul
-            | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor | LToI
-            | LToFExact | FToIExact | ToF64 => Effects::flags(DEOPT),
+            Guard(_) | GuardTrue | GuardFalse | GuardMiss | GuardSame | GuardProto(_) | IAdd
+            | ISub | IMul | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor
+            | LToI | LToFExact | FToIExact | ToF64 => Effects::flags(DEOPT),
             GuardNoFlag(_) | GuardFits(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) | GuardShapeIn(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
@@ -932,6 +935,7 @@ impl Op {
             | Barrier
             | GuardTrue
             | GuardFalse
+            | GuardMiss
             | GuardSame
             | GuardProto(_)
             | GuardNoFlag(_)
@@ -1035,6 +1039,7 @@ impl Op {
             Guard(s) => format!("guard {}", Ty::val(s)),
             GuardTrue => "guard.true".into(),
             GuardFalse => "guard.false".into(),
+            GuardMiss => "guard.miss".into(),
             GuardSame => "guard.same".into(),
             GuardProto(k) => format!("guard.proto p{k}"),
             GcCheck => "gccheck".into(),

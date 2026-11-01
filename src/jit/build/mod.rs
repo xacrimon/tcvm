@@ -2046,9 +2046,9 @@ fn refined_from(f: &Func<'_>, mut v: Val) -> Val {
 }
 
 /// Remove parameters whose incoming arguments are all one other value (or
-/// the parameter itself), to a fixpoint. Arguments that are refinements of
-/// one value (a register guarded differently on each path) join to that
-/// value, refined to their union where that is narrower.
+/// the parameter itself, refined or not), to a fixpoint. Arguments that are
+/// refinements of one value (a register guarded differently on each path)
+/// join to that value, refined to their union where that is narrower.
 pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
     let cfg = f.cfg();
     let mut map: Vec<Val> = Vec::new();
@@ -2071,7 +2071,8 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
                 let mut base: Option<(Val, TypeSet)> = None;
                 for &(term, e) in cfg.incoming(b) {
                     let a = resolve(&map, f.edge_args(term, e as usize)[k]);
-                    if a == p {
+                    // A refinement of the parameter is its value.
+                    if a == p || refined_from(f, a) == p {
                         continue;
                     }
                     let (ra, ta) = (refined_from(f, a), f.vals[a.idx()].ty);

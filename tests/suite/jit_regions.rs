@@ -1280,6 +1280,78 @@ fn float_modulo_edges() {
     );
 }
 
+/// Array elements under classes with `__index`/`__newindex` (W2.3): present
+/// ones read and written plainly, nil ones through the metamethod, for
+/// varying and invariant tables, a class gaining one later, a nil under a
+/// use that fails on it, and an `__index` table.
+#[test]
+fn array_misses_under_classes() {
+    agrees(
+        r##"
+        local function total(rows, j)
+            local s = 0
+            for i = 1, #rows do s = s + rows[i][j] end
+            return s
+        end
+        local function sum(t, n)
+            local s = 0
+            for i = 1, n do s = s + (t[i] or 0) end
+            return s
+        end
+        local function count(t, n)
+            local c = 0
+            for i = 1, n do if t[i] then c = c + 1 end end
+            return c
+        end
+        local function fill(t, n, v) for i = 1, n do t[i] = v end end
+        local function fill_rows(rows, j, v)
+            for i = 1, #rows do rows[i][j] = v end
+        end
+        local out = {}
+        local rows = {}
+        for i = 1, 50 do rows[i] = {1, 2, 3, 4} end
+        for r = 1, 300 do out[1] = total(rows, r % 4 + 1) end
+        setmetatable(rows[7], {__index = function() return 100 end})
+        for r = 1, 300 do out[2] = total(rows, 2) end
+        rows[7][2] = nil
+        out[3] = total(rows, 2)
+        setmetatable(rows[9], {__index = {[3] = 0.5}})
+        rows[9][3] = nil
+        out[4] = total(rows, 3)
+        rows[11][4] = nil
+        out[5] = select(2, pcall(total, rows, 4))
+        local h = {1, 2, 3, 4, 5, 6, 7, 8}
+        for r = 1, 300 do out[6] = sum(h, 8) + count(h, 8) end
+        h[3] = nil
+        out[7] = sum(h, 8) + count(h, 8)
+        setmetatable(h, {__index = function(_, k) return k * 10 end})
+        out[8] = sum(h, 8) + count(h, 8)
+        local log = {}
+        local p = {1, 2, 3, 4}
+        for r = 1, 300 do fill(p, 4, r) end
+        setmetatable(p, {__newindex = function(t, k, v)
+            log[#log + 1] = k
+            rawset(t, k, v)
+        end})
+        fill(p, 4, 7)
+        out[9] = #log
+        p[2] = nil
+        fill(p, 4, 9)
+        out[10] = #log .. ":" .. tostring(log[1]) .. ":" .. p[2]
+        local q = {}
+        for i = 1, 40 do q[i] = {0, 0, 0} end
+        for r = 1, 300 do fill_rows(q, r % 3 + 1, r) end
+        local seen = 0
+        setmetatable(q[5], {__newindex = function(t, k, v) seen = seen + v end})
+        fill_rows(q, 2, 1)
+        q[5][2] = nil
+        fill_rows(q, 2, 3)
+        out[11] = seen .. ":" .. tostring(q[5][2]) .. ":" .. q[6][2]
+        return table.concat(out, " ")
+"##,
+    );
+}
+
 /// Bounds checks against a loop's range (E2): limits past the array,
 /// early breaks, negative and non-unit steps, an array grown in the loop
 /// and empty loops.
