@@ -241,6 +241,9 @@ impl HelperId {
         // or adopts a metatable's class.
         let lookup = Effects::new(ALLOC, Mem::SHAPE | Mem::META, Mem::SHAPE | Mem::META);
         let table_write = Mem::TAB | Mem::ARR | Mem::SHAPE | Mem::META | Mem::GC;
+        // Stores that touch table memory alone: a metamethod fails them
+        // rather than run, and an allocation never collects (W2.7).
+        let table_store = Effects::new(ALLOC, table_write, table_write);
         let e = Effects::new;
         let (ctx, imm, args, ret, effects): (_, _, &'static [Rep], _, _) = match self {
             HelperId::FMod | HelperId::FPow => (&[][..], None, &[F64, F64], Some(F64), pure),
@@ -342,7 +345,7 @@ impl HelperId {
                 Some(keyed as u64),
                 &[Val, Val, Val],
                 Some(Val),
-                e(ALLOC, Mem::ALL, table_write),
+                table_store,
             ),
             HelperId::Type | HelperId::ToNumber | HelperId::StrLen => {
                 (RT, None, &[Val], Some(Val), e(ALLOC, NONE, NONE))
@@ -362,13 +365,7 @@ impl HelperId {
                 Some(Val),
                 Effects::reads(Mem::TAB | Mem::SHAPE | Mem::META),
             ),
-            HelperId::SetMetatable => (
-                RT,
-                None,
-                &[Val, Val],
-                Some(Val),
-                e(ALLOC, Mem::ALL, table_write),
-            ),
+            HelperId::SetMetatable => (RT, None, &[Val, Val], Some(Val), table_store),
             HelperId::RawGet => (
                 &[][..],
                 None,
@@ -376,24 +373,12 @@ impl HelperId {
                 Some(Val),
                 Effects::reads(Mem::TAB | Mem::ARR | Mem::SHAPE),
             ),
-            HelperId::RawSet => (
-                RT,
-                None,
-                &[Val, Val, Val],
-                Some(Val),
-                e(ALLOC, Mem::ALL, table_write),
-            ),
+            HelperId::RawSet => (RT, None, &[Val, Val, Val], Some(Val), table_store),
             HelperId::RawEqual => (&[][..], None, &[Val, Val], Some(I32), pure),
             HelperId::StrSub => (RT, None, &[Val, Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
             HelperId::StrByte => (&[][..], None, &[Val, Val], Some(Val), pure),
-            HelperId::TInsert => (
-                RT,
-                None,
-                &[Val, Val],
-                Some(Val),
-                e(ALLOC, Mem::ALL, table_write),
-            ),
-            HelperId::TRemove => (RT, None, &[Val], Some(Val), e(ALLOC, Mem::ALL, table_write)),
+            HelperId::TInsert => (RT, None, &[Val, Val], Some(Val), table_store),
+            HelperId::TRemove => (RT, None, &[Val], Some(Val), table_store),
             HelperId::Min | HelperId::Max => (&[][..], None, &[Val, Val], Some(Val), pure),
         };
         Sig {

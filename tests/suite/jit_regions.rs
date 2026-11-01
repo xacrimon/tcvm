@@ -1280,6 +1280,53 @@ fn float_modulo_edges() {
     );
 }
 
+/// Inlined callees that store through the table helpers (W2.7), where each
+/// helper fails over to the builtin or the interpreter: `__newindex` and
+/// `__len` under `table.insert`/`table.remove`, a protected metatable, a
+/// nil `rawset` key, and a store whose class gains `__newindex` later.
+#[test]
+fn inlined_table_helpers() {
+    agrees(
+        r##"
+        local log = {}
+        local mt = {}
+        local keys = {"p", "q", "r"}
+        local function put(t, k, v) return rawset(t, k, v) end
+        local function push(t, v) table.insert(t, v) end
+        local function pop(t) return table.remove(t) end
+        local function mk(x, m) return setmetatable({x = x}, m) end
+        local function set(t, k, v) t[k] = v end
+        local function run(t, n, m)
+            local s = 0
+            for i = 1, n do
+                put(t, "a", i); push(t, i); s = s + pop(t)
+                local o = mk(i, m); set(o, keys[i % 3 + 1], i); s = s + o.x
+            end
+            return s
+        end
+        local out = {}
+        for r = 1, 300 do out[1] = run({}, 10, mt) end
+        local logged = setmetatable({}, {__newindex = function(t, k, v)
+            log[#log + 1] = k
+            rawset(t, k, v)
+        end})
+        out[2] = run(logged, 3, mt)
+        local counted = setmetatable({}, {__len = function() return 0 end})
+        out[3] = tostring(pcall(run, counted, 3, mt))
+        out[4] = select(2, pcall(run, {}, 3, setmetatable({}, {__metatable = "no"})))
+        local function remeta(t, m) return setmetatable(t, m) end
+        local function remetas(n) for i = 1, n do remeta({}, mt) end end
+        for r = 1, 300 do remetas(5) end
+        out[5] = select(2, pcall(remeta, mk(0, {__metatable = "locked"}), mt))
+        out[6] = select(2, pcall(put, {}, nil, 1))
+        mt.__newindex = function(t, k, v) log[#log + 1] = k end
+        out[7] = run({}, 4, mt)
+        out[8] = #log .. ":" .. table.concat(log, ",")
+        return table.concat(out, " ")
+"##,
+    );
+}
+
 /// Array elements under classes with `__index`/`__newindex` (W2.3): present
 /// ones read and written plainly, nil ones through the metamethod, for
 /// varying and invariant tables, a class gaining one later, a nil under a

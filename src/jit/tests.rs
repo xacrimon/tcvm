@@ -648,6 +648,41 @@ fn field_loads_take_their_slot_kinds() {
     assert!(ir.contains("val:tab@s"), "{ir}");
 }
 
+/// Callees storing through the table helpers inline (W2.7): `rawset`,
+/// `table.insert`, `table.remove`, `setmetatable` and a generic store touch
+/// table memory alone. (A tail call or a constructor still keeps a callee
+/// out, `inline::needs_frame`.)
+#[test]
+fn table_helpers_inline() {
+    let src = "local mt = {}
+    local keys = {'p', 'q', 'r'}
+    local function put(t, k, v) rawset(t, k, v) end
+    local function push(t, v) table.insert(t, v) end
+    local function pop(t) local v = table.remove(t) return v end
+    local function mk(o) local r = setmetatable(o, mt) return r end
+    local function set(t, k, v) t[k] = v end
+    function f(t, n)
+        local s = 0
+        for i = 1, n do
+            put(t, 'a', i); push(t, i); s = s + pop(t)
+            local o = mk({x = i}); set(o, keys[i % 3 + 1], i); s = s + o.x
+        end
+        return s
+    end
+    for k = 1, 300 do f({}, 10) end";
+    let ir = ir_of(src, "f", 0);
+    assert!(!ir.contains("call r"), "{ir}");
+    for h in [
+        "call.rawset",
+        "call.tinsert",
+        "call.tremove",
+        "call.setmetatable",
+        "call.newindex",
+    ] {
+        assert!(ir.contains(h), "{h} in {ir}");
+    }
+}
+
 /// Array accesses read the class only for a nil element (W2.3): a read in
 /// the failing arm of its use's type guard, a varying table's store after
 /// testing the old value (none over an element read and typed already); an
