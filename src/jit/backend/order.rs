@@ -1,17 +1,19 @@
-//! Block layout (9.9): the order the allocator and the encoder work in.
-//! Every dominator of a block precedes it and each loop's blocks are
-//! contiguous, which plain reverse postorder does not give (nothing stops it
-//! from placing a block outside a loop between two of the loop's blocks).
-//! Each loop collapses to its header, the collapsed graph is laid out in
-//! reverse postorder, and each loop's own layout is spliced in where its
-//! header landed. Blocks that end in a deopt run at most once per entry and
-//! go after the rest, then cold arms (A5), so loop bodies fall through. Irreducible graphs never get here
-//! (`cfg.rs` refuses them).
+//! Block layout (9.9). The allocator works in an order where every dominator
+//! of a block precedes it and each loop's blocks are contiguous, which plain
+//! reverse postorder does not give (nothing stops it from placing a block
+//! outside a loop between two of the loop's blocks): each loop collapses to
+//! its header, the collapsed graph is laid out in reverse postorder, and each
+//! loop's own layout is spliced in where its header landed. Its live ranges
+//! are intervals of that order, so every block stays where it falls, cold
+//! arms included. The encoder emits blocks that end in a deopt (at most once
+//! per entry) after the rest, then cold arms (A5), so loop bodies fall
+//! through. Irreducible graphs never get here (`cfg.rs` refuses them).
 
 use crate::jit::ir::ops::Op;
 use crate::jit::ir::{Block, CfgInfo, Func};
 
-pub(crate) fn layout(f: &Func<'_>) -> Vec<Block> {
+/// The allocator's order, and the encoder's as indices into it.
+pub(crate) fn layout(f: &Func<'_>) -> (Vec<Block>, Vec<u32>) {
     let cfg = f.cfg();
     let n = f.blocks.len();
     let mut rpo_num = vec![u32::MAX; n];
@@ -71,13 +73,14 @@ pub(crate) fn layout(f: &Func<'_>) -> Vec<Block> {
     let mut order = Vec::with_capacity(cfg.rpo.len());
     lp.scope(f, None, f.entry, &mut order);
     debug_assert_eq!(order.len(), cfg.rpo.len());
-    let deopts = |b: &Block| f.terminator(*b).is_some_and(|t| f.op(t) == Op::Deopt);
-    let (deopt, rest): (Vec<Block>, Vec<Block>) = order.into_iter().partition(deopts);
-    let (cold, mut hot): (Vec<Block>, Vec<Block>) =
-        rest.into_iter().partition(|b| f.blocks[b.idx()].cold);
-    hot.extend(deopt);
-    hot.extend(cold);
-    hot
+    let rank = |b: Block| match f.terminator(b).map(|t| f.op(t)) {
+        Some(Op::Deopt) => 1,
+        _ if f.blocks[b.idx()].cold => 2,
+        _ => 0,
+    };
+    let mut emit: Vec<u32> = (0..order.len() as u32).collect();
+    emit.sort_by_key(|&k| rank(order[k as usize]));
+    (order, emit)
 }
 
 struct Loops<'a> {

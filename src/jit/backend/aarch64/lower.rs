@@ -61,6 +61,8 @@ pub(crate) struct Lowered {
     pub(crate) shape_sets: Vec<Vec<u64>>,
     /// The region has dependencies: its entry is patchable (ws2 §5.4).
     pub(crate) invalidable: bool,
+    /// The VCode blocks in the order the encoder lays them out.
+    pub(crate) emit_order: Vec<u32>,
 }
 
 struct Lower<'a, 'gc> {
@@ -132,7 +134,8 @@ fn float_cond(cc: Cc) -> Cond {
 /// The address of `Code[pc]` of the prototype being compiled.
 pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, String> {
     let cfg = f.cfg();
-    let order = &crate::jit::backend::order::layout(f);
+    let (order, emit_order) = crate::jit::backend::order::layout(f);
+    let order = &order;
     let mut block_of = vec![u32::MAX; f.blocks.len()];
     for (k, b) in order.iter().enumerate() {
         block_of[b.idx()] = k as u32;
@@ -229,6 +232,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
             })
             .collect(),
         invalidable: !f.deps.is_empty(),
+        emit_order,
     })
 }
 

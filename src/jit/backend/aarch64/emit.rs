@@ -344,11 +344,13 @@ pub(crate) fn emit(
         em.a.b_cond(Cond::Hi, fast_miss);
         l
     });
-    let nb = l.vcode.blocks.len();
-    for b in 0..nb {
-        if skip[b] {
-            continue;
-        }
+    let laid: Vec<usize> = l
+        .emit_order
+        .iter()
+        .map(|&b| b as usize)
+        .filter(|&b| !skip[b])
+        .collect();
+    for (at, &b) in laid.iter().enumerate() {
         let blk = &l.vcode.blocks[b];
         em.a.bind(em.labels[b]);
         for (k, ie) in out
@@ -363,7 +365,7 @@ pub(crate) fn emit(
                 }
                 regalloc2::InstOrEdit::Edit(Edit::Move { from, to }) => em.mov(*from, *to),
                 regalloc2::InstOrEdit::Inst(i) => {
-                    let next = (b + 1..nb).find(|&x| !skip[x]).map(|x| em.labels[x]);
+                    let next = laid.get(at + 1).map(|&x| em.labels[x]);
                     em.inst(i.index(), b, next)?;
                 }
             }

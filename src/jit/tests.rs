@@ -673,3 +673,40 @@ fn number_slots_take_what_the_site_saw() {
     assert!(ir.contains("val:small|float = tabload"), "{ir}");
     assert!(!ir.contains("tof64"), "{ir}");
 }
+
+/// A loop entered with its first store in a cold arm, whose hot blocks after
+/// the arm are reached only through it, compiles with every check on in
+/// debug builds: the allocator's checker visits blocks in their order, so
+/// the allocator gets them in reverse postorder, cold arms in place.
+#[test]
+fn cold_arm_successors_pass_the_allocator_checker() {
+    let src = "Src = {a = 1, b = 2, c = 3, d = 4}
+    function new()
+      local obj = {x = 1}
+      for k, v in pairs(Src) do obj[k] = v end
+      return obj
+    end
+    for i = 1, 3000 do new() end";
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let f = ctx
+            .globals()
+            .raw_get(Value::string(LuaString::new(ctx, b"new")));
+        let lf = f.get_function().and_then(|f| f.as_lua()).unwrap();
+        let st = lf.proto.jit.get().expect("compiled").borrow();
+        assert!(
+            st.strikes == 0 && st.regions.len() >= 2,
+            "{} strikes",
+            st.strikes
+        );
+    });
+}
