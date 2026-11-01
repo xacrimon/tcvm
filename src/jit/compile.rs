@@ -581,6 +581,7 @@ pub(crate) fn compile<'gc>(
                 c.depend(ctx.mutation(), region, bits);
             }
             DepOn::Holder(s) => s.depend(ctx.mutation(), region, groups),
+            DepOn::Field(f) => f.depend(ctx.mutation(), region),
         }
     }
     Ok(region)

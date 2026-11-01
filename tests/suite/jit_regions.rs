@@ -2450,3 +2450,186 @@ fn known_arithmetic_metamethods_follow_the_class() {
         return table.concat(r, ',')",
     );
 }
+
+/// Compiled loads take a slot's kind as their type (ws2 §6.1); a store that
+/// widens it, from outside, from a call or from the loop itself, reaches
+/// them.
+#[test]
+fn widened_slots_reach_typed_loads() {
+    agrees(
+        "local function new(x) return {x = x, y = 2} end
+        local ps = {}
+        for i = 1, 8 do ps[i] = new(i) end
+        local hook = function(i) end
+        local function run()
+          local s = 0
+          for i = 1, 300 do
+            local p = ps[i % 8 + 1]
+            hook(i)
+            s = s + p.x * p.y
+            if p.x == nil then s = s + 1000 end
+          end
+          return s
+        end
+        local r = {}
+        for k = 1, 10 do r[#r + 1] = run() end
+        ps[3].x = 1.5
+        r[#r + 1] = run()
+        hook = function(i) if i == 150 then ps[4].x = 'z' == 'z' and 2.25 end end
+        r[#r + 1] = run()
+        hook = function(i) if i == 100 then ps[5].x = 7 end end
+        r[#r + 1] = run()
+        local function self_edit()
+          local s = 0
+          for i = 1, 300 do
+            local p = ps[i % 8 + 1]
+            s = s + p.x
+            if i == 200 then p.x = 0.5 end
+          end
+          return s
+        end
+        for k = 1, 5 do r[#r + 1] = self_edit() end
+        return table.concat(r, ',')",
+    );
+}
+
+/// A compiled store whose value does not fit the slot leaves before it,
+/// and the interpreter's widens the slot for every table of the shapes
+/// sharing it.
+#[test]
+fn stores_that_do_not_fit_widen_their_slot() {
+    agrees(
+        "local function new() return {n = 0, s = ''} end
+        local ts = {new(), new(), new()}
+        local function set(t, v, w) t.n = v; t.s = w end
+        local function run(v, w)
+          local acc = {}
+          for i = 1, 300 do
+            local t = ts[i % 3 + 1]
+            set(t, i < 250 and i or v, w)
+            acc[#acc + 1] = type(t.n) .. type(t.s)
+          end
+          return table.concat(acc, '', 295)
+        end
+        local r = {}
+        for k = 1, 10 do r[#r + 1] = run(1, 'a') end
+        r[#r + 1] = run(1.5, 'a')
+        r[#r + 1] = run({}, nil)
+        r[#r + 1] = run(nil, true)
+        r[#r + 1] = run(1, 'a')
+        return table.concat(r, ',')",
+    );
+}
+
+/// A constructor's constant nil is in every table it makes, so the slot's
+/// kind holds nil though the other stores to it are tables (quadtree's
+/// `child1 = nil`).
+#[test]
+fn baked_nil_fields_stay_nil() {
+    agrees(
+        "local function cell() return {child = nil, color = 0.5} end
+        local root = cell()
+        local function split(q) q.child = cell() end
+        local function depth(q)
+          local d = 0
+          while q.child ~= nil do q = q.child; d = d + 1 end
+          return d
+        end
+        local r = {}
+        for k = 1, 300 do
+          local q = root
+          for i = 1, k % 5 do
+            if q.child == nil then split(q) end
+            q = q.child
+          end
+          r[#r + 1] = depth(root) + depth(cell())
+        end
+        return table.concat(r, ',')",
+    );
+}
+
+/// The collector clears a weak-valued table's slots to nil whatever their
+/// kind: mid-loop, in an arm shared with a plain shape warmed first, after
+/// a `__mode` set in place under code that loaded from the table, and in a
+/// table that then moves to a strong shape sharing the slot. Typed loads
+/// must agree with `rawget` (a helper, kinds aside) whenever collections
+/// run, which differs between the interpreter and compiled code.
+#[test]
+fn weak_slots_load_as_nilable() {
+    const PROBE: &str = "bad, nils = 0, 0
+function probe(t, gc)
+  for i = 1, 300 do
+    -- Collections at its checks clear `weak` mid-loop under gc stress.
+    local junk = {i}
+    if gc and i == 150 then yielder() end
+    local typed = t.obj == nil
+    if typed ~= (rawget(t, 'obj') == nil) then bad = bad + 1 end
+    if typed then nils = nils + 1 end
+  end
+end
+";
+    let runs = [
+        "plain = setmetatable({obj = {}, n = 1}, {})
+weak = setmetatable({obj = {}, n = 1}, {__mode = 'v'})
+flip = setmetatable({obj = {}, n = 1}, {})
+for k = 1, 10 do probe(plain); probe(flip) end
+for k = 1, 10 do probe(k % 2 == 0 and plain or weak) end
+weak2 = setmetatable({obj = {}, n = 1}, {__mode = 'v'})
+probe(weak2, true)
+getmetatable(flip).__mode = 'v'
+--gc
+for k = 1, 4 do probe(k % 2 == 0 and plain or weak) end
+probe(flip)
+return bad .. ' ' .. nils",
+        "plain = setmetatable({obj = {}, n = 1}, {})
+weak = setmetatable({obj = {}, n = 1}, {__mode = 'v'})
+for k = 1, 10 do probe(plain) end
+--gc
+setmetatable(weak, getmetatable(plain))
+for k = 1, 10 do probe(weak); probe(plain) end
+return bad .. ' ' .. nils",
+    ];
+    for src in runs {
+        for jit in [true, false] {
+            let mut lua = tcvm_lua_yielding();
+            lua.set_jit(jit);
+            let out = crate::common::run_chunks(&mut lua, &format!("{PROBE}{src}"));
+            let (bad, nils) = out.split_once(' ').unwrap();
+            assert!(bad == "0" && nils != "0", "jit {jit}: {out}\n{src}");
+        }
+    }
+}
+
+fn tcvm_lua_yielding() -> Lua {
+    crate::common::yielding_lua()
+}
+
+/// Writers past the cached stores widen slots too: `rawset`, a
+/// metatable kept in a poly shape's slot, and a holder's own stores.
+#[test]
+fn every_writer_widens_slots() {
+    agrees(
+        "local ts = {}
+        for i = 1, 6 do ts[i] = {x = i} end
+        local mts = {{}, {}}
+        local objs = {}
+        for i = 1, 6 do objs[i] = setmetatable({v = i}, mts[i % 2 + 1]) end
+        local function run()
+          local s = 0
+          for i = 1, 300 do
+            local t, o = ts[i % 6 + 1], objs[i % 6 + 1]
+            s = s + t.x + o.v
+          end
+          return s
+        end
+        local r = {}
+        for k = 1, 10 do r[#r + 1] = run() end
+        rawset(ts[2], 'x', 0.25)
+        r[#r + 1] = run()
+        rawset(objs[3], 'v', 0.5)
+        r[#r + 1] = run()
+        setmetatable(objs[4], nil)
+        r[#r + 1] = run()
+        return table.concat(r, ',')",
+    );
+}

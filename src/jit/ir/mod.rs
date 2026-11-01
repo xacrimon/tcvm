@@ -284,6 +284,8 @@ pub(crate) enum DepOn<'gc> {
     Class(crate::env::MtCache<'gc>),
     /// A watched holder's shape, by `deps::SHAPE_GROUP` and `deps::slot_group`.
     Holder(crate::env::Shape<'gc>),
+    /// A named slot's kind.
+    Field(crate::env::shape::Field<'gc>),
 }
 
 impl DepOn<'_> {
@@ -291,6 +293,7 @@ impl DepOn<'_> {
         match self {
             DepOn::Class(c) => c.as_word(),
             DepOn::Holder(s) => s.as_word(),
+            DepOn::Field(f) => f.as_word(),
         }
     }
 

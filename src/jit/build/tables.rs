@@ -5,6 +5,7 @@
 
 use crate::dmm::Gc;
 use crate::env::function::InlineCache;
+use crate::env::shape::{Kind, kind_class};
 use crate::env::string::LuaString;
 use crate::env::table::{SlotLoc, Table};
 use crate::env::value::Value;
@@ -17,7 +18,7 @@ use crate::jit::build::{Builder, Shapes};
 use crate::jit::deps;
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
-use crate::jit::ir::types::{Rep, TypeSet};
+use crate::jit::ir::types::{Rep, Ty, TypeSet};
 use crate::jit::ir::{Block, Val};
 use crate::vm::ops::field::read_ic;
 
@@ -49,6 +50,78 @@ fn table_of(b: &mut Builder<'_, '_>, v: Val) -> Val {
     b.ins(Op::Unbox(Rep::Ptr), &[g])
 }
 
+/// The types a slot of `kind` holds.
+fn kind_types(kind: Kind) -> TypeSet {
+    use kind_class as c;
+    let k = kind.classes();
+    let mut set = TypeSet::empty();
+    for (bit, ts) in [
+        (c::FLOAT, TypeSet::FLOAT),
+        (c::UDATA, TypeSet::UDATA),
+        (c::BIGINT, TypeSet::BIGINT),
+        (c::STR, TypeSet::STR),
+        (c::TAB, TypeSet::TAB),
+        (c::FUN, TypeSet::FUN),
+        (c::THR, TypeSet::THR),
+        (c::NIL_BOOL, TypeSet::NIL | TypeSet::BOOL),
+        (c::SMALL, TypeSet::SMALL),
+    ] {
+        if k & bit != 0 {
+            set |= ts;
+        }
+    }
+    set
+}
+
+/// What tables of `shape` hold in `slot`, assumed (ws2 §6.1). A weak
+/// table's slot the collector clears takes nil then, which the code meets
+/// only after leaving: collections run at parks, past a `gccheck` exit or in
+/// a call, whose lazy exit an invalidation takes.
+fn slot_types<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, slot: u32) -> TypeSet {
+    let f = shape.field(slot);
+    let kind = f.kind();
+    // `NONE`: only a constructor's own table before its stores holds it.
+    if kind == Kind::ANY || kind == Kind::NONE {
+        return TypeSet::ANY;
+    }
+    b.depend_field(f);
+    kind_types(kind)
+}
+
+/// `t.key` from `loc` of a table of `shape`, of the slot's types.
+fn slot_load<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    t: Val,
+    shape: Shape<'gc>,
+    loc: SlotLoc,
+    kid: u32,
+) -> Val {
+    let v = b.ins(
+        Op::TabLoad {
+            loc: loc.raw(),
+            key: kid,
+        },
+        &[t],
+    );
+    let set = slot_types(b, shape, loc.slot(shape));
+    b.set_ty(v, Ty::val(set));
+    v
+}
+
+/// `v` as a store to `slot` of tables of `shape` may take it, guarded to
+/// the slot's kind (a mismatch exits, and the interpreter widens it); `None`
+/// before any store, for the helper.
+fn fitted<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, slot: u32, v: Val) -> Option<Val> {
+    let kind = shape.field(slot).kind();
+    if kind == Kind::NONE {
+        return None;
+    }
+    Some(match kind_types(kind) {
+        TypeSet::ANY => v,
+        set => b.guard(v, set),
+    })
+}
+
 /// `t` guarded to have `shape`, unless it is known to have it already.
 fn guard_shape<'gc>(b: &mut Builder<'_, 'gc>, t: Val, shape: Shape<'gc>) {
     let k = b.intern_shape(shape);
@@ -64,12 +137,12 @@ fn guard_shape<'gc>(b: &mut Builder<'_, 'gc>, t: Val, shape: Shape<'gc>) {
 /// accesses).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Way {
-    /// A load of the own slot at this location, and what a nil there walks
-    /// to.
-    Own(u32, FoundKey),
-    /// A store to the own slot at this location, and the class when its
-    /// `__newindex` may fire (0 when it may not).
-    Store(u32, u64),
+    /// A load of the own slot at this location and of this field, and what a
+    /// nil there walks to.
+    Own(u32, u64, FoundKey),
+    /// A store to the own slot at this location and of this field, and the
+    /// class when its `__newindex` may fire (0 when it may not).
+    Store(u32, u64, u64),
     /// Absent: what the walk finds, unless it is `Live`.
     Walk(FoundKey),
     /// The slot at `loc` of an `__index` table of a shape, for this class
@@ -95,9 +168,10 @@ enum Found<'gc> {
     Nil,
     /// A slot of a watched holder that no store changed.
     Const(Value<'gc>),
-    /// The slot at `loc` of a holder: a watched one's whose value may change,
-    /// or an unwatched one's while it has this shape. Nil walks on.
-    Slot(Table<'gc>, Option<Shape<'gc>>, SlotLoc),
+    /// The slot at `loc` of a holder of this shape: a watched one's whose
+    /// value may change, or (guarded) an unwatched one's while it has the
+    /// shape. Nil walks on.
+    Slot(Table<'gc>, Shape<'gc>, bool, SlotLoc),
     /// The `__index` function, called with the receiver, or with the holder
     /// it is reached from.
     Call(Function<'gc>, Option<Table<'gc>>),
@@ -116,7 +190,9 @@ impl Found<'_> {
         match self {
             Found::Nil => (0, 0, 0, 0),
             Found::Const(v) => (1, v.to_raw(), 0, 0),
-            Found::Slot(h, s, loc) => (2, t(h), s.map_or(0, |s| s.as_word()), loc.raw() as u64),
+            Found::Slot(h, s, guard, loc) => {
+                (2 | (guard as u8) << 4, t(h), s.as_word(), loc.raw() as u64)
+            }
             Found::Call(f, on) => (3, Value::function(f).to_raw(), on.map_or(0, t), 0),
             Found::Helper => (4, 0, 0, 0),
             Found::Live(c) => (5, c.as_word(), 0, 0),
@@ -158,14 +234,14 @@ fn walk<'gc>(
         let slot = hs.find_slot(key);
         if !hs.is_watched() || hs.is_volatile_holder() {
             return match slot {
-                Some(s) => Found::Slot(h, Some(hs), SlotLoc::new(hs, s)),
+                Some(s) => Found::Slot(h, hs, true, SlotLoc::new(hs, s)),
                 None => Found::Helper,
             };
         }
         b.depend_holder(hs, deps::SHAPE_GROUP);
         if let Some(s) = slot {
             if hs.slot_mutable(s) {
-                return Found::Slot(h, None, SlotLoc::new(hs, s));
+                return Found::Slot(h, hs, false, SlotLoc::new(hs, s));
             }
             b.depend_holder(hs, deps::slot_group(s));
             let v = h.inner().borrow().named_get(s);
@@ -187,20 +263,17 @@ fn emit_found<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, found: Found<'gc>, site: &
     match found {
         Found::Nil => b.konst(Value::nil()),
         Found::Const(v) => b.konst(v),
-        Found::Slot(h, guard, loc) => {
+        Found::Slot(h, hs, guard, loc) => {
             let hv = b.konst(Value::table(h));
             let hp = b.ins(Op::Unbox(Rep::Ptr), &[hv]);
-            if let Some(hs) = guard {
+            if guard {
                 guard_shape(b, hp, hs);
             }
-            let v = b.ins(
-                Op::TabLoad {
-                    loc: loc.raw(),
-                    key: site.kid,
-                },
-                &[hp],
-            );
+            let v = slot_load(b, hp, hs, loc, site.kid);
             b.field_loads.insert(v, (hv, site.kv));
+            if !b.ty(v).set.intersects(TypeSet::NIL) {
+                return v;
+            }
             let join = b.new_block();
             let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
             let present = branch_arm(b, nil);
@@ -496,7 +569,7 @@ fn nil_walks<'gc>(
     site: &Site<'gc>,
     found: Found<'gc>,
 ) {
-    if let Found::Nil = found {
+    if matches!(found, Found::Nil) || !b.ty(v).set.intersects(TypeSet::NIL) {
         b.set(dst, v);
         b.note_def(&[v], None);
         return;
@@ -576,7 +649,7 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         Some(_) => {}
     }
     match ic {
-        InlineCache::Own { shape, loc } => {
+        InlineCache::Own { shape, loc, .. } => {
             let t = table_of(b, recv);
             guard_shape(b, t, shape);
             own_load(b, dst, &site, shape, t, loc);
@@ -676,13 +749,7 @@ fn string_method<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>) -> bo
     b.ins_exit(Op::GuardSame, &[iv, lv], ExitTag::Shape);
     let lp = b.ins(Op::Unbox(Rep::Ptr), &[lv]);
     guard_shape(b, lp, ls);
-    let m = b.ins(
-        Op::TabLoad {
-            loc: SlotLoc::new(ls, lslot).raw(),
-            key: site.kid,
-        },
-        &[lp],
-    );
+    let m = slot_load(b, lp, ls, SlotLoc::new(ls, lslot), site.kid);
     b.field_loads.insert(m, (lv, site.kv));
     b.set(dst, m);
     true
@@ -714,6 +781,7 @@ fn current_entry<'gc>(
                 Some(slot) => InlineCache::Own {
                     shape: p,
                     loc: SlotLoc::new(p, slot),
+                    kind: p.field(slot).kind(),
                 },
                 None => InlineCache::Empty,
             }
@@ -739,6 +807,7 @@ fn current_entry<'gc>(
                     from: p,
                     to,
                     loc: SlotLoc::new(to, p.slot_count()),
+                    kind: to.field(p.slot_count()).kind(),
                 },
                 _ => InlineCache::Empty,
             }
@@ -819,13 +888,7 @@ fn own_load<'gc>(
     t: Val,
     loc: SlotLoc,
 ) {
-    let v = b.ins(
-        Op::TabLoad {
-            loc: loc.raw(),
-            key: site.kid,
-        },
-        &[t],
-    );
+    let v = slot_load(b, t, shape, loc, site.kid);
     b.field_loads.insert(v, (site.recv, site.kv));
     let found = walk(b, shape.mt_cache(), site.str());
     nil_walks(b, dst, shape, v, site, found);
@@ -848,13 +911,11 @@ fn proto_load<'gc>(
     b.ins_exit(Op::GuardSame, &[live, hv], ExitTag::Shape);
     let h = b.ins(Op::Unbox(Rep::Ptr), &[hv]);
     guard_shape(b, h, holder_shape);
-    let v = b.ins(
-        Op::TabLoad {
-            loc: loc.raw(),
-            key: site.kid,
-        },
-        &[h],
-    );
+    let v = slot_load(b, h, holder_shape, loc, site.kid);
+    if !b.ty(v).set.intersects(TypeSet::NIL) {
+        b.set(dst, v);
+        return;
+    }
     // A nil slot means the walk goes on past `holder`.
     let join = b.new_block();
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
@@ -894,7 +955,11 @@ fn get_chain<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shapes: &
     let way = |b: &mut Builder<'_, 'gc>, _, s: Shape<'gc>| {
         let found = walk(b, s.mt_cache(), key);
         if let Some(slot) = s.find_slot(key) {
-            Way::Own(SlotLoc::new(s, slot).raw(), found.key())
+            Way::Own(
+                SlotLoc::new(s, slot).raw(),
+                s.field(slot).as_word(),
+                found.key(),
+            )
         } else if !matches!(found, Found::Live(_)) {
             Way::Walk(found.key())
         } else if let Some((holder, hs, loc)) = holder_of(s, key) {
@@ -956,7 +1021,7 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
                         Some(false) => 0,
                         _ => class_word(s),
                     };
-                    Way::Store(SlotLoc::new(s, slot).raw(), k)
+                    Way::Store(SlotLoc::new(s, slot).raw(), s.field(slot).as_word(), k)
                 }
                 (None, Some(to)) if !to.is_dict() => Way::Unique(n),
                 (None, _) => Way::Helper,
@@ -964,7 +1029,7 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
             dispatch(b, t, &shapes, way, |b, s| {
                 match (s.find_slot(ks), s.prop_child(mc, ks)) {
                     _ if tells(s) || !stores_inline(s, ks) => newindex(b, recv, key, v, false),
-                    (Some(slot), _) => own_store(b, s, t, SlotLoc::new(s, slot), kid, v),
+                    (Some(slot), _) => own_store(b, recv, key, s, t, SlotLoc::new(s, slot), kid, v),
                     (None, Some(to)) if !to.is_dict() => {
                         let loc = SlotLoc::new(to, s.slot_count());
                         trans_store(b, recv, key, s, to, t, loc, kid, v);
@@ -983,12 +1048,12 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         {
             newindex(b, recv, key, v, false);
         }
-        InlineCache::Own { shape, loc } => {
+        InlineCache::Own { shape, loc, .. } => {
             let t = table_of(b, recv);
             guard_shape(b, t, shape);
-            own_store(b, shape, t, loc, kid, v);
+            own_store(b, recv, key, shape, t, loc, kid, v);
         }
-        InlineCache::Transition { from, to, loc } => {
+        InlineCache::Transition { from, to, loc, .. } => {
             let t = table_of(b, recv);
             guard_shape(b, t, from);
             trans_store(b, recv, key, from, to, t, loc, kid, v);
@@ -1026,6 +1091,14 @@ fn trans_store<'gc>(
         let s = b.snap_before();
         b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Slow);
     }
+    // Nil adds nothing, so it fits whatever the new slot holds.
+    let v = match b.ty(v).set.intersects(TypeSet::NIL) {
+        true => v,
+        false => match fitted(b, to, from.slot_count(), v) {
+            Some(v) => v,
+            None => return newindex(b, recv, key, v, false),
+        },
+    };
     let join = b.new_block();
     // Storing nil to an absent key adds nothing.
     let set = b.ty(v).set;
@@ -1065,25 +1138,36 @@ fn trans_store<'gc>(
 
 /// `t.key = v` into the own slot at `loc`, `__newindex` checked live where
 /// the class may have it.
+#[allow(clippy::too_many_arguments)]
 fn own_store<'gc>(
     b: &mut Builder<'_, 'gc>,
+    recv: Val,
+    key: Val,
     shape: Shape<'gc>,
     t: Val,
     loc: SlotLoc,
     kid: u32,
     v: Val,
 ) {
+    let Some(v) = fitted(b, shape, loc.slot(shape), v) else {
+        return newindex(b, recv, key, v, false);
+    };
     if let Some(has) = class_has(b, shape, MetamethodBits::NEWINDEX)
         && !never(b, has)
     {
         // `__newindex` fires only on a nil slot.
-        let old = b.ins(
-            Op::TabLoad {
-                loc: loc.raw(),
-                key: kid,
-            },
-            &[t],
-        );
+        let old = slot_load(b, t, shape, loc, kid);
+        if !b.ty(old).set.intersects(TypeSet::NIL) {
+            barrier_for(b, t, v);
+            b.push(
+                Op::TabStore {
+                    loc: loc.raw(),
+                    key: kid,
+                },
+                &[t, v],
+            );
+            return;
+        }
         let join = b.new_block();
         let nil = b.ins(Op::IsType(TypeSet::NIL), &[old]);
         let rest = branch_arm(b, nil);

@@ -138,13 +138,14 @@ macro_rules! family {
     // the collector's clearing, which unquickens it: the form implies the
     // entry's kind.
     (@load Inl, $slow:ident, $cache:expr, $t:ident, $recv:ident, $insn:ident, $dst:ident, $self_:literal) => {{
-        let $crate::env::function::InlineCache::Own { shape, loc } = $cache else {
+        let $crate::env::function::InlineCache::Own { shape, loc, .. } = $cache else {
             unsafe { std::hint::unreachable_unchecked() }
         };
         if !$crate::env::shape::Shape::ptr_eq($t.shape(), shape) {
             tail!($slow)
         }
         let v = unsafe { $t.load_inline(loc) };
+        loc.check_kind(shape, v);
         // A nil own slot answers unless the metatable gained `__index`.
         if v.is_nil() && shape.has_mm($crate::env::MetamethodBits::INDEX) {
             tail!($slow)
@@ -152,7 +153,7 @@ macro_rules! family {
         v
     }};
     (@load Aux, $slow:ident, $cache:expr, $t:ident, $recv:ident, $insn:ident, $dst:ident, $self_:literal) => {{
-        let $crate::env::function::InlineCache::Own { shape, loc } = $cache else {
+        let $crate::env::function::InlineCache::Own { shape, loc, .. } = $cache else {
             unsafe { std::hint::unreachable_unchecked() }
         };
         let state = $t.inner().borrow();
@@ -162,6 +163,7 @@ macro_rules! family {
         }
         let v = unsafe { $t.load_aux(&state, loc) };
         drop(state);
+        loc.check_kind(shape, v);
         if v.is_nil() && shape.has_mm($crate::env::MetamethodBits::INDEX) {
             tail!($slow)
         }
@@ -224,7 +226,7 @@ macro_rules! family {
         v
     }};
     (@store Inl, $slow:ident, $insn:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
-        let $crate::env::function::InlineCache::Own { shape, loc } = $cache else {
+        let $crate::env::function::InlineCache::Own { shape, loc, kind } = $cache else {
             unsafe { std::hint::unreachable_unchecked() }
         };
         if !$crate::env::shape::Shape::ptr_eq($t.shape(), shape) {
@@ -232,14 +234,15 @@ macro_rules! family {
         }
         // `__newindex` fires only on currently-nil keys.
         let existing = unsafe { $t.load_inline(loc) };
-        if existing.is_nil() && shape.has_mm($crate::env::MetamethodBits::NEWINDEX) {
+        let v = reg![$src];
+        if existing.is_nil() && shape.has_mm($crate::env::MetamethodBits::NEWINDEX) || !kind.fits(v) {
             tail!($slow)
         }
         barrier!($t.inner());
-        unsafe { $t.store_inline(loc, reg![$src]) };
+        unsafe { $t.store_inline(loc, v) };
     };
     (@store Aux, $slow:ident, $insn:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
-        let $crate::env::function::InlineCache::Own { shape, loc } = $cache else {
+        let $crate::env::function::InlineCache::Own { shape, loc, kind } = $cache else {
             unsafe { std::hint::unreachable_unchecked() }
         };
         let state = $t.inner().borrow();
@@ -250,15 +253,16 @@ macro_rules! family {
         let slot = unsafe { state.aux_slot(loc) };
         drop(state);
         let existing = unsafe { *slot };
-        if existing.is_nil() && shape.has_mm($crate::env::MetamethodBits::NEWINDEX) {
+        let v = reg![$src];
+        if existing.is_nil() && shape.has_mm($crate::env::MetamethodBits::NEWINDEX) || !kind.fits(v) {
             tail!($slow)
         }
         barrier!($t.inner());
         // SAFETY: the shape still matched, so the spill cell holds `loc`.
-        unsafe { *slot = reg![$src] };
+        unsafe { *slot = v };
     };
     (@store Trans, $slow:ident, $insn:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
-        let $crate::env::function::InlineCache::Transition { from, to, loc } = $cache else {
+        let $crate::env::function::InlineCache::Transition { from, to, loc, kind } = $cache else {
             unsafe { std::hint::unreachable_unchecked() }
         };
         let state = $t.inner().borrow();
@@ -272,7 +276,7 @@ macro_rules! family {
             drop(state);
             next!()
         }
-        if !state.has_room(loc) {
+        if !state.has_room(loc) || !kind.fits(v) {
             drop(state);
             tail!($slow)
         }

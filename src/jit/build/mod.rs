@@ -1196,6 +1196,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.depend(DepOn::Holder(shape), groups);
     }
 
+    /// Assume `field`'s kind stays (ws2 §6.1).
+    pub(crate) fn depend_field(&mut self, field: crate::env::shape::Field<'gc>) {
+        self.depend(DepOn::Field(field), 1);
+    }
+
     fn depend(&mut self, on: DepOn<'gc>, groups: u64) {
         match self.f.deps.iter_mut().find(|(o, _)| o.same(on)) {
             Some((_, g)) => *g |= groups,

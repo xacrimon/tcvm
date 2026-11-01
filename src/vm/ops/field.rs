@@ -126,6 +126,7 @@ fn shape_entry<'gc>(shape: Shape<'gc>, slot: Option<u32>) -> InlineCache<'gc> {
         Some(slot) => InlineCache::Own {
             shape,
             loc: SlotLoc::new(shape, slot),
+            kind: shape.field(slot).kind(),
         },
         None => InlineCache::Absent { shape },
     }
@@ -141,10 +142,12 @@ fn ic_get<'gc>(
 ) -> Option<Value<'gc>> {
     let live = state.shape();
     let v = if std::hint::likely(matches!(cache, InlineCache::Own { .. }))
-        && let InlineCache::Own { shape, loc } = cache
+        && let InlineCache::Own { shape, loc, .. } = cache
         && Shape::ptr_eq(live, shape)
     {
-        unsafe { t.load(state, loc) }
+        let v = unsafe { t.load(state, loc) };
+        loc.check_kind(shape, v);
+        v
     } else if let InlineCache::Absent { shape } = cache
         && Shape::ptr_eq(live, shape)
     {
@@ -184,12 +187,12 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
     let state = t.inner().borrow();
     let live = state.shape();
     if std::hint::likely(matches!(cache, InlineCache::Own { .. }))
-        && let InlineCache::Own { shape, loc } = cache
+        && let InlineCache::Own { shape, loc, kind } = cache
         && Shape::ptr_eq(live, shape)
     {
         // `__newindex` fires only on currently-nil keys.
         let existing = unsafe { t.load(&state, loc) };
-        if existing.is_nil() && live.has_mm(MetamethodBits::NEWINDEX) {
+        if existing.is_nil() && live.has_mm(MetamethodBits::NEWINDEX) || !kind.fits(v) {
             return false;
         }
         // Barrier work goes to the slow path, keeping calls out of this handler.
@@ -201,7 +204,12 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
         unsafe { t.store(&state, loc, v) };
         return true;
     }
-    if let InlineCache::Transition { from, to, loc } = cache
+    if let InlineCache::Transition {
+        from,
+        to,
+        loc,
+        kind,
+    } = cache
         && Shape::ptr_eq(live, from)
     {
         if live.has_mm(MetamethodBits::NEWINDEX) {
@@ -211,7 +219,7 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
         if v.is_nil() {
             return true;
         }
-        if !state.has_room(loc) {
+        if !state.has_room(loc) || !kind.fits(v) {
             return false;
         }
         drop(state);
@@ -405,11 +413,12 @@ fn set_own_fill_ic<'gc>(
             if Shape::ptr_eq(to, shape) || to.is_dict() {
                 (InlineCache::Absent { shape }, cache)
             } else {
-                let loc = SlotLoc::new(to, shape.slot_count());
+                let slot = shape.slot_count();
                 let entry = InlineCache::Transition {
                     from: shape,
                     to,
-                    loc,
+                    loc: SlotLoc::new(to, slot),
+                    kind: to.field(slot).kind(),
                 };
                 (entry, cache && !shape.is_watched())
             }

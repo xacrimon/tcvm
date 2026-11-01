@@ -50,6 +50,19 @@ fn own_kind(b: &Builder<'_, '_>, v: Val) -> Option<NumKind> {
     }
 }
 
+/// The kind the hot path takes `v` as: its type's when that is one kind;
+/// for a number of either kind (a slot's), what the site saw when that is
+/// narrower, guarded as before slots had kinds; else its form's, then the
+/// site's feedback.
+fn num_kind(b: &Builder<'_, '_>, v: Val, form: Option<NumKind>, bits: fb::Bits) -> Option<NumKind> {
+    let seen = || form.or_else(|| bits_num_kind(bits));
+    match own_kind(b, v) {
+        Some(NumKind::Num) => seen().or(Some(NumKind::Num)),
+        Some(k) => Some(k),
+        None => seen(),
+    }
+}
+
 /// The operand kinds a site's feedback bits give both its operands, or
 /// `None` when it saw values no number kind covers (non-numbers, a
 /// metamethod, big integers with floats): those take the slow arm.
@@ -771,11 +784,10 @@ enum Operand {
 }
 
 impl Operand {
-    /// The kind the hot path assumes: the value's own, else its form's,
-    /// else the site's feedback (`bits_num_kind`).
+    /// The kind the hot path assumes (`num_kind`).
     fn kind(self, b: &Builder<'_, '_>, form: Option<NumKind>, bits: fb::Bits) -> Option<NumKind> {
         match self {
-            Operand::Reg(v) => own_kind(b, v).or(form).or_else(|| bits_num_kind(bits)),
+            Operand::Reg(v) => num_kind(b, v, form, bits),
             Operand::Int(_) => Some(NumKind::I32),
             Operand::Float(_) => Some(NumKind::F64),
         }
@@ -873,7 +885,7 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
     };
     // The interpreter's fast path, which records nothing, takes small
     // integers and floats: `bits_num_kind` makes empty bits `Num`.
-    let r = match own_kind(b, v).or_else(|| bits_num_kind(bits)) {
+    let r = match num_kind(b, v, None, bits) {
         Some(NumKind::F64) => {
             let x = b.as_f64(v);
             b.ins(Op::FNeg, &[x])
@@ -928,7 +940,7 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
 fn emit_bnot(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
     let v = b.reg(src);
     // The fast path takes small integers only.
-    let r = match own_kind(b, v).or_else(|| bits_num_kind(b.feedback(pc))) {
+    let r = match num_kind(b, v, None, b.feedback(pc)) {
         Some(NumKind::I64) => {
             let x = b.as_i64(v);
             b.ins(Op::LNot, &[x])
@@ -1474,7 +1486,17 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
         } else {
             NumKind::I32
         }));
-    let kind = |b: &Builder<'_, '_>, v| cmp_own(b, v).or(form).or_else(|| bits_cmp_kind(bits));
+    // A number of either kind takes what the site saw when narrower (`num_kind`).
+    let kind = |b: &Builder<'_, '_>, v| {
+        let seen = || form.or_else(|| bits_cmp_kind(bits));
+        match cmp_own(b, v) {
+            any @ Some(CmpKind::Num(NumKind::Num)) => {
+                seen().filter(|k| matches!(k, CmpKind::Num(_))).or(any)
+            }
+            Some(k) => Some(k),
+            None => seen(),
+        }
+    };
     let c = match (kind(b, x), kind(b, y)) {
         (Some(CmpKind::Num(kx)), Some(CmpKind::Num(ky))) => cmp_num(b, cc, (x, kx), (y, ky)),
         (Some(CmpKind::Str), Some(CmpKind::Str)) if eq => {
@@ -1676,7 +1698,7 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
     // The fast path takes big integers too, unrecorded: empty bits are any
     // number, which the `Num` path's conversion exits on when big.
     let form = (op != generic && !b.kind_exited(pc)).then_some(NumKind::F64);
-    let kind = own_kind(b, v).or(form).or_else(|| bits_num_kind(bits));
+    let kind = num_kind(b, v, form, bits);
     let imm = |b: &mut Builder<'_, '_>, kind: NumKind| match kind {
         NumKind::I32 => b.ki32(k as i32),
         NumKind::I64 => b.ins(Op::KI64(k), &[]),

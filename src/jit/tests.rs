@@ -360,7 +360,8 @@ fn shape_guards_carry_through_joins() {
         if c then a = o.x else a = o.y end
         return a + o.z
     end
-    for i = 1, 300 do f({x = 1, y = 2, z = 3}, i % 2 == 0) end";
+    for i = 1, 300 do keep = {x = 1, y = 2, z = 3}; f(keep, i % 2 == 0) end";
+    // `keep` holds the shape for the build after the run, past collections.
     let ir = ir_of(src, "f", 0);
     let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
     assert_eq!(count("guardshape"), 2, "{ir}");
@@ -463,9 +464,11 @@ fn polymorphic_dispatch_carries_its_shapes() {
 /// each call once a class's bits are folded.
 #[test]
 fn lazy_exits_need_dependencies() {
-    let plain = "function f()
+    // No field loads either: their slots' kinds are dependencies.
+    let plain = "local format = string.format
+    function f()
         local s = 0
-        for i = 1, 300 do s = s + #string.format('%d', i) end
+        for i = 1, 300 do s = s + #format('%d', i) end
         return s
     end
     f()";
@@ -624,4 +627,49 @@ fn guarded_callees_stay_known_across_calls() {
         1,
         "{ir}"
     );
+}
+
+#[test]
+fn field_loads_take_their_slot_kinds() {
+    let src = "function f(p, n)
+        local s = 0.0
+        for i = 1, n do s = s + p.x * p.y end
+        if p.next then s = s + p.next.x end
+        return s
+    end
+    local q = {x = 0.5, y = 1.5}
+    for k = 1, 300 do keep = {x = 1.5, y = 2.5, next = q}; f(keep, 10) end";
+    let ir = ir_of(src, "f", 0);
+    let count = |s: &str| ir.lines().filter(|l| l.contains(s)).count();
+    // The floats need no checks, nor the table loaded from `next`.
+    assert_eq!(count("guard val:float"), 0, "{ir}");
+    assert_eq!(count("istype"), 0, "{ir}");
+    assert!(ir.contains("val:float = tabload"), "{ir}");
+    assert!(ir.contains("val:tab = tabload"), "{ir}");
+}
+
+#[test]
+fn nilable_slots_load_with_nil() {
+    let src = "a, b = {o = {}}, {o = {}}
+    function f(t) if t.o then return 1 end return 0 end
+    for k = 1, 300 do f(a); f(b) end
+    b.o = nil
+    for k = 1, 300 do f(a) end";
+    let ir = ir_of(src, "f", 0);
+    // A nil store to one table's slot is in every table's kind of it.
+    assert!(
+        ir.contains("val:nil|false|true|tab|fun|thr = tabload"),
+        "{ir}"
+    );
+}
+
+#[test]
+fn number_slots_take_what_the_site_saw() {
+    // The slot holds small integers and floats; this site saw floats only.
+    let src = "zero = {x = 0}
+    function f(p, n) local s = 0.0 for i = 1, n do s = s + p.x * 2.0 end return s end
+    for k = 1, 300 do keep = {x = 1.5}; f(keep, 10) end";
+    let ir = ir_of(src, "f", 0);
+    assert!(ir.contains("val:small|float = tabload"), "{ir}");
+    assert!(!ir.contains("tof64"), "{ir}");
 }

@@ -1461,6 +1461,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
             shape,
             values: vec![Value::nil(); repeated.len()],
             bakeable: repeated.iter().map(|&r| !r && !keyed).collect(),
+            baked: vec![false; repeated.len()],
             items,
         })
     }
@@ -1468,6 +1469,14 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// `draft`'s index in the prototype's templates, shared with an identical one.
     fn finish_template(&mut self, draft: TemplateDraft<'gc>) -> Result<TemplateIdx, CompileError> {
         use crate::env::shape::Shape;
+        // Every table made from it holds the baked values, nil included. The
+        // nil of a slot the constructor stores is no store: nothing reads it
+        // before that.
+        for (i, &v) in draft.values.iter().enumerate() {
+            if draft.baked[i] {
+                draft.shape.field(i as u32).admit(self.ctx.mutation(), v);
+            }
+        }
         let templates = &mut self.chunk.templates;
         let same = |t: &Template<'gc>| {
             Shape::ptr_eq(t.shape, draft.shape)
@@ -3231,6 +3240,9 @@ struct TemplateDraft<'gc> {
     /// Per slot, whether a constant stored there may go in the template: its
     /// field appears once, and no `[k] = v` entry could write it.
     bakeable: Vec<bool>,
+    /// Per slot, whether `values` holds its constant (nil included); the
+    /// constructor itself stores the others.
+    baked: Vec<bool>,
     items: u32,
 }
 
@@ -3240,6 +3252,7 @@ impl<'gc> TemplateDraft<'gc> {
         match self.shape.find_slot(key) {
             Some(slot) if self.bakeable[slot as usize] => {
                 self.values[slot as usize] = v;
+                self.baked[slot as usize] = true;
                 true
             }
             _ => false,

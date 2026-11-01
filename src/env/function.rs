@@ -3,7 +3,7 @@ use std::cell::Cell;
 use crate::Context;
 use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::error::Error;
-use crate::env::shape::Shape;
+use crate::env::shape::{Kind, Shape};
 use crate::env::string::LuaString;
 use crate::env::table::{SlotLoc, TableState};
 use crate::env::thread::{Thread, ThreadState};
@@ -144,16 +144,22 @@ impl<'gc> Prototype<'gc> {
 #[derive(Clone, Copy, Default)]
 pub enum InlineCache<'gc> {
     // First, so the hottest hit tests a zero discriminant.
-    /// Tables of `shape` hold the key at `loc`.
-    Own { shape: Shape<'gc>, loc: SlotLoc },
+    /// Tables of `shape` hold the key at `loc`. A store needs its value to
+    /// fit `kind`, a copy of the slot's (which only widens).
+    Own {
+        shape: Shape<'gc>,
+        loc: SlotLoc,
+        kind: Kind,
+    },
     /// Tables of `shape` lack the key: a load is nil unless `__index` fires.
     Absent { shape: Shape<'gc> },
     /// Tables of `from` lack the key; adding it moves them to `to`, which
-    /// holds it at `loc`, the slot after `from`'s last.
+    /// holds it at `loc`, the slot after `from`'s last, of `kind` as in `Own`.
     Transition {
         from: Shape<'gc>,
         to: Shape<'gc>,
         loc: SlotLoc,
+        kind: Kind,
     },
     /// Tables of `recv` lack the key, and while their metatable's `__index`
     /// is `holder`, it holds the key at `loc` if its shape is `holder_shape`.

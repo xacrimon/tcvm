@@ -360,6 +360,7 @@ impl<'gc> Table<'gc> {
                     state.grow_spill(mc);
                 }
                 state.shape = to;
+                to.field(slot).admit(mc, Value::table(mt));
                 state.named_set(slot, Value::table(mt));
                 Some(grow)
             }
@@ -590,6 +591,25 @@ impl SlotLoc {
         self.0
     }
 
+    /// The slot this is for tables of `shape`.
+    pub(crate) fn slot(self, shape: Shape<'_>) -> u32 {
+        let size = size_of::<Value>() as u32;
+        match self.spilled() {
+            false => (self.0 - RefLock::<TableState>::TRAILING_FROM_LOCK as u32) / size,
+            true => shape.inline_cap() + self.offset() as u32 / size,
+        }
+    }
+
+    /// Debug builds: `v`, read from here in a table of `shape`, fits the
+    /// slot's kind (ws2 §6.1).
+    #[inline(always)]
+    pub(crate) fn check_kind(self, shape: Shape<'_>, v: Value<'_>) {
+        if cfg!(debug_assertions) {
+            let kind = shape.field(self.slot(shape)).kind();
+            assert!(kind.fits(v), "{:#x} in a slot of {kind:?}", v.to_raw());
+        }
+    }
+
     pub(crate) fn from_raw(raw: u32) -> Self {
         SlotLoc(raw)
     }
@@ -736,7 +756,9 @@ impl<'gc> TableState<'gc> {
                     self.grow_spill(mc);
                 }
                 self.set_shape(mc, shape);
-                self.named_set(slot, mt.map_or(Value::nil(), Value::table));
+                let v = mt.map_or(Value::nil(), Value::table);
+                self.shape.field(slot).admit(mc, v);
+                self.named_set(slot, v);
             }
         }
     }
@@ -806,6 +828,7 @@ impl<'gc> TableState<'gc> {
         if self.shape.is_watched() && !self.named_get(slot).same_bits(&v) {
             self.shape.slot_changed(mc, slot);
         }
+        self.shape.field(slot).admit(mc, v);
         self.named_set(slot, v);
         self.maybe_update_mt_bit(mc, Value::string(key), v);
     }
@@ -939,6 +962,9 @@ impl<'gc> TableState<'gc> {
                 if shape.is_watched() {
                     shape.slot_changed(fc, i as u32);
                 }
+                // Code that assumed otherwise is retired before it runs
+                // again (`jit::build::tables::slot_types`).
+                shape.field(i as u32).admit(fc, Value::nil());
             }
         }
         for v in self.array_mut().iter_mut().filter(|v| v.is_dead(fc)) {
@@ -1054,9 +1080,10 @@ impl<'gc> TableState<'gc> {
         unsafe { *self.named_ptr(slot) }
     }
 
-    /// Store to `slot` of this table's shape.
+    /// Store to `slot` of this table's shape, which the caller admitted to
+    /// the slot's field.
     #[inline]
-    pub fn named_set(&mut self, slot: u32, v: Value<'gc>) {
+    fn named_set(&mut self, slot: u32, v: Value<'gc>) {
         unsafe { *self.named_ptr(slot) = v }
     }
 
@@ -1246,6 +1273,7 @@ impl<'gc> TableState<'gc> {
             self.grow_spill(ctx.mutation());
         }
         self.set_shape(ctx.mutation(), new_shape);
+        self.shape.field(slot).admit(ctx.mutation(), value);
         self.named_set(slot, value);
         self.maybe_update_mt_bit(ctx.mutation(), Value::string(key), value);
     }
@@ -1279,6 +1307,7 @@ impl<'gc> TableState<'gc> {
         }
         self.set_shape(mc, to);
         for (i, v) in vals.into_iter().enumerate() {
+            self.shape.field(i as u32).admit(mc, v);
             self.named_set(i as u32, v);
         }
     }

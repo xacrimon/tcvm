@@ -35,6 +35,9 @@ use crate::env::table::Table;
 use crate::env::value::Value;
 use crate::jit::deps::{self, DepSlot};
 
+mod kind;
+pub use kind::{Field, Kind, class as kind_class};
+
 /// V8-style "Map" / hidden class. Copy wrapper over a single Gc pointer
 /// for cheap pass-by-value and pointer-equality identity checks.
 #[derive(Clone, Copy, Collect)]
@@ -61,6 +64,8 @@ pub struct MtCache<'gc>(Gc<'gc, MtCacheData<'gc>>);
 /// only a shape whose prefix is the whole array may, and it keeps that key alive.
 struct Keys<'gc> {
     slots: Box<[UnsafeCell<MaybeUninit<LuaString<'gc>>>], MetricsAlloc<'gc>>,
+    /// Each slot's [`Field`], shared with every copy of a prefix holding it.
+    fields: Box<[Cell<Option<Field<'gc>>>], MetricsAlloc<'gc>>,
     len: Cell<u32>,
     /// `(address, slot)` of the first `len` keys, built by the first lookup
     /// past `LINEAR_LOOKUP` keys. A dead key's address may be reused, but not
@@ -73,21 +78,38 @@ struct Keys<'gc> {
 /// Longest prefix [`Shape::find_slot`] scans rather than hashes.
 const LINEAR_LOOKUP: u32 = 16;
 
-// SAFETY: deliberately untraced (see `Keys`); it holds no other pointer.
+// SAFETY: the keys are deliberately untraced (see `Keys`); the fields are
+// traced, all `len` of them, and set once each behind a barrier.
 unsafe impl<'gc> Collect<'gc> for Keys<'gc> {
-    const NEEDS_TRACE: bool = false;
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        for f in &self.fields[..self.len.get() as usize] {
+            cc.trace(&f.get());
+        }
+    }
 }
 
 impl<'gc> Keys<'gc> {
-    fn new(mc: &Mutation<'gc>, prefix: &[LuaString<'gc>], cap: usize) -> Gc<'gc, Self> {
+    /// Keys `prefix` of `from`, with room for `cap`.
+    fn new(mc: &Mutation<'gc>, from: Option<&Keys<'gc>>, prefix: u32, cap: usize) -> Gc<'gc, Self> {
+        let n = prefix as usize;
         let mut slots = Vec::with_capacity_in(cap, MetricsAlloc::new(mc));
-        slots.extend(prefix.iter().map(|&k| UnsafeCell::new(MaybeUninit::new(k))));
+        let mut fields = Vec::with_capacity_in(cap, MetricsAlloc::new(mc));
+        if let Some(from) = from {
+            slots.extend(
+                from.prefix(prefix)
+                    .iter()
+                    .map(|&k| UnsafeCell::new(MaybeUninit::new(k))),
+            );
+            fields.extend(from.fields[..n].iter().map(|f| Cell::new(f.get())));
+        }
         slots.resize_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
+        fields.resize_with(cap, || Cell::new(None));
         Gc::new(
             mc,
             Keys {
                 slots: slots.into_boxed_slice(),
-                len: Cell::new(prefix.len() as u32),
+                fields: fields.into_boxed_slice(),
+                len: Cell::new(prefix),
                 index: UnsafeCell::new(None),
             },
         )
@@ -125,17 +147,20 @@ impl<'gc> Keys<'gc> {
         unsafe { core::slice::from_raw_parts(self.slots.as_ptr().cast(), n as usize) }
     }
 
-    /// Append `key` for a shape whose prefix is `n` long, if that is the
-    /// whole array and there is room.
-    fn try_push(&self, n: u32, key: LuaString<'gc>) -> bool {
-        if self.len.get() != n || n as usize == self.slots.len() {
+    /// Append `key`, in a new field, for a shape whose prefix is `n` long, if
+    /// that is the whole array and there is room.
+    fn try_push(this: Gc<'gc, Self>, mc: &Mutation<'gc>, n: u32, key: LuaString<'gc>) -> bool {
+        if this.len.get() != n || n as usize == this.slots.len() {
             return false;
         }
         // SAFETY: no prefix reaches slot `n` yet.
-        unsafe { (*self.slots[n as usize].get()).write(key) };
-        self.len.set(n + 1);
+        unsafe { (*this.slots[n as usize].get()).write(key) };
+        // Adopting a fresh `Gc` in place: barrier first.
+        mc.backward_barrier(Gc::erase(this), None);
+        this.fields[n as usize].set(Some(Field::new(mc)));
+        this.len.set(n + 1);
         // SAFETY: as in `find`.
-        if let Some(index) = unsafe { &mut *self.index.get() } {
+        if let Some(index) = unsafe { &mut *this.index.get() } {
             index.insert_unique(addr_hash(addr(key)), (addr(key), n), |e| addr_hash(e.0));
         }
         true
@@ -1027,7 +1052,7 @@ impl<'gc> Shape<'gc> {
                 is_dict: false,
                 inline_cap,
                 transitions: RefLock::new(TransitionTable::new()),
-                keys: Keys::new(mc, &[], 0),
+                keys: Keys::new(mc, None, 0, 0),
                 watch: Watch::default(),
                 deps: Lock::new(None),
             },
@@ -1055,7 +1080,7 @@ impl<'gc> Shape<'gc> {
                 is_dict: true,
                 inline_cap: 0,
                 transitions: RefLock::new(TransitionTable::new()),
-                keys: Keys::new(mc, &[], 0),
+                keys: Keys::new(mc, None, 0, 0),
                 watch: Watch::default(),
                 deps: Lock::new(None),
             },
@@ -1230,6 +1255,18 @@ impl<'gc> Shape<'gc> {
         Gc::as_ref(self.data().keys).prefix(self.data().slot_count)
     }
 
+    /// The field of `slot`, one of this shape's.
+    #[inline]
+    pub fn field(self, slot: u32) -> Field<'gc> {
+        debug_assert!(slot < self.slot_count());
+        // SAFETY: a set field stays set; a shape's slots are below `len`.
+        unsafe {
+            Gc::as_ref(self.data().keys).fields[slot as usize]
+                .get()
+                .unwrap_unchecked()
+        }
+    }
+
     /// Look up a string key in this shape. The IC fast path bypasses this
     /// entirely; only slow paths reach here.
     #[inline]
@@ -1380,13 +1417,14 @@ fn keys_with<'gc>(
 ) -> Gc<'gc, Keys<'gc>> {
     let new_slot = parent.data().slot_count;
     let mut keys = parent.data().keys;
-    if !keys.try_push(new_slot, key) {
+    if !Keys::try_push(keys, mc, new_slot, key) {
         keys = Keys::new(
             mc,
-            parent.keys(),
+            Some(Gc::as_ref(keys)),
+            new_slot,
             (new_slot as usize + 1).next_power_of_two().max(4),
         );
-        keys.try_push(new_slot, key);
+        Keys::try_push(keys, mc, new_slot, key);
     }
     keys
 }
