@@ -4,7 +4,8 @@
 
 use core::cell::Cell;
 
-use crate::dmm::{Collect, Gc, Mutation};
+use crate::dmm::{Collect, Gc, Lock, Mutation};
+use crate::env::shape::Shape;
 use crate::env::value::Value;
 use crate::jit::deps::{self, DepSlot};
 
@@ -44,6 +45,15 @@ pub mod class {
     /// Nil and the booleans, which share their upper word.
     pub const NIL_BOOL: u16 = 128;
     pub const SMALL: u16 = 256;
+}
+
+/// Whether `v` is a table of shape `s`.
+#[inline(always)]
+pub fn is_table_of<'gc>(s: Option<Shape<'gc>>, v: Value<'gc>) -> bool {
+    match (v.get_table(), s) {
+        (Some(t), Some(s)) => Shape::ptr_eq(t.shape_now(), s),
+        _ => false,
+    }
 }
 
 /// Widenings after which a slot takes anything, bounding the recompiles a
@@ -101,6 +111,36 @@ impl Kind {
         }
     }
 
+    /// Whether tables fit: arcs hold whole classes, so whether the first
+    /// table word does.
+    #[inline(always)]
+    pub fn has_tables(self) -> bool {
+        CLASSES[4].0.wrapping_sub(self.lo) <= self.span
+    }
+
+    /// This arc without tables: where they lie inside it, the part after
+    /// them, which holds nil.
+    #[inline(always)]
+    pub fn without_tables(self) -> Kind {
+        let (tlo, thi) = CLASSES[4];
+        if !self.has_tables() {
+            return self;
+        }
+        // Arcs hold whole classes, so tables start it, end it or lie inside.
+        let end = self.lo.wrapping_add(self.span);
+        match (self.lo == tlo, end == thi) {
+            (true, true) => Kind::NONE,
+            (false, true) => Kind {
+                lo: self.lo,
+                span: (tlo - 1).wrapping_sub(self.lo),
+            },
+            _ => Kind {
+                lo: thi + 1,
+                span: end.wrapping_sub(thi + 1),
+            },
+        }
+    }
+
     /// The types in this arc, as [`class`] bits.
     pub fn classes(self) -> u16 {
         let mut out = 0;
@@ -135,6 +175,10 @@ pub struct FieldData<'gc> {
     kind: Cell<u64>,
     #[collect(require_static)]
     widenings: Cell<u8>,
+    /// The shape every table stored here had when stored, while that was
+    /// one shape and stable then (ws2 §6.1's `table(S)`); `None` once the
+    /// arc holds tables of several (or before the first table).
+    shape: Lock<Option<Shape<'gc>>>,
     /// The regions assuming the kind stays.
     deps: DepSlot<'gc>,
 }
@@ -153,7 +197,8 @@ impl<'gc> Field<'gc> {
             FieldData {
                 kind: Cell::new(Kind::NONE.to_word()),
                 widenings: Cell::new(0),
-                deps: crate::dmm::Lock::new(None),
+                shape: Lock::new(None),
+                deps: Lock::new(None),
             },
         ))
     }
@@ -163,10 +208,49 @@ impl<'gc> Field<'gc> {
         Kind::from_word(self.0.kind.get())
     }
 
+    /// The shape of every table stored here, while there was one.
+    #[inline(always)]
+    pub fn shape(self) -> Option<Shape<'gc>> {
+        self.0.shape.get()
+    }
+
+    /// Whether storing `v` keeps what the slot says.
+    #[inline(always)]
+    pub fn fits(self, v: Value<'gc>) -> bool {
+        self.kind().fits(v) && self.shape_fits(v)
+    }
+
+    /// Whether `v` is no table or one of the tracked shape, if any.
+    #[inline(always)]
+    pub fn shape_fits(self, v: Value<'gc>) -> bool {
+        match (self.shape(), v.get_table()) {
+            (Some(s), Some(t)) => Shape::ptr_eq(t.shape_now(), s),
+            _ => true,
+        }
+    }
+
+    /// Whether `v` is a table of the shape tracked, which a cache entry's
+    /// kind leaves out (`store_kind`): the check a store of a table takes
+    /// out of line.
+    #[inline(always)]
+    pub fn tracks(self, v: Value<'gc>) -> bool {
+        is_table_of(self.shape(), v)
+    }
+
+    /// The kind a cache entry checks stores against: without tables while
+    /// a shape is tracked, so a table takes the check of its shape.
+    #[inline(always)]
+    pub fn store_kind(self) -> Kind {
+        match self.shape() {
+            Some(_) => self.kind().without_tables(),
+            None => self.kind(),
+        }
+    }
+
     /// Note that `v` is stored to this slot.
     #[inline(always)]
     pub fn admit(self, mc: &Mutation<'gc>, v: Value<'gc>) {
-        if !self.kind().fits(v) {
+        if !self.fits(v) {
             self.widen(mc, v);
         }
     }
@@ -178,14 +262,32 @@ impl<'gc> Field<'gc> {
     fn widen(self, mc: &Mutation<'gc>, v: Value<'gc>) {
         let old = self.kind();
         let mut new = old.widened(v);
+        let mut shape = self.shape();
+        if let Some(t) = v.get_table() {
+            // The first table names the shape, if it is one code may rely on.
+            shape = match old.has_tables() {
+                false => Some(t.shape_now()).filter(|s| s.is_stable() && !s.is_dict()),
+                true => None,
+            };
+        }
         if old != Kind::NONE {
             let n = self.0.widenings.get() + 1;
             self.0.widenings.set(n);
             if n >= MAX_WIDENINGS {
                 new = Kind::ANY;
+                shape = None;
             }
         }
         self.0.kind.set(new.to_word());
+        let same = match (shape, self.shape()) {
+            (Some(a), Some(b)) => Shape::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        if !same {
+            // A nil (a weak clear, from finalization) never gets here.
+            mc.backward_barrier(Gc::erase(self.0), None);
+            unsafe { self.0.shape.as_cell() }.set(shape);
+        }
         deps::invalidate(mc, &self.0.deps, u64::MAX);
     }
 
@@ -232,5 +334,33 @@ mod tests {
         assert!(fits(nilable, Value::boolean(true)));
         assert!(!Kind::NONE.fits(Value::nil()) && !Kind::NONE.fits(Value::small(0)));
         assert!(Kind::ANY.fits(Value::nil()) && Kind::ANY.classes() == 0x1ff);
+    }
+
+    #[test]
+    fn store_kinds_leave_tables_out() {
+        let nil = Kind::NONE.widened(Value::nil());
+        let tab_nil = Kind {
+            lo: CLASSES[4].0,
+            span: CLASSES[7].1 - CLASSES[4].0,
+        };
+        assert_eq!(
+            tab_nil.classes(),
+            class::TAB | class::FUN | class::THR | class::NIL_BOOL
+        );
+        let rest = tab_nil.without_tables();
+        assert_eq!(rest.classes(), class::FUN | class::THR | class::NIL_BOOL);
+        assert!(rest.fits(Value::nil()) && !rest.has_tables());
+        let tab = Kind {
+            lo: CLASSES[4].0,
+            span: CLASSES[4].1 - CLASSES[4].0,
+        };
+        assert_eq!(tab.without_tables(), Kind::NONE);
+        assert_eq!(nil.without_tables(), nil);
+        assert!(!Kind::NONE.has_tables() && Kind::ANY.has_tables());
+        let str_fun = Kind {
+            lo: CLASSES[3].0,
+            span: CLASSES[5].1 - CLASSES[3].0,
+        };
+        assert_eq!(str_fun.without_tables().classes(), class::FUN);
     }
 }

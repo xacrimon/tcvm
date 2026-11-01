@@ -274,7 +274,20 @@ pub(crate) struct Func<'gc> {
     /// What the code assumes of runtime objects, and which groups of facts
     /// (ws2 §5.3); without any, the lazy exits go.
     pub(crate) deps: Vec<(DepOn<'gc>, u64)>,
+    /// Shapes (by `shapes` index) whose stability a shape fact the builder
+    /// used rests on, depended on when the build ends (ws2 §6.2).
+    pub(crate) stable_used: RefCell<Vec<u32>>,
     cfg: RefCell<Option<Rc<CfgInfo>>>,
+}
+
+impl<'gc> Func<'gc> {
+    /// Note that the code assumes `groups` of `on`.
+    pub(crate) fn depend(&mut self, on: DepOn<'gc>, groups: u64) {
+        match self.deps.iter_mut().find(|(o, _)| o.same(on)) {
+            Some((_, g)) => *g |= groups,
+            None => self.deps.push((on, groups)),
+        }
+    }
 }
 
 /// An object the region assumes something of (`Func::deps`).
@@ -282,8 +295,9 @@ pub(crate) struct Func<'gc> {
 pub(crate) enum DepOn<'gc> {
     /// A class's metamethods, by their bits.
     Class(crate::env::MtCache<'gc>),
-    /// A watched holder's shape, by `deps::SHAPE_GROUP` and `deps::slot_group`.
-    Holder(crate::env::Shape<'gc>),
+    /// A shape: its tables stay (`deps::SHAPE_GROUP`), a watched holder's
+    /// slots keep their values (`deps::slot_group`).
+    Shape(crate::env::Shape<'gc>),
     /// A named slot's kind.
     Field(crate::env::shape::Field<'gc>),
 }
@@ -292,7 +306,7 @@ impl DepOn<'_> {
     fn word(self) -> u64 {
         match self {
             DepOn::Class(c) => c.as_word(),
-            DepOn::Holder(s) => s.as_word(),
+            DepOn::Shape(s) => s.as_word(),
             DepOn::Field(f) => f.as_word(),
         }
     }
@@ -344,6 +358,7 @@ impl<'gc> Func<'gc> {
             inline_frames: Vec::new(),
             protos: Vec::new(),
             deps: Vec::new(),
+            stable_used: RefCell::new(Vec::new()),
             cfg: RefCell::new(None),
         }
     }

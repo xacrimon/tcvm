@@ -11,6 +11,7 @@ pub(crate) mod simplify;
 pub(crate) mod sink;
 pub(crate) mod snaps;
 pub(crate) mod speculate;
+pub(crate) mod stable;
 
 use crate::jit::ir::ops::Op;
 use crate::jit::ir::{Block, Func, Inst};

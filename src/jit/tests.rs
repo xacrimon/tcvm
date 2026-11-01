@@ -645,7 +645,34 @@ fn field_loads_take_their_slot_kinds() {
     assert_eq!(count("guard val:float"), 0, "{ir}");
     assert_eq!(count("istype"), 0, "{ir}");
     assert!(ir.contains("val:float = tabload"), "{ir}");
-    assert!(ir.contains("val:tab = tabload"), "{ir}");
+    assert!(ir.contains("val:tab@s"), "{ir}");
+}
+
+/// A table loaded from a slot that tracks its tables' stable shape needs no
+/// shape guard (ws2 §6.1-6.2), in a loop over a list too: only the list's
+/// head, a parameter, is guarded.
+#[test]
+fn loaded_tables_keep_their_tracked_shape() {
+    let src = "for i = 1, 100 do keep = {v = i, next = keep} end
+    function f(l) local s = 0 while l do s = s + l.v l = l.next end return s end
+    for k = 1, 30 do f(keep) end";
+    let ir = ir_of(src, "f", 0);
+    let guards = ir.lines().filter(|l| l.contains("guardshape")).count();
+    assert_eq!(guards, 1, "{ir}");
+}
+
+/// A shape guarded before a call holds after it while stable: the call's
+/// lazy exit catches a table leaving it.
+#[test]
+fn stable_shapes_outlive_calls() {
+    let src = "local n = 0
+    local function g() n = n + 1 return 1 end
+    function f(o) local s = o.x + g() s = s + o.y + g() return s + o.x end
+    keep = {x = 1, y = 2}
+    for k = 1, 300 do f(keep) end";
+    let ir = ir_of(src, "f", 0);
+    let guards = ir.lines().filter(|l| l.contains("guardshape")).count();
+    assert_eq!(guards, 1, "{ir}");
 }
 
 #[test]

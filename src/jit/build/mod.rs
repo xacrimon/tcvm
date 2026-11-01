@@ -16,7 +16,7 @@ use crate::env::function::{LuaFn, Prototype};
 use crate::env::value::Value;
 use crate::instruction::Instruction;
 use crate::jit::build::cfg::{Cfg, RegSet};
-use crate::jit::ir::ops::{ExitTag, Op};
+use crate::jit::ir::ops::{ExitTag, HelperId, Op};
 use crate::jit::ir::types::{Refine, Rep, Ty, TypeSet};
 use crate::jit::ir::{
     Block, BlockCall, DepOn, ExitKind, Func, Inst, List, RegionMeta, Snap, Val, ValDef,
@@ -171,8 +171,14 @@ struct BlockState {
     on_entry: Vec<(Val, Fact)>,
     /// The shapes tables have here, by the value they unbox (`root_of`):
     /// the shape guards and tests passed since an instruction that may
-    /// change shapes (W1.7 5.2).
-    shapes: Vec<(Val, Shapes)>,
+    /// change shapes (W1.7 5.2), and whether a fact holds only while its
+    /// shapes stay stable (ws2 §6.2): one kept across such an instruction,
+    /// or a load from a slot that tracks its tables' shape.
+    shapes: Vec<(Val, Shapes, bool)>,
+    /// The facts of stable shapes an instruction that may change shapes
+    /// left, back at the lazy exit after it: no frame passes that exit
+    /// once one of their shapes is left.
+    stash: Vec<(Val, Shapes)>,
 }
 
 pub(crate) struct Builder<'a, 'gc> {
@@ -263,6 +269,7 @@ impl BlockState {
             refines: Vec::new(),
             on_entry: Vec::new(),
             shapes: Vec::new(),
+            stash: Vec::new(),
         }
     }
 }
@@ -499,6 +506,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let (n, c) = (self.nregs, self.cur.idx());
         self.slots.copy_within(c * n..(c + 1) * n, b.idx() * n);
         self.bs[b.idx()].shapes = self.bs[c].shapes.clone();
+        self.bs[b.idx()].stash = self.bs[c].stash.clone();
         b
     }
 
@@ -846,28 +854,98 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     pub(crate) fn known_shapes(&self, t: Val) -> Option<Shapes> {
         let r = self.fact_key(t);
         let s = &self.bs[self.cur.idx()].shapes;
-        s.iter().find(|x| x.0 == r).map(|x| x.1)
+        let &(_, set, stable) = s.iter().find(|x| x.0 == r)?;
+        if stable {
+            self.f
+                .stable_used
+                .borrow_mut()
+                .extend_from_slice(set.as_slice());
+        }
+        Some(set)
     }
 
     /// Know that the table `t` unboxes from has one of `s` here.
     pub(crate) fn set_shapes(&mut self, t: Val, s: Shapes) {
+        self.put_shapes(t, s, false);
+    }
+
+    /// Know that the table `t` unboxes from has `s` while `s` stays stable.
+    pub(crate) fn set_stable_shapes(&mut self, t: Val, s: Shapes) {
+        self.put_shapes(t, s, true);
+    }
+
+    fn put_shapes(&mut self, t: Val, s: Shapes, stable: bool) {
         let r = self.fact_key(t);
         let facts = &mut self.bs[self.cur.idx()].shapes;
         match facts.iter_mut().find(|x| x.0 == r) {
-            Some(x) => x.1 = s,
-            None => facts.push((r, s)),
+            Some(x) => (x.1, x.2) = (s, stable),
+            None => facts.push((r, s, stable)),
         }
     }
 
-    /// An instruction that may change shapes ends what is known of them.
+    /// Whether code may rely on the tables of every shape in `s` staying.
+    fn all_stable(&self, s: Shapes) -> bool {
+        s.as_slice().iter().all(|&k| {
+            let shape = self.f.shapes[k as usize];
+            shape.is_stable() && !shape.is_dict()
+        })
+    }
+
+    /// The facts of stable shapes, for after an instruction that may change
+    /// shapes and is followed by a lazy exit.
+    fn stable_facts(&self, b: Block) -> Vec<(Val, Shapes)> {
+        let facts = &self.bs[b.idx()].shapes;
+        facts
+            .iter()
+            .filter(|x| self.all_stable(x.1))
+            .map(|x| (x.0, x.1))
+            .collect()
+    }
+
+    /// An instruction that may change shapes ends what is known of them,
+    /// but for stable shapes past a lazy exit after it: calls (`call`), and
+    /// the helpers followed by one.
     fn note_effects(&mut self, op: Op) {
-        if op
+        if !op
             .effects()
             .writes
             .contains(crate::jit::ir::ops::Mem::SHAPE)
         {
-            self.bs[self.cur.idx()].shapes.clear();
+            return;
         }
+        let lazy = matches!(
+            op,
+            Op::Helper(HelperId::NewIndex { .. } | HelperId::RawSet | HelperId::SetMetatable)
+        );
+        let stash = match lazy {
+            true => self.stable_facts(self.cur),
+            false => Vec::new(),
+        };
+        let s = &mut self.bs[self.cur.idx()];
+        s.shapes.clear();
+        s.stash = stash;
+    }
+
+    /// `t` (of one of the shapes known for it, none stable) moves to shape
+    /// `k`: facts of tables that cannot be `t`, their shapes disjoint from
+    /// its, stay.
+    pub(crate) fn move_shape(&mut self, t: Val, k: u32) {
+        let from = self.known_shapes(t);
+        let i = self
+            .f
+            .make_inst(Op::TabSetShape(k), &[t], None, ExitTag::Type);
+        self.inline_check(Op::TabSetShape(k));
+        self.f.append(self.cur, i);
+        let r = self.fact_key(t);
+        let s = &mut self.bs[self.cur.idx()];
+        s.stash.clear();
+        match from {
+            Some(f) => s
+                .shapes
+                .retain(|x| x.0 != r && !x.1.as_slice().iter().any(|&j| f.contains(j))),
+            None => s.shapes.clear(),
+        }
+        self.set_shapes(t, Shapes::one(k));
     }
 
     /// What an exiting check just emitted proves from here on.
@@ -1170,6 +1248,12 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// table write, before anything that assumes what a dependency names.
     pub(crate) fn lazy_exit(&mut self, s: Snap) {
         self.ins_snap(Op::LazyExit, &[], s, ExitTag::Lazy);
+        let st = &mut self.bs[self.cur.idx()];
+        for (v, set) in std::mem::take(&mut st.stash) {
+            if !st.shapes.iter().any(|x| x.0 == v) {
+                st.shapes.push((v, set, true));
+            }
+        }
     }
 
     /// A lazy exit past the instruction, once its writes are flushed.
@@ -1193,7 +1277,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// Assume the watched holder of `shape` keeps it, and `groups` of it.
     pub(crate) fn depend_holder(&mut self, shape: crate::env::Shape<'gc>, groups: u64) {
-        self.depend(DepOn::Holder(shape), groups);
+        self.depend(DepOn::Shape(shape), groups);
     }
 
     /// Assume `field`'s kind stays (ws2 §6.1).
@@ -1202,10 +1286,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     }
 
     fn depend(&mut self, on: DepOn<'gc>, groups: u64) {
-        match self.f.deps.iter_mut().find(|(o, _)| o.same(on)) {
-            Some((_, g)) => *g |= groups,
-            None => self.f.deps.push((on, groups)),
-        }
+        self.f.depend(on, groups);
     }
 
     /// Store the registers in `live` (and the captured ones) whose home
@@ -1335,9 +1416,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let before = self.cur;
         let resume = self.new_block();
         self.f.blocks[resume.idx()].resume = true;
+        let stash = self.stable_facts(before);
         let s = &mut self.bs[resume.idx()];
         s.sealed = true;
         s.reload = reload;
+        s.stash = stash;
         self.terminate(op, args, &[resume], Some((snap, ExitTag::Type)));
         for r in 0..self.nregs {
             let state = if reload.contains(r) {
@@ -1732,6 +1815,13 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             }
         }
         remove_trivial_params(&mut self.f);
+        let mut used = std::mem::take(self.f.stable_used.get_mut());
+        used.sort_unstable();
+        used.dedup();
+        for k in used {
+            let s = self.f.shapes[k as usize];
+            self.depend(DepOn::Shape(s), crate::jit::deps::SHAPE_GROUP);
+        }
         // Nothing can invalidate a region without dependencies.
         if self.f.deps.is_empty() {
             for b in 0..self.f.blocks.len() {
@@ -1826,6 +1916,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 self.slots_of(b).fill(SlotState::Unknown);
             }
             self.bs[b.idx()].shapes.clear();
+            self.bs[b.idx()].stash.clear();
             return;
         }
         let p0 = self.bs[b.idx()].preds[0];
@@ -1841,10 +1932,13 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             }
             // A table's shapes are those it may have on every edge.
             let theirs = &self.bs[p.idx()].shapes;
-            shapes.retain_mut(|(v, s)| {
-                match theirs.iter().find(|x| x.0 == *v).and_then(|x| s.union(x.1)) {
+            shapes.retain_mut(|(v, s, stable)| {
+                let Some(x) = theirs.iter().find(|x| x.0 == *v) else {
+                    return false;
+                };
+                match s.union(x.1) {
                     Some(u) => {
-                        *s = u;
+                        (*s, *stable) = (u, *stable || x.2);
                         true
                     }
                     None => false,

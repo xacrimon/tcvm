@@ -36,7 +36,7 @@ use crate::env::value::Value;
 use crate::jit::deps::{self, DepSlot};
 
 mod kind;
-pub use kind::{Field, Kind, class as kind_class};
+pub use kind::{Field, Kind, class as kind_class, is_table_of};
 
 /// V8-style "Map" / hidden class. Copy wrapper over a single Gc pointer
 /// for cheap pass-by-value and pointer-equality identity checks.
@@ -474,9 +474,13 @@ pub struct ShapeData<'gc> {
     /// by its children (see [`Watch`]).
     #[collect(require_static)]
     watch: Watch,
-    /// The regions assuming a watched holder keeps this shape, or a slot's
-    /// value (ws2 §5.2), by `deps::SHAPE_GROUP` and `deps::slot_group`.
+    /// The regions assuming tables in this shape stay in it (ws2 §6.2),
+    /// a watched holder its slots' values (§5.2), by `deps::SHAPE_GROUP` and
+    /// `deps::slot_group`.
     deps: DepSlot<'gc>,
+    /// A table left this shape: one seen in it may be elsewhere now.
+    #[collect(require_static)]
+    unstable: Cell<bool>,
 }
 
 /// A watched holder's shape (ws2 §5.2): only the one table, a class's
@@ -1055,6 +1059,7 @@ impl<'gc> Shape<'gc> {
                 keys: Keys::new(mc, None, 0, 0),
                 watch: Watch::default(),
                 deps: Lock::new(None),
+                unstable: Cell::new(false),
             },
         ))
     }
@@ -1083,6 +1088,7 @@ impl<'gc> Shape<'gc> {
                 keys: Keys::new(mc, None, 0, 0),
                 watch: Watch::default(),
                 deps: Lock::new(None),
+                unstable: Cell::new(false),
             },
         ))
     }
@@ -1360,6 +1366,7 @@ impl<'gc> Shape<'gc> {
                     volatile: Cell::new(volatile),
                 },
                 deps: Lock::new(None),
+                unstable: Cell::new(false),
             },
         ))
     }
@@ -1380,7 +1387,8 @@ impl<'gc> Shape<'gc> {
         out
     }
 
-    /// Note that `region` assumes `groups` of this watched shape hold.
+    /// Note that `region` assumes `groups` of this shape hold: its tables
+    /// stay (`deps::SHAPE_GROUP`), a watched holder's slots keep their values.
     pub(crate) fn depend(
         self,
         mc: &Mutation<'gc>,
@@ -1404,7 +1412,24 @@ impl<'gc> Shape<'gc> {
     /// This watched shape's table left it: everything assumed of it is
     /// invalidated; whether anything was.
     pub(crate) fn left(self, mc: &Mutation<'gc>) -> bool {
+        self.data().unstable.set(true);
         deps::invalidate(mc, &self.0.deps, u64::MAX)
+    }
+
+    /// Whether no table has left this shape, so a table seen in it is still
+    /// there (V8's stable maps; ws2 §6.2). Every move off a shape goes
+    /// through `TableState::set_shape`, or repeats one that did from it.
+    #[inline(always)]
+    pub fn is_stable(self) -> bool {
+        !self.data().unstable.get()
+    }
+
+    /// A table left this shape: code assuming its tables stay is invalidated.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn unstabilize(self, mc: &Mutation<'gc>) {
+        self.data().unstable.set(true);
+        deps::invalidate(mc, &self.0.deps, deps::SHAPE_GROUP);
     }
 }
 
@@ -1478,6 +1503,7 @@ pub fn transition_add_prop<'gc>(
             keys: keys_with(mc, parent, key),
             watch: p.watch.inherit(),
             deps: Lock::new(None),
+            unstable: Cell::new(false),
         },
     );
     let parent_write = Gc::write(mc, parent.0);
@@ -1554,6 +1580,7 @@ pub fn transition_set_metatable<'gc>(
             keys,
             watch: p.watch.inherit(),
             deps: Lock::new(None),
+            unstable: Cell::new(false),
         },
     );
     let parent_write = Gc::write(mc, parent.0);
@@ -1601,6 +1628,7 @@ pub fn transition_adopt<'gc>(
                     keys: p.keys,
                     watch: p.watch.inherit(),
                     deps: Lock::new(None),
+                    unstable: Cell::new(false),
                 },
             );
             let parent_write = Gc::write(mc, parent.0);

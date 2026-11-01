@@ -145,11 +145,15 @@ impl<'gc> Prototype<'gc> {
 pub enum InlineCache<'gc> {
     // First, so the hottest hit tests a zero discriminant.
     /// Tables of `shape` hold the key at `loc`. A store needs its value to
-    /// fit `kind`, a copy of the slot's (which only widens).
+    /// fit `kind`, a copy of the slot's (which only widens), or to be a
+    /// table of `expect`, the shape the slot tracked when filled (ws2 §6.2).
+    /// Untraced: while the slot tracks it, the slot keeps it alive; after,
+    /// the slot takes every table, so a stale match admits nothing wrong.
     Own {
         shape: Shape<'gc>,
         loc: SlotLoc,
         kind: Kind,
+        expect: Option<Shape<'gc>>,
     },
     /// Tables of `shape` lack the key: a load is nil unless `__index` fires.
     Absent { shape: Shape<'gc> },

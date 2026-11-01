@@ -59,13 +59,17 @@ bitflags::bitflags! {
 }
 
 /// A fact about a value beyond its type set, valid for as long as the value
-/// exists. Shapes are not facts of a value (a store changes them), so none is
-/// here.
+/// exists. Shapes are not facts of a value (a store changes them), except
+/// a stable one's (ws2 §6.2).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Refine {
     None,
     /// The exact value, the pool index of its boxed word.
     Const(u32),
+    /// If a table, one in the stable shape of this index (`Func::shapes`),
+    /// wherever no table may have moved since a lazy exit
+    /// (`opt::stable`).
+    Shape(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -184,8 +188,10 @@ impl fmt::Display for Ty {
                 }
             }
         }
-        if let Refine::Const(p) = self.refine {
-            write!(f, "=k{p}")?;
+        match self.refine {
+            Refine::Const(p) => write!(f, "=k{p}")?,
+            Refine::Shape(s) => write!(f, "@s{s}")?,
+            Refine::None => {}
         }
         Ok(())
     }

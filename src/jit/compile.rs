@@ -169,6 +169,7 @@ pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
         t.timed("infer", || opt::infer::infer(f));
         let mut changed = t.timed("narrow", || opt::infer::narrow(f));
         t.timed("infer", || opt::infer::infer(f));
+        changed |= t.timed("stable", || opt::stable::fold(f));
         changed |= t.timed("simplify", || opt::simplify::simplify(f));
         t.timed("params", || remove_trivial_params(f));
         changed |= t.timed("gvn", || opt::gvn::gvn(f));
@@ -580,7 +581,7 @@ pub(crate) fn compile<'gc>(
                 let bits = crate::env::MetamethodBits::from_bits_retain(groups as u32);
                 c.depend(ctx.mutation(), region, bits);
             }
-            DepOn::Holder(s) => s.depend(ctx.mutation(), region, groups),
+            DepOn::Shape(s) => s.depend(ctx.mutation(), region, groups),
             DepOn::Field(f) => f.depend(ctx.mutation(), region),
         }
     }

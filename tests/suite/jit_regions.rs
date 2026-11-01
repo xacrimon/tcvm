@@ -2633,3 +2633,77 @@ fn every_writer_widens_slots() {
         return table.concat(r, ',')",
     );
 }
+
+/// Tables loaded from a slot that tracks their stable shape (ws2 §6.1-6.2)
+/// leave it every way a table can: a new key, a metatable, becoming an
+/// `__index` holder; a compiled loop over them is invalidated each time.
+#[test]
+fn tables_leaving_tracked_shapes_invalidate() {
+    agrees(
+        "local head
+        for i = 1, 200 do head = {v = i, next = head} end
+        local function sum(l) local s = 0 while l do s = s + l.v l = l.next end return s end
+        local r = {}
+        for k = 1, 20 do r[#r + 1] = sum(head) end
+        head.next.next.w = 1
+        r[#r + 1] = sum(head)
+        setmetatable(head.next.next.next, {__index = {v = 0}})
+        r[#r + 1] = sum(head)
+        local n4 = head.next.next.next.next
+        setmetatable({}, {__index = n4})
+        r[#r + 1] = sum(head)
+        n4.v = 0.5
+        r[#r + 1] = sum(head)
+        return table.concat(r, ',')",
+    );
+}
+
+/// A slot tracking one shape takes a table of another, stored by the
+/// interpreter, by compiled code, into itself, and by a transition.
+#[test]
+fn tracked_slots_take_other_shapes() {
+    agrees(
+        "local function mk(i) return {a = i, b = i * 2} end
+        local holder = {p = mk(1)}
+        local function get(h) return h.p.a + h.p.b end
+        local function put(h, v) h.p = v end
+        local r = {}
+        for i = 1, 300 do put(holder, mk(i)); r[#r + 1] = get(holder) end
+        put(holder, {b = 5, a = 7})
+        r[#r + 1] = get(holder)
+        holder.p = {a = 1, b = 2, c = 3}
+        r[#r + 1] = get(holder)
+        local s = {a = 1, b = 2}
+        s.p = s
+        s.p = s
+        r[#r + 1] = s.p.p.a
+        local t = {}
+        t.self = t
+        t.self = t
+        r[#r + 1] = tostring(t.self == t)
+        return table.concat(r, ',')",
+    );
+}
+
+/// Shapes known before a call are known after it while stable; a callee
+/// that moves the table, or another of its shape, invalidates the caller.
+#[test]
+fn stable_shapes_across_calls() {
+    agrees(
+        "local P = {}
+        P.__index = P
+        local function new(x) return setmetatable({x = x, y = x + 1}, P) end
+        local go = false
+        local other = new(0)
+        local function g(o) if go then o.z = 1 end return 1 end
+        local function h() if go then other.w = 2 end return 1 end
+        local function m(o) local s = o.x + g(o) s = s + o.y + h() return s + o.x + (o.z or 0) end
+        local r = {}
+        local a = new(5)
+        for i = 1, 3000 do r[#r + 1] = m(a) end
+        go = true
+        r[#r + 1] = m(new(7))
+        r[#r + 1] = m(a)
+        return table.concat(r, ',')",
+    );
+}

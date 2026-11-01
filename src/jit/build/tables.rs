@@ -103,8 +103,24 @@ fn slot_load<'gc>(
         },
         &[t],
     );
-    let set = slot_types(b, shape, loc.slot(shape));
+    let slot = loc.slot(shape);
+    let set = slot_types(b, shape, slot);
     b.set_ty(v, Ty::val(set));
+    // A table loaded from a slot that tracks its tables' stable shape is in
+    // it (ws2 §6.1's `table(S)`), for as long as nothing leaves it.
+    if let Some(s) = shape.field(slot).shape()
+        && s.is_stable()
+    {
+        let k = b.intern_shape(s);
+        b.set_stable_shapes(v, Shapes::one(k));
+        b.set_ty(
+            v,
+            Ty {
+                refine: crate::jit::ir::types::Refine::Shape(k),
+                ..Ty::val(set)
+            },
+        );
+    }
     v
 }
 
@@ -112,14 +128,52 @@ fn slot_load<'gc>(
 /// the slot's kind (a mismatch exits, and the interpreter widens it); `None`
 /// before any store, for the helper.
 fn fitted<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, slot: u32, v: Val) -> Option<Val> {
-    let kind = shape.field(slot).kind();
+    let f = shape.field(slot);
+    let kind = f.kind();
     if kind == Kind::NONE {
         return None;
     }
-    Some(match kind_types(kind) {
+    let v = match kind_types(kind) {
         TypeSet::ANY => v,
         set => b.guard(v, set),
-    })
+    };
+    // Code may rely on the tracked shape only while it is stable.
+    if let Some(s) = f.shape()
+        && s.is_stable()
+    {
+        of_shape(b, v, s);
+    }
+    Some(v)
+}
+
+/// `v`, if a table, guarded to have `shape`, as a slot tracking it takes
+/// it; a mismatch exits, and the interpreter's store widens the slot.
+fn of_shape<'gc>(b: &mut Builder<'_, 'gc>, v: Val, shape: Shape<'gc>) {
+    let k = b.intern_shape(shape);
+    // An empty set is no knowledge.
+    let set = Some(b.ty(v).set)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(TypeSet::ANY);
+    if !set.intersects(TypeSet::TAB) || b.known_shapes(v) == Some(Shapes::one(k)) {
+        return;
+    }
+    let guard = |b: &mut Builder<'_, 'gc>, v: Val| {
+        let g = b.ins(Op::Refine(TypeSet::TAB), &[v]);
+        let t = b.ins(Op::Unbox(Rep::Ptr), &[g]);
+        b.ins_exit(Op::GuardShape(k), &[t], ExitTag::Type);
+        b.set_shapes(t, Shapes::one(k));
+    };
+    if TypeSet::TAB.contains(set) {
+        return guard(b, v);
+    }
+    let is = b.ins(Op::IsType(TypeSet::TAB), &[v]);
+    let other = branch_arm(b, is);
+    guard(b, v);
+    let join = b.new_block();
+    b.jump(join);
+    b.switch_to(other);
+    b.jump(join);
+    enter_join(b, join);
 }
 
 /// `t` guarded to have `shape`, unless it is known to have it already.
@@ -781,7 +835,8 @@ fn current_entry<'gc>(
                 Some(slot) => InlineCache::Own {
                     shape: p,
                     loc: SlotLoc::new(p, slot),
-                    kind: p.field(slot).kind(),
+                    kind: p.field(slot).store_kind(),
+                    expect: p.field(slot).shape(),
                 },
                 None => InlineCache::Empty,
             }
@@ -1085,6 +1140,12 @@ fn trans_store<'gc>(
     kid: u32,
     v: Val,
 ) {
+    // The interpreter made this move first, which left `from` unstable;
+    // compiled moves never mark it (ws2 §6.2).
+    debug_assert!(!from.is_stable());
+    if from.is_stable() {
+        return newindex(b, recv, key, v, false);
+    }
     if let Some(has) = class_has(b, from, MetamethodBits::NEWINDEX)
         && !never(b, has)
     {
@@ -1123,8 +1184,7 @@ fn trans_store<'gc>(
         &[t, v],
     );
     let k = b.intern_shape(to);
-    b.push(Op::TabSetShape(k), &[t]);
-    b.set_shapes(t, Shapes::one(k));
+    b.move_shape(t, k);
     b.jump(join);
     if let Some(full) = full {
         b.switch_to(full);

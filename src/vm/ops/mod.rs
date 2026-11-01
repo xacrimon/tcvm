@@ -226,7 +226,7 @@ macro_rules! family {
         v
     }};
     (@store Inl, $slow:ident, $insn:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
-        let $crate::env::function::InlineCache::Own { shape, loc, kind } = $cache else {
+        let $crate::env::function::InlineCache::Own { shape, loc, kind, expect } = $cache else {
             unsafe { std::hint::unreachable_unchecked() }
         };
         if !$crate::env::shape::Shape::ptr_eq($t.shape(), shape) {
@@ -235,14 +235,16 @@ macro_rules! family {
         // `__newindex` fires only on currently-nil keys.
         let existing = unsafe { $t.load_inline(loc) };
         let v = reg![$src];
-        if existing.is_nil() && shape.has_mm($crate::env::MetamethodBits::NEWINDEX) || !kind.fits(v) {
+        if existing.is_nil() && shape.has_mm($crate::env::MetamethodBits::NEWINDEX)
+            || !kind.fits(v) && !$crate::env::shape::is_table_of(expect, v)
+        {
             tail!($slow)
         }
         barrier!($t.inner());
         unsafe { $t.store_inline(loc, v) };
     };
     (@store Aux, $slow:ident, $insn:ident, $cache:ident, $t:ident, $recv:ident, $src:ident) => {
-        let $crate::env::function::InlineCache::Own { shape, loc, kind } = $cache else {
+        let $crate::env::function::InlineCache::Own { shape, loc, kind, expect } = $cache else {
             unsafe { std::hint::unreachable_unchecked() }
         };
         let state = $t.inner().borrow();
@@ -254,7 +256,9 @@ macro_rules! family {
         drop(state);
         let existing = unsafe { *slot };
         let v = reg![$src];
-        if existing.is_nil() && shape.has_mm($crate::env::MetamethodBits::NEWINDEX) || !kind.fits(v) {
+        if existing.is_nil() && shape.has_mm($crate::env::MetamethodBits::NEWINDEX)
+            || !kind.fits(v) && !$crate::env::shape::is_table_of(expect, v)
+        {
             tail!($slow)
         }
         barrier!($t.inner());
@@ -276,7 +280,7 @@ macro_rules! family {
             drop(state);
             next!()
         }
-        if !state.has_room(loc) || !kind.fits(v) {
+        if !state.has_room(loc) || !kind.fits(v) && !to.field(from.slot_count()).tracks(v) {
             drop(state);
             tail!($slow)
         }

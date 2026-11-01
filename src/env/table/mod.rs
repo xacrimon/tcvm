@@ -131,8 +131,9 @@ impl<'gc> Table<'gc> {
         v: Value<'gc>,
     ) {
         debug_assert!(state.has_room(loc) && to.slot_count() == state.shape.slot_count() + 1);
-        // No cache entry or compiled store moves a watched holder.
-        debug_assert!(!state.shape.is_watched());
+        // No cache entry or compiled store moves a watched holder, and each
+        // repeats a move a slow path made from the shape (ws2 §6.2).
+        debug_assert!(!state.shape.is_watched() && !state.shape.is_stable());
         unsafe { *self.slot_ptr(state, loc) = v };
         state.shape = to;
     }
@@ -347,8 +348,9 @@ impl<'gc> Table<'gc> {
         if !Shape::ptr_eq(state.shape, from) {
             return None;
         }
-        // `set_metatable` records no move from a watched holder's shape.
-        debug_assert!(!from.is_watched());
+        // `set_metatable` records no move from a watched holder's shape, and
+        // made the move it records (ws2 §6.2).
+        debug_assert!(!from.is_watched() && (Shape::ptr_eq(from, to) || !from.is_stable()));
         match to.mt_home() {
             MtHome::Class if class.owned_by(mt) && !class.is_shared() => {
                 state.shape = to;
@@ -411,6 +413,14 @@ impl<'gc> Table<'gc> {
 
     pub fn shape(self) -> Shape<'gc> {
         self.0.borrow().shape
+    }
+
+    /// The shape, read without a borrow: also while the table is borrowed
+    /// for a store (of itself, into itself).
+    #[inline(always)]
+    pub fn shape_now(self) -> Shape<'gc> {
+        // SAFETY: a word only this thread writes, never mid-write here.
+        unsafe { (*RefLock::as_ptr(self.0.as_ref())).shape }
     }
 
     pub fn inner(self) -> Gc<'gc, RefLock<TableState<'gc>>> {
@@ -603,10 +613,17 @@ impl SlotLoc {
     /// Debug builds: `v`, read from here in a table of `shape`, fits the
     /// slot's kind (ws2 §6.1).
     #[inline(always)]
-    pub(crate) fn check_kind(self, shape: Shape<'_>, v: Value<'_>) {
+    pub(crate) fn check_kind<'gc>(self, shape: Shape<'gc>, v: Value<'gc>) {
         if cfg!(debug_assertions) {
-            let kind = shape.field(self.slot(shape)).kind();
+            let f = shape.field(self.slot(shape));
+            let kind = f.kind();
             assert!(kind.fits(v), "{:#x} in a slot of {kind:?}", v.to_raw());
+            if let (Some(s), Some(t)) = (f.shape(), v.get_table()) {
+                assert!(
+                    !s.is_stable() || Shape::ptr_eq(s, t.shape_now()),
+                    "a table left a stable shape it was stored in"
+                );
+            }
         }
     }
 
@@ -772,6 +789,8 @@ impl<'gc> TableState<'gc> {
         self.shape = to;
         if from.is_watched() {
             self.rewatch(mc, from);
+        } else if from.is_stable() && !Shape::ptr_eq(from, to) {
+            from.unstabilize(mc);
         }
     }
 
@@ -800,6 +819,10 @@ impl<'gc> TableState<'gc> {
     fn watch(&mut self, mc: &Mutation<'gc>) {
         let s = self.shape;
         if !s.is_dict() && !s.is_watched() {
+            // Other tables may keep `s`; this one leaves it.
+            if s.is_stable() {
+                s.unstabilize(mc);
+            }
             self.shape = s.watched_copy(mc, 0, false);
         }
     }
@@ -876,8 +899,8 @@ impl<'gc> TableState<'gc> {
         }
         class.join();
         // Only `transition_adopt` leaves a memo, on the shape its table
-        // leaves: none is a watched holder's.
-        debug_assert!(!self.shape.is_watched());
+        // leaves: none is a watched holder's, and none stable.
+        debug_assert!(!self.shape.is_watched() && !self.shape.is_stable());
         self.shape = to;
         Some(to)
     }

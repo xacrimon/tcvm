@@ -123,11 +123,15 @@ fn quicken(site: *const Instruction, entry: &InlineCache<'_>) {
 #[inline(always)]
 fn shape_entry<'gc>(shape: Shape<'gc>, slot: Option<u32>) -> InlineCache<'gc> {
     match slot {
-        Some(slot) => InlineCache::Own {
-            shape,
-            loc: SlotLoc::new(shape, slot),
-            kind: shape.field(slot).kind(),
-        },
+        Some(slot) => {
+            let f = shape.field(slot);
+            InlineCache::Own {
+                shape,
+                loc: SlotLoc::new(shape, slot),
+                kind: f.store_kind(),
+                expect: f.shape(),
+            }
+        }
         None => InlineCache::Absent { shape },
     }
 }
@@ -187,12 +191,19 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
     let state = t.inner().borrow();
     let live = state.shape();
     if std::hint::likely(matches!(cache, InlineCache::Own { .. }))
-        && let InlineCache::Own { shape, loc, kind } = cache
+        && let InlineCache::Own {
+            shape,
+            loc,
+            kind,
+            expect,
+        } = cache
         && Shape::ptr_eq(live, shape)
     {
         // `__newindex` fires only on currently-nil keys.
         let existing = unsafe { t.load(&state, loc) };
-        if existing.is_nil() && live.has_mm(MetamethodBits::NEWINDEX) || !kind.fits(v) {
+        if existing.is_nil() && live.has_mm(MetamethodBits::NEWINDEX)
+            || !kind.fits(v) && !crate::env::shape::is_table_of(expect, v)
+        {
             return false;
         }
         // Barrier work goes to the slow path, keeping calls out of this handler.
@@ -219,7 +230,7 @@ fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Val
         if v.is_nil() {
             return true;
         }
-        if !state.has_room(loc) || !kind.fits(v) {
+        if !state.has_room(loc) || !kind.fits(v) && !to.field(from.slot_count()).tracks(v) {
             return false;
         }
         drop(state);
@@ -418,7 +429,7 @@ fn set_own_fill_ic<'gc>(
                     from: shape,
                     to,
                     loc: SlotLoc::new(to, slot),
-                    kind: to.field(slot).kind(),
+                    kind: to.field(slot).store_kind(),
                 };
                 (entry, cache && !shape.is_watched())
             }
