@@ -889,6 +889,20 @@ fn recursion_inlines_one_copy() {
     assert_eq!(ir.matches("call r").count(), 4, "{ir}");
 }
 
+/// A region frame's self tail call up to a real call's `top` is its loop:
+/// `ack`'s region does not leave for the interpreter's `TAILCALL`.
+#[test]
+fn self_tail_calls_up_to_top_loop() {
+    let src = "function ack(m, n)
+        if m == 0 then return n + 1 end
+        if n == 0 then return ack(m - 1, 1) end
+        return ack(m - 1, ack(m, n - 1))
+    end
+    for k = 1, 30 do ack(2, 3) end";
+    let ir = ir_of(src, "ack", 0);
+    assert!(!ir.contains("dispatch"), "{ir}");
+}
+
 /// A self-call's result is what the region's returns give (W4 step 6):
 /// its guards are refinements, and one landing guard per call tests it
 /// where the ways back other than the fast return land.

@@ -2678,6 +2678,36 @@ fn recursion_inlines_one_copy() {
     );
 }
 
+/// A region frame's tail call taking a call's results up to `top`: `f`
+/// and `ack` loop (W3 step 6c), `f`'s arguments past `acc` from `m`'s
+/// zero, one or two results, nil past them.
+#[test]
+fn tail_calls_up_to_top_loop() {
+    compiles_cleanly(
+        "local function m(n)
+          if n % 7 == 3 then return end
+          if n % 5 == 0 then return n, 'x' end
+          return n
+        end
+        local function f(acc, n, tag)
+          if n == nil then return acc .. '-' end
+          if n == 0 then return acc .. (tag or '') end
+          return f(acc + 1, m(n - 1))
+        end
+        local function ack(m, n)
+          if m == 0 then return n + 1 end
+          if n == 0 then return ack(m - 1, 1) end
+          return ack(m - 1, ack(m, n - 1))
+        end
+        local out = {}
+        for i = 1, 300 do out[#out + 1] = f(0, i % 40) end
+        local s = 0
+        for i = 1, 30 do s = s + ack(2, i % 9) end
+        return table.concat(out, ' ', 280) .. ' ' .. s",
+        true,
+    );
+}
+
 /// Typed self-calls (W4 step 6): `f`'s calls of itself enter past its
 /// entry guard and trust its integer result. `f(31)` overflows an i32 add
 /// and exits, and the interpreter returns a big integer to a typed call,

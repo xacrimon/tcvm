@@ -421,7 +421,13 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             let cv = b.boxed(callee);
             let me = b.ins(Op::FrameFn, &[]);
             b.ins_exit(Op::GuardSame, &[cv, me], ExitTag::Const);
-            let args: Vec<Val> = (0..rb - 1).map(|k| b.reg(a + 4 + k)).collect();
+            // Up to `top`: a call before it set it (`self_tail_calls`).
+            let args: Vec<Val> = if rb == 0 {
+                let n = b.proto.num_params;
+                super::inline::top_args(b, pc, a, n).expect("a call setting top")
+            } else {
+                (0..rb - 1).map(|k| b.reg(a + 4 + k)).collect()
+            };
             let nil = b.konst(Value::nil());
             for k in 0..b.proto.num_params {
                 b.set(k, args.get(k as usize).copied().unwrap_or(nil));
@@ -451,10 +457,12 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             }
             if let Some(slow) = slow {
                 b.switch_to(slow);
-                if rb == 0 {
-                    dispatch(b);
-                } else if !(none && super::inline::try_inline(b, pc, insn, callee)) {
-                    emit_tailcall(b, pc, a, rb - 1);
+                if !(none && super::inline::try_inline(b, pc, insn, callee)) {
+                    if rb == 0 {
+                        dispatch(b);
+                    } else {
+                        emit_tailcall(b, pc, a, rb - 1);
+                    }
                 }
             }
         }
@@ -587,20 +595,18 @@ fn dispatch(b: &mut Builder<'_, '_>) {
     b.terminate(Op::Dispatch { pc, word }, &[], &[], None);
 }
 
-/// `TAILCALL a` with `nargs` arguments: the fast arm of 5.5 for a Lua
-/// closure without varargs whose window fits, from a frame with nothing to
-/// close; any other callee the interpreter's TAILCALL, from the slots. A
-/// known callee (`known_callee`) is entered past its checks (D2), its
-/// window checked there.
 /// `TAILCALL` in an inlined body (W3 §5): the call replaces the body's
 /// frame, as the interpreter's does. A builtin's result is the body's; an
 /// inlinable callee is inlined in its place; any other is called as the
 /// body's caller called the body.
 fn body_tailcall(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     let (a, nb) = (insn.a(), insn.b());
-    // Arguments up to `top` (W3 step 7).
+    // Arguments up to `top` (W3 step 7): inlined, else the body fails.
     if nb == 0 {
-        dispatch(b);
+        let callee = callee_at(b, pc, a);
+        if !super::inline::try_inline(b, pc, insn, callee) {
+            dispatch(b);
+        }
         return;
     }
     let callee = callee_at(b, pc, a);
@@ -636,6 +642,11 @@ fn body_tailcall(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     }
 }
 
+/// `TAILCALL a` with `nargs` arguments: the fast arm of 5.5 for a Lua
+/// closure without varargs whose window fits, from a frame with nothing to
+/// close; any other callee the interpreter's TAILCALL, from the slots. A
+/// known callee (`known_callee`) is entered past its checks (D2), its
+/// window checked there.
 fn emit_tailcall(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8) {
     use crate::vm::frame::flag::{HAS_OPEN, HAS_TBC};
     let f = b.reg(a);

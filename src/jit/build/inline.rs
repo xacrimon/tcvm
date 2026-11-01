@@ -123,19 +123,11 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     if multi && (code.tails || a as usize + returns as usize > b.nregs) {
         return false;
     }
-    // Arguments up to `top`, which an inlined call or a real one set.
     let top_args = if nb == 0 {
-        match b.cur_top {
-            Some((from, Top::Count(n, most))) => {
-                reg_top_values(b, a + 4, proto.num_params, from, n, most)
-            }
-            _ => {
-                let Some(n) = top_count(b, pc, b.slot_of(a)) else {
-                    return false;
-                };
-                top_values(b, pc, a + 4, proto.num_params, n)
-            }
-        }
+        let Some(v) = top_args(b, pc, a, proto.num_params) else {
+            return false;
+        };
+        v
     } else {
         Vec::new()
     };
@@ -601,6 +593,18 @@ pub(super) fn inline_return_top(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> bool
     close_frame(b);
     return_values(b, &res, seen, None);
     true
+}
+
+/// The first `n` arguments up to `top` of the call at `pc` from `R[a]`,
+/// which an inlined call or a real one before it set; none without one.
+pub(super) fn top_args(b: &mut Builder<'_, '_>, pc: u32, a: u8, n: u8) -> Option<Vec<Val>> {
+    Some(match b.cur_top {
+        Some((from, Top::Count(c, most))) => reg_top_values(b, a + 4, n, from, c, most),
+        _ => {
+            let c = top_count(b, pc, b.slot_of(a))?;
+            top_values(b, pc, a + 4, n, c)
+        }
+    })
 }
 
 /// `n` values of `R[r..top)`, which an inlined call left in registers from

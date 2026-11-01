@@ -250,8 +250,22 @@ pub(crate) fn self_tail_calls(
     (0..code.len() as u32)
         .filter(|&t| {
             let i = code[t as usize];
+            // Up to `top` only after a call setting it.
+            let after_call = t > 0 && {
+                let p = code[t as usize - 1];
+                p.c() == 0
+                    && matches!(
+                        p.op().unquickened(),
+                        crate::instruction::Op::CALL
+                            | crate::instruction::Op::CALL_R0
+                            | crate::instruction::Op::CALL_R1
+                            | crate::instruction::Op::CALLS
+                            | crate::instruction::Op::CALLS_R0
+                            | crate::instruction::Op::CALLS_R1
+                    )
+            };
             if i.op() != crate::instruction::Op::TAILCALL
-                || i.b() == 0
+                || (i.b() == 0 && !after_call)
                 || proto.feedback.bits(t as usize) & crate::jit::feedback::CONST_MISS != 0
             {
                 return false;
