@@ -2651,6 +2651,27 @@ fn exits_before_takers_see_the_inlined_top() {
     );
 }
 
+/// Known callees (W3 step 8): `fs`'s two closures of one prototype take
+/// turns at a site, inlined by the prototype with each one's `k` read from
+/// the closure called; `add` and `bump` are closures the loop makes, inlined
+/// unguarded, `bump` writing the loop's captured `count` through its cell.
+#[test]
+fn known_callees_inline() {
+    agrees(
+        "local function mk(k) return function(x) return x * k end end
+        local fs = {mk(2), mk(3)}
+        local s, count = 0, 0
+        for i = 1, 3000 do
+          s = s + fs[i % 2 + 1](i)
+          local add = function(x) return x + i end
+          local bump = function() count = count + 1 end
+          s = s + add(1)
+          bump()
+        end
+        return s .. ' ' .. count",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]

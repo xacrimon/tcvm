@@ -20,7 +20,6 @@ use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, Ty, TypeSet};
 use crate::jit::ir::{Block, Val};
-use crate::vm::ops::field::read_ic;
 
 /// The receiver of a constant-key site: a register, a by-value upvalue, or
 /// a shared cell's value.
@@ -30,7 +29,8 @@ fn receiver(b: &mut Builder<'_, '_>, insn: Instruction) -> Val {
             match b.inline.as_ref().and_then(|i| i.closure) {
                 Some(c) => b.ins(Op::UpvalValueOf(insn.b()), &[c]),
                 None => {
-                    let now = unsafe { (*b.closure.upvalue_ptr().add(insn.b() as usize)).value };
+                    let c = b.closure.expect("a constant callee");
+                    let now = unsafe { (*c.upvalue_ptr().add(insn.b() as usize)).value };
                     b.konst(now)
                 }
             }
@@ -687,14 +687,14 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
         b.set(dst + 4, recv);
         b.flush();
     }
-    let kv = b.closure.proto.constants[e as usize];
+    let kv = b.proto.constants[e as usize];
     let key = b.konst(kv);
     let kid = b.f.intern(kv);
     let site = Site { recv, key, kv, kid };
     if string_method(b, dst, &site) {
         return;
     }
-    let ic = current_entry(b, read_ic(b.closure, ic), kv);
+    let ic = current_entry(b, b.proto.feedback.cache(ic as usize).get(), kv);
     let first = match ic {
         InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
         InlineCache::ProtoLoad { recv, .. } => Some(recv),
@@ -1053,10 +1053,10 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     let recv = receiver(b, insn);
     let v = b.reg(src);
     let v = b.boxed(v);
-    let kv = b.closure.proto.constants[e as usize];
+    let kv = b.proto.constants[e as usize];
     let key = b.konst(kv);
     let kid = b.f.intern(kv);
-    let ic = current_entry(b, read_ic(b.closure, ic), kv);
+    let ic = current_entry(b, b.proto.feedback.cache(ic as usize).get(), kv);
     let first = match ic {
         InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
         InlineCache::ProtoLoad { recv, .. } => Some(recv),

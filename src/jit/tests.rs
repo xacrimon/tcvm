@@ -64,9 +64,9 @@ fn built_ir_of(src: &str, name: &str, pc: u32) -> String {
             .proto
             .code
             .iter()
-            .map(|i| resolve_original(lf, i))
+            .map(|i| resolve_original(&lf.proto, i))
             .collect();
-        canonical_back_edges(lf, &mut code);
+        canonical_back_edges(&lf.proto, &mut code);
         let loop_entry = code[pc as usize].op() != crate::instruction::Op::FUNC;
         let tails = if loop_entry {
             Vec::new()
@@ -877,6 +877,34 @@ fn constants_stay_in_their_blocks() {
         .filter(|l| l.starts_with('b') && l.contains('(') && l.contains("=k"))
         .collect();
     assert!(params.is_empty(), "{params:?}\n{ir}");
+}
+
+/// Callees known by their prototype alone inline (W3 step 8): closures of
+/// one prototype taking turns at a site, guarded by the prototype, and one
+/// the loop makes, without a guard.
+#[test]
+fn prototype_known_callees_inline() {
+    let src = "local function mk(k) return function(x) return x * k end end
+    local fs = {mk(2), mk(3)}
+    function f(n)
+        local s = 0
+        for i = 1, n do
+            s = s + fs[i % 2 + 1](i)
+            local add = function(x) return x + i end
+            s = s + add(1)
+        end
+        return s
+    end
+    for k = 1, 300 do f(10) end";
+    let ir = ir_of(src, "f", 0);
+    assert!(!ir.contains("call r"), "{ir}");
+    // One prototype guard per copy of the loop body (`fs`'s site), as many
+    // as the closures made, which need none.
+    assert_eq!(
+        ir.matches("guard.proto").count(),
+        ir.matches("call.closure").count(),
+        "{ir}"
+    );
 }
 
 /// Constructors and concatenation inline (W3 step 3): `NEWTABLE` takes its

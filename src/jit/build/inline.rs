@@ -15,7 +15,6 @@ use std::rc::Rc;
 
 use super::intrinsics::{Callee, callee_of};
 use super::{Builder, Inline, SlotState, Top};
-use crate::env::function::LuaFn;
 use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::cfg::{Cfg, RegSet, use_def};
 use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
@@ -84,17 +83,18 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     if depth >= MAX_DEPTH || b.f.insts.len() > MAX_INSTS {
         return false;
     }
-    // A closure of a prototype that made several closures stands for any
-    // of them: only its prototype's facts are used.
-    let (lf, dynamic) = match callee_of(b, pc, callee) {
+    // A callee known by its prototype (several closures of it, or one this
+    // compile made) is built from its prototype, its upvalues loaded from
+    // the closure value (W3 §10); one the compile made needs no guard.
+    let (lf, proto, dynamic, made) = match callee_of(b, pc, callee) {
         Callee::Const(f) | Callee::Same(f) => match f.as_lua() {
-            Some(lf) => (lf, false),
+            Some(lf) => (Some(lf), lf.proto, false, false),
             None => return false,
         },
-        Callee::Proto(_, Some(lf)) if !in_region_place => (lf, true),
-        Callee::Proto(..) | Callee::Unknown => return false,
+        Callee::Proto(p, lf) if !in_region_place => (lf, p, true, false),
+        Callee::Made(p) if !in_region_place => (None, p, true, true),
+        Callee::Proto(..) | Callee::Made(_) | Callee::Unknown => return false,
     };
-    let proto = lf.proto;
     let base = if tail {
         b.reg_base()
     } else {
@@ -111,7 +111,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     let code = match b.known.callees.get(&key) {
         Some(code) => code.clone(),
         None => {
-            let code = prepare(lf).map(Rc::new);
+            let code = prepare(proto).map(Rc::new);
             b.known.callees.insert(key, code.clone());
             code
         }
@@ -215,6 +215,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             let p = b.ins(Op::Unbox(Rep::Ptr), &[cv]);
             (Err(k), crate::jit::region::DYNAMIC | k, Some(p))
         } else {
+            let lf = lf.expect("a constant callee");
             let k = b.konst(crate::env::value::Value::function(lf.function()));
             let Some(Op::KObj(func)) = b.f.def_op(k) else {
                 return false;
@@ -277,7 +278,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             closure,
         };
         let from = b.cur;
-        let mut ib = Builder::new_inline(b, lf, &code.cfg, inline);
+        let mut ib = Builder::new_inline(b, lf, proto, &code.cfg, inline);
         let entry = ib.build_inline(&args, from, MAX_INSTS);
         let inline = ib.finish(b);
         let Some(entry) = entry else {
@@ -336,9 +337,14 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         close_frame(b);
     }
     match guard {
-        Ok(k) => b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const),
-        Err(k) => b.ins_exit(Op::GuardProto(k), &[cv], ExitTag::Const),
-    };
+        Ok(k) => {
+            b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
+        }
+        Err(k) if !made => {
+            b.ins_exit(Op::GuardProto(k), &[cv], ExitTag::Const);
+        }
+        Err(_) => {}
+    }
     let end = (base + proto.max_stack_size as usize) as u16;
     b.ins_exit(Op::GuardWindow(end), &[], ExitTag::Slow);
     b.flush();
@@ -457,17 +463,16 @@ fn takes_count(b: &Builder<'_, '_>, next: Instruction) -> bool {
 
 /// A callee's code for inlining, or none when a body of it would need its
 /// frame or its entry never ran.
-fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
-    let proto = lf.proto;
+fn prepare(proto: crate::dmm::Gc<'_, crate::env::function::Prototype<'_>>) -> Option<InlineCode> {
     let mut code: Vec<Instruction> = proto
         .code
         .iter()
-        .map(|i| crate::jit::compile::resolve_original(lf, i))
+        .map(|i| crate::jit::compile::resolve_original(&proto, i))
         .collect();
     if code.iter().any(|i| needs_frame(i.op())) {
         return None;
     }
-    crate::jit::compile::canonical_back_edges(lf, &mut code);
+    crate::jit::compile::canonical_back_edges(&proto, &mut code);
     let cfg = Cfg::build(&proto, code, 0, Vec::new()).ok()?;
     if cfg.never_ran[cfg.block_of[0] as usize] {
         return None;

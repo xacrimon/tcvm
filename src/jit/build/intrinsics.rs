@@ -183,6 +183,8 @@ pub(super) enum Callee<'gc> {
     /// ones on each call), or that a site's slot names (`proto_slot`).
     /// With a closure of it `known_callee` names.
     Proto(Gc<'gc, Prototype<'gc>>, Option<LuaFn<'gc>>),
+    /// A closure a `CLOSURE` of this compile made (W3 §10): no guard.
+    Made(Gc<'gc, Prototype<'gc>>),
 }
 
 /// The callee of the call at `pc` as the region may take it: a constant;
@@ -192,6 +194,9 @@ pub(super) enum Callee<'gc> {
 /// compiled closure's own upvalues, which may differ per closure.
 pub(super) fn callee_of<'gc>(b: &Builder<'_, 'gc>, pc: u32, callee: Val) -> Callee<'gc> {
     use crate::env::feedback::slot_proto;
+    if let Some(&p) = b.known.made.get(&b.root_of(callee)) {
+        return Callee::Made(p);
+    }
     if let Some(Op::KObj(k)) = b.f.def_op(callee) {
         return match b.f.pool[k as usize].get_function() {
             Some(f) => Callee::Const(f),

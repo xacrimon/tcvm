@@ -229,12 +229,16 @@ pub(crate) struct Known<'gc> {
     konst_keys: crate::jit::FastMap<u32, Val>,
     /// Callees' code as their bodies are built, by prototype.
     pub(crate) callees: crate::jit::FastMap<usize, Option<std::rc::Rc<inline::InlineCode>>>,
+    /// Closures a `CLOSURE` of the compile made, with their prototypes.
+    pub(crate) made: crate::jit::FastMap<Val, Gc<'gc, Prototype<'gc>>>,
 }
 
 pub(crate) struct Builder<'a, 'gc> {
     pub(crate) ctx: crate::lua::Context<'gc>,
     pub(crate) f: Func<'gc>,
-    pub(crate) closure: LuaFn<'gc>,
+    /// The frame's closure, but for a callee known by its prototype, whose
+    /// upvalues come from `Inline::closure`.
+    pub(crate) closure: Option<LuaFn<'gc>>,
     /// Frame 0's closure, whose upvalues `UpvalValue` and `UpvalCell` read:
     /// an inlined body's builder has its callee as `closure`.
     pub(crate) region: LuaFn<'gc>,
@@ -379,7 +383,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         Builder {
             ctx,
             f,
-            closure,
+            closure: Some(closure),
             region: closure,
             proto,
             cfg,
@@ -413,7 +417,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// `Func`, block states and value facts until `finish`.
     pub(crate) fn new_inline(
         outer: &mut Builder<'_, 'gc>,
-        closure: LuaFn<'gc>,
+        closure: Option<LuaFn<'gc>>,
+        proto: Gc<'gc, Prototype<'gc>>,
         cfg: &'a Cfg,
         inline: Inline,
     ) -> Self {
@@ -425,7 +430,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             f,
             closure,
             region: outer.region,
-            proto: closure.proto,
+            proto,
             cfg,
             nregs: cfg.nregs,
             bs: std::mem::take(&mut outer.bs),
@@ -495,7 +500,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         if let Some(c) = i.closure {
             return Some(c);
         }
-        let k = self.konst(Value::function(self.closure.function()));
+        let c = self.closure.expect("a constant callee");
+        let k = self.konst(Value::function(c.function()));
         Some(self.ins(Op::Unbox(Rep::Ptr), &[k]))
     }
 

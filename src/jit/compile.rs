@@ -106,9 +106,9 @@ pub(crate) fn build_ir<'gc>(
         .proto
         .code
         .iter()
-        .map(|i| resolve_original(closure, i))
+        .map(|i| resolve_original(&closure.proto, i))
         .collect();
-    canonical_back_edges(closure, &mut code);
+    canonical_back_edges(&closure.proto, &mut code);
     let loop_entry = code[pc as usize].op() != crate::instruction::Op::FUNC;
     let tails = if loop_entry {
         Vec::new()
@@ -207,17 +207,13 @@ pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
 
 /// The word a JIT entry replaced, for an instruction that is one.
 pub(crate) fn resolve_original(
-    closure: LuaFn<'_>,
+    proto: &crate::env::function::Prototype<'_>,
     i: crate::instruction::Instruction,
 ) -> crate::instruction::Instruction {
     if !i.is_jit_word() {
         return i;
     }
-    let state = closure
-        .proto
-        .jit
-        .get()
-        .expect("a JIT word without a JIT state");
+    let state = proto.jit.get().expect("a JIT word without a JIT state");
     let st = state.borrow();
     st.entries
         .iter()
@@ -226,9 +222,6 @@ pub(crate) fn resolve_original(
         .expect("a JIT word without its entry")
 }
 
-/// Point each counted back edge that jumps past a `LOOP` at it, as the CFG
-/// takes the `LOOP` for the loop's header; an entry there pointed its own
-/// already (`Entry::back_edges`).
 /// The `TAILCALL`s of a function region whose call sites saw only its own
 /// prototype's closures, which become jumps to its start (W3 §5, Q6), the
 /// callee guarded to be the frame's: not for a vararg function, nor one
@@ -264,12 +257,15 @@ pub(crate) fn self_tail_calls(
         .collect()
 }
 
+/// Point each counted back edge that jumps past a `LOOP` at it, as the CFG
+/// takes the `LOOP` for the loop's header; an entry there pointed its own
+/// already (`Entry::back_edges`).
 pub(crate) fn canonical_back_edges(
-    closure: LuaFn<'_>,
+    proto: &crate::env::function::Prototype<'_>,
     code: &mut [crate::instruction::Instruction],
 ) {
     use crate::instruction::Op;
-    let pointed: Vec<u32> = closure.proto.jit.get().map_or(Vec::new(), |s| {
+    let pointed: Vec<u32> = proto.jit.get().map_or(Vec::new(), |s| {
         s.borrow()
             .entries
             .iter()

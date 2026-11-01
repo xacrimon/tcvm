@@ -201,7 +201,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         NOP | FUNC | LOOP => {}
         VARARGPREP => {
             if b.proto.needs_vararg_table {
-                let np = b.closure.num_params;
+                let np = b.proto.num_params;
                 let t = b.ins(Op::Helper(HelperId::VarargTable(np)), &[]);
                 b.set(np, t);
             }
@@ -284,7 +284,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.set(a, v);
         }
         LOAD => {
-            let k = b.closure.proto.constants[insn.d() as usize];
+            let k = b.proto.constants[insn.d() as usize];
             let v = b.konst(k);
             b.set(a, v);
         }
@@ -310,7 +310,8 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             let v = match b.inline.as_ref().and_then(|i| i.closure) {
                 Some(c) => b.ins(Op::UpvalValueOf(rb), &[c]),
                 None => {
-                    let now = unsafe { (*b.closure.upvalue_ptr().add(rb as usize)).value };
+                    let c = b.closure.expect("a constant callee");
+                    let now = unsafe { (*c.upvalue_ptr().add(rb as usize)).value };
                     b.konst(now)
                 }
             };
@@ -319,9 +320,9 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         // A by-value upvalue is a constant of the closure, guarded once per
         // region since other closures of the prototype may run it, unless
         // closures differ in it.
-        GETUPVAL if !b.closure.proto.feedback.upvalue_varies(rb as usize) => {
+        GETUPVAL if !b.proto.feedback.upvalue_varies(rb as usize) => {
             let v = b.ins(Op::UpvalValue(rb), &[]);
-            let now = unsafe { (*b.closure.upvalue_ptr().add(rb as usize)).value };
+            let now = unsafe { (*b.region.upvalue_ptr().add(rb as usize)).value };
             let k = b.konst(now);
             b.ins_exit(Op::GuardSame, &[v, k], ExitTag::Const);
             b.set(a, k);
@@ -385,7 +386,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         }
         JEQS | JNEQS => {
             let v = b.reg(a);
-            let k = b.closure.proto.constants[insn.h() as usize];
+            let k = b.proto.constants[insn.h() as usize];
             let kv = b.konst(k);
             let eq = b.ins(Op::SameBits, &[v, kv]);
             branch(b, eq, insn.op() == JEQS, succs);
@@ -493,6 +494,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
                 }
                 None => b.ins(Op::Helper(HelperId::Closure { proto, dst: a }), &[]),
             };
+            b.known.made.insert(f, child);
             b.set(a, f);
         }
         CLOSE => {
@@ -1979,6 +1981,11 @@ pub(super) fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> (Va
     ) -> Option<crate::dmm::Gc<'gc, crate::env::function::Prototype<'gc>>> {
         f.as_lua().filter(|c| !c.proto.is_vararg).map(|c| c.proto)
     }
+    fn fixed_proto<'gc>(
+        p: crate::dmm::Gc<'gc, crate::env::function::Prototype<'gc>>,
+    ) -> Option<crate::dmm::Gc<'gc, crate::env::function::Prototype<'gc>>> {
+        (!p.is_vararg).then_some(p)
+    }
     match intrinsics::callee_of(b, pc, callee) {
         Callee::Unknown => (callee, NO_PROTO),
         Callee::Const(f) => (callee, fixed(f).map_or(NO_PROTO, |p| b.f.intern_proto(p))),
@@ -1988,6 +1995,10 @@ pub(super) fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> (Va
             b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const);
             (k, fixed(f).map_or(NO_PROTO, |p| b.f.intern_proto(p)))
         }
+        Callee::Made(p) => (
+            callee,
+            fixed_proto(p).map_or(NO_PROTO, |p| b.f.intern_proto(p)),
+        ),
         Callee::Proto(p, _) => {
             let cv = b.boxed(callee);
             let k = b.f.intern_proto(p);
