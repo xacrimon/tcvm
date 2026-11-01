@@ -2545,6 +2545,27 @@ fn tail_self_calls_loop() {
     );
 }
 
+/// Counts up to `top` in inlined bodies (W3 step 7a): `pair` returns `1`
+/// (a register) and what `table.unpack` left in its slots; `add3` is
+/// inlined with arguments up to `top`, a register before them or not, nil
+/// past the count.
+#[test]
+fn bodies_take_values_up_to_top() {
+    agrees(
+        "local function pair(t) return 1, table.unpack(t) end
+        local function add3(a, b, c) return a + b + (c or 100) end
+        local t1, t2, t3 = {5}, {10, 20}, {10, 20, 30}
+        local s = 0
+        for i = 1, 3000 do
+          local x, y, z, w = pair(i % 2 == 0 and t2 or t3)
+          s = s + x + y + z + (w or 7)
+          s = s + add3(table.unpack(i % 3 == 0 and t2 or t3))
+          s = s + add3(i, table.unpack(i % 4 == 0 and t1 or t2))
+        end
+        return tostring(s)",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]

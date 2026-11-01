@@ -18,7 +18,7 @@ use super::{Builder, Inline, SlotState};
 use crate::env::function::LuaFn;
 use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::cfg::{Cfg, RegSet, use_def};
-use crate::jit::ir::ops::{ExitTag, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
 use crate::jit::ir::types::{Rep, Ty};
 use crate::jit::ir::{InlineFrame, Val};
 
@@ -67,7 +67,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         None if tail => 1,
         _ => insn.c(),
     };
-    if nb == 0 || c == 0 {
+    if c == 0 {
         return false;
     }
     let depth = b.inline.as_ref().map_or(0, |i| i.depth);
@@ -113,6 +113,15 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     // cells: they live in their slots across it, read from them after. Its
     // code may say so (a call, a cell); else a body that called anyway (a
     // metamethod, a builtin's fallback) is built again with them there.
+    // Arguments up to `top`, which a real call set (W3 §7).
+    let top_args = if nb == 0 {
+        let Some(n) = top_count(b, pc, b.slot_of(a)) else {
+            return false;
+        };
+        top_values(b, pc, a + 4, proto.num_params, n)
+    } else {
+        Vec::new()
+    };
     // A tail call's frame is gone: what the body it replaces watched, the
     // values its returns report.
     let mut sync = code.cells && !tail;
@@ -161,7 +170,11 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             .into_iter()
             .map(|r| (r as u8, b.reg(r as u8)))
             .collect();
-        let args: Vec<Val> = (0..nb - 1).map(|k| b.reg(a + 4 + k)).collect();
+        let args: Vec<Val> = if nb == 0 {
+            top_args.clone()
+        } else {
+            (0..nb - 1).map(|k| b.reg(a + 4 + k)).collect()
+        };
         let mut watch: Vec<u8> = Vec::new();
         for (k, &v) in args.iter().enumerate().take(proto.num_params as usize) {
             if !tail
@@ -442,6 +455,63 @@ pub(super) fn inline_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
     let seen = watched(b);
     close_frame(b);
     return_values(b, &res, seen);
+}
+
+/// The body's `RETURN` of `R[a..top)` at `pc`, which a real call set (W3
+/// §7); false if no call before it did.
+pub(super) fn inline_return_top(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> bool {
+    let wanted = b.inline.as_ref().expect("an inlined body").wanted;
+    // A body's slots start past a header: `TopArgs(s)` counts from `s + 4`.
+    let Some(n) = top_count(b, pc, b.slot_of(a) - 4) else {
+        return false;
+    };
+    let res = top_values(b, pc, a, wanted, n);
+    let seen = watched(b);
+    close_frame(b);
+    return_values(b, &res, seen);
+    true
+}
+
+/// How many values there are from region slot `s + 4` to `top`, which a
+/// real call at the instruction before `pc` set (`TopArgs`): none if no
+/// call did.
+fn top_count(b: &mut Builder<'_, '_>, pc: u32, s: u8) -> Option<Val> {
+    producer(b, pc)?;
+    Some(b.ins(Op::Helper(HelperId::TopArgs(s)), &[]))
+}
+
+/// The first register of the call at the instruction before `pc` that
+/// returned up to `top`.
+fn producer(b: &Builder<'_, '_>, pc: u32) -> Option<u8> {
+    use BcOp::*;
+    let p = b.code(pc.checked_sub(1)?);
+    let call = matches!(
+        p.op().unquickened(),
+        CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1
+    );
+    (call && p.c() == 0).then_some(p.a())
+}
+
+/// `n` values of `R[r..top)` (`count` of them, an i32) for the instruction
+/// at `pc`: the registers before the call that set `top` as they are, its
+/// results from their slots where below `top` and nil past it. The window
+/// guard keeps the loads in the stack.
+fn top_values(b: &mut Builder<'_, '_>, pc: u32, r: u8, n: u8, count: Val) -> Vec<Val> {
+    let first = producer(b, pc).expect("a call returning to top");
+    let end = b.slot_of(r) as u16 + n as u16;
+    b.ins_exit(Op::GuardWindow(end), &[], ExitTag::Slow);
+    let nil = b.konst(crate::env::value::Value::nil());
+    (0..n)
+        .map(|k| {
+            if r + k < first {
+                return b.reg(r + k);
+            }
+            let kk = b.ki32(k as i32);
+            let has = b.ins(Op::ICmp(Cc::Lt), &[kk, count]);
+            let v = b.ins(Op::Load(b.slot_of(r + k)), &[]);
+            b.ins(Op::Select, &[has, v, nil])
+        })
+        .collect()
 }
 
 /// What the body's watched parameters hold now.

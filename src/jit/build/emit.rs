@@ -399,6 +399,11 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.terminate(Op::Return { a, n: 1 }, &[], &[], None);
         }
         // Up to `top`: the interpreter's RETURN, which closes too.
+        RETURN if rb == 0 && b.inline.as_ref().is_some_and(|i| !i.region_return) => {
+            if !super::inline::inline_return_top(b, pc, a) {
+                dispatch(b);
+            }
+        }
         RETURN if rb == 0 => dispatch(b),
         RETURN => emit_return(b, a, rb - 1),
         TAILCALL if b.inline.is_some() => body_tailcall(b, pc, insn),
