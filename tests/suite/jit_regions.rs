@@ -2678,6 +2678,40 @@ fn recursion_inlines_one_copy() {
     );
 }
 
+/// A call whose callee joins constant functions dispatches on them (W3
+/// §11): `get` of `A` or `B` by the receiver's shape, each body inlined in
+/// its arm. Float fields exit inside each arm; then a `C` takes the real
+/// call for any other callee.
+#[test]
+fn polymorphic_calls_dispatch() {
+    compiles_cleanly(
+        "local A = {} A.__index = A
+        function A.new(v) return setmetatable({v = v}, A) end
+        function A:get() return self.v + 1 end
+        local B = {} B.__index = B
+        function B.new(v) return setmetatable({v = v}, B) end
+        function B:get() return self.v * 2 end
+        local C = {} C.__index = C
+        function C:get() return -self.v end
+        local objs = {}
+        for i = 1, 100 do objs[i] = (i % 2 == 0) and A.new(i) or B.new(i) end
+        local function sum(n)
+          local s = 0
+          for i = 1, n do s = s + objs[(i % 100) + 1]:get() end
+          return s
+        end
+        local t = 0
+        for k = 1, 300 do t = t + sum(100) end
+        objs[3] = A.new(0.5)
+        objs[4] = B.new(0.25)
+        t = t + sum(100)
+        objs[5] = setmetatable({v = 7}, C)
+        t = t + sum(100)
+        return tostring(t)",
+        true,
+    );
+}
+
 /// A metamethod the operand's class gives as a constant inlines (W3 §9):
 /// `a + b`'s `__add`, where `a.y` guarded `a`'s shape. At 2500 its i32 add
 /// overflows and exits inside it (its frame's continuation stores the

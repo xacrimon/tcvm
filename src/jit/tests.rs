@@ -889,6 +889,25 @@ fn recursion_inlines_one_copy() {
     assert_eq!(ir.matches("call r").count(), 4, "{ir}");
 }
 
+/// A call whose callee joins two constant functions dispatches on them
+/// (W3 §11): both bodies inline, one real call stays for any other value.
+#[test]
+fn polymorphic_calls_dispatch() {
+    let src = "local A = {} A.__index = A
+    function A:get() return self.v + 1 end
+    local B = {} B.__index = B
+    function B:get() return self.v * 2 end
+    local objs = {setmetatable({v = 1}, A), setmetatable({v = 2}, B)}
+    function f(o) local r = o:get() return r end
+    for k = 1, 300 do f(objs[k % 2 + 1]) end";
+    let ir = ir_of(src, "f", 0);
+    assert_eq!(ir.matches("call r").count(), 1, "{ir}");
+    assert!(
+        ir.contains("imul") || ir.contains("ishl") || ir.contains("iadd"),
+        "{ir}"
+    );
+}
+
 /// A `setmetatable` result with a constant metatable has the class its
 /// last move gave the table's shape, guarded after the call: its
 /// metamethods are constants that inline (W3 §9). (A second `setmetatable`

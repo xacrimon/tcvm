@@ -1955,7 +1955,7 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     };
     match intrinsics::emit(b, pc, insn, callee) {
         Emitted::No => {
-            if !super::inline::try_inline(b, pc, insn, callee) {
+            if !super::inline::try_inline(b, pc, insn, callee) && !poly_call(b, pc, insn, callee) {
                 call(b, pc, insn, callee)
             }
         }
@@ -1984,6 +1984,71 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
             }
         }
     }
+}
+
+/// A call whose callee joins two to four constant Lua functions (W3 §11):
+/// a test of each, its body inlined in its arm (else a call of it), a real
+/// call for any other value; the arms join after. Not with results up to
+/// `top`, which the arms would leave differently.
+fn poly_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> bool {
+    if insn.c() == 0 || !b.ctx.jit().config.inline {
+        return false;
+    }
+    let Some(targets) = joined_functions(b, b.root_of(callee)) else {
+        return false;
+    };
+    let cv = b.boxed(callee);
+    let join = b.new_block();
+    for f in targets {
+        let k = b.konst(f);
+        let eq = b.ins(Op::SameBits, &[cv, k]);
+        let (yes, no) = (b.new_sealed_succ(), b.new_sealed_succ());
+        b.br(eq, yes, no);
+        b.switch_to(yes);
+        if !super::inline::try_inline(b, pc, insn, k) {
+            call(b, pc, insn, k);
+        }
+        b.flush();
+        b.jump(join);
+        b.switch_to(no);
+    }
+    call(b, pc, insn, callee);
+    b.flush();
+    b.jump(join);
+    enter_join(b, join);
+    true
+}
+
+/// The distinct constant Lua functions without varargs a block parameter
+/// joins, when there are two to four and nothing else.
+fn joined_functions<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<Vec<Value<'gc>>> {
+    let crate::jit::ir::ValDef::Param(blk, k) = b.f.vals[v.idx()].def else {
+        return None;
+    };
+    if !b.bs[blk.idx()].sealed {
+        return None;
+    }
+    let mut out: Vec<Value<'gc>> = Vec::new();
+    for &pred in &b.bs[blk.idx()].preds {
+        let term = b.f.terminator(pred)?;
+        for e in b.f.edges(term).iter().filter(|e| e.target == blk) {
+            let x = *b.f.vl(e.args).get(k as usize)?;
+            if x == v {
+                continue;
+            }
+            let Some(Op::KObj(i)) = b.f.def_op(x) else {
+                return None;
+            };
+            let f = b.f.pool[i as usize];
+            if !(f.get_function().and_then(|f| f.as_lua())).is_some_and(|f| !f.proto.is_vararg) {
+                return None;
+            }
+            if !out.iter().any(|&g| g.to_raw() == f.to_raw()) {
+                out.push(f);
+            }
+        }
+    }
+    (2..=4).contains(&out.len()).then_some(out)
 }
 
 /// The count of `insn` (a call, tail call or return of values up to `top`)

@@ -14,6 +14,7 @@ use crate::jit::ir::{Block, CfgInfo, Func, Inst, Val};
 
 pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
     f.boundaries = true;
+    fold_ptr_params(f);
     let cfg = f.cfg();
     if !cfg.rpo.iter().any(|b| f.blocks[b.idx()].resume) {
         return Ok(());
@@ -41,6 +42,92 @@ fn const_chain(f: &Func<'_>, v: Val) -> bool {
     };
     let op = f.op(d);
     op.is_pure() && !matches!(op, Op::Helper(_)) && f.args(d).iter().all(|&a| const_chain(f, a))
+}
+
+/// Pointer parameters that join unboxings of one table value are that
+/// unboxing, made where their block starts: a call keeps no raw pointer,
+/// and only a definition is made again after one (the receiver of a call
+/// dispatched by shape, W3 §11, across its bodies' calls).
+fn fold_ptr_params(f: &mut Func<'_>) {
+    let cfg = f.cfg();
+    let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
+    let mut changed = false;
+    for &b in &cfg.rpo {
+        let ps = f.params(b).to_vec();
+        if cfg.incoming(b).is_empty() || !ps.iter().any(|&p| f.ty(p).rep == Rep::Ptr) {
+            continue;
+        }
+        let mut at = usize::from(
+            (f.insts_of(b).first()).is_some_and(|&i| matches!(f.op(i), Op::Resume { .. })),
+        );
+        let mut kept = Vec::new();
+        for (k, &p) in ps.iter().enumerate() {
+            let Some(x) = (f.ty(p).rep == Rep::Ptr)
+                .then(|| unboxed_from(f, &cfg, b, k, p))
+                .flatten()
+            else {
+                kept.push(k);
+                continue;
+            };
+            let i = f.make_inst(Op::Unbox(Rep::Ptr), &[x], None, ExitTag::Type);
+            f.insert(b, at, i);
+            at += 1;
+            let u = f.result(i);
+            f.vals[u.idx()].ty = f.vals[p.idx()].ty;
+            map.push(Val(map.len() as u32));
+            map[p.idx()] = u;
+        }
+        if kept.len() == ps.len() {
+            continue;
+        }
+        for &(t, e) in cfg.incoming(b) {
+            let args: Vec<Val> = kept
+                .iter()
+                .map(|&k| f.edge_args(t, e as usize)[k])
+                .collect();
+            f.set_edge_args(t, e as usize, &args);
+        }
+        let ps2: Vec<Val> = kept.iter().map(|&k| ps[k]).collect();
+        f.set_params(b, &ps2);
+        changed = true;
+    }
+    if changed {
+        map.resize(f.vals.len(), Val(0));
+        for (x, m) in map.iter_mut().enumerate() {
+            if m.0 == 0 && x != 0 {
+                *m = Val(x as u32);
+            }
+        }
+        f.apply_replacements(&mut map);
+    }
+}
+
+/// The table value whose unboxing every edge into `b` passes as its `k`th
+/// parameter `p` (through guards and refinements), when it dominates `b`.
+fn unboxed_from(f: &Func<'_>, cfg: &CfgInfo, b: Block, k: usize, p: Val) -> Option<Val> {
+    let mut x = None;
+    for &(t, e) in cfg.incoming(b) {
+        let a = f.edge_args(t, e as usize)[k];
+        if a == p {
+            continue;
+        }
+        let d = f.def_inst(a)?;
+        if f.op(d) != Op::Unbox(Rep::Ptr) {
+            return None;
+        }
+        let r = same_reg(f, f.args(d)[0]);
+        match x {
+            None => x = Some(r),
+            Some(y) if y == r => {}
+            Some(_) => return None,
+        }
+    }
+    let x = x?;
+    let home = match f.vals[x.idx()].def {
+        crate::jit::ir::ValDef::Param(blk, _) => blk,
+        crate::jit::ir::ValDef::Inst(i, _) => f.insts[i.idx()].block,
+    };
+    (home != b && cfg.dominates(home, b)).then_some(x)
 }
 
 /// `v`'s computation again in block `b` at `at` (advanced past it), once
