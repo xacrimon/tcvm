@@ -21,17 +21,185 @@ use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
 use crate::jit::ir::types::{Rep, Ty};
 use crate::jit::ir::{InlineFrame, Val};
 
-/// Callees longer than this many bytecodes are called. Fitted to two
-/// programs: ray's `sphere_distance` (41) inlined runs 7% fewer cycles,
-/// bounce's `Ball:bounce` (49), copied again by loop peeling, 10% more (on
-/// 3% fewer instructions: instruction delivery stalls).
-const INLINE_LIMIT: usize = 48;
-/// Inlined frames nest at most this deep.
+/// Inlined frames nest at most this deep: a snapshot holds three frames.
 const MAX_DEPTH: u8 = 3;
 /// No inlining grows a region past this many instructions: compile time
 /// grows faster than the region (json at 3000: 81 ms of compiles, 22 without
 /// inlining).
 const MAX_INSTS: usize = 1500;
+
+/// Callees of at most this many IR instructions inline without drawing on
+/// the budget (Turbolev's tiny functions, 10 nodes).
+const TINY: u32 = 10;
+/// The IR instructions inlined bodies other than tiny ones may add.
+const BUDGET: u32 = 1200;
+/// A callee that is not tiny: the least calls per call of its caller, and
+/// the most bytecodes (Turbolev's 0.15 and 460).
+const MIN_FREQ: f64 = 0.15;
+const MAX_BYTECODES: usize = 460;
+/// IR instructions per bytecode where no build measured a callee.
+const IR_PER_BC: u32 = 8;
+
+/// Which call sites inline (W3 §12): ranked before the build by frequency
+/// over size, a site in a loop by half again, and taken greedily within the
+/// budget, tiny callees always. Sites by their function's code and pc.
+#[derive(Default)]
+pub(crate) struct Plan {
+    take: std::collections::HashSet<(usize, u32), foldhash::fast::FixedState>,
+    ranked: std::collections::HashSet<(usize, u32), foldhash::fast::FixedState>,
+    spent: u32,
+}
+
+/// What a body of `p` adds: its last build's IR, else an estimate.
+fn size_of(p: &crate::env::function::Prototype<'_>) -> u32 {
+    match p.ir_size.get() {
+        0 => p.code.len() as u32 * IR_PER_BC,
+        n => n,
+    }
+}
+
+/// A site's candidate: where it is, its callee, how often it runs per
+/// region entry, and the prototypes of the frames it would run in.
+struct Cand<'gc> {
+    at: (usize, u32),
+    callee: crate::dmm::Gc<'gc, crate::env::function::Prototype<'gc>>,
+    freq: f64,
+    score: f64,
+    chain: Vec<usize>,
+}
+
+/// Plan the region's inlining from the interpreter's call counts.
+pub(super) fn make_plan(b: &mut Builder<'_, '_>) {
+    let mut cands = Vec::new();
+    let region = b.proto;
+    let code = region.code.as_ptr() as usize;
+    push_sites(
+        region,
+        b.cfg,
+        1.0,
+        vec![code],
+        &mut b.known.plan,
+        &mut cands,
+    );
+    while let Some(k) = (0..cands.len()).max_by(|&x, &y| cands[x].score.total_cmp(&cands[y].score))
+    {
+        let c = cands.swap_remove(k);
+        let size = size_of(&c.callee);
+        if size > TINY {
+            let plan = &mut b.known.plan;
+            if c.freq < MIN_FREQ
+                || c.callee.code.len() > MAX_BYTECODES
+                || plan.spent + size > BUDGET
+            {
+                continue;
+            }
+            plan.spent += size;
+        }
+        b.known.plan.take.insert(c.at);
+        if c.chain.len() >= MAX_DEPTH as usize {
+            continue;
+        }
+        let key = crate::dmm::Gc::as_ptr(c.callee) as usize;
+        let prepared = match b.known.callees.get(&key) {
+            Some(p) => p.clone(),
+            None => {
+                let p = prepare(c.callee).map(Rc::new);
+                b.known.callees.insert(key, p.clone());
+                p
+            }
+        };
+        if let Some(p) = prepared {
+            let mut chain = c.chain.clone();
+            chain.push(c.callee.code.as_ptr() as usize);
+            push_sites(
+                c.callee,
+                &p.cfg,
+                c.freq,
+                chain,
+                &mut b.known.plan,
+                &mut cands,
+            );
+        }
+    }
+}
+
+/// The call sites of `proto` (its `cfg`) as candidates, run `freq` times
+/// per region entry each time `proto` runs.
+fn push_sites<'gc>(
+    proto: crate::dmm::Gc<'gc, crate::env::function::Prototype<'gc>>,
+    cfg: &Cfg,
+    freq: f64,
+    chain: Vec<usize>,
+    plan: &mut Plan,
+    cands: &mut Vec<Cand<'gc>>,
+) {
+    use crate::env::feedback::{MEGAMORPHIC, slot_proto};
+    let runs = proto.feedback.invocations().max(1) as f64;
+    let code = proto.code.as_ptr() as usize;
+    for (pc, insn) in cfg.code.iter().enumerate() {
+        use BcOp::*;
+        let call = matches!(
+            insn.op().unquickened(),
+            CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 | TAILCALL
+        );
+        let blk = cfg.block_of[pc] as usize;
+        if !call || cfg.never_ran[blk] {
+            continue;
+        }
+        let calls = proto.feedback.call_count(pc) as f64;
+        let w = proto.feedback.callee(pc).map_or(0, |c| c.get());
+        let callee = match slot_proto(w) {
+            Some(p) => Some(p),
+            None if w == 0 || w == MEGAMORPHIC => None,
+            // SAFETY: a callee word other than those holds a value.
+            None => unsafe { crate::env::value::Value::from_raw(w) }
+                .get_function()
+                .and_then(|f| f.as_lua())
+                .map(|f| f.proto),
+        };
+        let Some(callee) = callee.filter(|p| !p.is_vararg) else {
+            continue;
+        };
+        // Recursion inlines one copy (W3 §8).
+        let ptr = callee.code.as_ptr() as usize;
+        if calls == 0.0 || chain.iter().filter(|&&c| c == ptr).count() > 1 {
+            continue;
+        }
+        plan.ranked.insert((code, pc as u32));
+        let f = freq * calls / runs;
+        let mut score = f / size_of(&callee) as f64;
+        if cfg.loop_of[blk].is_some() {
+            score *= 1.5;
+        }
+        cands.push(Cand {
+            at: (code, pc as u32),
+            callee,
+            freq: f,
+            score,
+            chain: chain.clone(),
+        });
+    }
+}
+
+/// Whether the call at `pc` may inline `callee`: as the plan says, or for a
+/// site the plan did not rank (its callee known only while building) when
+/// it is tiny or fits what is left of the budget.
+fn planned(b: &mut Builder<'_, '_>, pc: u32, callee: &crate::env::function::Prototype<'_>) -> bool {
+    let at = (b.proto.code.as_ptr() as usize, pc);
+    let plan = &mut b.known.plan;
+    if plan.take.contains(&at) {
+        return true;
+    }
+    let size = size_of(callee);
+    if size <= TINY {
+        return true;
+    }
+    if plan.ranked.contains(&at) || plan.spent + size > BUDGET {
+        return false;
+    }
+    plan.spent += size;
+    true
+}
 
 /// A callee's code as its bodies are built, kept per prototype for the
 /// compile (`Known::callees`).
@@ -155,7 +323,7 @@ fn inline_site(
         b.reg_base() + a as usize + 4
     };
     if proto.is_vararg
-        || proto.code.len() > INLINE_LIMIT
+        || !planned(b, pc, &proto)
         || runs_in_chain(b, proto) > 1
         || base + proto.max_stack_size as usize > 255
     {
@@ -326,7 +494,9 @@ fn inline_site(
         };
         let from = b.cur;
         let mut ib = Builder::new_inline(b, lf, proto, &code.cfg, inline);
+        let insts = ib.f.insts.len();
         let entry = ib.build_inline(&args, from, MAX_INSTS);
+        let grew = (ib.f.insts.len() - insts) as u32;
         let inline = ib.finish(b);
         let Some(entry) = entry else {
             if !tail {
@@ -337,6 +507,8 @@ fn inline_site(
             b.known.recv_shapes = recv_shapes;
             return None;
         };
+        // What its body came to, the plan's size of it from here on.
+        proto.ir_size.set(grew);
         if inline.called && !sync && b.cfg.captured.iter().next().is_some() {
             b.f.blocks[cont.idx()].dead = true;
             b.f.def_snaps.truncate(def_snaps);

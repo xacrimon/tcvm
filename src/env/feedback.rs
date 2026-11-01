@@ -269,6 +269,22 @@ impl<'gc> FeedbackVector<'gc> {
         }
     }
 
+    /// The calls the interpreter made at `pc` (W1's count; 0 for a site of
+    /// another kind).
+    #[inline]
+    pub(crate) fn call_count(&self, pc: usize) -> u64 {
+        match self.slot(pc) {
+            Some((w, SlotKind::Call)) => self.word(w + 2).get(),
+            _ => 0,
+        }
+    }
+
+    /// The function's invocations (`FUNC`), the word before slot 0.
+    #[inline]
+    pub(crate) fn invocations(&self) -> u64 {
+        self.words[self.head as usize - 1].get()
+    }
+
     /// The callee word of the call slot at word `w` (a call's `d`, the null
     /// slot's included); its count is the word after.
     #[inline(always)]

@@ -71,6 +71,10 @@ pub struct Prototype<'gc> {
     /// `PROTO_CLCOUNT`).
     #[collect(require_static)]
     pub(crate) closures: Cell<u8>,
+    /// IR instructions of its last build, a function region's or an
+    /// inlined body's (0 before one): the inliner's size estimate (W3 §12).
+    #[collect(require_static)]
+    pub(crate) ir_size: Cell<u32>,
 }
 
 /// A prototype's bytecode, in cells: the interpreter rewrites an

@@ -889,6 +889,79 @@ fn recursion_inlines_one_copy() {
     assert_eq!(ir.matches("call r").count(), 4, "{ir}");
 }
 
+/// The plan inlines by frequency over size (W3 §12): `h`, longer than the
+/// old 48-bytecode limit, runs on every call of `f` and inlines; `g` runs
+/// on one call in a hundred, under the frequency floor, and is called.
+#[test]
+fn inlining_follows_the_plan() {
+    let src = "local function h(x)
+        local a0 = x
+        local a1 = x * 1 + a0
+        local a2 = x * 2 + a1
+        local a3 = x * 3 + a2
+        local a4 = x * 4 + a3
+        local a5 = x * 5 + a4
+        local a6 = x * 6 + a5
+        local a7 = x * 7 + a6
+        local a8 = x * 8 + a7
+        local a9 = x * 9 + a8
+        local a10 = x * 10 + a9
+        local a11 = x * 11 + a10
+        local a12 = x * 12 + a11
+        local a13 = x * 13 + a12
+        local a14 = x * 14 + a13
+        local a15 = x * 15 + a14
+        local a16 = x * 16 + a15
+        local a17 = x * 17 + a16
+        local a18 = x * 18 + a17
+        local a19 = x * 19 + a18
+        local a20 = x * 20 + a19
+        local a21 = x * 21 + a20
+        local a22 = x * 22 + a21
+        local a23 = x * 23 + a22
+        local a24 = x * 24 + a23
+        local a25 = x * 25 + a24
+        return a25
+    end
+    local function g(x)
+        local a0 = x
+        local a1 = x * 1 + a0
+        local a2 = x * 2 + a1
+        local a3 = x * 3 + a2
+        local a4 = x * 4 + a3
+        local a5 = x * 5 + a4
+        local a6 = x * 6 + a5
+        local a7 = x * 7 + a6
+        local a8 = x * 8 + a7
+        local a9 = x * 9 + a8
+        local a10 = x * 10 + a9
+        local a11 = x * 11 + a10
+        local a12 = x * 12 + a11
+        local a13 = x * 13 + a12
+        local a14 = x * 14 + a13
+        local a15 = x * 15 + a14
+        local a16 = x * 16 + a15
+        local a17 = x * 17 + a16
+        local a18 = x * 18 + a17
+        local a19 = x * 19 + a18
+        local a20 = x * 20 + a19
+        local a21 = x * 21 + a20
+        local a22 = x * 22 + a21
+        local a23 = x * 23 + a22
+        local a24 = x * 24 + a23
+        local a25 = x * 25 + a24
+        return a25 + x
+    end
+    function f(n)
+        local r = h(n)
+        if n % 100 == 0 then r = r + g(n) end
+        return r
+    end
+    for k = 1, 3000 do f(k) end";
+    let ir = ir_of(src, "f", 0);
+    assert_eq!(ir.matches("call r").count(), 1, "{ir}");
+}
+
 /// A call whose callee joins two constant functions dispatches on them
 /// (W3 §11): both bodies inline, one real call stays for any other value.
 #[test]

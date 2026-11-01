@@ -231,6 +231,8 @@ pub(crate) struct Known<'gc> {
     pub(crate) callees: crate::jit::FastMap<usize, Option<std::rc::Rc<inline::InlineCode>>>,
     /// Closures a `CLOSURE` of the compile made, with their prototypes.
     pub(crate) made: crate::jit::FastMap<Val, Gc<'gc, Prototype<'gc>>>,
+    /// The inlining plan (W3 §12).
+    pub(crate) plan: inline::Plan,
 }
 
 pub(crate) struct Builder<'a, 'gc> {
@@ -1976,6 +1978,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     // --- driver -------------------------------------------------------------
 
     pub(crate) fn build(mut self) -> Result<Func<'gc>, BuildError> {
+        inline::make_plan(&mut self);
         let entry_pc = self.f.meta.entry_pc;
         let entry_bc = self.cfg.block_of[entry_pc as usize];
         let prologue = self.new_root(vec![TypeSet::ANY; self.nregs]);
