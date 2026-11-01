@@ -401,6 +401,12 @@ fn builtin<'gc>(
         };
         b.set(a, r);
     }
+    // `rawset` may change a class (`MtCache::member_write`); a `TAILCALL`
+    // only returns after it.
+    if h == HelperId::RawSet && b.code(b.pc).op() != crate::instruction::Op::TAILCALL {
+        b.flush();
+        b.lazy_exit_after();
+    }
     out
 }
 

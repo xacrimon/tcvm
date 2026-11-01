@@ -438,6 +438,8 @@ pub(crate) enum ExitTag {
     /// A prologue guard on an entry value (5.2): fails to the entry-fail
     /// stub, which records the entry's kinds.
     Entry,
+    /// A `LazyExit`: a dependency broke.
+    Lazy,
 }
 
 impl ExitTag {
@@ -739,6 +741,10 @@ pub(crate) enum Op {
     },
     /// Leave for the interpreter (with a snapshot).
     Deopt,
+    /// Leave once the region is invalidated (ws2 §5.4): nothing until then,
+    /// its place patched to the exit after. One follows every call and
+    /// table write, where a dependency can break.
+    LazyExit,
 }
 
 bitflags::bitflags! {
@@ -882,6 +888,7 @@ impl Op {
                 e(Flags::TERMINATOR | Flags::TAILOUT, Mem::ALL, Mem::ALL)
             }
             Deopt => Effects::flags(Flags::TERMINATOR | DEOPT),
+            LazyExit => Effects::flags(Flags::SIDE_EFFECT | DEOPT),
             _ => Effects::NONE,
         }
     }
@@ -938,7 +945,8 @@ impl Op {
             | TailEnter { .. }
             | GuardFits(_)
             | GuardWindow(_)
-            | Deopt => 0,
+            | Deopt
+            | LazyExit => 0,
             Resume { c } => match c {
                 2 => 1,
                 3 => 2,

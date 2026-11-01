@@ -527,6 +527,10 @@ pub struct MtCacheData<'gc> {
     /// share a shape.
     pub dict_sentinel: Lock<Option<Shape<'gc>>>,
     pub dict_sentinel_poly: Lock<Option<Shape<'gc>>>,
+    /// The regions assuming the bits stay (ws2 §5.3), by the bits.
+    deps: Lock<Option<Gc<'gc, crate::jit::deps::DepList<'gc>>>>,
+    #[collect(require_static)]
+    volatile: Cell<bool>,
 }
 
 /// A metamethod in [`MtCacheData`]. Untraced: every member metatable holds
@@ -666,6 +670,8 @@ impl<'gc> MtCache<'gc> {
                 rest: Lock::new(rest),
                 dict_sentinel: Lock::new(None),
                 dict_sentinel_poly: Lock::new(None),
+                deps: Lock::new(None),
+                volatile: Cell::new(false),
             },
         ))
     }
@@ -747,11 +753,12 @@ impl<'gc> MtCache<'gc> {
 
     /// Apply the write of `key` by the member whose `TableState` is at
     /// `member` to the class, which the member's metamethods define: in
-    /// place for its only member, else the class is retired. `mc` is `None`
-    /// for a weak clear.
+    /// place for its only member, else the class is retired. Code depending
+    /// on what changed is invalidated. A weak clear passes its
+    /// finalization's `mc`: storing nil allocates and adopts nothing.
     pub fn member_write(
         self,
-        mc: Option<&Mutation<'gc>>,
+        mc: &Mutation<'gc>,
         key: LuaString<'gc>,
         value: Value<'gc>,
         member: usize,
@@ -759,9 +766,12 @@ impl<'gc> MtCache<'gc> {
         if self.is_stale() {
             return;
         }
-        let unchanged = match metamethod_bit_of_bytes(key.as_bytes()) {
-            Some(bit) => self.mm(bit).same_bits(&value),
-            None if key.as_bytes() == b"__mode" => self.weak() == WeakMode::of(value),
+        let (unchanged, bit) = match metamethod_bit_of_bytes(key.as_bytes()) {
+            Some(bit) => (self.mm(bit).same_bits(&value), bit),
+            // No code depends on the mode.
+            None if key.as_bytes() == b"__mode" => {
+                (self.weak() == WeakMode::of(value), MetamethodBits::empty())
+            }
             None => return,
         };
         if unchanged {
@@ -769,9 +779,51 @@ impl<'gc> MtCache<'gc> {
         }
         if self.0.members.get() > 1 {
             self.make_stale(member);
+            self.changed(mc, MetamethodBits::all());
             return;
         }
         self.mirror(mc, key, value);
+        self.changed(mc, bit);
+    }
+
+    /// Invalidate the code depending on `bits` of this class; a class that
+    /// had some is volatile from then on.
+    fn changed(self, mc: &Mutation<'gc>, bits: MetamethodBits) {
+        if let Some(list) = self.0.deps.get()
+            && !bits.is_empty()
+            && crate::jit::deps::invalidate(mc, list, bits.bits())
+        {
+            self.0.volatile.set(true);
+        }
+    }
+
+    /// Note that `region` assumes `bits` of this class stay as they are
+    /// (ws2 §5.5).
+    pub(crate) fn depend(
+        self,
+        mc: &Mutation<'gc>,
+        region: Gc<'gc, crate::jit::region::Region<'gc>>,
+        bits: MetamethodBits,
+    ) {
+        let list = match self.0.deps.get() {
+            Some(l) => l,
+            None => {
+                let l = Gc::new(mc, RefLock::new(Vec::new()));
+                // Adopting a fresh `Gc` through the lock, as
+                // `ensure_dict_sentinel` does.
+                mc.backward_barrier(Gc::erase(self.0), None);
+                unsafe { self.0.deps.as_cell() }.set(Some(l));
+                l
+            }
+        };
+        crate::jit::deps::add(mc, list, region, bits.bits());
+    }
+
+    /// Whether code that depended on this class was invalidated: the
+    /// compiler reads its bits live instead (V8's mutable property cells).
+    #[inline]
+    pub(crate) fn is_volatile(self) -> bool {
+        self.0.volatile.get()
     }
 
     /// Whether a metatable may join this class whose mode is `weak` and
@@ -808,21 +860,6 @@ impl<'gc> MtCache<'gc> {
     #[inline]
     pub fn get(self) -> MetamethodBits {
         self.0.get()
-    }
-
-    #[inline]
-    pub fn set_bit(self, bit: MetamethodBits) {
-        self.0.set_bit(bit);
-    }
-
-    #[inline]
-    pub fn clear_bit(self, bit: MetamethodBits) {
-        self.0.clear_bit(bit);
-    }
-
-    #[inline]
-    pub fn update(self, bit: MetamethodBits, value: crate::env::value::Value<'gc>) {
-        self.0.update(bit, value);
     }
 
     #[inline]
@@ -875,10 +912,10 @@ impl<'gc> MtCache<'gc> {
     }
 
     /// Mirror a write of `key` to this cache's metatable into its bits and
-    /// weak mode; only keys [`mirrored`] names change anything. `mc` may be
-    /// `None` for a store of nil (a weak clear), which allocates nothing.
+    /// weak mode; only keys [`mirrored`] names change anything. A store of
+    /// nil allocates nothing. Only `member_write`'s, which invalidates.
     #[inline]
-    pub fn mirror(self, mc: Option<&Mutation<'gc>>, key: LuaString<'gc>, value: Value<'gc>) {
+    fn mirror(self, mc: &Mutation<'gc>, key: LuaString<'gc>, value: Value<'gc>) {
         match metamethod_bit_of_bytes(key.as_bytes()) {
             Some(bit) => {
                 if bit == MetamethodBits::INDEX {
@@ -890,7 +927,6 @@ impl<'gc> MtCache<'gc> {
                         Some(rest) => Some(rest),
                         None if value.is_nil() => None,
                         None => {
-                            let mc = mc.expect("a metamethod stored without a mutation");
                             let rest = Gc::new(
                                 mc,
                                 MmValues(std::array::from_fn(|_| Cell::new(Value::nil()))),
@@ -906,7 +942,7 @@ impl<'gc> MtCache<'gc> {
                         rest.0[bit.bits().trailing_zeros() as usize].set(value);
                     }
                 }
-                self.update(bit, value)
+                self.0.update(bit, value)
             }
             None if key.as_bytes() == b"__mode" => self.0.weak.set(WeakMode::of(value)),
             None => {}

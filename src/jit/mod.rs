@@ -4,6 +4,7 @@
 pub(crate) mod backend;
 pub(crate) mod build;
 pub(crate) mod compile;
+pub(crate) mod deps;
 pub(crate) mod feedback;
 pub(crate) mod helpers;
 pub(crate) mod ir;
@@ -171,6 +172,9 @@ handler! {
         }
         base = fbase;
         let closure = fclosure;
+        if region.invalidated.get() {
+            retire_invalidated(rt, region_closure, region);
+        }
         on_exit(rt, region_closure, closure, base, region, e, snap.kind, snap.pc);
         let at = if snap.kind == ExitKind::Before { snap.pc } else { snap.pc + 1 };
         let resume = unsafe { closure.code.add(at as usize) };
@@ -193,6 +197,23 @@ handler! {
         let region: &Region<'gc> = unsafe { &*(insn.raw() as *const Region<'gc>) };
         let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
         on_entry_fail(rt, closure, base, region);
+        let site = unsafe { closure.code.add(region.entry_pc as usize) };
+        let mut word = unsafe { *site };
+        if word.is_jit_word() {
+            word = original_of(closure, word);
+        }
+        pc = unsafe { site.add(1) };
+        let h = rt.handler(word.opcode());
+        tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
+    }
+
+    /// The entry of a region a broken dependency invalidated
+    /// (`Region::invalidate`), from its stub with `insn` the region and its
+    /// frame not open: retire the entry and run the original word.
+    slow fn jit_dead_entry {
+        let region: &Region<'gc> = unsafe { &*(insn.raw() as *const Region<'gc>) };
+        let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        retire_invalidated(rt, closure, region);
         let site = unsafe { closure.code.add(region.entry_pc as usize) };
         let mut word = unsafe { *site };
         if word.is_jit_word() {
@@ -566,6 +587,34 @@ fn retire_entry<'gc>(
     }
 }
 
+/// Retire the entry of invalidated `region` of `closure`'s prototype, unless
+/// a recompile replaced it already.
+fn retire_invalidated<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, region: &Region<'gc>) {
+    if region.retired.replace(true) {
+        return;
+    }
+    log(ctx, || {
+        format!(
+            "invalidated {} pc{}",
+            crate::jit::compile::chunk_name(closure),
+            region.entry_pc
+        )
+    });
+    let Some(state) = closure.proto.jit.get() else {
+        return;
+    };
+    let mut st = state.borrow_mut(ctx.mutation());
+    let me = region as *const Region<'gc>;
+    if let Some(k) = st
+        .entries
+        .iter()
+        .position(|e| e.region.is_some_and(|r| Gc::as_ptr(r) == me))
+    {
+        let e = st.entries.remove(k);
+        retire_entry(ctx, closure, &mut st, &e);
+    }
+}
+
 /// What an exit leaves behind: the operand kinds the guard saw, the count,
 /// and a recompile request when the exit is hot. `closure` and `base` are
 /// the innermost frame's, an inlined callee's when the exit is in its body
@@ -583,8 +632,9 @@ fn on_exit<'gc>(
 ) {
     use crate::jit::ir::ops::ExitTag;
     // A `Before` exit's operands are in their home slots; the other kinds
-    // follow a completed instruction and have no failed guard.
-    if kind == ExitKind::Before {
+    // follow a completed instruction and have no failed guard, as a lazy
+    // exit has none.
+    if kind == ExitKind::Before && e.tag != ExitTag::Lazy {
         let extra = match e.tag {
             ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
             ExitTag::Mm => crate::jit::feedback::MM,

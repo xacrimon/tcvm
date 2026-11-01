@@ -193,4 +193,6 @@ pub(super) fn emit_tforcall(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     for (k, &v) in rs.iter().enumerate() {
         b.set(vars + k as u8, v);
     }
+    b.flush();
+    b.lazy_exit_after();
 }

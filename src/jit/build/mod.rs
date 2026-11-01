@@ -11,6 +11,7 @@ mod iter;
 mod tables;
 
 use crate::dmm::Gc;
+use crate::env::MetamethodBits;
 use crate::env::function::{LuaFn, Prototype};
 use crate::env::value::Value;
 use crate::instruction::Instruction;
@@ -1143,7 +1144,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// Note the `After` snapshot of `v`'s definition, the instruction at the
     /// current pc, and of the loads of the block it starts when that is a
     /// resume block (9.1).
-    pub(crate) fn note_def(&mut self, vals: &[Val], resume: Option<Block>) {
+    pub(crate) fn note_def(&mut self, vals: &[Val], resume: Option<Block>) -> Snap {
         self.flush();
         let s = self.snap_after(self.pc);
         for &v in vals {
@@ -1151,6 +1152,40 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         }
         if let Some(b) = resume {
             self.bs[b.idx()].after = Some(s);
+        }
+        s
+    }
+
+    /// A lazy exit with `s` (ws2 §5.4), for a point right after a call or a
+    /// table write, before anything that assumes what a dependency names.
+    pub(crate) fn lazy_exit(&mut self, s: Snap) {
+        self.ins_snap(Op::LazyExit, &[], s, ExitTag::Lazy);
+    }
+
+    /// A lazy exit past the instruction, once its writes are flushed.
+    pub(crate) fn lazy_exit_after(&mut self) {
+        debug_assert!(self.pending.is_empty());
+        let s = self.snap_after(self.pc);
+        self.lazy_exit(s);
+    }
+
+    /// The snapshot that runs the instruction at `pc` from the current
+    /// state: a successor of the one being emitted.
+    pub(crate) fn snap_at(&mut self, pc: u32) -> Snap {
+        let live = self.cfg.live_in[pc as usize];
+        self.snapshot(pc, ExitKind::Before, live)
+    }
+
+    /// Assume `class` keeps `bits` as they are now (ws2 §5.5).
+    pub(crate) fn depend_class(&mut self, class: crate::env::MtCache<'gc>, bits: MetamethodBits) {
+        match self
+            .f
+            .deps
+            .iter_mut()
+            .find(|(c, _)| c.as_word() == class.as_word())
+        {
+            Some((_, b)) => *b |= bits,
+            None => self.f.deps.push((class, bits)),
         }
     }
 
@@ -1677,6 +1712,13 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             }
         }
         remove_trivial_params(&mut self.f);
+        // Nothing can invalidate a region without dependencies.
+        if self.f.deps.is_empty() {
+            for b in 0..self.f.blocks.len() {
+                self.f
+                    .retain(Block(b as u32), |f, i| f.op(i) != Op::LazyExit);
+            }
+        }
         Ok(self.f)
     }
 

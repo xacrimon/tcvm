@@ -346,6 +346,7 @@ pub(crate) fn compile<'gc>(
             abi::coro_yield as *const () as usize,
         ],
         native_act: crate::vm::native::native_act as *const () as usize,
+        dead_entry: crate::jit::jit_dead_entry as *const () as usize,
         trampolines,
         direct: f
             .protos
@@ -402,6 +403,16 @@ pub(crate) fn compile<'gc>(
         .direct
         .iter()
         .map(|&(l, p)| (em.asm.label_offset(l) as u32, p))
+        .collect();
+    // Each patch as the `b` it writes.
+    let lazy: Box<[(u32, u32)]> = em
+        .lazy
+        .iter()
+        .map(|&(at, to)| {
+            let (at, to) = (em.asm.label_offset(at), em.asm.label_offset(to));
+            let d = (to as i64 - at as i64) >> 2;
+            (at as u32, 0x1400_0000 | (d as u32 & 0x03ff_ffff))
+        })
         .collect();
     let words = em
         .asm
@@ -545,6 +556,8 @@ pub(crate) fn compile<'gc>(
             retired: std::cell::Cell::new(false),
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
             sites: sites.into_boxed_slice(),
+            lazy,
+            invalidated: std::cell::Cell::new(false),
         },
     );
     region
@@ -560,6 +573,9 @@ pub(crate) fn compile<'gc>(
         let state = crate::jit::state::jit_state(ctx.mutation(), proto);
         let weak = crate::dmm::Gc::downgrade(region);
         state.borrow_mut(ctx.mutation()).callers.push((weak, off));
+    }
+    for &(class, bits) in &f.deps {
+        class.depend(ctx.mutation(), region, bits);
     }
     Ok(region)
 }

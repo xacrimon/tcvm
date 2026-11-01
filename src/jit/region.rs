@@ -237,6 +237,12 @@ pub(crate) struct Region<'gc> {
     /// it, by the code offset of the return addresses naming them.
     #[collect(require_static)]
     pub(crate) sites: Box<[Site]>,
+    /// For a region with dependencies (ws2 §5.3), what `invalidate`
+    /// writes: (code offset, branch), the entry's and each lazy exit's.
+    #[collect(require_static)]
+    pub(crate) lazy: Box<[(u32, u32)]>,
+    #[collect(require_static)]
+    pub(crate) invalidated: Cell<bool>,
 }
 
 /// A call of the region's: its return address, and what a walk of the
@@ -260,6 +266,20 @@ pub(crate) struct Site {
 impl<'gc> Region<'gc> {
     pub(crate) fn snap(&self, e: &ExitInfo) -> SnapView<'_> {
         SnapView::decode(&self.snaps[e.snap as usize..])
+    }
+
+    /// A dependency broke (ws2 §5.4): from now on its entry goes to
+    /// `jit_dead_entry`, and a frame leaves at the first lazy exit it
+    /// reaches, each past a call or a table write, where any break happens.
+    /// No context is needed, so a collector's weak clear may break one; the
+    /// entry is retired by whichever comes first.
+    pub(crate) fn invalidate(&self) {
+        if self.invalidated.replace(true) {
+            return;
+        }
+        for &(off, w) in &self.lazy {
+            self.code.patch_u32(off as usize, w);
+        }
     }
 
     /// The site whose return address is `ra`, and its snapshot.

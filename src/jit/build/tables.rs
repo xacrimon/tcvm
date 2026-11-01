@@ -10,7 +10,9 @@ use crate::env::table::{SlotLoc, Table};
 use crate::env::value::Value;
 use crate::env::{MetamethodBits, Shape};
 use crate::instruction::{Instruction, Op as BcOp};
-use crate::jit::build::emit::{arm_end, branch_arm, calls_mm, cold, enter_join, mm_call};
+use crate::jit::build::emit::{
+    arm_end, branch_arm, call_arm_end, calls_mm, cold, enter_join, mm_call,
+};
 use crate::jit::build::{Builder, Shapes};
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
@@ -161,17 +163,31 @@ fn dispatch<'gc>(
     enter_join(b, join);
 }
 
-/// Whether the class `shape` pins has `bit` now, read live (a shape pins
-/// its class, not the class's bits); `None` for a shape without a class,
-/// whose tables have no metatable.
+/// Whether the class `shape` pins has `bit` (a shape pins its class, not
+/// the class's bits): a constant the region depends on (ws2 §5.5), or read
+/// live from a class whose dependents were invalidated before; `None` for a
+/// shape without a class, whose tables have no metatable.
 fn class_has<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, bit: MetamethodBits) -> Option<Val> {
-    shape.mt_cache()?;
+    let class = shape.mt_cache()?;
+    // A stale class has every bit, and changes no more.
+    if class.is_stale() {
+        return Some(b.ins(Op::KB1(true), &[]));
+    }
+    if !class.is_volatile() {
+        b.depend_class(class, bit);
+        return Some(b.ins(Op::KB1(class.get().contains(bit)), &[]));
+    }
     let k = b.intern_shape(shape);
     let bits = b.ins(Op::ClassBits(k), &[]);
     let mask = b.ki32(bit.bits() as i32);
     let has = b.ins(Op::IAnd, &[bits, mask]);
     let zero = b.ki32(0);
     Some(b.ins(Op::ICmp(Cc::Ne), &[has, zero]))
+}
+
+/// Whether `has` is a constant false: the class lacks the bit for good.
+fn never(b: &Builder<'_, '_>, has: Val) -> bool {
+    b.f.def_op(has) == Some(Op::KB1(false))
 }
 
 /// Whether the class of table `t` (a `Ptr`) has `bit`, read live: a table's
@@ -210,7 +226,7 @@ fn index(b: &mut Builder<'_, '_>, dst: u8, recv: Val, key: Val) -> Val {
     cold(b, |b| {
         let f = function_or_deopt(b, HelperId::IndexFn, recv, key);
         let w = mm_call(b, f, &[recv, key]);
-        arm_end(b, join, dst, w);
+        call_arm_end(b, join, Some((dst, w)));
     });
     b.switch_to(ok);
     arm_end(b, join, dst, r);
@@ -226,9 +242,12 @@ fn newindex(b: &mut Builder<'_, '_>, recv: Val, key: Val, v: Val, keyed: bool) {
     let r = b.ins(Op::Helper(HelperId::NewIndex { keyed }), &[recv, key, v]);
     let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
     let failed = b.ins(Op::SameBits, &[r, fail]);
+    // The store may change a class (`MtCache::member_write`).
     if !calls_mm(b) {
         let s = b.snap_before();
         b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Mm);
+        b.flush();
+        b.lazy_exit_after();
         return;
     }
     let join = b.new_block();
@@ -236,10 +255,10 @@ fn newindex(b: &mut Builder<'_, '_>, recv: Val, key: Val, v: Val, keyed: bool) {
     cold(b, |b| {
         let f = function_or_deopt(b, HelperId::NewIndexFn, recv, key);
         mm_call(b, f, &[recv, key, v]);
-        b.jump(join);
+        call_arm_end(b, join, None);
     });
     b.switch_to(ok);
-    b.jump(join);
+    call_arm_end(b, join, None);
     enter_join(b, join);
 }
 
@@ -262,15 +281,16 @@ fn nil_walks<'gc>(
     recv: Val,
     key: Val,
 ) {
-    if shape.mt_cache().is_none() {
+    let has = class_has(b, shape, MetamethodBits::INDEX);
+    if has.is_none_or(|h| never(b, h)) {
         b.set(dst, v);
         b.note_def(&[v], None);
         return;
     }
+    let has = has.unwrap();
     let join = b.new_block();
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
     let not_nil = branch_arm(b, nil);
-    let has = class_has(b, shape, MetamethodBits::INDEX).unwrap();
     let plain = branch_arm(b, has);
     cold(b, |b| {
         let w = index(b, dst, recv, key);
@@ -719,7 +739,9 @@ fn trans_store<'gc>(
     kid: u32,
     v: Val,
 ) {
-    if let Some(has) = class_has(b, from, MetamethodBits::NEWINDEX) {
+    if let Some(has) = class_has(b, from, MetamethodBits::NEWINDEX)
+        && !never(b, has)
+    {
         let s = b.snap_before();
         b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Slow);
     }
@@ -770,7 +792,9 @@ fn own_store<'gc>(
     kid: u32,
     v: Val,
 ) {
-    if shape.mt_cache().is_some() {
+    if let Some(has) = class_has(b, shape, MetamethodBits::NEWINDEX)
+        && !never(b, has)
+    {
         // `__newindex` fires only on a nil slot.
         let old = b.ins(
             Op::TabLoad {
@@ -782,7 +806,6 @@ fn own_store<'gc>(
         let join = b.new_block();
         let nil = b.ins(Op::IsType(TypeSet::NIL), &[old]);
         let rest = branch_arm(b, nil);
-        let has = class_has(b, shape, MetamethodBits::NEWINDEX).unwrap();
         let s = b.snap_before();
         b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Slow);
         b.jump(join);

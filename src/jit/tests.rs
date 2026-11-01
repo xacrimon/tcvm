@@ -458,3 +458,89 @@ fn polymorphic_dispatch_carries_its_shapes() {
     assert_eq!(count("guardshape("), 1, "{ir}");
     assert_eq!(count("deopt"), 0, "{ir}");
 }
+
+/// Only a region with dependencies keeps lazy exits (ws2 §5.4): one past
+/// each call once a class's bits are folded.
+#[test]
+fn lazy_exits_need_dependencies() {
+    let plain = "function f()
+        local s = 0
+        for i = 1, 300 do s = s + #string.format('%d', i) end
+        return s
+    end
+    f()";
+    assert!(!ir_of(plain, "f", 0).contains("lazyexit"));
+    let folded = "local mt = {}
+    local o = setmetatable({}, mt)
+    function f()
+        local s = 0
+        for i = 1, 300 do
+            s = s + #string.format('%d', i)
+            if o.y then s = s + 1 end
+        end
+        return s
+    end
+    f()";
+    let ir = ir_of(folded, "f", 0);
+    assert!(ir.contains("lazyexit"), "{ir}");
+}
+
+/// A write changing a class's bits invalidates the region that folded
+/// them: its frame leaves at the lazy exit past the call it is in, and its
+/// entry is retired.
+#[test]
+fn class_writes_invalidate_dependent_regions() {
+    let src = "mt = {}
+    local o = setmetatable({x = 1}, mt)
+    go = false
+    local function hook(i) if go and i == 150 then mt.__index = {y = 5} end end
+    function f()
+        local s = 0
+        for i = 1, 300 do
+            hook(i)
+            local y = o.y
+            if y then s = s + y end
+        end
+        return s
+    end
+    for k = 1, 20 do f() end
+    go = true
+    r = f()";
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let g = |n: &str| {
+            ctx.globals()
+                .raw_get(Value::string(LuaString::new(ctx, n.as_bytes())))
+        };
+        assert_eq!(g("r").get_integer(), Some(755));
+        let f = g("f").get_function().and_then(|f| f.as_lua()).unwrap();
+        let st = f.proto.jit.get().expect("compiled").borrow();
+        let dead: Vec<_> = st.regions.iter().filter(|r| r.invalidated.get()).collect();
+        assert!(!dead.is_empty());
+        let mut left = 0;
+        for &&r in &dead {
+            assert!(r.retired.get() && !r.lazy.is_empty());
+            assert!(
+                !st.entries
+                    .iter()
+                    .any(|e| e.region.is_some_and(|x| crate::dmm::Gc::ptr_eq(x, r)))
+            );
+            left += r
+                .exits
+                .iter()
+                .filter(|e| e.tag == crate::jit::ir::ops::ExitTag::Lazy)
+                .map(|e| e.count.get())
+                .sum::<u32>();
+        }
+        assert!(left >= 1);
+    });
+}

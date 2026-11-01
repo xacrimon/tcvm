@@ -2170,3 +2170,140 @@ fn captured_slots_change_across_calls() {
         return tostring(s)",
     );
 }
+
+/// A class gains `__index` in a call from a compiled loop that folded its
+/// absence (ws2 §5.4): the frame leaves past the call, the next field read
+/// walks.
+#[test]
+fn class_change_in_a_call_deopts_the_caller() {
+    agrees(
+        "local mt = {}
+        local o = setmetatable({x = 1}, mt)
+        local go = false
+        local function hook(i) if go and i == 150 then mt.__index = {y = 5} end end
+        local function f()
+          local s = 0
+          for i = 1, 300 do
+            hook(i)
+            local y = o.y
+            if y then s = s + y end
+          end
+          return s
+        end
+        for k = 1, 20 do assert(f() == 0) end
+        go = true
+        return f() .. ':' .. f()",
+    );
+}
+
+/// The compiled frame changes a class itself, through the store helper and
+/// `rawset`, whose stores it compiled while they changed nothing; each class
+/// is changed first while the region depends on it.
+#[test]
+fn class_change_by_the_frame_deopts_it() {
+    agrees(
+        "local mt, mt2 = {}, {}
+        local o, o2 = setmetatable({x = 1}, mt), setmetatable({}, mt2)
+        local sel, news = {}, {}
+        local count = 0
+        local function nf(t, k, v) count = count + 1 end
+        local function g()
+          local s = 0
+          for i = 1, 300 do
+            mt.__index = sel[i]
+            rawset(mt2, '__newindex', news[i])
+            local y = o.y
+            if y then s = s + y end
+            o2.z = i
+            o2.z = nil
+          end
+          return s
+        end
+        local r = {}
+        for k = 1, 10 do r[#r + 1] = g() end
+        for i = 150, 300 do sel[i] = {y = 5} end
+        r[#r + 1] = g()
+        for i = 1, 300 do sel[i] = nil end
+        for k = 1, 3 do r[#r + 1] = g() end
+        for i = 200, 300 do news[i] = nf end
+        r[#r + 1] = g()
+        return table.concat(r, ',') .. ':' .. count",
+    );
+}
+
+/// A coroutine suspended in a compiled frame resumes after the class
+/// changed: the patched code reaches its frame on its own stack.
+#[test]
+fn suspended_coroutine_frames_deopt() {
+    agrees(
+        "local mt = {}
+        local o = setmetatable({x = 1}, mt)
+        local co = coroutine.wrap(function()
+          local s = 0
+          for i = 1, 600 do
+            coroutine.yield(i)
+            local y = o.y
+            if y then s = s + y end
+          end
+          return s
+        end)
+        for i = 1, 300 do co() end
+        mt.__index = {y = 7}
+        local r
+        for i = 1, 301 do r = co() end
+        return tostring(r)",
+    );
+}
+
+/// Own-slot reads and stores that folded a class's `__index` and
+/// `__newindex` absence, through a metamethod call's arm and function
+/// entries after the region is gone.
+#[test]
+fn class_changes_reach_metamethod_arms_and_entries() {
+    agrees(
+        "local mt = {}
+        local function new(x) return setmetatable({x = x, y = false}, mt) end
+        local objs = {}
+        for i = 1, 8 do objs[i] = new(i) end
+        local function reader(o)
+          local v = o.x
+          o.y = nil
+          local w = o.y
+          o.y = false
+          return v, w
+        end
+        local function run()
+          local s, n = 0, 0
+          for i = 1, 400 do
+            local v, w = reader(objs[i % 8 + 1])
+            s = s + v
+            if w then n = n + 1 end
+          end
+          return s .. ':' .. n
+        end
+        local out = {}
+        for k = 1, 10 do run() end
+        out[#out + 1] = run()
+        mt.__index = function(t, k) return k == 'y' and 1 or nil end
+        out[#out + 1] = run()
+        local log = 0
+        mt.__newindex = function(t, k, v) log = log + 1; rawset(t, k, v) end
+        out[#out + 1] = run() .. '/' .. log
+        local lt = setmetatable({}, {__lt = function(a, b)
+          mt.__index = nil
+          return true
+        end})
+        local c = 0
+        for i = 1, 400 do
+          if lt < lt then c = c + 1 end
+          local w = objs[1].zz
+          if w then c = c + 1000 end
+          mt.__index = function() return 1 end
+        end
+        out[#out + 1] = c
+        mt.__index = nil
+        mt.__newindex = nil
+        out[#out + 1] = run()
+        return table.concat(out, ' ')",
+    );
+}

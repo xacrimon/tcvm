@@ -353,6 +353,11 @@ pub(crate) enum MInst {
     Deopt {
         exit: u32,
     },
+    /// `[snap..]`: no code; `Region::invalidate` patches a branch to the
+    /// exit over what follows.
+    LazyExit {
+        exit: u32,
+    },
 }
 
 impl MInst {
@@ -377,6 +382,7 @@ impl MInst {
             | GuardShapeIn { exit, .. }
             | GuardProto { exit, .. }
             | GcCheck { exit }
+            | LazyExit { exit }
             | GuardFits { exit, .. } => exit,
             _ => return None,
         };

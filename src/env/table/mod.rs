@@ -800,7 +800,7 @@ impl<'gc> TableState<'gc> {
         if let Some(s) = key.get_string()
             && let Some(cache) = self.mt_cache()
         {
-            cache.member_write(Some(mc), s, value, self.addr());
+            cache.member_write(mc, s, value, self.addr());
         }
     }
 
@@ -841,7 +841,7 @@ impl<'gc> TableState<'gc> {
         let addr = self.addr();
         let cleared = |key| {
             if let Some(c) = mt_cache {
-                c.member_write(None, key, Value::nil(), addr);
+                c.member_write(fc, key, Value::nil(), addr);
             }
         };
         let keys = self.shape.keys();

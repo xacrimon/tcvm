@@ -164,6 +164,9 @@ pub(crate) struct Asm {
     /// 64-bit literals by label, emitted after the code.
     literals: Vec<(Label, u64)>,
     lit_index: std::collections::HashMap<u64, Label>,
+    /// The word of the last patch point (`patch_point`), at which no label
+    /// is bound.
+    patch: Option<u32>,
 }
 
 const UNBOUND: u32 = u32::MAX;
@@ -200,7 +203,18 @@ impl Asm {
 
     pub(crate) fn bind(&mut self, l: Label) {
         debug_assert_eq!(self.labels[l.0 as usize], UNBOUND, "label bound twice");
+        if self.patch == Some(self.words.len() as u32) {
+            self.nop();
+        }
         self.labels[l.0 as usize] = self.words.len() as u32;
+    }
+
+    /// Bind `l` where code may be overwritten (`Region::invalidate`): the
+    /// instruction there is reached only from the one before, a `nop` if
+    /// anything would branch there.
+    pub(crate) fn patch_point(&mut self, l: Label) {
+        self.bind(l);
+        self.patch = Some(self.words.len() as u32);
     }
 
     pub(crate) fn is_bound(&self, l: Label) -> bool {

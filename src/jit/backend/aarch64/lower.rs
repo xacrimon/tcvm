@@ -59,6 +59,8 @@ pub(crate) struct Lowered {
     pub(crate) entry_regs: Vec<u8>,
     /// `Func::shape_sets` as the shapes' addresses.
     pub(crate) shape_sets: Vec<Vec<u64>>,
+    /// The region has dependencies: its entry is patchable (ws2 §5.4).
+    pub(crate) invalidable: bool,
 }
 
 struct Lower<'a, 'gc> {
@@ -226,6 +228,7 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
                     .collect()
             })
             .collect(),
+        invalidable: !f.deps.is_empty(),
     })
 }
 
@@ -1387,6 +1390,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 }
             }
             Op::Deopt => self.push_exit(i, |exit| MInst::Deopt { exit }, vec![], none),
+            Op::LazyExit => self.push_exit(i, |exit| MInst::LazyExit { exit }, vec![], none),
         }
         Ok(())
     }

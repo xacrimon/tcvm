@@ -45,6 +45,9 @@ pub(crate) struct Emitted {
     /// The direct branches to other regions' known entries, by the callee's
     /// prototype (its box), which `jit::set_fast` repoints.
     pub(crate) direct: Vec<(Label, u64)>,
+    /// What `Region::invalidate` patches: each place and the branch target
+    /// written there, the entry's first (ws2 §5.4).
+    pub(crate) lazy: Vec<(Label, Label)>,
 }
 
 /// A call of the region: its return addresses, whether each is a level's
@@ -143,6 +146,7 @@ struct Em<'a> {
     direct: Vec<(Label, u64)>,
     /// `FMod`'s out-of-line paths: (entry, return, d, a, b).
     fmods: Vec<(Label, Label, Fpr, Fpr, Fpr)>,
+    lazy: Vec<(Label, Label)>,
 }
 
 /// A function region's fast entry: what `enter` would check of the callee.
@@ -176,6 +180,8 @@ pub(crate) struct Helpers {
     pub(crate) native: usize,
     pub(crate) coro: [usize; 3],
     pub(crate) native_act: usize,
+    /// `jit::jit_dead_entry`, where an invalidated region's entry goes.
+    pub(crate) dead_entry: usize,
     /// The trampolines of the helpers cold arms call: (helper, trampoline).
     pub(crate) trampolines: Vec<(usize, usize)>,
     /// Known callees' prototypes (their boxes) and where a direct call of
@@ -306,6 +312,7 @@ pub(crate) fn emit(
         fmods: Vec::new(),
         own_entry: None,
         direct: Vec::new(),
+        lazy: Vec::new(),
     };
     // A compiled caller has written the header, set base, closure and `insn`
     // (the argument count) as `enter` would, and its `blr` left the return
@@ -401,6 +408,16 @@ pub(crate) fn emit(
     em.a.ldr_label(X17, region_word);
     em.a.orr_shift(Sz::X, X16, X17, X16, Shift::Lsl, 48);
     em.a.b_far(em.helpers.exit_common);
+    if l.invalidable {
+        // An invalidated region's entry, its frame not open yet: on to
+        // `jit_dead_entry` as the entry-fail stub goes on (ws2 §5.4).
+        let dead = em.a.new_label();
+        em.a.bind(dead);
+        em.a.ldr_label(INSN, region_word);
+        em.a.ldr_lit(X16, em.helpers.dead_entry as u64);
+        em.tail_level();
+        em.lazy.insert(0, (em.labels[0], dead));
+    }
     if !l.entry_regs.is_empty() {
         em.a.bind(em.entry_fail);
         em.close_frame();
@@ -475,6 +492,7 @@ pub(crate) fn emit(
         exits,
         sites: em.sites,
         direct: em.direct,
+        lazy: em.lazy,
     })
 }
 
@@ -2124,6 +2142,11 @@ impl Em<'_> {
             Deopt { exit } => {
                 let l = self.exit(exit);
                 self.a.b(l);
+            }
+            LazyExit { exit } => {
+                let (at, l) = (self.a.new_label(), self.exit(exit));
+                self.a.patch_point(at);
+                self.lazy.push((at, l));
             }
         }
         Ok(())

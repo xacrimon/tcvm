@@ -152,6 +152,15 @@ impl CodeBlock {
         }
     }
 
+    /// Overwrite the instruction at byte `off` and publish it.
+    pub(crate) fn patch_u32(&self, off: usize, w: u32) {
+        assert!(off + 4 <= self.len() && off.is_multiple_of(4));
+        unsafe {
+            self.rw.as_ptr().add(off).cast::<u32>().write(w);
+            sync_icache(self.rw.as_ptr().add(off), self.rx.as_ptr().add(off), 4);
+        }
+    }
+
     /// Overwrite the 64-bit word at byte `off` and publish it.
     pub(crate) fn patch_u64(&self, off: usize, v: u64) {
         assert!(off + 8 <= self.len() && off.is_multiple_of(8));

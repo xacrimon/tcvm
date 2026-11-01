@@ -271,6 +271,9 @@ pub(crate) struct Func<'gc> {
     /// The prototypes guards prove callees closures of, which the region
     /// keeps alive.
     pub(crate) protos: Vec<Gc<'gc, Prototype<'gc>>>,
+    /// The classes whose metamethod bits the code assumes, and which
+    /// (ws2 §5.3); without any, the lazy exits go.
+    pub(crate) deps: Vec<(crate::env::MtCache<'gc>, crate::env::MetamethodBits)>,
     cfg: RefCell<Option<Rc<CfgInfo>>>,
 }
 
@@ -315,6 +318,7 @@ impl<'gc> Func<'gc> {
             exit_sites: Default::default(),
             inline_frames: Vec::new(),
             protos: Vec::new(),
+            deps: Vec::new(),
             cfg: RefCell::new(None),
         }
     }

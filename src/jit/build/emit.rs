@@ -1011,6 +1011,8 @@ fn emit_arith_mm(b: &mut Builder<'_, '_>, insn: Instruction) {
     };
     let v = mm_call(b, f, &[lv, rv]);
     b.set(insn.a(), v);
+    b.flush();
+    b.lazy_exit_after();
 }
 
 /// The metamethod of an arithmetic kind (`arith_slow`'s).
@@ -1190,7 +1192,7 @@ pub(super) fn helper_arms(
     cold(b, |b| {
         let f = metamethod(b, bit, mm_args);
         let res = mm_call(b, f, mm_args);
-        arm_end(b, join, dst, res);
+        call_arm_end(b, join, Some((dst, res)));
     });
     b.switch_to(ok);
     arm_end(b, join, dst, r);
@@ -1302,6 +1304,35 @@ pub(super) fn arm_end(b: &mut Builder<'_, '_>, join: Block, dst: u8, v: Val) {
     b.flush();
     b.jump(join);
     b.pending = earlier;
+}
+
+/// The end of an arm that called (setting `dst` first): it leaves lazily
+/// once its writes hold, as the call may have invalidated the region.
+pub(super) fn call_arm_end(b: &mut Builder<'_, '_>, join: Block, dst: Option<(u8, Val)>) {
+    let earlier = b.pending.clone();
+    if let Some((r, v)) = dst {
+        b.set(r, v);
+    }
+    b.flush();
+    b.lazy_exit_after();
+    b.jump(join);
+    b.pending = earlier;
+}
+
+/// Branch on `c` to `t` or `f`, successors of the instruction, after a call
+/// in it: each edge leaves lazily first, with its successor's snapshot.
+fn call_br(b: &mut Builder<'_, '_>, c: Val, t: Block, f: Block, succs: &[Block]) {
+    let (et, ef) = (b.new_sealed_succ(), b.new_sealed_succ());
+    b.br(c, et, ef);
+    let insn = b.code(b.pc);
+    let target = (b.pc as i64 + 1 + insn.branch_offset() as i64) as u32;
+    for (e, to) in [(et, t), (ef, f)] {
+        b.switch_to(e);
+        let pc = if to == succs[0] { b.pc + 1 } else { target };
+        let s = b.snap_at(pc);
+        b.lazy_exit(s);
+        b.jump(to);
+    }
 }
 
 /// Emit `arm` into the current block as a cold arm (A5).
@@ -1520,7 +1551,7 @@ fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Blo
     }
     let not_tables = all_in(b, TypeSet::TAB, &[x, y]);
     if calls_mm(b) {
-        cold(b, |b| eq_mm_arm(b, x, y, yes, no));
+        cold(b, |b| eq_mm_arm(b, x, y, yes, no, succs));
     } else {
         let (px, py) = (
             b.ins(Op::Unbox(Rep::Ptr), &[x]),
@@ -1536,7 +1567,7 @@ fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Blo
     enter_join(b, not_tables);
     let not_udata = all_in(b, TypeSet::UDATA, &[x, y]);
     if calls_mm(b) {
-        cold(b, |b| eq_mm_arm(b, x, y, yes, no));
+        cold(b, |b| eq_mm_arm(b, x, y, yes, no, succs));
     } else {
         // Whether `__eq` runs is the interpreter's to find out.
         b.deopt(ExitTag::Mm);
@@ -1564,7 +1595,7 @@ fn big_float_eq(b: &mut Builder<'_, '_>, big: bool, v: Val, f: Val, yes: Block, 
 
 /// `__eq` of two tables or two userdata with different bits: none means
 /// unequal, else its result's truth.
-fn eq_mm_arm(b: &mut Builder<'_, '_>, x: Val, y: Val, yes: Block, no: Block) {
+fn eq_mm_arm(b: &mut Builder<'_, '_>, x: Val, y: Val, yes: Block, no: Block, succs: &[Block]) {
     let f = b.ins(Op::Helper(HelperId::Mm(MetamethodBits::EQ.bits())), &[x, y]);
     let none = b.ins(Op::IsType(TypeSet::NIL), &[f]);
     let call = b.new_sealed_succ();
@@ -1572,7 +1603,7 @@ fn eq_mm_arm(b: &mut Builder<'_, '_>, x: Val, y: Val, yes: Block, no: Block) {
     b.switch_to(call);
     let res = mm_call(b, f, &[x, y]);
     let falsy = b.ins(Op::IsFalsy, &[res]);
-    b.br(falsy, no, yes);
+    call_br(b, falsy, no, yes, succs);
 }
 
 /// `x < y` (or `<=`) where a kind is unknown: numbers and strings behind
@@ -1616,7 +1647,7 @@ fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, suc
         let f = metamethod(b, bit, &[x, y]);
         let res = mm_call(b, f, &[x, y]);
         let falsy = b.ins(Op::IsFalsy, &[res]);
-        b.br(falsy, no, yes);
+        call_br(b, falsy, no, yes, succs);
     });
 }
 
@@ -1697,7 +1728,7 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
                 let f = metamethod(b, bit, &args);
                 let res = mm_call(b, f, &args);
                 let falsy = b.ins(Op::IsFalsy, &[res]);
-                b.br(falsy, no, yes);
+                call_br(b, falsy, no, yes, succs);
             });
             return;
         }
@@ -1872,7 +1903,8 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     for (k, &v) in rs.iter().enumerate() {
         b.set(a + k as u8, v);
     }
-    b.note_def(&rs, Some(resume));
+    let s = b.note_def(&rs, Some(resume));
+    b.lazy_exit(s);
 }
 
 // --- loops --------------------------------------------------------------------
