@@ -339,6 +339,10 @@ pub(crate) enum MInst {
     /// A resume block's first instruction, where a fast callee's `ret`
     /// lands: `[def x0, def x1]` up to `wanted` (1 or 2), or the landing
     /// helper.
+    /// `top` past slot `at` and the operand's count of values (`Op::SetTop`).
+    SetTop {
+        at: u8,
+    },
     Resume {
         wanted: u8,
         c: u8,

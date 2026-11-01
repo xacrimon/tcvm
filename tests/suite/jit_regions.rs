@@ -2566,6 +2566,54 @@ fn bodies_take_values_up_to_top() {
     );
 }
 
+/// Inlined calls wanting every result (W3 step 7b): `two` always gives two
+/// (the next call's count fixed), `maybe` one or two (a count the next
+/// call, inlined or real, takes as a value), `wrap` returns `maybe`'s.
+/// The callee of the last call changes at 2500: that exit runs it in the
+/// interpreter, which takes `top` as the inlined call left it.
+#[test]
+fn inlined_calls_leave_values_up_to_top() {
+    agrees(
+        "local function two(x) return x, x + 1 end
+        local function maybe(x) if x % 2 == 0 then return x end return x, x * 2 end
+        local function add3(a, b, c) return a + (b or 0) + (c or 100) end
+        local function wrap(x) return 1, maybe(x) end
+        local function count(...) return select('#', ...) end
+        local function count2(...) return select('#', ...) * 1000 end
+        local s = 0
+        for i = 1, 3000 do
+          s = s + add3(two(i))
+          s = s + add3(maybe(i))
+          s = s + count(maybe(i)) + count(two(i))
+          local a, b, c = wrap(i)
+          s = s + a + b + (c or 7)
+          local f = i == 2500 and count2 or count
+          s = s + f(two(i))
+        end
+        return tostring(s)",
+    );
+}
+
+/// An exit right before the instruction that takes what an inlined call
+/// left up to `top` (the callee guard of `fs[1]`, replaced at 2501) runs
+/// it in the interpreter, which reads `top` and the slots: the inlined
+/// call leaves them as a real one would. `maybe` gives one or two values,
+/// so a `top` left from another run would be wrong.
+#[test]
+fn exits_before_takers_see_the_inlined_top() {
+    agrees(
+        "local function maybe(x) if x % 2 == 0 then return x end return x, x * 2 end
+        local fs = {function(a, b, c) if b == nil then return 1 end return 2 end}
+        local other = function(a, b, c) if b == nil then return 10 end return 20 end
+        local s = 0
+        for i = 1, 3000 do
+          if i == 2501 then fs[1] = other end
+          s = s + fs[1](maybe(i))
+        end
+        return tostring(s)",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]

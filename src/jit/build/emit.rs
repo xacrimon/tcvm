@@ -9,7 +9,7 @@ use crate::instruction::TFOR_VARS;
 use crate::instruction::{ArithKind, Family, Instruction, Op as BcOp, UpvalSource};
 use crate::jit::build::cfg::RegSet;
 use crate::jit::build::intrinsics::Emitted;
-use crate::jit::build::{Builder, intrinsics, iter, tables};
+use crate::jit::build::{Builder, Top, intrinsics, iter, tables};
 use crate::jit::feedback as fb;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, NO_PROTO, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -183,7 +183,14 @@ fn any_f64(b: &mut Builder<'_, '_>, v: Val) -> Val {
 /// block's successors when it is the block's last instruction:
 /// `[fallthrough, target]` for a branch, `[target]` for a jump.
 pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
-    let insn = b.code(pc);
+    let mut insn = b.code(pc);
+    // An inlined call before it left values up to `top`: a fixed number
+    // makes the instruction's count fixed (W3 §7).
+    b.cur_top = b.top.take();
+    if let Some((from, Top::Fixed(n))) = b.cur_top {
+        fix_count(&mut insn, from, n);
+        b.cur_top = None;
+    }
     if always_deopts(b, pc) {
         b.deopt(ExitTag::Unsupported);
         return;
@@ -1938,6 +1945,20 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     }
 }
 
+/// The count of `insn` (a call, tail call or return of values up to `top`)
+/// when an inlined call left `n` values up to `top` from register `from`.
+fn fix_count(insn: &mut Instruction, from: u8, n: u8) {
+    use BcOp::*;
+    let (a, end) = (insn.a() as usize, from as usize + n as usize);
+    match insn.op().unquickened() {
+        CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 | TAILCALL if insn.b() == 0 => {
+            insn.set_b((end - (a + 4) + 1) as u8)
+        }
+        RETURN if insn.b() == 0 => insn.set_b((end - a + 1) as u8),
+        _ => {}
+    }
+}
+
 /// `R[a]`, the callee of the call at `pc`.
 fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
     match b.callee_hint {
@@ -2014,7 +2035,15 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     }
     // Arguments up to `top`: their count from it.
     let (nargs, count) = if nb == 0 {
-        let n = b.ins(Op::Helper(HelperId::TopArgs(b.slot_of(a))), &[]);
+        // Up to `top`: a count an inlined call left (its values stored with
+        // the registers above), or the one a real call set.
+        let n = match b.cur_top {
+            Some((from, Top::Count(c, _))) => {
+                let before = b.ki32(from as i32 - a as i32 - 4);
+                b.ins(Op::IAddNo, &[c, before])
+            }
+            _ => b.ins(Op::Helper(HelperId::TopArgs(b.slot_of(a))), &[]),
+        };
         (u8::MAX, vec![n])
     } else {
         (nb - 1, args)

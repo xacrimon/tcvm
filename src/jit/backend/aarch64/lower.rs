@@ -858,6 +858,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let c = Operand::reg_use(self.closure.expect("the frame's closure"));
                 self.push(MInst::LoadUpvalOf(k), &[d, c], none);
             }
+            Op::SetTop(at) => {
+                let n = self.use_(args[0]);
+                self.push(MInst::SetTop { at }, &[n], none);
+            }
             Op::FrameFn => {
                 let d = self.def(res.unwrap());
                 let t = self.v.new_vreg(RegClass::Int);

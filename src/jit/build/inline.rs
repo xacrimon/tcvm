@@ -14,7 +14,7 @@
 use std::rc::Rc;
 
 use super::intrinsics::{Callee, callee_of};
-use super::{Builder, Inline, SlotState};
+use super::{Builder, Inline, SlotState, Top};
 use crate::env::function::LuaFn;
 use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::cfg::{Cfg, RegSet, use_def};
@@ -43,6 +43,10 @@ pub(crate) struct InlineCode {
     /// Some instruction may read or write its callers' captured registers
     /// through their cells: a call, or a load or store of a cell upvalue.
     cells: bool,
+    /// The most values a return gives, none if one returns up to `top`.
+    returns: Option<u8>,
+    /// Some instruction is a tail call.
+    tails: bool,
 }
 
 /// Inline the CALL at `pc` of `callee`; whether it did, the current block
@@ -67,7 +71,10 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         None if tail => 1,
         _ => insn.c(),
     };
-    if c == 0 {
+    // Every result (W3 §7): for an instruction after it that takes them up
+    // to `top`, from a callee each of whose returns gives a fixed count.
+    let multi = c == 0 && !tail;
+    if multi && !takes_top(b.code(pc + 1)) {
         return false;
     }
     let depth = b.inline.as_ref().map_or(0, |i| i.depth);
@@ -109,20 +116,31 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     let Some(code) = code else {
         return false;
     };
-    // The body may read or write the captured registers through their
-    // cells: they live in their slots across it, read from them after. Its
-    // code may say so (a call, a cell); else a body that called anyway (a
-    // metamethod, a builtin's fallback) is built again with them there.
-    // Arguments up to `top`, which a real call set (W3 §7).
+    let returns = code.returns.unwrap_or(u8::MAX);
+    if multi && (code.tails || a as usize + returns as usize > b.nregs) {
+        return false;
+    }
+    // Arguments up to `top`, which an inlined call or a real one set.
     let top_args = if nb == 0 {
-        let Some(n) = top_count(b, pc, b.slot_of(a)) else {
-            return false;
-        };
-        top_values(b, pc, a + 4, proto.num_params, n)
+        match b.cur_top {
+            Some((from, Top::Count(n, most))) => {
+                reg_top_values(b, a + 4, proto.num_params, from, n, most)
+            }
+            _ => {
+                let Some(n) = top_count(b, pc, b.slot_of(a)) else {
+                    return false;
+                };
+                top_values(b, pc, a + 4, proto.num_params, n)
+            }
+        }
     } else {
         Vec::new()
     };
-    // A tail call's frame is gone: what the body it replaces watched, the
+    // The body may read or write the captured registers through their
+    // cells: they live in their slots across it, read from them after. Its
+    // code may say so (a call, a cell); else a body that called anyway (a
+    // metamethod, a builtin's fallback) is built again with them there. A
+    // tail call's frame is gone: what the body it replaces watched, the
     // values its returns report.
     let mut sync = code.cells && !tail;
     let seen = if tail && !replace {
@@ -130,7 +148,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     } else {
         Vec::new()
     };
-    let (entry, inline, cont, results, args, kept, captured, guard, cv) = loop {
+    let (entry, inline, cont, results, args, kept, captured, guard, cv, top) = loop {
         let captured = if sync { b.cfg.captured } else { RegSet::EMPTY };
         b.store_regs(captured.iter());
         // What the callers hold at the call, and the callee's arguments.
@@ -223,7 +241,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         for r in code.cfg.captured.iter() {
             b.f.captured.insert(base + r);
         }
-        let wanted = c - 1;
+        let wanted = if multi { returns } else { c - 1 };
         let region_return = b.inline.as_ref().is_some_and(|i| tail && i.region_return) || replace;
         let (cont, results) = match &b.inline {
             Some(i) if tail => (i.cont, Vec::new()),
@@ -234,6 +252,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
                 (cont, results)
             }
         };
+        let count = multi.then(|| b.f.add_param(cont, Ty::I32));
         // What a body that fails leaves behind is undone.
         let def_snaps = b.f.def_snaps.len();
         let stable_used = b.f.stable_used.borrow().len();
@@ -245,6 +264,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             outer_homes,
             called: false,
             region_return,
+            counted: multi,
             cont,
             wanted,
             depth: depth + 1,
@@ -274,8 +294,31 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             sync = true;
             continue;
         }
+        // How many it left: one count, or a value only a call or a body's
+        // return after it takes.
+        let top = count.map(|n| {
+            let counts: Vec<Option<i32>> = (inline.returns.iter())
+                .map(
+                    |&(t, _)| match b.f.def_op(b.f.edge_args(t, 0)[wanted as usize]) {
+                        Some(Op::KI32(k)) => Some(k),
+                        _ => None,
+                    },
+                )
+                .collect();
+            match counts[0] {
+                Some(k) if counts.iter().all(|&x| x == Some(k)) => Some(Top::Fixed(k as u8)),
+                _ => takes_count(b, b.code(pc + 1)).then_some(Top::Count(n, wanted)),
+            }
+        });
+        if matches!(top, Some(None)) {
+            b.f.blocks[cont.idx()].dead = true;
+            b.f.def_snaps.truncate(def_snaps);
+            b.f.stable_used.borrow_mut().truncate(stable_used);
+            b.known.recv_shapes = recv_shapes;
+            return false;
+        }
         break (
-            entry, inline, cont, results, args, kept, captured, guard, cv,
+            entry, inline, cont, results, args, kept, captured, guard, cv, top,
         );
     };
     // A call in it is a call of its caller's.
@@ -373,7 +416,40 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     for (v, to) in refined {
         b.refine(v, to);
     }
+    // As a call returning them leaves them, for an exit before the next
+    // instruction takes them, which runs it in the interpreter.
+    if let Some(Some(t)) = top {
+        b.store_regs(a as usize..a as usize + inline.wanted as usize);
+        let n = match t {
+            Top::Fixed(k) => b.ki32(k as i32),
+            Top::Count(n, _) => n,
+        };
+        b.push(Op::SetTop(b.slot_of(a)), &[n]);
+        b.top = Some((a, t));
+    }
     true
+}
+
+/// Whether `next` takes values up to `top`: a call, tail call or return.
+fn takes_top(next: Instruction) -> bool {
+    use BcOp::*;
+    let op = next.op().unquickened();
+    next.b() == 0
+        && matches!(
+            op,
+            CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 | TAILCALL | RETURN
+        )
+}
+
+/// Whether `next` takes a count of values up to `top` as a value: a call,
+/// or an inlined body's return.
+fn takes_count(b: &Builder<'_, '_>, next: Instruction) -> bool {
+    use BcOp::*;
+    match next.op().unquickened() {
+        CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => true,
+        RETURN => b.inline.as_ref().is_some_and(|i| !i.region_return),
+        _ => false,
+    }
 }
 
 /// A callee's code for inlining, or none when a body of it would need its
@@ -409,6 +485,24 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
                 | SETTABUP_REF
         )
     });
+    let (mut returns, mut tails) = (Some(0u8), false);
+    for &i in &cfg.code {
+        let n = match i.op().unquickened() {
+            BcOp::RETURN0 => 0,
+            BcOp::RETURN1 => 1,
+            BcOp::RETURN if i.b() == 0 => {
+                returns = None;
+                continue;
+            }
+            BcOp::RETURN => i.b() - 1,
+            BcOp::TAILCALL => {
+                tails = true;
+                continue;
+            }
+            _ => continue,
+        };
+        returns = returns.map(|r| r.max(n));
+    }
     let mut written = RegSet::EMPTY;
     for &i in &cfg.code {
         written.union(&use_def(&proto, i, cfg.nregs, &cfg.captured).defs);
@@ -421,6 +515,8 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
         cfg,
         written,
         cells,
+        returns,
+        tails,
     })
 }
 
@@ -454,7 +550,8 @@ pub(super) fn inline_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
     }
     let seen = watched(b);
     close_frame(b);
-    return_values(b, &res, seen);
+    let count = b.inline.as_ref().unwrap().counted.then_some(n);
+    return_values(b, &res, seen, count);
 }
 
 /// The body's `RETURN` of `R[a..top)` at `pc`, which a real call set (W3
@@ -462,14 +559,47 @@ pub(super) fn inline_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
 pub(super) fn inline_return_top(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> bool {
     let wanted = b.inline.as_ref().expect("an inlined body").wanted;
     // A body's slots start past a header: `TopArgs(s)` counts from `s + 4`.
-    let Some(n) = top_count(b, pc, b.slot_of(a) - 4) else {
-        return false;
+    let res = match b.cur_top {
+        Some((from, Top::Count(n, most))) => reg_top_values(b, a, wanted, from, n, most),
+        _ => {
+            let Some(n) = top_count(b, pc, b.slot_of(a) - 4) else {
+                return false;
+            };
+            top_values(b, pc, a, wanted, n)
+        }
     };
-    let res = top_values(b, pc, a, wanted, n);
     let seen = watched(b);
     close_frame(b);
-    return_values(b, &res, seen);
+    return_values(b, &res, seen, None);
     true
+}
+
+/// `n` values of `R[r..top)`, which an inlined call left in registers from
+/// `from`, `count` (an i32, at most `most`) of them, nil past it.
+fn reg_top_values(
+    b: &mut Builder<'_, '_>,
+    r: u8,
+    n: u8,
+    from: u8,
+    count: Val,
+    most: u8,
+) -> Vec<Val> {
+    let nil = b.konst(crate::env::value::Value::nil());
+    (0..n)
+        .map(|k| {
+            let x = r + k;
+            if x < from {
+                return b.reg(x);
+            }
+            if x >= from + most {
+                return nil;
+            }
+            let kk = b.ki32((x - from) as i32);
+            let has = b.ins(Op::ICmp(Cc::Lt), &[kk, count]);
+            let v = b.reg(x);
+            b.ins(Op::Select, &[has, v, nil])
+        })
+        .collect()
 }
 
 /// How many values there are from region slot `s + 4` to `top`, which a
@@ -533,10 +663,14 @@ pub(super) fn close_frame(b: &mut Builder<'_, '_>) {
 
 /// Jump to the block after the call with the results, `seen` what the
 /// watched parameters held.
-fn return_values(b: &mut Builder<'_, '_>, res: &[Val], seen: Vec<Val>) {
+fn return_values(b: &mut Builder<'_, '_>, res: &[Val], seen: Vec<Val>, count: Option<u8>) {
     let cont = b.inline.as_ref().expect("an inlined body").cont;
+    let mut args = res.to_vec();
+    if let Some(n) = count {
+        args.push(b.ki32(n as i32));
+    }
     let t = b.terminate(Op::Jump, &[], &[cont], None);
-    b.f.set_edge_args(t, 0, res);
+    b.f.set_edge_args(t, 0, &args);
     b.inline.as_mut().unwrap().returns.push((t, seen));
 }
 
@@ -589,5 +723,5 @@ pub(super) fn tail_call(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8, call
     let s =
         b.f.finish_snap(x.parent, x.caller_pc, crate::jit::ir::ExitKind::After, from);
     b.lazy_exit(s);
-    return_values(b, &res, seen);
+    return_values(b, &res, seen, None);
 }

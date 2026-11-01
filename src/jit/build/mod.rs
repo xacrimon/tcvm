@@ -261,6 +261,10 @@ pub(crate) struct Builder<'a, 'gc> {
     /// The callee and first argument of the call at a pc, known before a
     /// `VARARG` up to `top` that reloads their registers.
     pub(crate) callee_hint: Option<(u32, Val, Val)>,
+    /// What an inlined call left up to `top` from a register, for the next
+    /// instruction (W3 §7); `cur_top` is the current instruction's.
+    pub(crate) top: Option<(u8, Top)>,
+    pub(crate) cur_top: Option<(u8, Top)>,
     /// Blocks made now are cold arms (A5).
     cold: bool,
     /// A loop entry's frame, by register: what `intrinsics::value_now`
@@ -300,6 +304,9 @@ pub(crate) struct Inline {
     /// It replaces the region's own frame (W3 §5): its returns and tail
     /// calls are the region's, and `cont` is none.
     pub(crate) region_return: bool,
+    /// Its call wants every result (W3 §7): its returns pass `wanted`
+    /// values, nil past theirs, and their count.
+    pub(crate) counted: bool,
     /// Parameters the body never writes whose arguments the caller's
     /// registers hold after the call, reported at each return.
     pub(crate) watch: Vec<u8>,
@@ -309,6 +316,14 @@ pub(crate) struct Inline {
     /// The callee closure (a `Ptr`) when known by its prototype only, whose
     /// upvalues are loaded from it; else the builder's closure is it.
     pub(crate) closure: Option<Val>,
+}
+
+/// How many values an inlined call left up to `top` (W3 §7).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Top {
+    Fixed(u8),
+    /// An i32, at most the second many.
+    Count(Val, u8),
 }
 
 impl Inline {
@@ -382,6 +397,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             deopt_all: false,
             known: Known::default(),
             callee_hint: None,
+            top: None,
+            cur_top: None,
             cold: false,
             entry_frame: Vec::new(),
             loop_entry,
@@ -424,6 +441,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             deopt_all: outer.deopt_all,
             known: std::mem::take(&mut outer.known),
             callee_hint: None,
+            top: None,
+            cur_top: None,
             cold: outer.cold,
             entry_frame: Vec::new(),
             loop_entry: false,
@@ -504,6 +523,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 | Op::Store(_)
                 | Op::CellLoad
                 | Op::CellStore
+                | Op::SetTop(_)
                 | Op::Call { .. }
                 | Op::CallMm { .. }
                 | Op::Resume { .. }

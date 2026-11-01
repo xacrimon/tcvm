@@ -2147,6 +2147,14 @@ impl Em<'_> {
                 self.a.ldr_idx(X16, X16, X17, Extend::Lsl, true);
                 self.tail_level();
             }
+            SetTop { at } => {
+                let n = self.r(i, 0);
+                self.a.ldr(X16, THREAD, layout::THREAD_STACK as i32);
+                self.a.add_imm(Sz::X, X17, BASE, at as u64 * 8);
+                self.a.sub(Sz::X, X17, X17, X16);
+                self.a.add_shift(Sz::X, X17, n, X17, Shift::Lsr, 3);
+                self.a.str(X17, THREAD, layout::THREAD_TOP as i32);
+            }
             Resume { wanted, c, a, hdr } => {
                 // A fast callee returns here (`fall_into_resume`).
                 self.a.bind(self.fast_resume[block]);

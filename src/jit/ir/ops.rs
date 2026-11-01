@@ -616,6 +616,9 @@ pub(crate) enum Op {
     UpvalCellOf(u8),
     /// The region frame's function, from its header.
     FrameFn,
+    /// `top` past region slot `at` and the operand's count (an i32) of
+    /// values, as a call returning them up to `top` leaves it (W3 §7).
+    SetTop(u8),
     /// The value of an upvalue cell. An open cell is a slot, perhaps one of
     /// this region's: it reads and writes slots too.
     CellLoad,
@@ -912,6 +915,7 @@ impl Op {
             HasFlag(_) | FnFits => Effects::reads(Mem::FRAME),
             UpvalValueOf(_) | UpvalCellOf(_) => Effects::reads(Mem::UPVAL),
             FrameFn => Effects::reads(Mem::FRAME),
+            SetTop(_) => e(Flags::empty(), Mem::empty(), Mem::FRAME),
             CellLoad => Effects::reads(Mem::UPVAL | Mem::SLOT),
             CellStore => e(Flags::empty(), Mem::empty(), Mem::UPVAL | Mem::SLOT),
             Helper(h) => h.sig().effects,
@@ -957,6 +961,7 @@ impl Op {
         match self {
             Helper(h) => h.sig().ret.is_some() as usize,
             Store(_)
+            | SetTop(_)
             | CellStore
             | GuardShape(_)
             | GuardShapeIn(_)
@@ -1088,6 +1093,7 @@ impl Op {
             UpvalCell(i) => format!("upcell u{i}"),
             UpvalCellOf(i) => format!("upcell.of u{i}"),
             FrameFn => "framefn".into(),
+            SetTop(at) => format!("settop r{at}"),
             Helper(h) => format!("call.{}", h.name()),
             Resume { c } => format!("resume c={c}"),
             Return { a, n } => format!("return r{a} n={n}"),
