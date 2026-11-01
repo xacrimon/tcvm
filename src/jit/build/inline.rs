@@ -7,13 +7,16 @@
 //! (`intrinsics::callee_of`): a closure, whose upvalues are constants, or
 //! one of a prototype, whose upvalues are loaded from it.
 
+use std::rc::Rc;
+
 use super::intrinsics::{Callee, callee_of};
 use super::{Builder, Inline, SlotState};
+use crate::env::function::LuaFn;
 use crate::instruction::{Instruction, Op as BcOp};
-use crate::jit::build::cfg::Cfg;
+use crate::jit::build::cfg::{Cfg, RegSet, use_def};
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Rep, Ty};
-use crate::jit::ir::{Func, InlineFrame, Val};
+use crate::jit::ir::{InlineFrame, Val};
 
 /// Callees longer than this many bytecodes are called. Fitted to two
 /// programs: ray's `sphere_distance` (41) inlined runs 7% fewer cycles,
@@ -26,6 +29,14 @@ const MAX_DEPTH: u8 = 3;
 /// grows faster than the region (json at 3000: 81 ms of compiles, 22 without
 /// inlining).
 const MAX_INSTS: usize = 1500;
+
+/// A callee's code as its bodies are built, kept per prototype for the
+/// compile (`Known::callees`).
+pub(crate) struct InlineCode {
+    cfg: Cfg,
+    /// The registers some instruction writes.
+    written: RegSet,
+}
 
 /// Inline the CALL at `pc` of `callee`; whether it did, the current block
 /// then the one after the call.
@@ -60,21 +71,18 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     {
         return false;
     }
-    let mut code: Vec<Instruction> = proto
-        .code
-        .iter()
-        .map(|i| crate::jit::compile::resolve_original(lf, i))
-        .collect();
-    if code.iter().any(|i| needs_frame(i.op())) {
-        return false;
-    }
-    crate::jit::compile::canonical_back_edges(lf, &mut code);
-    let Ok(cfg) = Cfg::build(&proto, code, 0) else {
+    let key = crate::dmm::Gc::as_ptr(proto) as usize;
+    let code = match b.known.callees.get(&key) {
+        Some(code) => code.clone(),
+        None => {
+            let code = prepare(lf).map(Rc::new);
+            b.known.callees.insert(key, code.clone());
+            code
+        }
+    };
+    let Some(code) = code else {
         return false;
     };
-    if cfg.never_ran[cfg.block_of[0] as usize] {
-        return false;
-    }
     // What the callers hold at the call, and the callee's arguments.
     let live = b
         .cfg
@@ -83,8 +91,13 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         .copied()
         .unwrap_or_default();
     let mut outer = b.call_entries(live, a);
-    let regs: Vec<usize> = b
-        .exit_regs(live)
+    // A body's watched parameters hold their arguments to its returns, live
+    // or not (any call is above them, as it would write them).
+    let mut keep = b.exit_regs(live);
+    for &k in b.inline.iter().flat_map(|i| &i.watch) {
+        keep.insert(k as usize);
+    }
+    let regs: Vec<usize> = keep
         .iter()
         .filter(|&r| r < a as usize && r < b.nregs)
         .collect();
@@ -93,6 +106,15 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         .map(|r| (r as u8, b.reg(r as u8)))
         .collect();
     let args: Vec<Val> = (0..nb - 1).map(|k| b.reg(a + 4 + k)).collect();
+    let mut watch: Vec<u8> = Vec::new();
+    for (k, &v) in args.iter().enumerate().take(proto.num_params as usize) {
+        if !code.written.contains(k)
+            && kept.iter().any(|&(_, x)| x == v)
+            && !watch.iter().any(|&j| args[j as usize] == v)
+        {
+            watch.push(k as u8);
+        }
+    }
     let cv = b.boxed(callee);
     // The guard's operand: the closure, or the prototype (`Func::protos`).
     let (guard, func, closure) = if dynamic {
@@ -120,9 +142,10 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     let wanted = c - 1;
     let cont = b.new_block();
     let results: Vec<Val> = (0..wanted).map(|_| b.f.add_param(cont, Ty::ANY)).collect();
+    // What a body that fails leaves behind is undone.
     let def_snaps = b.f.def_snaps.len();
-    let meta = b.f.meta;
-    let f = std::mem::replace(&mut b.f, Func::new(meta));
+    let stable_used = b.f.stable_used.borrow().len();
+    let recv_shapes = b.known.recv_shapes.clone();
     let inline = Inline {
         frame,
         base,
@@ -131,17 +154,19 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         wanted,
         depth: depth + 1,
         failed: false,
-        returned: false,
+        watch,
+        returns: Vec::new(),
         closure,
     };
-    let mut ib = Builder::new_inline(b.ctx, lf, b.region, &cfg, f, inline, b.cold, b.deopt_all);
-    let entry = ib.build_inline(&args, MAX_INSTS);
-    b.f = std::mem::replace(&mut ib.f, Func::new(meta));
-    drop(ib);
-    b.pad_blocks();
+    let from = b.cur;
+    let mut ib = Builder::new_inline(b, lf, &code.cfg, inline);
+    let entry = ib.build_inline(&args, from, MAX_INSTS);
+    let inline = ib.finish(b);
     let Some(entry) = entry else {
         b.f.blocks[cont.idx()].dead = true;
         b.f.def_snaps.truncate(def_snaps);
+        b.f.stable_used.borrow_mut().truncate(stable_used);
+        b.known.recv_shapes = recv_shapes;
         return false;
     };
     // The callee pinned, its frame's window, then its body.
@@ -154,8 +179,47 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     b.flush();
     let slots: Vec<SlotState> = (0..a as usize).map(|r| b.slot(b.cur, r)).collect();
     b.jump(entry);
-    // After it: the callers' registers as at the call, the results.
+    // The results have the types the returns give them.
+    let rets = &inline.returns;
+    for (k, &p) in results.iter().enumerate() {
+        let t = rets
+            .iter()
+            .map(|&(j, _)| b.ty(b.f.edge_args(j, 0)[k]))
+            .reduce(Ty::join)
+            .expect("a return");
+        b.set_ty(p, t);
+    }
+    // What the returns refined of arguments callers' registers hold: one
+    // value, or a join where that is narrower than the argument.
+    let mut refined = Vec::new();
+    for (w, &k) in inline.watch.iter().enumerate() {
+        let v = args[k as usize];
+        let x0 = rets[0].1[w];
+        let to = if rets.iter().all(|r| r.1[w] == x0) {
+            x0
+        } else {
+            let t = rets.iter().map(|r| b.ty(r.1[w])).reduce(Ty::join).unwrap();
+            let tv = b.ty(v);
+            if t.set == tv.set && t.refine == tv.refine {
+                continue;
+            }
+            let q = b.f.add_param(cont, t);
+            for r in rets {
+                b.f.push_edge_arg(r.0, 0, r.1[w]);
+            }
+            q
+        };
+        if to != v {
+            refined.push((v, to));
+        }
+    }
+    // After it: the callers' registers as at the call, the results. Every
+    // register is defined, so no read walks into the body's blocks.
     b.bs[cont.idx()].sealed = true;
+    let nil = b.konst_in(cont, crate::env::value::Value::nil());
+    for r in 0..b.nregs as u8 {
+        b.set_def(cont, r, nil);
+    }
     for &(r, v) in &kept {
         b.set_def(cont, r, v);
     }
@@ -165,8 +229,40 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     for (r, s) in slots.into_iter().enumerate() {
         b.set_slot(cont, r, s);
     }
+    b.init_facts(cont);
     b.switch_to(cont);
+    for (v, to) in refined {
+        b.refine(v, to);
+    }
     true
+}
+
+/// A callee's code for inlining, or none when a body of it would need its
+/// frame or its entry never ran.
+fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
+    let proto = lf.proto;
+    let mut code: Vec<Instruction> = proto
+        .code
+        .iter()
+        .map(|i| crate::jit::compile::resolve_original(lf, i))
+        .collect();
+    if code.iter().any(|i| needs_frame(i.op())) {
+        return None;
+    }
+    crate::jit::compile::canonical_back_edges(lf, &mut code);
+    let cfg = Cfg::build(&proto, code, 0).ok()?;
+    if cfg.never_ran[cfg.block_of[0] as usize] {
+        return None;
+    }
+    let mut written = RegSet::EMPTY;
+    for &i in &cfg.code {
+        written.union(&use_def(&proto, i, cfg.nregs, &cfg.captured).defs);
+        // Written on their jump edge only.
+        if matches!(i.op(), BcOp::JTSET | BcOp::JFSET) && (i.a() as usize) < cfg.nregs {
+            written.insert(i.a() as usize);
+        }
+    }
+    Some(InlineCode { cfg, written })
 }
 
 /// Whether a callee's instruction needs its frame on the stack: its slots,
@@ -200,22 +296,22 @@ fn needs_frame(op: BcOp) -> bool {
     )
 }
 
-/// The inlined callee's `RETURN` of `n` results from `R[a..]`: a jump to
-/// the block after the call with the results it wants.
+/// The inlined callee's `RETURN` of `n` results from `R[a]`: a jump to the
+/// block after the call with the results it wants, as they are.
 pub(super) fn inline_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
-    let i = b.inline.as_mut().expect("an inlined body");
-    i.returned = true;
-    let (cont, wanted) = (i.cont, i.wanted);
+    let i = b.inline.as_ref().expect("an inlined body");
+    let (cont, wanted, watch) = (i.cont, i.wanted, i.watch.clone());
     let mut res = Vec::with_capacity(wanted as usize);
     for k in 0..wanted {
         let v = if k < n {
-            let v = b.reg(a + k);
-            b.boxed(v)
+            b.reg(a + k)
         } else {
             b.konst(crate::env::value::Value::nil())
         };
         res.push(v);
     }
+    let seen: Vec<Val> = watch.iter().map(|&r| b.reg(r)).collect();
     let t = b.terminate(Op::Jump, &[], &[cont], None);
     b.f.set_edge_args(t, 0, &res);
+    b.inline.as_mut().unwrap().returns.push((t, seen));
 }

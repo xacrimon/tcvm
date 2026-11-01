@@ -142,7 +142,7 @@ pub(super) fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Optio
             Some(unsafe { (*b.region.upvalue_ptr().add(k as usize)).cell }.get())
         }
         _ => {
-            let &(recv, key) = b.field_loads.get(&v)?;
+            let &(recv, key) = b.known.field_loads.get(&v)?;
             Some(value_now(b, recv, guess)?.get_table()?.raw_get(key))
         }
     }

@@ -3,9 +3,13 @@
 use crate::env::{LuaString, Value};
 use crate::{Executor, LoadError, Lua};
 
-/// Run `src` in the interpreter, then build the IR of global function
-/// `name` from `pc` with the feedback it left, whatever the JIT mode.
-pub(crate) fn ir_of(src: &str, name: &str, pc: u32) -> String {
+/// Run `src` in the interpreter, then hand `with` global function `name`
+/// with the feedback it left.
+fn warmed<R>(
+    src: &str,
+    name: &str,
+    with: impl for<'gc> FnOnce(crate::lua::Context<'gc>, crate::env::function::LuaFn<'gc>) -> R,
+) -> R {
     let mut lua = Lua::new();
     lua.set_jit(false);
     lua.load_all();
@@ -24,6 +28,14 @@ pub(crate) fn ir_of(src: &str, name: &str, pc: u32) -> String {
             .get_function()
             .and_then(|f| f.as_lua())
             .expect("a Lua function");
+        with(ctx, lf)
+    })
+}
+
+/// Run `src` in the interpreter, then build the IR of global function
+/// `name` from `pc` with the feedback it left, whatever the JIT mode.
+pub(crate) fn ir_of(src: &str, name: &str, pc: u32) -> String {
+    warmed(src, name, |ctx, lf| {
         let opts = crate::jit::compile::Options {
             check: true,
             deopt_all: false,
@@ -40,6 +52,25 @@ pub(crate) fn ir_of(src: &str, name: &str, pc: u32) -> String {
             Ok((func, _)) => func.print(),
             Err(e) => panic!("{e:?}"),
         }
+    })
+}
+
+/// The IR the builder makes of global function `name` from `pc`, before
+/// any pass: what it knows as it builds.
+fn built_ir_of(src: &str, name: &str, pc: u32) -> String {
+    use crate::jit::compile::{canonical_back_edges, resolve_original};
+    warmed(src, name, |ctx, lf| {
+        let mut code: Vec<_> = lf
+            .proto
+            .code
+            .iter()
+            .map(|i| resolve_original(lf, i))
+            .collect();
+        canonical_back_edges(lf, &mut code);
+        let loop_entry = code[pc as usize].op() != crate::instruction::Op::FUNC;
+        let cfg = crate::jit::build::cfg::Cfg::build(&lf.proto, code, pc).expect("a CFG");
+        let b = crate::jit::build::Builder::new(ctx, lf, &cfg, pc, loop_entry);
+        b.build().expect("built").print()
     })
 }
 
@@ -1083,4 +1114,51 @@ fn branches_deciding_nothing_fold() {
     let ir = ir_of(src, "f", 0);
     assert_eq!(idle_branches(&ir), 0, "{ir}");
     assert_eq!(branches_on(&ir, "cmp.lt"), 0, "{ir}");
+}
+
+/// Elements of two shapes, read in the caller then in an inlined body: the
+/// body starts with the caller's facts (W3 §3) and tests no shape it knows.
+#[test]
+fn bodies_start_with_their_callers_facts() {
+    let src = "local A = {}
+    for i = 1, 50 do A[#A + 1] = {v = i, w = 1} A[#A + 1] = {u = 0, v = i, w = 2} end
+    local function w(n) return n.w end
+    function f(n) local s = 0 for i = 1, n do local o = A[i] s = s + o.v + w(o) end return s end
+    for k = 1, 30 do f(100) end";
+    let ir = ir_of(src, "f", 0);
+    let body = ir
+        .lines()
+        .filter(|l| l.contains("guardshape") && l.contains("before f0"));
+    assert_eq!(body.count(), 0, "{ir}");
+}
+
+/// The same read first in an inlined body: the caller continues with the
+/// facts of the body's returns and tests no shape again.
+#[test]
+fn callers_continue_with_their_bodies_facts() {
+    let src = "local A = {}
+    for i = 1, 50 do A[#A + 1] = {v = i, w = 1} A[#A + 1] = {u = 0, v = i, w = 2} end
+    local function w(n) return n.w end
+    function f(n) local s = 0 for i = 1, n do local o = A[i] s = s + w(o) + o.v end return s end
+    for k = 1, 30 do f(100) end";
+    let ir = ir_of(src, "f", 0);
+    let caller = ir
+        .lines()
+        .filter(|l| l.contains("guardshape") && !l.contains("before f0"));
+    assert_eq!(caller.count(), 0, "{ir}");
+}
+
+/// An inlined body's results keep the types its returns give them: the
+/// builder's join parameters are untyped but this one, an `i32` the caller
+/// adds without a guard.
+#[test]
+fn inlined_results_keep_their_types() {
+    let src = "local function inc(x) if x > 3 then return x + 1 end return x - 1 end
+    function f(n) local s = 0 for i = 1, n do s = s + inc(i) end return s end
+    for r = 1, 300 do f(10) end";
+    let ir = built_ir_of(src, "f", 0);
+    let typed = ir
+        .lines()
+        .filter(|l| l.starts_with('b') && l.contains(": i32)"));
+    assert_eq!(typed.count(), 1, "{ir}");
 }

@@ -324,7 +324,7 @@ fn emit_found<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, found: Found<'gc>, site: &
                 guard_shape(b, hp, hs);
             }
             let v = slot_load(b, hp, hs, loc, site.kid);
-            b.field_loads.insert(v, (hv, site.kv));
+            b.known.field_loads.insert(v, (hv, site.kv));
             if !b.ty(v).set.intersects(TypeSet::NIL) {
                 return v;
             }
@@ -815,7 +815,7 @@ fn string_method<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>) -> bo
     let lp = b.ins(Op::Unbox(Rep::Ptr), &[lv]);
     guard_shape(b, lp, ls);
     let m = slot_load(b, lp, ls, SlotLoc::new(ls, lslot), site.kid);
-    b.field_loads.insert(m, (lv, site.kv));
+    b.known.field_loads.insert(m, (lv, site.kv));
     b.set(dst, m);
     true
 }
@@ -931,7 +931,7 @@ fn site_shapes<'gc>(
     if v.len() > MAX || v.iter().any(|s| s.is_dict()) {
         return None;
     }
-    let known = b.recv_shapes.entry(b.root_of(recv)).or_default();
+    let known = b.known.recv_shapes.entry(b.root_of(recv)).or_default();
     for &s in known.iter() {
         if v.len() < MAX && !has(&v, s) && !s.is_deprecated() {
             v.push(s);
@@ -955,7 +955,7 @@ fn own_load<'gc>(
     loc: SlotLoc,
 ) {
     let v = slot_load(b, t, shape, loc, site.kid);
-    b.field_loads.insert(v, (site.recv, site.kv));
+    b.known.field_loads.insert(v, (site.recv, site.kv));
     let found = walk(b, shape.mt_cache(), site.str());
     nil_walks(b, dst, shape, v, site, found);
 }

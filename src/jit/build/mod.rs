@@ -169,16 +169,66 @@ struct BlockState {
     /// What the branch into it tells, bound once it is entered from that
     /// branch alone.
     on_entry: Vec<(Val, Fact)>,
-    /// The shapes tables have here, by the value they unbox (`root_of`):
-    /// the shape guards and tests passed since an instruction that may
-    /// change shapes (W1.7 5.2), and whether a fact holds only while its
-    /// shapes stay stable (ws2 §6.2): one kept across such an instruction,
-    /// or a load from a slot that tracks its tables' shape.
+    facts: Facts,
+}
+
+/// What the builder knows of values on a path (W3 §3). A block starts
+/// with the meet over its predecessors'; an inlined body with its caller's
+/// at the call, the code after the call with the meet over its returns'.
+/// Refinements are the registers' (`BlockState::refines`): a body's of its
+/// arguments reach the caller through the parameters it never writes.
+#[derive(Clone, Default)]
+struct Facts {
+    /// The shapes tables have here, by fact key (`fact_key`): the shape
+    /// guards and tests passed since an instruction that may change shapes
+    /// (W1.7 5.2), and whether a fact holds only while its shapes stay
+    /// stable (ws2 §6.2): one kept across such an instruction, or a load
+    /// from a slot that tracks its tables' shape.
     shapes: Vec<(Val, Shapes, bool)>,
     /// The facts of stable shapes an instruction that may change shapes
     /// left, back at the lazy exit after it: no frame passes that exit
     /// once one of their shapes is left.
     stash: Vec<(Val, Shapes)>,
+}
+
+impl Facts {
+    /// What holds where a path with `o` joins: a table's shapes are those
+    /// it may have on either. A join follows no instruction's lazy exit, so
+    /// nothing is stashed.
+    fn meet(&mut self, o: &Facts) {
+        self.shapes.retain_mut(|(v, s, stable)| {
+            let Some(x) = o.shapes.iter().find(|x| x.0 == *v) else {
+                return false;
+            };
+            match s.union(x.1) {
+                Some(u) => {
+                    (*s, *stable) = (u, *stable || x.2);
+                    true
+                }
+                None => false,
+            }
+        });
+        self.stash.clear();
+    }
+}
+
+/// What holds of values wherever they are, shared by a region's builders
+/// with its block states: an inlined body's builder takes them at the call
+/// and gives them back (W3 §3).
+#[derive(Default)]
+pub(crate) struct Known<'gc> {
+    /// The receiver and constant key of each direct field load, for values
+    /// the builder can know now (intrinsic callees).
+    pub(crate) field_loads: crate::jit::FastMap<Val, (Val, Value<'gc>)>,
+    /// The shapes field sites compiled tests for, by receiver value.
+    pub(crate) recv_shapes: crate::jit::FastMap<Val, Vec<crate::env::Shape<'gc>>>,
+    /// `fact_key` of parameters of sealed blocks, whose arguments are final.
+    fact_keys: std::cell::RefCell<crate::jit::FastMap<Val, Val>>,
+    /// The first constant of each pool entry, which facts of every other
+    /// constant of it are kept under.
+    konst_keys: crate::jit::FastMap<u32, Val>,
+    /// Callees' code as their bodies are built, by prototype.
+    pub(crate) callees: crate::jit::FastMap<usize, Option<std::rc::Rc<inline::InlineCode>>>,
 }
 
 pub(crate) struct Builder<'a, 'gc> {
@@ -207,14 +257,10 @@ pub(crate) struct Builder<'a, 'gc> {
     cur_snap: Option<Snap>,
     pub(crate) pc: u32,
     pub(crate) deopt_all: bool,
-    /// The receiver and constant key of each direct field load, for values
-    /// the builder can know now (intrinsic callees).
-    pub(crate) field_loads: crate::jit::FastMap<Val, (Val, Value<'gc>)>,
+    pub(crate) known: Known<'gc>,
     /// The callee and first argument of the call at a pc, known before a
     /// `VARARG` up to `top` that reloads their registers.
     pub(crate) callee_hint: Option<(u32, Val, Val)>,
-    /// The shapes field sites compiled tests for, by receiver value.
-    pub(crate) recv_shapes: crate::jit::FastMap<Val, Vec<crate::env::Shape<'gc>>>,
     /// Blocks made now are cold arms (A5).
     cold: bool,
     /// A loop entry's frame, by register: what `intrinsics::value_now`
@@ -228,11 +274,6 @@ pub(crate) struct Builder<'a, 'gc> {
     /// The refinements the instruction being emitted made, in order: its
     /// `Before` snapshot, shared by all its arms, names what they refined.
     pc_refines: Vec<(Val, Val)>,
-    /// `fact_key` of parameters of sealed blocks, whose arguments are final.
-    fact_keys: std::cell::RefCell<crate::jit::FastMap<Val, Val>>,
-    /// The first constant of each pool entry, which facts of every other
-    /// constant of it are kept under.
-    konst_keys: crate::jit::FastMap<u32, Val>,
 }
 
 /// What the builder of an inlined callee knows of its call (E1).
@@ -250,8 +291,12 @@ pub(crate) struct Inline {
     pub(crate) depth: u8,
     /// It emitted an instruction that needs its frame on the stack.
     pub(crate) failed: bool,
-    /// Some path reached a return: a body that only exits is no inline.
-    pub(crate) returned: bool,
+    /// Parameters the body never writes whose arguments the caller's
+    /// registers hold after the call, reported at each return.
+    pub(crate) watch: Vec<u8>,
+    /// Each return's jump and what `watch` holds there; none for a body
+    /// that only exits, which is no inline.
+    pub(crate) returns: Vec<(Inst, Vec<Val>)>,
     /// The callee closure (a `Ptr`) when known by its prototype only, whose
     /// upvalues are loaded from it; else the builder's closure is it.
     pub(crate) closure: Option<Val>,
@@ -271,8 +316,7 @@ impl BlockState {
             terminated: false,
             refines: Vec::new(),
             on_entry: Vec::new(),
-            shapes: Vec::new(),
-            stash: Vec::new(),
+            facts: Facts::default(),
         }
     }
 }
@@ -313,8 +357,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             cur_snap: None,
             pc: entry_pc,
             deopt_all: false,
-            field_loads: Default::default(),
-            recv_shapes: Default::default(),
+            known: Known::default(),
             callee_hint: None,
             cold: false,
             entry_frame: Vec::new(),
@@ -322,33 +365,29 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             inline: None,
             chain: Vec::new(),
             pc_refines: Vec::new(),
-            fact_keys: Default::default(),
-            konst_keys: Default::default(),
         }
     }
 
-    /// The builder of an inlined callee's body into `f`, whose blocks so far
-    /// are another builder's.
+    /// The builder of an inlined callee's body, which takes `outer`'s
+    /// `Func`, block states and value facts until `finish`.
     pub(crate) fn new_inline(
-        ctx: crate::lua::Context<'gc>,
+        outer: &mut Builder<'_, 'gc>,
         closure: LuaFn<'gc>,
-        region: LuaFn<'gc>,
         cfg: &'a Cfg,
-        f: Func<'gc>,
         inline: Inline,
-        cold: bool,
-        deopt_all: bool,
     ) -> Self {
+        let meta = outer.f.meta;
+        let f = std::mem::replace(&mut outer.f, Func::new(meta));
         let n = f.blocks.len();
-        let mut b = Builder {
-            ctx,
+        Builder {
+            ctx: outer.ctx,
             f,
             closure,
-            region,
+            region: outer.region,
             proto: closure.proto,
             cfg,
             nregs: cfg.nregs,
-            bs: Vec::new(),
+            bs: std::mem::take(&mut outer.bs),
             defs: vec![None; n * cfg.nregs],
             slots: vec![SlotState::Unknown; n * cfg.nregs],
             cur: Block(0),
@@ -359,29 +398,33 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             pending: Vec::new(),
             cur_snap: None,
             pc: 0,
-            deopt_all,
-            field_loads: Default::default(),
-            recv_shapes: Default::default(),
+            deopt_all: outer.deopt_all,
+            known: std::mem::take(&mut outer.known),
             callee_hint: None,
-            cold,
+            cold: outer.cold,
             entry_frame: Vec::new(),
             loop_entry: false,
             inline: Some(inline),
             chain: Vec::new(),
             pc_refines: Vec::new(),
-            fact_keys: Default::default(),
-            konst_keys: Default::default(),
-        };
-        b.bs.resize_with(n, BlockState::placeholder);
-        b
+        }
+    }
+
+    /// Give `outer` back what `new_inline` took; the body's call state.
+    pub(crate) fn finish(mut self, outer: &mut Builder<'_, 'gc>) -> Inline {
+        let meta = self.f.meta;
+        outer.f = std::mem::replace(&mut self.f, Func::new(meta));
+        outer.bs = std::mem::take(&mut self.bs);
+        outer.known = std::mem::take(&mut self.known);
+        outer.pad_blocks();
+        self.inline.take().expect("an inlined body")
     }
 
     /// Cover blocks another builder made since this one's last.
-    pub(crate) fn pad_blocks(&mut self) {
+    fn pad_blocks(&mut self) {
         let n = self.f.blocks.len();
         self.defs.resize(n * self.nregs, None);
         self.slots.resize(n * self.nregs, SlotState::Unknown);
-        self.bs.resize_with(n, BlockState::placeholder);
     }
 
     /// The inlined frame snapshots name, or `NO_FRAME`.
@@ -511,8 +554,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         // Its slots and facts start as the current block's end with them.
         let (n, c) = (self.nregs, self.cur.idx());
         self.slots.copy_within(c * n..(c + 1) * n, b.idx() * n);
-        self.bs[b.idx()].shapes = self.bs[c].shapes.clone();
-        self.bs[b.idx()].stash = self.bs[c].stash.clone();
+        self.bs[b.idx()].facts = self.bs[c].facts.clone();
         b
     }
 
@@ -815,18 +857,18 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let r = self.root_of(v);
         let ValDef::Param(blk, k) = self.f.vals[r.idx()].def else {
             return match self.f.def_op(r) {
-                Some(Op::KObj(idx)) => self.konst_keys.get(&idx).copied().unwrap_or(r),
+                Some(Op::KObj(idx)) => self.known.konst_keys.get(&idx).copied().unwrap_or(r),
                 _ => r,
             };
         };
         if depth == 0 || !self.bs[blk.idx()].sealed {
             return r;
         }
-        if let Some(&x) = self.fact_keys.borrow().get(&r) {
+        if let Some(&x) = self.known.fact_keys.borrow().get(&r) {
             return x;
         }
         let x = self.param_fact_key(r, blk, k, depth);
-        self.fact_keys.borrow_mut().insert(r, x);
+        self.known.fact_keys.borrow_mut().insert(r, x);
         x
     }
 
@@ -859,7 +901,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// The shapes the table `t` unboxes from may have here, if known.
     pub(crate) fn known_shapes(&self, t: Val) -> Option<Shapes> {
         let r = self.fact_key(t);
-        let s = &self.bs[self.cur.idx()].shapes;
+        let s = &self.bs[self.cur.idx()].facts.shapes;
         let &(_, set, stable) = s.iter().find(|x| x.0 == r)?;
         if stable {
             self.f
@@ -882,7 +924,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     fn put_shapes(&mut self, t: Val, s: Shapes, stable: bool) {
         let r = self.fact_key(t);
-        let facts = &mut self.bs[self.cur.idx()].shapes;
+        let facts = &mut self.bs[self.cur.idx()].facts.shapes;
         match facts.iter_mut().find(|x| x.0 == r) {
             Some(x) => (x.1, x.2) = (s, stable),
             None => facts.push((r, s, stable)),
@@ -900,7 +942,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// The facts of stable shapes, for after an instruction that may change
     /// shapes and is followed by a lazy exit.
     fn stable_facts(&self, b: Block) -> Vec<(Val, Shapes)> {
-        let facts = &self.bs[b.idx()].shapes;
+        let facts = &self.bs[b.idx()].facts.shapes;
         facts
             .iter()
             .filter(|x| self.all_stable(x.1))
@@ -927,7 +969,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             true => self.stable_facts(self.cur),
             false => Vec::new(),
         };
-        let s = &mut self.bs[self.cur.idx()];
+        let s = &mut self.bs[self.cur.idx()].facts;
         s.shapes.clear();
         s.stash = stash;
     }
@@ -943,7 +985,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.inline_check(Op::TabSetShape(k));
         self.f.append(self.cur, i);
         let r = self.fact_key(t);
-        let s = &mut self.bs[self.cur.idx()];
+        let s = &mut self.bs[self.cur.idx()].facts;
         s.stash.clear();
         match from {
             Some(f) => s
@@ -1254,7 +1296,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// table write, before anything that assumes what a dependency names.
     pub(crate) fn lazy_exit(&mut self, s: Snap) {
         self.ins_snap(Op::LazyExit, &[], s, ExitTag::Lazy);
-        let st = &mut self.bs[self.cur.idx()];
+        let st = &mut self.bs[self.cur.idx()].facts;
         for (v, set) in std::mem::take(&mut st.stash) {
             if !st.shapes.iter().any(|x| x.0 == v) {
                 st.shapes.push((v, set, true));
@@ -1426,7 +1468,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let s = &mut self.bs[resume.idx()];
         s.sealed = true;
         s.reload = reload;
-        s.stash = stash;
+        s.facts.stash = stash;
         self.terminate(op, args, &[resume], Some((snap, ExitTag::Type)));
         for r in 0..self.nregs {
             let state = if reload.contains(r) {
@@ -1457,7 +1499,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         }
         let idx = self.f.intern(v);
         let k = self.ins(Op::KObj(idx), &[]);
-        self.konst_keys.entry(idx).or_insert(k);
+        self.known.konst_keys.entry(idx).or_insert(k);
         let set = value_set(v);
         self.set_ty(
             k,
@@ -1838,13 +1880,20 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         Ok(self.f)
     }
 
-    /// Build an inlined callee's body from `args`, its parameters: its entry
-    /// block, unreached until the caller jumps there, or none when it needs
-    /// its frame (`Inline::failed`) or grew past `limit` instructions.
-    pub(crate) fn build_inline(&mut self, args: &[Val], limit: usize) -> Option<Block> {
+    /// Build an inlined callee's body from `args`, its parameters, and the
+    /// facts of the caller's block `from`: its entry block, unreached until
+    /// the caller jumps there, or none when it needs its frame
+    /// (`Inline::failed`) or grew past `limit` instructions.
+    pub(crate) fn build_inline(
+        &mut self,
+        args: &[Val],
+        from: Block,
+        limit: usize,
+    ) -> Option<Block> {
         let first_block = self.f.blocks.len();
         let entry = self.new_block();
         self.bs[entry.idx()].sealed = true;
+        self.bs[entry.idx()].facts = self.bs[from.idx()].facts.clone();
         for r in 0..self.proto.num_params as usize {
             let v = match args.get(r) {
                 Some(&v) => v,
@@ -1867,7 +1916,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             && self
                 .inline
                 .as_ref()
-                .is_some_and(|i| !i.failed && i.returned);
+                .is_some_and(|i| !i.failed && !i.returns.is_empty());
         if !ok {
             for b in first_block..self.f.blocks.len() {
                 self.f.blocks[b].dead = true;
@@ -1913,22 +1962,20 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         Ok(())
     }
 
-    /// The slot state at the start of a block: the meet over its emitted
-    /// predecessors, unknown at a loop header.
+    /// The slot state and facts at the start of a block: the meet over its
+    /// emitted predecessors, unknown at a loop header.
     fn init_slots(&mut self, b: Block) {
+        self.init_facts(b);
         let n = self.nregs;
         if !self.bs[b.idx()].sealed || self.bs[b.idx()].preds.is_empty() {
             if !self.bs[b.idx()].root {
                 self.slots_of(b).fill(SlotState::Unknown);
             }
-            self.bs[b.idx()].shapes.clear();
-            self.bs[b.idx()].stash.clear();
             return;
         }
         let p0 = self.bs[b.idx()].preds[0];
         self.slots
             .copy_within(p0.idx() * n..(p0.idx() + 1) * n, b.idx() * n);
-        let mut shapes = self.bs[p0.idx()].shapes.clone();
         for j in 1..self.bs[b.idx()].preds.len() {
             let p = self.bs[b.idx()].preds[j];
             for r in 0..n {
@@ -1936,22 +1983,25 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                     self.set_slot(b, r, SlotState::Unknown);
                 }
             }
-            // A table's shapes are those it may have on every edge.
-            let theirs = &self.bs[p.idx()].shapes;
-            shapes.retain_mut(|(v, s, stable)| {
-                let Some(x) = theirs.iter().find(|x| x.0 == *v) else {
-                    return false;
-                };
-                match s.union(x.1) {
-                    Some(u) => {
-                        (*s, *stable) = (u, *stable || x.2);
-                        true
-                    }
-                    None => false,
-                }
-            });
         }
-        self.bs[b.idx()].shapes = shapes;
+    }
+
+    /// The facts at the start of a block: the meet over its predecessors',
+    /// none at a loop header.
+    fn init_facts(&mut self, b: Block) {
+        let s = &self.bs[b.idx()];
+        let facts = match s.preds.split_first() {
+            Some((p0, rest)) if s.sealed => {
+                let mut x = self.bs[p0.idx()].facts.clone();
+                x.stash.clear();
+                for p in rest {
+                    x.meet(&self.bs[p.idx()].facts);
+                }
+                x
+            }
+            _ => Facts::default(),
+        };
+        self.bs[b.idx()].facts = facts;
     }
 
     fn emit_instance(&mut self, ii: usize, bc: u32) {
