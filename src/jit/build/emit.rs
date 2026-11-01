@@ -401,6 +401,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         // Up to `top`: the interpreter's RETURN, which closes too.
         RETURN if rb == 0 => dispatch(b),
         RETURN => emit_return(b, a, rb - 1),
+        TAILCALL if b.inline.is_some() => body_tailcall(b, pc, insn),
         TAILCALL => {
             let callee = callee_at(b, pc, a);
             // The frame before the TAILCALL, for the return's exit, which is
@@ -563,6 +564,41 @@ fn dispatch(b: &mut Builder<'_, '_>) {
 /// close; any other callee the interpreter's TAILCALL, from the slots. A
 /// known callee (`known_callee`) is entered past its checks (D2), its
 /// window checked there.
+/// `TAILCALL` in an inlined body (W3 §5): the call replaces the body's
+/// frame, as the interpreter's does. A builtin's result is the body's; an
+/// inlinable callee is inlined in its place; any other is called as the
+/// body's caller called the body.
+fn body_tailcall(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
+    let (a, nb) = (insn.a(), insn.b());
+    // Arguments up to `top` (W3 step 7).
+    if nb == 0 {
+        dispatch(b);
+        return;
+    }
+    let callee = callee_at(b, pc, a);
+    match intrinsics::emit(b, pc, insn, callee) {
+        Emitted::Done => {
+            if !b.terminated() {
+                b.flush();
+                super::inline::inline_return(b, a, 1);
+            }
+        }
+        Emitted::Fallback(slow, f) => {
+            if !b.terminated() {
+                b.flush();
+                super::inline::inline_return(b, a, 1);
+            }
+            b.switch_to(slow);
+            super::inline::tail_call(b, pc, a, nb - 1, f);
+        }
+        Emitted::No => {
+            if !super::inline::try_inline(b, pc, insn, callee) {
+                super::inline::tail_call(b, pc, a, nb - 1, callee);
+            }
+        }
+    }
+}
+
 fn emit_tailcall(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8) {
     use crate::vm::frame::flag::{HAS_OPEN, HAS_TBC};
     let f = b.reg(a);
@@ -1881,7 +1917,7 @@ fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
 /// (`Func::protos`, else `NO_PROTO`), which lowering enters past its checks
 /// (D2). A function guarded by identity becomes a constant: a native is
 /// called through `jit_call_native` (I1).
-fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> (Val, u32) {
+pub(super) fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> (Val, u32) {
     use intrinsics::Callee;
     fn fixed<'gc>(
         f: Function<'gc>,

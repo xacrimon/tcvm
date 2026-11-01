@@ -46,13 +46,25 @@ pub(crate) struct InlineCode {
 }
 
 /// Inline the CALL at `pc` of `callee`; whether it did, the current block
-/// then the one after the call.
+/// then the one after the call. An inlined body's `TAILCALL` inlines its
+/// callee in the body's place (W3 §5): the frame it replaces is gone, so
+/// the callee has its base, caller and continuation, and its returns are
+/// the body's.
 pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> bool {
     if !b.ctx.jit().config.inline {
         return false;
     }
-    let (a, nb, c) = (insn.a(), insn.b(), insn.c());
-    if nb == 0 || c == 0 || insn.op() == BcOp::TAILCALL {
+    let tail = insn.op() == BcOp::TAILCALL;
+    // The region's own frame calls (W3 step 6b).
+    if tail && b.inline.is_none() {
+        return false;
+    }
+    let (a, nb) = (insn.a(), insn.b());
+    let c = match &b.inline {
+        Some(i) if tail => b.f.inline_frames[i.frame as usize].c,
+        _ => insn.c(),
+    };
+    if nb == 0 || c == 0 {
         return false;
     }
     let depth = b.inline.as_ref().map_or(0, |i| i.depth);
@@ -70,7 +82,11 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         Callee::Proto(_, None) | Callee::Unknown => return false,
     };
     let proto = lf.proto;
-    let base = b.reg_base() + a as usize + 4;
+    let base = if tail {
+        b.reg_base()
+    } else {
+        b.reg_base() + a as usize + 4
+    };
     if proto.is_vararg
         || proto.code.len() > INLINE_LIMIT
         || crate::dmm::Gc::ptr_eq(proto, b.proto)
@@ -94,7 +110,10 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     // cells: they live in their slots across it, read from them after. Its
     // code may say so (a call, a cell); else a body that called anyway (a
     // metamethod, a builtin's fallback) is built again with them there.
-    let mut sync = code.cells;
+    // A tail call's frame is gone: what the body it replaces watched, the
+    // values its returns report.
+    let mut sync = code.cells && !tail;
+    let seen = if tail { watched(b) } else { Vec::new() };
     let (entry, inline, cont, results, args, kept, captured, guard, cv) = loop {
         let captured = if sync { b.cfg.captured } else { RegSet::EMPTY };
         b.store_regs(captured.iter());
@@ -105,7 +124,10 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             .get(pc as usize + 1)
             .copied()
             .unwrap_or_default();
-        let mut outer = b.call_entries(live, a);
+        let mut outer = match &b.inline {
+            Some(i) if tail => i.outer_entries(),
+            _ => b.call_entries(live, a),
+        };
         // A body's watched parameters hold their arguments to its returns, live
         // or not (any call is above them, as it would write them).
         let mut keep = b.exit_regs(live);
@@ -114,7 +136,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         }
         let regs: Vec<usize> = keep
             .iter()
-            .filter(|&r| r < a as usize && r < b.nregs)
+            .filter(|&r| !tail && r < a as usize && r < b.nregs)
             .collect();
         // The callers' slots a call in the body keeps, by region slot.
         let mut outer_homes = b.inline.as_ref().map_or(RegSet::EMPTY, |i| i.outer_homes);
@@ -134,7 +156,8 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         let args: Vec<Val> = (0..nb - 1).map(|k| b.reg(a + 4 + k)).collect();
         let mut watch: Vec<u8> = Vec::new();
         for (k, &v) in args.iter().enumerate().take(proto.num_params as usize) {
-            if !code.written.contains(k)
+            if !tail
+                && !code.written.contains(k)
                 && kept.iter().any(|&(_, x)| x == v)
                 && !watch.iter().any(|&j| args[j as usize] == v)
             {
@@ -157,13 +180,19 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             (Ok(k), func, None)
         };
         let frame = b.f.inline_frames.len() as u32;
-        let parent = b.frame_id();
+        let (parent, fa, caller_pc) = match &b.inline {
+            Some(i) if tail => {
+                let x = b.f.inline_frames[i.frame as usize];
+                (x.parent, x.a, x.caller_pc)
+            }
+            _ => (b.frame_id(), a, pc),
+        };
         b.f.inline_frames.push(InlineFrame {
             parent,
             func,
-            a,
+            a: fa,
             c,
-            caller_pc: pc,
+            caller_pc,
             code: proto.code.as_ptr() as usize,
             open: code.cfg.captured.iter().next().is_some(),
         });
@@ -173,8 +202,14 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
             b.f.captured.insert(base + r);
         }
         let wanted = c - 1;
-        let cont = b.new_block();
-        let results: Vec<Val> = (0..wanted).map(|_| b.f.add_param(cont, Ty::ANY)).collect();
+        let (cont, results) = match &b.inline {
+            Some(i) if tail => (i.cont, Vec::new()),
+            _ => {
+                let cont = b.new_block();
+                let results: Vec<Val> = (0..wanted).map(|_| b.f.add_param(cont, Ty::ANY)).collect();
+                (cont, results)
+            }
+        };
         // What a body that fails leaves behind is undone.
         let def_snaps = b.f.def_snaps.len();
         let stable_used = b.f.stable_used.borrow().len();
@@ -198,7 +233,9 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         let entry = ib.build_inline(&args, from, MAX_INSTS);
         let inline = ib.finish(b);
         let Some(entry) = entry else {
-            b.f.blocks[cont.idx()].dead = true;
+            if !tail {
+                b.f.blocks[cont.idx()].dead = true;
+            }
             b.f.def_snaps.truncate(def_snaps);
             b.f.stable_used.borrow_mut().truncate(stable_used);
             b.known.recv_shapes = recv_shapes;
@@ -222,7 +259,11 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     {
         i.called = true;
     }
-    // The callee pinned, its frame's window, then its body.
+    // The frame it replaces closes; the callee pinned, its frame's window,
+    // then its body.
+    if tail {
+        close_frame(b);
+    }
     match guard {
         Ok(k) => b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const),
         Err(k) => b.ins_exit(Op::GuardProto(k), &[cv], ExitTag::Const),
@@ -232,6 +273,14 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     b.flush();
     let slots: Vec<SlotState> = (0..a as usize).map(|r| b.slot(b.cur, r)).collect();
     b.jump(entry);
+    // Its returns are the body's, reporting what the body's watched.
+    if tail {
+        let i = b.inline.as_mut().unwrap();
+        for (t, _) in inline.returns {
+            i.returns.push((t, seen.clone()));
+        }
+        return true;
+    }
     // The results have the types the returns give them.
     let rets = &inline.returns;
     for (k, &p) in results.iter().enumerate() {
@@ -323,6 +372,7 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
             i.op().unquickened(),
             CALL | CALL_R0
                 | CALL_R1
+                | TAILCALL
                 | CALLS
                 | CALLS_R0
                 | CALLS_R1
@@ -351,17 +401,13 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
 /// to-be-closed variable, varargs.
 fn needs_frame(op: BcOp) -> bool {
     use BcOp::*;
-    matches!(
-        op.unquickened(),
-        TAILCALL | TBC | VARARG | VARARGGET | VARARGPREP
-    )
+    matches!(op.unquickened(), TBC | VARARG | VARARGGET | VARARGPREP)
 }
 
 /// The inlined callee's `RETURN` of `n` results from `R[a]`: a jump to the
 /// block after the call with the results it wants, as they are.
 pub(super) fn inline_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
-    let i = b.inline.as_ref().expect("an inlined body");
-    let (cont, wanted, watch) = (i.cont, i.wanted, i.watch.clone());
+    let wanted = b.inline.as_ref().expect("an inlined body").wanted;
     let mut res = Vec::with_capacity(wanted as usize);
     for k in 0..wanted {
         let v = if k < n {
@@ -371,16 +417,85 @@ pub(super) fn inline_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
         };
         res.push(v);
     }
-    let seen: Vec<Val> = watch.iter().map(|&r| b.reg(r)).collect();
-    // What its closures opened on its slots closes with it, from their
-    // values now.
+    let seen = watched(b);
+    close_frame(b);
+    return_values(b, &res, seen);
+}
+
+/// What the body's watched parameters hold now.
+fn watched(b: &mut Builder<'_, '_>) -> Vec<Val> {
+    let watch = b.inline.as_ref().expect("an inlined body").watch.clone();
+    watch.iter().map(|&r| b.reg(r)).collect()
+}
+
+/// Close what the body's closures opened on its slots, from their values
+/// now: its frame goes.
+fn close_frame(b: &mut Builder<'_, '_>) {
     let captured = b.cfg.captured;
     if captured.iter().next().is_some() {
         b.store_regs(captured.iter());
         let at = b.slot_of(0);
         b.push(Op::Helper(crate::jit::ir::ops::HelperId::Close(at)), &[]);
     }
+}
+
+/// Jump to the block after the call with the results, `seen` what the
+/// watched parameters held.
+fn return_values(b: &mut Builder<'_, '_>, res: &[Val], seen: Vec<Val>) {
+    let cont = b.inline.as_ref().expect("an inlined body").cont;
     let t = b.terminate(Op::Jump, &[], &[cont], None);
-    b.f.set_edge_args(t, 0, &res);
+    b.f.set_edge_args(t, 0, res);
     b.inline.as_mut().unwrap().returns.push((t, seen));
+}
+
+/// The body's `TAILCALL` of `callee` with `nargs` arguments from `R[a+4]`
+/// as a real call replacing its frame (W3 §5): from the body's header
+/// slot, wanting what its caller wanted, its results the body's returns.
+/// A lazy exit past it leaves as the caller, after the call it made.
+pub(super) fn tail_call(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8, callee: Val) {
+    let i = b.inline.as_ref().expect("an inlined body");
+    let (base, wanted) = (i.base, i.wanted);
+    let x = b.f.inline_frames[i.frame as usize];
+    let seen = watched(b);
+    let (callee, proto) = super::emit::known_callee(b, pc, callee);
+    let vals: Vec<Val> = (0..nargs)
+        .map(|k| {
+            let v = b.reg(a + 4 + k);
+            b.boxed(v)
+        })
+        .collect();
+    close_frame(b);
+    // The first eight are the call's operands (W4 §2), the rest go to the
+    // callee's slots, the body's from its base.
+    let in_regs = (nargs as usize).min(8);
+    for (k, &v) in vals.iter().enumerate().skip(in_regs) {
+        b.push(Op::Store((base + k) as u8), &[v]);
+    }
+    let cv = b.boxed(callee);
+    let hdr = (base - 4) as u8;
+    b.push(Op::Store(hdr), &[cv]);
+    let op = Op::Call {
+        a: hdr,
+        nargs,
+        c: x.c,
+        pc: x.caller_pc,
+        proto,
+    };
+    let resume = b.tail_call(op, &vals[..in_regs], x.c);
+    let res: Vec<Val> = if x.c == 2 || x.c == 3 {
+        let first = b.f.insts_of(resume)[0];
+        b.f.results(first).collect()
+    } else {
+        (0..wanted).map(|k| b.ins(Op::Load(hdr + k), &[])).collect()
+    };
+    let from = b.f.snap_pool.len();
+    let outer = b.inline.as_ref().unwrap().outer_entries();
+    b.f.snap_pool.extend_from_slice(&outer);
+    for (k, &v) in res.iter().enumerate() {
+        b.f.snap_pool.push((hdr + k as u8, v));
+    }
+    let s =
+        b.f.finish_snap(x.parent, x.caller_pc, crate::jit::ir::ExitKind::After, from);
+    b.lazy_exit(s);
+    return_values(b, &res, seen);
 }

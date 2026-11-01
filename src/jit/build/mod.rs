@@ -308,6 +308,19 @@ pub(crate) struct Inline {
     pub(crate) closure: Option<Val>,
 }
 
+impl Inline {
+    /// The enclosing frames' entries without its own header's (a callee
+    /// known by its prototype), for what replaces its frame.
+    pub(crate) fn outer_entries(&self) -> Vec<(u8, Val)> {
+        let hdr = (self.base - 4) as u8;
+        self.outer
+            .iter()
+            .copied()
+            .filter(|&(r, _)| r != hdr)
+            .collect()
+    }
+}
+
 impl BlockState {
     fn placeholder() -> Self {
         BlockState {
@@ -1537,6 +1550,41 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 SlotState::Unknown
             };
             self.set_slot(resume, r, state);
+        }
+        self.switch_to(resume);
+        self.push(Op::Resume { c }, &[]);
+        self.bs[resume.idx()].root_at = 1;
+        resume
+    }
+
+    /// End an inlined body with a real call that replaces its frame (its
+    /// `TAILCALL`, W3 §5): made from the body's header slot, as its caller
+    /// made the call the body was inlined at, so its site is the caller's
+    /// frame there, keeping what the caller kept. Continues in the resume
+    /// block, where the body's registers are dead.
+    pub(crate) fn tail_call(&mut self, op: Op, args: &[Val], c: u8) -> Block {
+        let i = self.inline.as_mut().expect("an inlined body");
+        i.called = true;
+        let x = self.f.inline_frames[i.frame as usize];
+        let homes = i.outer_homes;
+        let from = self.f.snap_pool.len();
+        let outer = self.inline.as_ref().unwrap().outer_entries();
+        self.f.snap_pool.extend_from_slice(&outer);
+        self.inline_check(op);
+        let snap = self
+            .f
+            .finish_snap(x.parent, x.caller_pc, ExitKind::After, from);
+        self.f.call_homes.entry(snap.0).or_default().union(&homes);
+        let before = self.cur;
+        let resume = self.new_block();
+        self.f.blocks[resume.idx()].resume = true;
+        let stash = self.stable_facts(before);
+        let s = &mut self.bs[resume.idx()];
+        s.sealed = true;
+        s.facts.stash = stash;
+        self.terminate(op, args, &[resume], Some((snap, ExitTag::Type)));
+        for r in 0..self.nregs {
+            self.set_slot(resume, r, SlotState::Unknown);
         }
         self.switch_to(resume);
         self.push(Op::Resume { c }, &[]);

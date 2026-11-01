@@ -2433,6 +2433,47 @@ fn bodies_iterate_and_call_metamethods() {
     );
 }
 
+/// Tail calls in inlined bodies (W3 step 6a) replace the body's frame, as
+/// the interpreter's do: `f` is inlined in `g`'s place and `k` (an
+/// irreducible loop, never compiled) called from `g2`'s header, so level 3
+/// from either is the loop in `run`, `g` and `g2` gone; `k`'s four results
+/// come back through the slots.
+#[test]
+fn tail_calls_in_bodies_replace_their_frames() {
+    agrees(
+        "local function f(x)
+          local ok, e = pcall(error, 'm', 3)
+          return e, x
+        end
+        local function g(x)
+          return f(x + 1)
+        end
+        local function k(m)
+          local i = 0
+          if m > 3 then goto b end
+          ::a:: i = i + 1
+          ::b:: i = i + 2
+          if i < 5 then goto a end
+          local ok, e = pcall(error, 'n', 3)
+          return e, m + i, i, m
+        end
+        local function g2(x)
+          return k(x * 2)
+        end
+        local function run(n)
+          local s, e1, e2 = 0
+          for i = 1, n do
+            local e, v = g(i)
+            local d, p, q, r = g2(i)
+            s = s + v + p + q + r
+            e1, e2 = e, d
+          end
+          return s .. ' ' .. e1 .. ' ' .. e2
+        end
+        return run(3000)",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]
