@@ -185,6 +185,9 @@ pub(crate) struct Builder<'a, 'gc> {
     pub(crate) ctx: crate::lua::Context<'gc>,
     pub(crate) f: Func<'gc>,
     pub(crate) closure: LuaFn<'gc>,
+    /// Frame 0's closure, whose upvalues `UpvalValue` and `UpvalCell` read:
+    /// an inlined body's builder has its callee as `closure`.
+    pub(crate) region: LuaFn<'gc>,
     pub(crate) proto: Gc<'gc, Prototype<'gc>>,
     pub(crate) cfg: &'a Cfg,
     nregs: usize,
@@ -294,6 +297,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             ctx,
             f,
             closure,
+            region: closure,
             proto,
             cfg,
             nregs: cfg.nregs,
@@ -328,6 +332,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     pub(crate) fn new_inline(
         ctx: crate::lua::Context<'gc>,
         closure: LuaFn<'gc>,
+        region: LuaFn<'gc>,
         cfg: &'a Cfg,
         f: Func<'gc>,
         inline: Inline,
@@ -339,6 +344,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             ctx,
             f,
             closure,
+            region,
             proto: closure.proto,
             cfg,
             nregs: cfg.nregs,

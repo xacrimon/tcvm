@@ -131,15 +131,15 @@ pub(super) fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Optio
         }
         Op::KObj(p) => Some(b.f.pool[p as usize]),
         Op::Guard(_) | Op::Refine(_) => value_now(b, b.f.args(i)[0], guess),
-        Op::UpvalValue(k) if !b.closure.proto.feedback.upvalue_varies(k as usize) => {
-            Some(unsafe { (*b.closure.upvalue_ptr().add(k as usize)).value })
+        Op::UpvalValue(k) if !b.region.proto.feedback.upvalue_varies(k as usize) => {
+            Some(unsafe { (*b.region.upvalue_ptr().add(k as usize)).value })
         }
         Op::CellLoad => {
             let c = b.f.def_inst(b.f.args(i)[0])?;
             let Op::UpvalCell(k) = b.f.op(c) else {
                 return None;
             };
-            Some(unsafe { (*b.closure.upvalue_ptr().add(k as usize)).cell }.get())
+            Some(unsafe { (*b.region.upvalue_ptr().add(k as usize)).cell }.get())
         }
         _ => {
             let &(recv, key) = b.field_loads.get(&v)?;
@@ -234,12 +234,12 @@ fn varying_closure<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<LuaFn<'gc>> {
     let Op::UpvalValue(k) = b.f.op(i) else {
         return None;
     };
-    b.closure
+    b.region
         .proto
         .feedback
         .upvalue_varies(k as usize)
         .then_some(())?;
-    unsafe { (*b.closure.upvalue_ptr().add(k as usize)).value }
+    unsafe { (*b.region.upvalue_ptr().add(k as usize)).value }
         .get_function()?
         .as_lua()
 }

@@ -663,6 +663,25 @@ fn unboxed_refinements_survive_repeated_calls() {
     assert!(ir.contains("call"), "{ir}");
 }
 
+/// An inlined body's builder reads the region's upvalues through the
+/// region's closure, not its callee's: `h` is `f`'s varying upvalue, not
+/// `apply`'s second (`z`, whose body would be inlined under a guard that
+/// always fails).
+#[test]
+fn bodies_read_the_regions_upvalues() {
+    let src = "local y, z = false, function(x) return x * 1000 end
+    local function apply(h, v) if y then return z end local r = h(v); return r end
+    local function mk(g)
+        return function(n) local s = 0 for i = 1, n do s = s + apply(g, i) end return s end
+    end
+    local f1 = mk(function(x) return x + 1 end)
+    local f2 = mk(function(x) return x + 2 end)
+    for k = 1, 3 do f1(100); f2(100) end
+    f = f1";
+    let ir = ir_of(src, "f", 0);
+    assert!(!ir.contains("ki32 1000"), "{ir}");
+}
+
 #[test]
 fn guarded_callees_stay_known_across_calls() {
     let src = "function f(resume, co, n)

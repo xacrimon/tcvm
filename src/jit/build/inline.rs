@@ -134,7 +134,7 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         returned: false,
         closure,
     };
-    let mut ib = Builder::new_inline(b.ctx, lf, &cfg, f, inline, b.cold, b.deopt_all);
+    let mut ib = Builder::new_inline(b.ctx, lf, b.region, &cfg, f, inline, b.cold, b.deopt_all);
     let entry = ib.build_inline(&args, MAX_INSTS);
     b.f = std::mem::replace(&mut ib.f, Func::new(meta));
     drop(ib);
