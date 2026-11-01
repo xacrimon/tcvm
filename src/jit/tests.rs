@@ -606,3 +606,22 @@ fn unboxed_refinements_survive_repeated_calls() {
     let ir = ir_of(src, "f", 0);
     assert!(ir.contains("call"), "{ir}");
 }
+
+#[test]
+fn guarded_callees_stay_known_across_calls() {
+    let src = "function f(resume, co, n)
+        local ok, r
+        for _ = 1, n do ok, r = resume(co) end
+        return ok, r
+    end
+    local co = coroutine.create(function() while true do coroutine.yield(1) end end)
+    for k = 1, 3 do f(coroutine.resume, co, 1000) end";
+    let ir = ir_of(src, "f", 0);
+    // After the peeled iteration's call the loop gets the callee as a
+    // copy of the constant, which needs no guard.
+    assert_eq!(
+        ir.lines().filter(|l| l.contains("guard.same")).count(),
+        1,
+        "{ir}"
+    );
+}

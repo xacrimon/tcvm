@@ -1957,6 +1957,8 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
     // Parameters replaced by a refinement of a value, made where the block
     // starts once the replacements settle.
     let mut refined: Vec<(Block, Val, Val, TypeSet)> = Vec::new();
+    // Parameters replaced by a constant (op, one argument for its type).
+    let mut konsts: Vec<(Block, Val, Op, Val)> = Vec::new();
     loop {
         map.clear();
         map.extend((0..f.vals.len() as u32).map(Val));
@@ -1990,6 +1992,25 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
                     if !trivial && base.is_none() {
                         break;
                     }
+                }
+                // Copies of one constant (made again after calls): a copy
+                // where the block starts, as no argument need dominate it.
+                let mut konst: Option<(Op, Val)> = None;
+                let copies = !trivial
+                    && cfg.incoming(b).iter().all(|&(term, e)| {
+                        let a = resolve(&map, f.edge_args(term, e as usize)[k]);
+                        let op = match f.def_op(a) {
+                            Some(op @ (Op::KVal(_) | Op::KObj(_) | Op::KI32(_))) => op,
+                            Some(op @ (Op::KI64(_) | Op::KF64(_) | Op::KB1(_))) => op,
+                            _ => return a == p,
+                        };
+                        f.vals[a.idx()].ty.rep == f.vals[p.idx()].ty.rep
+                            && konst.get_or_insert((op, a)).0 == op
+                    });
+                if copies && let Some((op, a)) = konst {
+                    konsts.push((b, p, op, a));
+                    changed = true;
+                    continue;
                 }
                 if !trivial
                     && let Some((x, set)) = base
@@ -2045,6 +2066,16 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
             let i = f.make_inst(Op::Refine(set), &[x], None, ExitTag::Type);
             f.insert(b, 0, i);
             let r = f.result(i);
+            while map.len() < f.vals.len() {
+                map.push(Val(map.len() as u32));
+            }
+            map[p.idx()] = r;
+        }
+        for (b, p, op, a) in konsts.drain(..) {
+            let i = f.make_inst(op, &[], None, ExitTag::Type);
+            f.insert(b, 0, i);
+            let r = f.result(i);
+            f.vals[r.idx()].ty = f.vals[a.idx()].ty;
             while map.len() < f.vals.len() {
                 map.push(Val(map.len() as u32));
             }
