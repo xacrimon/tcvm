@@ -575,6 +575,16 @@ impl<'gc> Walk<'gc> {
         let mut cur = f0;
         let mut code = f0.closure().code;
         for fr in snap.frames() {
+            // A tail callee in the compiled frame's place (W3 §5).
+            if fr.delta == 0 {
+                let callee = region.pool[fr.func as usize]
+                    .get_function()
+                    .and_then(|f| f.as_lua())
+                    .expect("an inlined Lua closure");
+                cur.func = lua_func_word(callee, 0);
+                code = callee.code;
+                continue;
+            }
             cur.pc = unsafe { code.add(fr.caller_pc as usize + 1) };
             self.queue[self.queued] = Some(cur);
             self.queued += 1;
@@ -609,9 +619,6 @@ impl<'gc> Walk<'gc> {
                 inlined: true,
             };
             code = callee.code;
-        }
-        if self.queued == 0 {
-            return f0;
         }
         cur.pc = site.pc_after as usize as *const Instruction;
         cur

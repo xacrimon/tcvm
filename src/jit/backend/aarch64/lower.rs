@@ -719,7 +719,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 func: x.func,
                 a: x.a,
                 c: x.c,
-                delta: x.a as u16 + 4,
+                delta: if x.replaces { 0 } else { x.a as u16 + 4 },
                 caller_pc: x.caller_pc,
                 open: x.open,
             });

@@ -146,6 +146,18 @@ handler! {
                 .get_function()
                 .and_then(|f| f.as_lua())
                 .expect("an inlined Lua closure");
+            // A tail callee in the region frame's place: its header, as the
+            // interpreter's `TAILCALL` leaves it.
+            if fr.delta == 0 {
+                unsafe {
+                    frame::set_func_word(fbase, frame::lua_func_word(callee, 0));
+                    if fr.open {
+                        frame::set_flags(fbase, frame::flag::HAS_OPEN);
+                    }
+                }
+                fclosure = callee;
+                continue;
+            }
             debug_assert_eq!(fr.delta as usize, fr.a as usize + frame::HDR);
             unsafe {
                 let nb = fbase.add(fr.delta as usize);

@@ -205,6 +205,9 @@ pub(crate) struct InlineFrame {
     pub(crate) code: usize,
     /// The callee captures locals (`SnapFrame::open`).
     pub(crate) open: bool,
+    /// It replaces the region's own frame, which tail-called it (W3 §5):
+    /// at the same base, base delta 0 in its snapshot frame.
+    pub(crate) replaces: bool,
 }
 
 /// What a region was compiled from.

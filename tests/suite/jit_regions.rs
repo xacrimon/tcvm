@@ -2474,6 +2474,37 @@ fn tail_calls_in_bodies_replace_their_frames() {
     );
 }
 
+/// A tail call in a region's own frame (W3 step 6b): `outer` (its region
+/// made through `pcall`, which no caller inlines) tail-calls `inner`, which
+/// takes over its frame. Level 3 from `inner` is the `pcall`, `outer`
+/// gone; at 2500 a float exits inside `inner`, its frame's header must
+/// name it for the positions after.
+#[test]
+fn tail_calls_take_over_the_region_frame() {
+    agrees(
+        "local xs = {}
+        for i = 1, 3000 do xs[i] = i end
+        xs[2500] = 0.5
+        local function inner(i, y)
+          local v = xs[i] + y
+          local ok, e = pcall(error, 'm', 2)
+          local ok3, e3 = pcall(error, 'n', 3)
+          return v, e, e3
+        end
+        local function outer(i)
+          return inner(i, 1)
+        end
+        local s, l1, l2, at = 0
+        for i = 1, 3000 do
+          local ok, v, e, e3 = pcall(outer, i)
+          s = s + v
+          if i == 2500 then at = e end
+          l1, l2 = e, e3
+        end
+        return s .. ' ' .. l1 .. ' ' .. l2 .. ' ' .. at",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]

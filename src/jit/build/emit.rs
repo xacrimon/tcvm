@@ -411,10 +411,10 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             if intrinsic {
                 return_guard(b, before);
             }
-            let slow = match intrinsics::emit(b, pc, insn, callee) {
-                Emitted::No => Some(b.cur),
-                Emitted::Done => None,
-                Emitted::Fallback(slow, _) => Some(slow),
+            let (slow, none) = match intrinsics::emit(b, pc, insn, callee) {
+                Emitted::No => (Some(b.cur), true),
+                Emitted::Done => (None, false),
+                Emitted::Fallback(slow, _) => (Some(slow), false),
             };
             // `return error(...)` left already.
             if slow != Some(b.cur) && !b.terminated() {
@@ -424,10 +424,10 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             }
             if let Some(slow) = slow {
                 b.switch_to(slow);
-                if rb != 0 {
-                    emit_tailcall(b, pc, a, rb - 1);
-                } else {
+                if rb == 0 {
                     dispatch(b);
+                } else if !(none && super::inline::try_inline(b, pc, insn, callee)) {
+                    emit_tailcall(b, pc, a, rb - 1);
                 }
             }
         }
@@ -576,6 +576,15 @@ fn body_tailcall(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
         return;
     }
     let callee = callee_at(b, pc, a);
+    // A body in the region frame's place calls as that frame does.
+    let real = |b: &mut Builder<'_, '_>, f: Val| {
+        if b.inline.as_ref().unwrap().region_return {
+            super::inline::close_frame(b);
+            emit_tailcall(b, pc, a, nb - 1);
+        } else {
+            super::inline::tail_call(b, pc, a, nb - 1, f);
+        }
+    };
     match intrinsics::emit(b, pc, insn, callee) {
         Emitted::Done => {
             if !b.terminated() {
@@ -589,11 +598,11 @@ fn body_tailcall(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
                 super::inline::inline_return(b, a, 1);
             }
             b.switch_to(slow);
-            super::inline::tail_call(b, pc, a, nb - 1, f);
+            real(b, f);
         }
         Emitted::No => {
             if !super::inline::try_inline(b, pc, insn, callee) {
-                super::inline::tail_call(b, pc, a, nb - 1, callee);
+                real(b, callee);
             }
         }
     }
@@ -638,7 +647,13 @@ fn emit_tailcall(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8) {
         b.jump(slow);
     }
     enter_join(b, slow);
-    dispatch(b);
+    // The interpreter would run a body in the region frame's place with the
+    // header's closure: it leaves by its snapshot, which rewrites it.
+    if b.inline.is_some() {
+        b.deopt(ExitTag::Unsupported);
+    } else {
+        dispatch(b);
+    }
 }
 
 /// `RETURN` of `n` results from `R[a..]`. A frame with to-be-closed
@@ -685,7 +700,7 @@ fn return_tested(b: &mut Builder<'_, '_>, a: u8, n: u8) {
 }
 
 /// Store `R[a..a+n]` before a return.
-fn store_results(b: &mut Builder<'_, '_>, a: u8, n: u8) {
+pub(super) fn store_results(b: &mut Builder<'_, '_>, a: u8, n: u8) {
     for r in a..a + n {
         let v = b.reg(r);
         let bv = b.boxed(v);

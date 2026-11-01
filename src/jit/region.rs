@@ -53,6 +53,8 @@ pub(crate) struct SnapFrame {
     pub(crate) func: u32,
     pub(crate) a: u8,
     pub(crate) c: u8,
+    /// Its base past the enclosing frame's; 0 for a callee that replaced
+    /// the region's frame by a tail call, whose header it takes.
     pub(crate) delta: u16,
     pub(crate) caller_pc: u32,
     /// Its callee captures locals: the header an exit writes has

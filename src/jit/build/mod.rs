@@ -297,6 +297,9 @@ pub(crate) struct Inline {
     /// It, or a body inlined into it, makes a call, which may write its
     /// callers' captured registers through their cells.
     pub(crate) called: bool,
+    /// It replaces the region's own frame (W3 §5): its returns and tail
+    /// calls are the region's, and `cont` is none.
+    pub(crate) region_return: bool,
     /// Parameters the body never writes whose arguments the caller's
     /// registers hold after the call, reported at each return.
     pub(crate) watch: Vec<u8>,
@@ -492,6 +495,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let Some(i) = &mut self.inline else {
             return;
         };
+        if i.region_return && matches!(op, Op::Return { .. } | Op::TailEnter { .. }) {
+            return;
+        }
         if matches!(
             op,
             Op::Load(_)
