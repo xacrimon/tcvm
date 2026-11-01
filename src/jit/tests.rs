@@ -847,6 +847,38 @@ fn closures_inline() {
     }
 }
 
+/// No loop parameter carries a constant around the back edge, where it was
+/// spilled: the call-boundary pass's copies after each call joined the
+/// preheader's at the header, and `K`'s table pointer (not argument-free)
+/// stayed joined; the header makes it again.
+#[test]
+fn constants_stay_in_their_blocks() {
+    let src = "local K = {a = 1, b = 2}
+    local function g(m)
+        local i = 0
+        if m > 3 then goto b end
+        ::a:: i = i + 1
+        ::b:: i = i + 2
+        if i < 5 then goto a end
+        return i
+    end
+    function f(n)
+        local s = 0
+        for i = 1, n do
+            s = s + K.a + K.b
+            g(i)
+        end
+        return s
+    end
+    for k = 1, 300 do f(10) end";
+    let ir = ir_of(src, "f", 0);
+    let params: Vec<&str> = ir
+        .lines()
+        .filter(|l| l.starts_with('b') && l.contains('(') && l.contains("=k"))
+        .collect();
+    assert!(params.is_empty(), "{params:?}\n{ir}");
+}
+
 /// Constructors and concatenation inline (W3 step 3): `NEWTABLE` takes its
 /// template by address, `SETLIST` stores from the body's slots, and the
 /// only call left is `table.unpack`, made from `copy`'s body.

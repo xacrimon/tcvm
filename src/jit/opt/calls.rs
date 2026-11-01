@@ -34,67 +34,163 @@ pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
     Err("the call boundaries did not settle".into())
 }
 
-/// Parameters that only join copies of one argument-free value (a constant
-/// made again after each call) are that value, made where the block starts:
-/// a loop's callee stays a constant (`find_known_callees`) and costs no
-/// moves.
+/// Whether `v` is a constant or a pure computation of constants alone.
+fn const_chain(f: &Func<'_>, v: Val) -> bool {
+    let Some(d) = f.def_inst(v) else {
+        return false;
+    };
+    let op = f.op(d);
+    op.is_pure() && !matches!(op, Op::Helper(_)) && f.args(d).iter().all(|&a| const_chain(f, a))
+}
+
+/// `v`'s computation again in block `b` at `at` (advanced past it), once
+/// per block.
+fn copy_chain(
+    f: &mut Func<'_>,
+    v: Val,
+    b: Block,
+    at: &mut usize,
+    copies: &mut FastMap<(Block, Val), Val>,
+) -> Val {
+    if let Some(&c) = copies.get(&(b, v)) {
+        return c;
+    }
+    let d = f.def_inst(v).expect("a computation");
+    let args: Vec<Val> = f.args(d).to_vec();
+    let args: Vec<Val> = args
+        .into_iter()
+        .map(|a| copy_chain(f, a, b, at, copies))
+        .collect();
+    let i = f.make_inst(f.op(d), &args, None, ExitTag::Type);
+    f.insert(b, *at, i);
+    *at += 1;
+    let c = f.result(i);
+    f.vals[c.idx()].ty = f.vals[v.idx()].ty;
+    copies.insert((b, v), c);
+    c
+}
+
+/// Parameters that only join copies of one constant computation (the
+/// call-boundary pass's copies after calls, or other such parameters
+/// around nested loops) are that computation, made again where the block
+/// starts: no loop carries a constant around its back edge in a register
+/// the allocator may spill on every iteration.
 fn fold_constant_params(f: &mut Func<'_>) {
     let cfg = f.cfg();
-    let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
-    let mut changed = false;
+    let mut params: Vec<(Block, usize, Val)> = Vec::new();
     for &b in &cfg.rpo {
-        let incoming = cfg.incoming(b);
-        if f.blocks[b.idx()].params.len() == 0 || incoming.is_empty() {
-            continue;
+        if !cfg.incoming(b).is_empty() {
+            for (k, &p) in f.params(b).iter().enumerate() {
+                params.push((b, k, p));
+            }
         }
-        let params = f.params(b).to_vec();
-        let mut kept = Vec::with_capacity(params.len());
-        for (k, &p) in params.iter().enumerate() {
-            let mut op = None;
-            let same = incoming.iter().all(|&(t, e)| {
-                let a = map[f.edge_args(t, e as usize)[k].idx()];
+    }
+    // The computation each parameter stands for (a value of it), or none;
+    // absent until known, optimistically around cycles.
+    let mut of: FastMap<Val, Option<Val>> = FastMap::default();
+    loop {
+        let mut changed = false;
+        for &(b, k, p) in &params {
+            if of.get(&p) == Some(&None) {
+                continue;
+            }
+            let mut rep: Option<Val> = None;
+            let mut bad = false;
+            for &(t, e) in cfg.incoming(b) {
+                let a = f.edge_args(t, e as usize)[k];
                 if a == p {
-                    return true;
+                    continue;
                 }
-                let o = f
-                    .def_inst(a)
-                    .filter(|&d| f.insts[d.idx()].an == 0 && f.op(d).is_pure())
-                    .map(|d| f.op(d));
-                o.is_some() && *op.get_or_insert(o) == o
-            });
-            let Some(Some(op)) = op.filter(|_| same) else {
-                kept.push(k);
+                let r = match of.get(&a) {
+                    Some(&Some(r)) => r,
+                    Some(&None) => {
+                        bad = true;
+                        break;
+                    }
+                    None if const_chain(f, a) => a,
+                    None if f.def_inst(a).is_none() => continue,
+                    None => {
+                        bad = true;
+                        break;
+                    }
+                };
+                match rep {
+                    None => rep = Some(r),
+                    Some(x) if chain_eq(f, x, r) => {}
+                    Some(_) => {
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+            let new = if bad {
+                None
+            } else if let Some(r) = rep {
+                Some(r)
+            } else {
                 continue;
             };
-            let at = usize::from(
-                f.insts_of(b)
-                    .first()
-                    .is_some_and(|&i| matches!(f.op(i), Op::Resume { .. })),
-            );
-            let i = f.make_inst(op, &[], None, ExitTag::Type);
-            f.insert(b, at, i);
-            let r = f.result(i);
-            f.vals[r.idx()].ty = f.vals[p.idx()].ty;
-            map.push(r);
-            map[p.idx()] = r;
-            changed = true;
+            if of.get(&p) != Some(&new) {
+                of.insert(p, new);
+                changed = true;
+            }
         }
-        if kept.len() == params.len() {
+        if !changed {
+            break;
+        }
+    }
+    let mut copies: FastMap<(Block, Val), Val> = FastMap::default();
+    let mut repl: Vec<(Val, Val)> = Vec::new();
+    for &b in &cfg.rpo {
+        let ps = f.params(b).to_vec();
+        let folded: Vec<(usize, Val)> = (ps.iter().enumerate())
+            .filter_map(|(k, &p)| of.get(&p).copied().flatten().map(|r| (k, r)))
+            .collect();
+        if folded.is_empty() {
             continue;
         }
-        for &(t, e) in incoming {
+        let mut at = usize::from(
+            f.insts_of(b)
+                .first()
+                .is_some_and(|&i| matches!(f.op(i), Op::Resume { .. })),
+        );
+        for &(k, r) in &folded {
+            let c = copy_chain(f, r, b, &mut at, &mut copies);
+            repl.push((ps[k], c));
+        }
+        let kept: Vec<usize> = (0..ps.len())
+            .filter(|k| !folded.iter().any(|&(j, _)| j == *k))
+            .collect();
+        for &(t, e) in cfg.incoming(b) {
             let args: Vec<Val> = kept
                 .iter()
                 .map(|&k| f.edge_args(t, e as usize)[k])
                 .collect();
             f.set_edge_args(t, e as usize, &args);
         }
-        let ps: Vec<Val> = kept.iter().map(|&k| params[k]).collect();
-        f.set_params(b, &ps);
+        let ps2: Vec<Val> = kept.iter().map(|&k| ps[k]).collect();
+        f.set_params(b, &ps2);
     }
-    if changed {
+    if !repl.is_empty() {
+        let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
+        for (p, c) in repl {
+            map[p.idx()] = c;
+        }
         f.apply_replacements(&mut map);
     }
+}
+
+/// Whether `a` and `b` compute the same constant.
+fn chain_eq(f: &Func<'_>, a: Val, b: Val) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(x), Some(y)) = (f.def_inst(a), f.def_inst(b)) else {
+        return false;
+    };
+    f.op(x) == f.op(y)
+        && f.args(x).len() == f.args(y).len()
+        && (0..f.args(x).len()).all(|k| chain_eq(f, f.args(x)[k], f.args(y)[k]))
 }
 
 /// Keep or copy what is live across each call, and give later uses the
