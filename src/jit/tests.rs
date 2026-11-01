@@ -701,6 +701,24 @@ fn field_loads_take_their_slot_kinds() {
     assert!(ir.contains("val:tab@s"), "{ir}");
 }
 
+/// A store keeps its barrier only while the value may be a heap object: a
+/// parameter, untyped where the store is built, is a small integer once
+/// its arithmetic use's guard moves to its definition (`speculate`).
+#[test]
+fn barriers_leave_stores_of_numbers() {
+    let src = "function f(t, n, v)
+        local s = 0
+        for i = 1, n do t[i] = v; s = s + v end
+        return s
+    end
+    keep = {}
+    for i = 1, 40 do keep[i] = 0 end
+    for r = 1, 300 do f(keep, 30, r) end";
+    let ir = ir_of(src, "f", 0);
+    assert!(ir.contains("arrstore"), "{ir}");
+    assert!(!ir.contains("barrier"), "{ir}");
+}
+
 /// String keys of a table access read and write its string part directly
 /// (W2.5), the generic walk only in a cold arm.
 #[test]

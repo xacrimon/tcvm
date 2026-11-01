@@ -666,7 +666,9 @@ pub(crate) enum Op {
     /// at an `I32` index below the shape's slot count.
     NamedVal,
     NamedKey,
-    /// The table's backward barrier unless it is gray.
+    /// The table's backward barrier unless it is gray; with a second
+    /// operand, the value stored, for that value alone (`simplify` drops it
+    /// once the value is never a heap object).
     Barrier,
 
     // --- varargs: the frame's extras below its header ----------------------

@@ -557,7 +557,7 @@ pub(super) fn class_mm(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> 
 fn barrier_for(b: &mut Builder<'_, '_>, t: Val, v: Val) {
     let set = b.ty(v).set;
     if set.is_empty() || set.intersects(TypeSet::HEAP) {
-        b.push(Op::Barrier, &[t]);
+        b.push(Op::Barrier, &[t, v]);
     }
 }
 

@@ -267,6 +267,14 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
+                Op::Barrier
+                    if args.len() == 2
+                        && !f.ty(args[1]).set.is_empty()
+                        && !f.ty(args[1]).set.intersects(TypeSet::HEAP) =>
+                {
+                    remove(i);
+                    changed = true;
+                }
                 Op::GuardMiss
                     if konst_b1(f, args[1]) == Some(false)
                         || !f.ty(args[0]).set.intersects(TypeSet::NIL) =>
