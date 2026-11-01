@@ -1006,6 +1006,7 @@ fn number_slots_take_what_the_site_saw() {
 /// the arm are reached only through it, compiles with every check on in
 /// debug builds: the allocator's checker visits blocks in their order, so
 /// the allocator gets them in reverse postorder, cold arms in place.
+/// Inlining is off: `new`'s own regions are the subject.
 #[test]
 fn cold_arm_successors_pass_the_allocator_checker() {
     let src = "Src = {a = 1, b = 2, c = 3, d = 4}
@@ -1017,6 +1018,7 @@ fn cold_arm_successors_pass_the_allocator_checker() {
     for i = 1, 3000 do new() end";
     let mut lua = Lua::new();
     lua.set_jit(true);
+    lua.set_jit_inline(false);
     lua.load_all();
     let ex = lua
         .try_enter(|ctx| -> Result<_, LoadError> {

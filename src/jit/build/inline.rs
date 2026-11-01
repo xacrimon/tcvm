@@ -91,118 +91,137 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         return false;
     };
     // The body may read or write the captured registers through their
-    // cells: they live in their slots across it, read from them after.
-    let captured = if code.cells {
-        b.cfg.captured
-    } else {
-        RegSet::EMPTY
-    };
-    b.store_regs(captured.iter());
-    // What the callers hold at the call, and the callee's arguments.
-    let live = b
-        .cfg
-        .live_in
-        .get(pc as usize + 1)
-        .copied()
-        .unwrap_or_default();
-    let mut outer = b.call_entries(live, a);
-    // A body's watched parameters hold their arguments to its returns, live
-    // or not (any call is above them, as it would write them).
-    let mut keep = b.exit_regs(live);
-    for &k in b.inline.iter().flat_map(|i| &i.watch) {
-        keep.insert(k as usize);
-    }
-    let regs: Vec<usize> = keep
-        .iter()
-        .filter(|&r| r < a as usize && r < b.nregs)
-        .collect();
-    // The callers' slots a call in the body keeps, by region slot.
-    let mut outer_homes = b.inline.as_ref().map_or(RegSet::EMPTY, |i| i.outer_homes);
-    for r in captured.iter() {
-        outer_homes.insert(b.reg_base() + r);
-    }
-    for &r in &regs {
-        let v = b.reg(r as u8);
-        if b.untouched(r) || b.slot_holds(r as u8, v) {
+    // cells: they live in their slots across it, read from them after. Its
+    // code may say so (a call, a cell); else a body that called anyway (a
+    // metamethod, a builtin's fallback) is built again with them there.
+    let mut sync = code.cells;
+    let (entry, inline, cont, results, args, kept, captured, guard, cv) = loop {
+        let captured = if sync { b.cfg.captured } else { RegSet::EMPTY };
+        b.store_regs(captured.iter());
+        // What the callers hold at the call, and the callee's arguments.
+        let live = b
+            .cfg
+            .live_in
+            .get(pc as usize + 1)
+            .copied()
+            .unwrap_or_default();
+        let mut outer = b.call_entries(live, a);
+        // A body's watched parameters hold their arguments to its returns, live
+        // or not (any call is above them, as it would write them).
+        let mut keep = b.exit_regs(live);
+        for &k in b.inline.iter().flat_map(|i| &i.watch) {
+            keep.insert(k as usize);
+        }
+        let regs: Vec<usize> = keep
+            .iter()
+            .filter(|&r| r < a as usize && r < b.nregs)
+            .collect();
+        // The callers' slots a call in the body keeps, by region slot.
+        let mut outer_homes = b.inline.as_ref().map_or(RegSet::EMPTY, |i| i.outer_homes);
+        for r in captured.iter() {
             outer_homes.insert(b.reg_base() + r);
         }
-    }
-    let kept: Vec<(u8, Val)> = regs
-        .into_iter()
-        .map(|r| (r as u8, b.reg(r as u8)))
-        .collect();
-    let args: Vec<Val> = (0..nb - 1).map(|k| b.reg(a + 4 + k)).collect();
-    let mut watch: Vec<u8> = Vec::new();
-    for (k, &v) in args.iter().enumerate().take(proto.num_params as usize) {
-        if !code.written.contains(k)
-            && kept.iter().any(|&(_, x)| x == v)
-            && !watch.iter().any(|&j| args[j as usize] == v)
-        {
-            watch.push(k as u8);
+        for &r in &regs {
+            let v = b.reg(r as u8);
+            if b.untouched(r) || b.slot_holds(r as u8, v) {
+                outer_homes.insert(b.reg_base() + r);
+            }
         }
-    }
-    let cv = b.boxed(callee);
-    // The guard's operand: the closure, or the prototype (`Func::protos`).
-    let (guard, func, closure) = if dynamic {
-        let k = b.f.intern_proto(proto);
-        // Exits write the closure to the frame's header.
-        outer.push(((base - 4) as u8, cv));
-        let p = b.ins(Op::Unbox(Rep::Ptr), &[cv]);
-        (Err(k), crate::jit::region::DYNAMIC | k, Some(p))
-    } else {
-        let k = b.konst(crate::env::value::Value::function(lf.function()));
-        let Some(Op::KObj(func)) = b.f.def_op(k) else {
+        let kept: Vec<(u8, Val)> = regs
+            .into_iter()
+            .map(|r| (r as u8, b.reg(r as u8)))
+            .collect();
+        let args: Vec<Val> = (0..nb - 1).map(|k| b.reg(a + 4 + k)).collect();
+        let mut watch: Vec<u8> = Vec::new();
+        for (k, &v) in args.iter().enumerate().take(proto.num_params as usize) {
+            if !code.written.contains(k)
+                && kept.iter().any(|&(_, x)| x == v)
+                && !watch.iter().any(|&j| args[j as usize] == v)
+            {
+                watch.push(k as u8);
+            }
+        }
+        let cv = b.boxed(callee);
+        // The guard's operand: the closure, or the prototype (`Func::protos`).
+        let (guard, func, closure) = if dynamic {
+            let k = b.f.intern_proto(proto);
+            // Exits write the closure to the frame's header.
+            outer.push(((base - 4) as u8, cv));
+            let p = b.ins(Op::Unbox(Rep::Ptr), &[cv]);
+            (Err(k), crate::jit::region::DYNAMIC | k, Some(p))
+        } else {
+            let k = b.konst(crate::env::value::Value::function(lf.function()));
+            let Some(Op::KObj(func)) = b.f.def_op(k) else {
+                return false;
+            };
+            (Ok(k), func, None)
+        };
+        let frame = b.f.inline_frames.len() as u32;
+        let parent = b.frame_id();
+        b.f.inline_frames.push(InlineFrame {
+            parent,
+            func,
+            a,
+            c,
+            caller_pc: pc,
+            code: proto.code.as_ptr() as usize,
+            open: code.cfg.captured.iter().next().is_some(),
+        });
+        // A call keeps none of them as a home (a body that fails leaves them
+        // in, which only costs reloads).
+        for r in code.cfg.captured.iter() {
+            b.f.captured.insert(base + r);
+        }
+        let wanted = c - 1;
+        let cont = b.new_block();
+        let results: Vec<Val> = (0..wanted).map(|_| b.f.add_param(cont, Ty::ANY)).collect();
+        // What a body that fails leaves behind is undone.
+        let def_snaps = b.f.def_snaps.len();
+        let stable_used = b.f.stable_used.borrow().len();
+        let recv_shapes = b.known.recv_shapes.clone();
+        let inline = Inline {
+            frame,
+            base,
+            outer,
+            outer_homes,
+            called: false,
+            cont,
+            wanted,
+            depth: depth + 1,
+            failed: false,
+            watch,
+            returns: Vec::new(),
+            closure,
+        };
+        let from = b.cur;
+        let mut ib = Builder::new_inline(b, lf, &code.cfg, inline);
+        let entry = ib.build_inline(&args, from, MAX_INSTS);
+        let inline = ib.finish(b);
+        let Some(entry) = entry else {
+            b.f.blocks[cont.idx()].dead = true;
+            b.f.def_snaps.truncate(def_snaps);
+            b.f.stable_used.borrow_mut().truncate(stable_used);
+            b.known.recv_shapes = recv_shapes;
             return false;
         };
-        (Ok(k), func, None)
+        if inline.called && !sync && b.cfg.captured.iter().next().is_some() {
+            b.f.blocks[cont.idx()].dead = true;
+            b.f.def_snaps.truncate(def_snaps);
+            b.f.stable_used.borrow_mut().truncate(stable_used);
+            b.known.recv_shapes = recv_shapes;
+            sync = true;
+            continue;
+        }
+        break (
+            entry, inline, cont, results, args, kept, captured, guard, cv,
+        );
     };
-    let frame = b.f.inline_frames.len() as u32;
-    let parent = b.frame_id();
-    b.f.inline_frames.push(InlineFrame {
-        parent,
-        func,
-        a,
-        c,
-        caller_pc: pc,
-        code: proto.code.as_ptr() as usize,
-        open: code.cfg.captured.iter().next().is_some(),
-    });
-    // A call keeps none of them as a home (a body that fails leaves them
-    // in, which only costs reloads).
-    for r in code.cfg.captured.iter() {
-        b.f.captured.insert(base + r);
+    // A call in it is a call of its caller's.
+    if inline.called
+        && let Some(i) = b.inline.as_mut()
+    {
+        i.called = true;
     }
-    let wanted = c - 1;
-    let cont = b.new_block();
-    let results: Vec<Val> = (0..wanted).map(|_| b.f.add_param(cont, Ty::ANY)).collect();
-    // What a body that fails leaves behind is undone.
-    let def_snaps = b.f.def_snaps.len();
-    let stable_used = b.f.stable_used.borrow().len();
-    let recv_shapes = b.known.recv_shapes.clone();
-    let inline = Inline {
-        frame,
-        base,
-        outer,
-        outer_homes,
-        cont,
-        wanted,
-        depth: depth + 1,
-        failed: false,
-        watch,
-        returns: Vec::new(),
-        closure,
-    };
-    let from = b.cur;
-    let mut ib = Builder::new_inline(b, lf, &code.cfg, inline);
-    let entry = ib.build_inline(&args, from, MAX_INSTS);
-    let inline = ib.finish(b);
-    let Some(entry) = entry else {
-        b.f.blocks[cont.idx()].dead = true;
-        b.f.def_snaps.truncate(def_snaps);
-        b.f.stable_used.borrow_mut().truncate(stable_used);
-        b.known.recv_shapes = recv_shapes;
-        return false;
-    };
     // The callee pinned, its frame's window, then its body.
     match guard {
         Ok(k) => b.ins_exit(Op::GuardSame, &[cv, k], ExitTag::Const),
@@ -329,22 +348,12 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
 }
 
 /// Whether a callee's instruction needs its frame on the stack: a
-/// to-be-closed variable, varargs, metamethod calls.
+/// to-be-closed variable, varargs.
 fn needs_frame(op: BcOp) -> bool {
     use BcOp::*;
     matches!(
         op.unquickened(),
-        TAILCALL
-            | TBC
-            | TFORPREP
-            | TFORCALL
-            | TFORLOOP
-            | VARARG
-            | VARARGGET
-            | VARARGPREP
-            | ARITH_MM
-            | ARITH_MM_R
-            | ARITH_MMI
+        TAILCALL | TBC | VARARG | VARARGGET | VARARGPREP
     )
 }
 

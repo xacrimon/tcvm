@@ -212,7 +212,6 @@ pub(crate) struct InlineFrame {
 pub(crate) struct RegionMeta {
     pub(crate) entry_pc: u32,
     pub(crate) loop_entry: bool,
-    pub(crate) max_stack: u8,
     /// The parameters every entry passes in registers (`Op::Param`): a
     /// function region's first eight, none for a loop entry or a vararg
     /// function (W4 §2).

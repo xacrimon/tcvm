@@ -721,19 +721,18 @@ pub(crate) enum Op {
         a: u8,
         n: u8,
     },
-    /// Call the first operand with the rest as arguments from a header past
-    /// the frame's registers (`stage_mm!`): a metamethod or a generic `for`'s
-    /// iterator. Edge 0 is the resume block, which takes `c - 1` results,
-    /// landed from `R[land]` when more than two.
+    /// Call the first operand with the rest as arguments from a header at
+    /// region slot `hdr`, past the calling frame's registers (`stage_mm!`): a
+    /// metamethod or a generic `for`'s iterator. Edge 0 is the resume block,
+    /// which takes `c - 1` results, landed from region slot `land` when more
+    /// than two.
     CallMm {
         pc: u32,
         nargs: u8,
         land: u8,
         c: u8,
+        hdr: u8,
     },
-    /// Exits unless a metamethod call's header and `n` arguments fit below
-    /// the stack's end.
-    GuardFits(u8),
     /// Exits unless the stack holds `end` slots past the region's base: an
     /// inlined frame's window, which its exits write (E1).
     GuardWindow(u16),
@@ -893,7 +892,7 @@ impl Op {
             Guard(_) | GuardTrue | GuardFalse | GuardMiss | GuardSame | GuardProto(_) | IAdd
             | ISub | IMul | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor
             | LToI | LToFExact | FToIExact | ToF64 => Effects::flags(DEOPT),
-            GuardNoFlag(_) | GuardFits(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
+            GuardNoFlag(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) | GuardShapeIn(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
             ShapeIs(_) | ShapeIn(_) | TabHasRoom(_) | NamedKey => Effects::reads(Mem::SHAPE),
@@ -976,7 +975,6 @@ impl Op {
             | CallMm { .. }
             | Dispatch { .. }
             | TailEnter { .. }
-            | GuardFits(_)
             | GuardWindow(_)
             | Deopt
             | LazyExit => 0,

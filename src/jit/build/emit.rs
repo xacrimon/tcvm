@@ -1164,8 +1164,12 @@ pub(super) fn mm_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Val {
 /// in the resume block.
 pub(super) fn staged_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val], land: u8, c: u8) -> Block {
     let pc = b.pc;
+    // Where the frame's window ends, an inlined one's too (`GuardWindow`
+    // reserved it).
+    let hdr = b.slot_of(0) as u16 + b.proto.max_stack_size as u16;
     let s = b.snap_before();
-    b.ins_snap(Op::GuardFits(args.len() as u8), &[], s, ExitTag::Slow);
+    let end = hdr + 4 + args.len() as u16;
+    b.ins_snap(Op::GuardWindow(end), &[], s, ExitTag::Slow);
     let insn = b.code(pc);
     let mut live = b.cfg.live_in[pc as usize];
     if let Some(next) = b.cfg.live_in.get(pc as usize + 1) {
@@ -1195,8 +1199,9 @@ pub(super) fn staged_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val], land: u
     let op = Op::CallMm {
         pc,
         nargs: args.len() as u8,
-        land,
+        land: b.slot_of(land),
         c,
+        hdr: hdr as u8,
     };
     b.call(op, &ops, live, written, c)
 }

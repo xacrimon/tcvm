@@ -111,7 +111,8 @@ pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     }
     enter_join(b, slow);
     b.store_regs([a as usize + 1, a as usize + 3]);
-    b.push(Op::Helper(HelperId::TforNext { a, count }), &[]);
+    let at = b.slot_of(a);
+    b.push(Op::Helper(HelperId::TforNext { a: at, count }), &[]);
     for k in 0..count {
         b.reload(vars + k);
     }

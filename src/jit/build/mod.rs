@@ -294,6 +294,9 @@ pub(crate) struct Inline {
     pub(crate) depth: u8,
     /// It emitted an instruction that needs its frame on the stack.
     pub(crate) failed: bool,
+    /// It, or a body inlined into it, makes a call, which may write its
+    /// callers' captured registers through their cells.
+    pub(crate) called: bool,
     /// Parameters the body never writes whose arguments the caller's
     /// registers hold after the call, reported at each return.
     pub(crate) watch: Vec<u8>,
@@ -337,7 +340,6 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let meta = RegionMeta {
             entry_pc,
             loop_entry,
-            max_stack: proto.max_stack_size,
             params: if function { proto.num_params.min(8) } else { 0 },
         };
         let mut f = Func::new(meta);
@@ -469,11 +471,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         }
     }
 
-    /// An inlined body cannot hold what needs its frame on the stack (its
-    /// closure's upvalues, a tail-out, a frame-relative helper) or a
-    /// metamethod call, whose frame goes past the region's registers and
-    /// so may overlap the body's. Its slots, calls and `SETLIST` are the
-    /// region's.
+    /// An inlined body cannot hold what needs its frame on the stack: its
+    /// closure's upvalues as the frame's, a tail-out, a frame-relative
+    /// helper. Its slots, calls and slot-reading helpers are the region's.
     fn inline_check(&mut self, op: Op) {
         use crate::jit::ir::ops::{Ctx, HelperId, Mem};
         let Some(i) = &mut self.inline else {
@@ -486,12 +486,14 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                 | Op::CellLoad
                 | Op::CellStore
                 | Op::Call { .. }
+                | Op::CallMm { .. }
                 | Op::Resume { .. }
                 | Op::Helper(
                     HelperId::TopArgs(_)
                         | HelperId::SetList { .. }
                         | HelperId::ClosureOf { .. }
                         | HelperId::Close(_)
+                        | HelperId::TforNext { .. }
                 )
         ) {
             return;
@@ -503,11 +505,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             || match op {
                 Op::UpvalValue(_)
                 | Op::UpvalCell(_)
-                | Op::CallMm { .. }
                 | Op::Dispatch { .. }
                 | Op::TailEnter { .. }
-                | Op::Return { .. }
-                | Op::GuardFits(_) => true,
+                | Op::Return { .. } => true,
                 Op::Helper(h) => h.sig().ctx.contains(&Ctx::Base),
                 _ => false,
             };
@@ -1481,6 +1481,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         written: RegSet,
         c: u8,
     ) -> Block {
+        if let Some(i) = self.inline.as_mut() {
+            i.called = true;
+        }
         let mut reload = written;
         reload.union(&self.cfg.captured);
         // By region slot: the captured registers are stored and read through

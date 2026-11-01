@@ -1569,9 +1569,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 });
                 self.push(MInst::TailEnter { nargs, known }, &[p], none);
             }
-            Op::CallMm { pc, nargs, .. } => {
+            Op::CallMm { pc, nargs, hdr, .. } => {
                 let pc_after = self.pc_after(i, pc);
-                let hdr = f.meta.max_stack as u16;
+                let hdr = hdr as u16;
                 let ops: Vec<Operand> = args.iter().map(|&a| self.use_(a)).collect();
                 self.push_call(
                     i,
@@ -1584,10 +1584,6 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 );
             }
             Op::GuardWindow(end) => {
-                self.push_exit(i, |exit| MInst::GuardFits { end, exit }, vec![], none);
-            }
-            Op::GuardFits(n) => {
-                let end = f.meta.max_stack as u16 + 4 + n as u16;
                 self.push_exit(i, |exit| MInst::GuardFits { end, exit }, vec![], none);
             }
             Op::Return { a, n } => {
@@ -1629,7 +1625,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             if let Some(t) = self.f.terminator(p) {
                 match self.f.op(t) {
                     Op::Call { a, .. } => return (a, a as u16),
-                    Op::CallMm { land, .. } => return (land, self.f.meta.max_stack as u16),
+                    Op::CallMm { land, hdr, .. } => return (land, hdr as u16),
                     _ => {}
                 }
             }

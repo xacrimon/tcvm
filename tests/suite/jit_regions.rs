@@ -2398,6 +2398,41 @@ fn cell_stores_in_bodies_write_their_slots() {
     );
 }
 
+/// Generic `for` and metamethod calls in inlined bodies (W3 step 5): the
+/// `next` and `ipairs` steps at the body's slots, another iterator (a
+/// closure made in the body) and `__add` as calls from a header past the
+/// body's registers, where they overwrite nothing: `p`, `q` and `r` wait
+/// in the body's slots across the metamethod call.
+#[test]
+fn bodies_iterate_and_call_metamethods() {
+    agrees(
+        "local function sum_pairs(t) local s = 0 for k, v in pairs(t) do s = s + v end return s end
+        local function sum_ipairs(t) local s = 0 for i, v in ipairs(t) do s = s + i * v end return s end
+        local function range(n) return function(_, i) if i < n then return i + 1 end end, nil, 0 end
+        local function sum_range(n) local s = 0 for i in range(n) do s = s + i end return s end
+        local V = {}
+        V.__add = function(a, b) return setmetatable({x = a.x + b.x}, V) end
+        local function three(i) return i, i + 1, i + 2 end
+        local function addv(v, w, i)
+          local ok, p, q, r = pcall(three, i)
+          local u = v + w
+          return u, p + q + r
+        end
+        local t = {a = 1, b = 2, c = 3}
+        local arr = {4, 5, 6}
+        local s = 0
+        local v = setmetatable({x = 0}, V)
+        local one = setmetatable({x = 1}, V)
+        for i = 1, 3000 do
+          local n
+          s = s + sum_pairs(t) + sum_ipairs(arr) + sum_range(i % 5)
+          v, n = addv(v, one, i)
+          s = s + n
+        end
+        return s .. ' ' .. v.x",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]
