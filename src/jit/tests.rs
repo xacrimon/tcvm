@@ -819,6 +819,29 @@ fn float_keys_index_arrays() {
     assert!(ir.contains("ftoiexact"), "{ir}");
 }
 
+/// Closures and cell upvalues inline (W3 step 4): `make`'s closures come
+/// from `closure.of` with its closure, its cell store goes through that
+/// closure's cell, and its return closes what they opened.
+#[test]
+fn closures_inline() {
+    let src = "local count = 0
+    local function make(k)
+        local n = k
+        count = count + 1
+        return function() n = n + 1 return n end
+    end
+    function f(n)
+        local s = 0
+        for i = 1, n do s = s + make(i)() end
+        return s
+    end
+    for k = 1, 300 do f(10) end";
+    let ir = ir_of(src, "f", 0);
+    for op in ["closure.of", "upcell.of", "cellstore", "close r"] {
+        assert!(ir.contains(op), "{op}: {ir}");
+    }
+}
+
 /// Constructors and concatenation inline (W3 step 3): `NEWTABLE` takes its
 /// template by address, `SETLIST` stores from the body's slots, and the
 /// only call left is `table.unpack`, made from `copy`'s body.

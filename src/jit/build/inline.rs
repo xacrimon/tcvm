@@ -3,9 +3,11 @@
 //! snapshots name its frame and the callers' registers at the call, so an
 //! exit rebuilds both; its returns jump to a block taking the results.
 //! A call in the body is the region's, its frame past the body's registers;
-//! the frame walk finds the inlined frames from its site (W3 §4). A body
-//! that needs its frame on the stack (its closure's cells, a frame-relative
-//! helper) is not inlined. The callee is what the call would guard
+//! the frame walk finds the inlined frames from its site (W3 §4). Its
+//! cells and closures go through the callee closure, and what its closures
+//! open on its slots closes at its returns (§6). A body that needs its
+//! frame on the stack (a to-be-closed variable, varargs) is not inlined.
+//! The callee is what the call would guard
 //! (`intrinsics::callee_of`): a closure, whose upvalues are constants, or
 //! one of a prototype, whose upvalues are loaded from it.
 
@@ -38,8 +40,9 @@ pub(crate) struct InlineCode {
     cfg: Cfg,
     /// The registers some instruction writes.
     written: RegSet,
-    /// Some instruction is a call, which a body may make.
-    calls: bool,
+    /// Some instruction may read or write its callers' captured registers
+    /// through their cells: a call, or a load or store of a cell upvalue.
+    cells: bool,
 }
 
 /// Inline the CALL at `pc` of `callee`; whether it did, the current block
@@ -87,9 +90,9 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
     let Some(code) = code else {
         return false;
     };
-    // A call in the body may write the captured registers through their
+    // The body may read or write the captured registers through their
     // cells: they live in their slots across it, read from them after.
-    let captured = if code.calls {
+    let captured = if code.cells {
         b.cfg.captured
     } else {
         RegSet::EMPTY
@@ -162,7 +165,13 @@ pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, ca
         c,
         caller_pc: pc,
         code: proto.code.as_ptr() as usize,
+        open: code.cfg.captured.iter().next().is_some(),
     });
+    // A call keeps none of them as a home (a body that fails leaves them
+    // in, which only costs reloads).
+    for r in code.cfg.captured.iter() {
+        b.f.captured.insert(base + r);
+    }
     let wanted = c - 1;
     let cont = b.new_block();
     let results: Vec<Val> = (0..wanted).map(|_| b.f.add_param(cont, Ty::ANY)).collect();
@@ -289,11 +298,19 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
     if cfg.never_ran[cfg.block_of[0] as usize] {
         return None;
     }
-    let calls = cfg.code.iter().any(|i| {
+    let cells = cfg.code.iter().any(|i| {
         use BcOp::*;
         matches!(
             i.op().unquickened(),
-            CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1
+            CALL | CALL_R0
+                | CALL_R1
+                | CALLS
+                | CALLS_R0
+                | CALLS_R1
+                | GETUPVAL_REF
+                | SETUPVAL
+                | GETTABUP_REF
+                | SETTABUP_REF
         )
     });
     let mut written = RegSet::EMPTY;
@@ -307,30 +324,24 @@ fn prepare(lf: LuaFn<'_>) -> Option<InlineCode> {
     Some(InlineCode {
         cfg,
         written,
-        calls,
+        cells,
     })
 }
 
-/// Whether a callee's instruction needs its frame on the stack: closures
-/// over it, cells, varargs, metamethod calls.
+/// Whether a callee's instruction needs its frame on the stack: a
+/// to-be-closed variable, varargs, metamethod calls.
 fn needs_frame(op: BcOp) -> bool {
     use BcOp::*;
     matches!(
         op.unquickened(),
         TAILCALL
-            | CLOSE
             | TBC
             | TFORPREP
             | TFORCALL
             | TFORLOOP
-            | CLOSURE
             | VARARG
             | VARARGGET
             | VARARGPREP
-            | SETUPVAL
-            | GETUPVAL_REF
-            | GETTABUP_REF
-            | SETTABUP_REF
             | ARITH_MM
             | ARITH_MM_R
             | ARITH_MMI
@@ -352,6 +363,14 @@ pub(super) fn inline_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
         res.push(v);
     }
     let seen: Vec<Val> = watch.iter().map(|&r| b.reg(r)).collect();
+    // What its closures opened on its slots closes with it, from their
+    // values now.
+    let captured = b.cfg.captured;
+    if captured.iter().next().is_some() {
+        b.store_regs(captured.iter());
+        let at = b.slot_of(0);
+        b.push(Op::Helper(crate::jit::ir::ops::HelperId::Close(at)), &[]);
+    }
     let t = b.terminate(Op::Jump, &[], &[cont], None);
     b.f.set_edge_args(t, 0, &res);
     b.inline.as_mut().unwrap().returns.push((t, seen));

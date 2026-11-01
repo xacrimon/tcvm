@@ -84,13 +84,21 @@ pub(crate) enum HelperId {
     /// `(Val, Val) -> Val`: `a .. b` of strings and numbers, or
     /// `HELPER_FAIL_VAL`.
     Concat,
-    /// `->`: the barrier of a store of a heap value into upvalue `i`'s cell.
-    UpvalBarrier(u8),
+    /// `Ptr ->`: the barrier of a store of a heap value into the cell.
+    UpvalBarrier,
     /// `-> Val`: `CLOSURE` of prototype `proto` into `R[dst]`, from the
     /// captured registers' home slots.
     Closure {
         proto: u16,
         dst: u8,
+    },
+    /// `Ptr -> Val`: `CLOSURE` in the inlined frame at region slot `at`, of
+    /// the operand closure's prototype `proto` (W3 §6). No header marks
+    /// its open upvalues: exits mark the frame they write (`SnapFrame`).
+    ClosureOf {
+        proto: u16,
+        dst: u8,
+        at: u8,
     },
     /// `->`: close this frame's open upvalues from `R[a]` up, from the
     /// captured registers' home slots.
@@ -214,8 +222,8 @@ impl HelperId {
             HelperId::BNot => "bnot".into(),
             HelperId::Len => "len".into(),
             HelperId::Concat => "concat".into(),
-            HelperId::UpvalBarrier(i) => format!("upval_barrier u{i}"),
             HelperId::Closure { proto, dst } => format!("closure p{proto} r{dst}"),
+            HelperId::ClosureOf { proto, dst, at } => format!("closure.of p{proto} r{dst} @{at}"),
             HelperId::Close(a) => format!("close r{a}"),
             HelperId::SetList { a, n, off } => format!("setlist r{a} n={n} off={off}"),
             HelperId::VarargGet => "varargget".into(),
@@ -239,6 +247,7 @@ impl HelperId {
         const FRAME: &[Ctx] = &[Ctx::Rt, Ctx::Thread, Ctx::Base];
         const BASE: &[Ctx] = &[Ctx::Rt, Ctx::Base];
         const STACK: &[Ctx] = &[Ctx::Thread, Ctx::Base];
+        const THREAD: &[Ctx] = &[Ctx::Rt, Ctx::Thread];
         const ALLOC: Flags = Flags::MAY_ALLOC;
         const NO: Flags = Flags::empty();
         const NONE: Mem = Mem::empty();
@@ -271,7 +280,7 @@ impl HelperId {
                 e(ALLOC, Mem::TAB | Mem::ARR | lookup.reads, lookup.writes),
             ),
             HelperId::Concat => (RT, None, &[Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
-            HelperId::UpvalBarrier(i) => (FRAME, Some(i as u64), &[], None, e(NO, NONE, Mem::GC)),
+            HelperId::UpvalBarrier => (THREAD, None, &[Ptr], None, e(NO, NONE, Mem::GC)),
             // New open upvalues join the thread's list.
             HelperId::Closure { proto, dst } => (
                 FRAME,
@@ -279,6 +288,13 @@ impl HelperId {
                 &[],
                 Some(Val),
                 e(ALLOC, Mem::SLOT, Mem::FRAME),
+            ),
+            HelperId::ClosureOf { proto, dst, at } => (
+                FRAME,
+                Some(proto as u64 | (dst as u64) << 32 | (at as u64) << 40),
+                &[Ptr],
+                Some(Val),
+                e(ALLOC, Mem::SLOT, NONE),
             ),
             HelperId::Close(a) => (
                 FRAME,
@@ -595,7 +611,11 @@ pub(crate) enum Op {
     /// callee known by its prototype (E1). A memory read, so that it stays
     /// behind that guard.
     UpvalValueOf(u8),
-    /// The value of an upvalue cell.
+    /// The cell of a shared upvalue of the Lua closure (a `Ptr`): of an
+    /// inlined callee (W3 §6).
+    UpvalCellOf(u8),
+    /// The value of an upvalue cell. An open cell is a slot, perhaps one of
+    /// this region's: it reads and writes slots too.
     CellLoad,
     /// `cell = v`, without its barrier.
     CellStore,
@@ -889,8 +909,9 @@ impl Op {
             TabSetShape(_) => e(Flags::empty(), Mem::empty(), Mem::SHAPE),
             Barrier => e(Flags::empty(), Mem::empty(), Mem::GC),
             HasFlag(_) | FnFits => Effects::reads(Mem::FRAME),
-            CellLoad | UpvalValueOf(_) => Effects::reads(Mem::UPVAL),
-            CellStore => e(Flags::empty(), Mem::empty(), Mem::UPVAL),
+            UpvalValueOf(_) | UpvalCellOf(_) => Effects::reads(Mem::UPVAL),
+            CellLoad => Effects::reads(Mem::UPVAL | Mem::SLOT),
+            CellStore => e(Flags::empty(), Mem::empty(), Mem::UPVAL | Mem::SLOT),
             Helper(h) => h.sig().effects,
             Resume { .. } => e(Flags::SIDE_EFFECT, Mem::SLOT, Mem::empty()),
             Jump | Br => Effects::flags(Flags::TERMINATOR),
@@ -981,7 +1002,7 @@ impl Op {
             Load(_) | Param(_) | UpvalValue(_) | UpvalValueOf(_) | CellLoad | Resume { .. } => {
                 Ty::ANY
             }
-            UpvalCell(_) => Ty::PTR,
+            UpvalCell(_) | UpvalCellOf(_) => Ty::PTR,
             NumVarargs | ClassBits(_) | TabASize | ArrNext | TabMmBits | NamedNext => Ty::I32,
             NamedVal => Ty::ANY,
             NamedKey => Ty::val(TypeSet::STR),
@@ -1023,7 +1044,7 @@ impl Op {
                 Ty::val(TypeSet::INT)
             }
             Helper(HelperId::Concat | HelperId::Type) => Ty::val(TypeSet::STR),
-            Helper(HelperId::Closure { .. }) => Ty::val(TypeSet::FUN),
+            Helper(HelperId::Closure { .. } | HelperId::ClosureOf { .. }) => Ty::val(TypeSet::FUN),
             Helper(HelperId::NewTable | HelperId::VarargTable(_)) => Ty::val(TypeSet::TAB),
             Helper(h) => Ty::of_rep(h.sig().ret.unwrap_or(Rep::Val)),
             _ => Ty::ANY,
@@ -1063,6 +1084,7 @@ impl Op {
             UpvalValue(i) => format!("upval u{i}"),
             UpvalValueOf(i) => format!("upval.of u{i}"),
             UpvalCell(i) => format!("upcell u{i}"),
+            UpvalCellOf(i) => format!("upcell.of u{i}"),
             Helper(h) => format!("call.{}", h.name()),
             Resume { c } => format!("resume c={c}"),
             Return { a, n } => format!("return r{a} n={n}"),

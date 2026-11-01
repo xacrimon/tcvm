@@ -37,7 +37,7 @@ fn receiver(b: &mut Builder<'_, '_>, insn: Instruction) -> Val {
         }
         BcOp::GETTABUP | BcOp::SETTABUP => b.ins(Op::UpvalValue(insn.b()), &[]),
         BcOp::GETTABUP_REF | BcOp::SETTABUP_REF => {
-            let c = b.ins(Op::UpvalCell(insn.b()), &[]);
+            let c = b.upval_cell(insn.b());
             b.ins(Op::CellLoad, &[c])
         }
         _ => b.reg(insn.b()),

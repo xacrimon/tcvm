@@ -55,7 +55,13 @@ pub(crate) struct SnapFrame {
     pub(crate) c: u8,
     pub(crate) delta: u16,
     pub(crate) caller_pc: u32,
+    /// Its callee captures locals: the header an exit writes has
+    /// `HAS_OPEN`, so the frame's return closes what a `CLOSURE` opened.
+    pub(crate) open: bool,
 }
+
+/// `SnapFrame::open` in the encoded caller pc.
+const OPEN: u32 = 1 << 31;
 
 /// A `SnapFrame::func` of a closure known by its prototype, `Region::protos`
 /// by the low bits: the snapshot's entry for the header's word 0 (register
@@ -78,7 +84,7 @@ pub(crate) fn encode_snap(
     for f in frames {
         out.push(f.func);
         out.push(f.a as u32 | (f.c as u32) << 8 | (f.delta as u32) << 16);
-        out.push(f.caller_pc);
+        out.push(f.caller_pc | if f.open { OPEN } else { 0 });
     }
     for e in entries {
         let (loc, index) = match e.loc {
@@ -132,7 +138,8 @@ impl<'a> SnapView<'a> {
                 a: w as u8,
                 c: (w >> 8) as u8,
                 delta: (w >> 16) as u16,
-                caller_pc,
+                caller_pc: caller_pc & !OPEN,
+                open: caller_pc & OPEN != 0,
             })
     }
 
@@ -329,6 +336,7 @@ mod tests {
                 c: 2,
                 delta: 11,
                 caller_pc: 40,
+                open: true,
             },
             SnapFrame {
                 func: 0,
@@ -336,6 +344,7 @@ mod tests {
                 c: 0,
                 delta: 4,
                 caller_pc: 1 << 20,
+                open: false,
             },
         ];
         let entries = [

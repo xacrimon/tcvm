@@ -35,8 +35,9 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::BNot => jit_bnot as *const () as usize,
         HelperId::Len => jit_len as *const () as usize,
         HelperId::Concat => jit_concat as *const () as usize,
-        HelperId::UpvalBarrier(_) => jit_upval_barrier as *const () as usize,
+        HelperId::UpvalBarrier => jit_upval_barrier as *const () as usize,
         HelperId::Closure { .. } => jit_closure as *const () as usize,
+        HelperId::ClosureOf { .. } => jit_closure_of as *const () as usize,
         HelperId::Close(_) => jit_close as *const () as usize,
         HelperId::NewTable => jit_newtable as *const () as usize,
         HelperId::SetList { .. } => jit_setlist as *const () as usize,
@@ -181,16 +182,16 @@ pub(crate) extern "C" fn jit_concat(rt: *const State<'static>, a: u64, b: u64) -
     }
 }
 
-/// The barrier of a store into upvalue `i`'s cell, as `op_setupval` runs it.
+/// The barrier of a store into the upvalue cell, as `op_setupval` runs it.
 pub(crate) extern "C" fn jit_upval_barrier(
     rt: *const State<'static>,
     thread: *mut ThreadState<'static>,
-    base: *mut Value<'static>,
-    i: u64,
+    cell: u64,
 ) {
     let ctx = unsafe { Context::from_state(rt) };
-    let closure = unsafe { frame::closure(base) };
-    let cell = unsafe { (*closure.upvalue_ptr().add(i as usize)).cell };
+    // SAFETY: an upvalue slot's word for a cell is the `Upvalue` itself.
+    let cell: crate::env::function::Upvalue<'static> =
+        unsafe { std::mem::transmute(cell as usize as *const ()) };
     let running = unsafe { (*thread).handle() };
     if let Some(target) = UpvalueCell::barrier_target(cell, running)
         && !Gc::is_gray(target)
@@ -217,6 +218,36 @@ pub(crate) extern "C" fn jit_closure(
         closure,
         imm as u32 as usize,
         (imm >> 32) as u8,
+        true,
+    );
+    Value::function(f).to_raw()
+}
+
+/// `CLOSURE` in an inlined frame (`imm`: `proto | dst << 32 | at << 40`, `at`
+/// its base's region slot) of `closure`'s prototype: no header to mark.
+pub(crate) extern "C" fn jit_closure_of(
+    rt: *const State<'static>,
+    thread: *mut ThreadState<'static>,
+    base: *mut Value<'static>,
+    imm: u64,
+    closure: u64,
+) -> u64 {
+    let ctx = unsafe { Context::from_state(rt) };
+    let ts = unsafe { &mut *thread };
+    let closure = unsafe {
+        crate::env::function::LuaFn::from_ptr(
+            closure as *const crate::env::function::FunctionKind<'static>,
+        )
+    };
+    let at = unsafe { base.add((imm >> 40) as u8 as usize) };
+    let f = new_closure(
+        ctx,
+        ts,
+        at,
+        closure,
+        imm as u32 as usize,
+        (imm >> 32) as u8,
+        false,
     );
     Value::function(f).to_raw()
 }

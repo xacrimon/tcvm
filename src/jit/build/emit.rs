@@ -431,7 +431,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             }
         }
         GETUPVAL_REF => {
-            let c = b.ins(Op::UpvalCell(rb), &[]);
+            let c = b.upval_cell(rb);
             let v = b.ins(Op::CellLoad, &[c]);
             b.set(a, v);
             b.note_def(&[v], None);
@@ -439,11 +439,11 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         SETUPVAL => {
             let v = b.reg(a);
             let v = b.boxed(v);
-            let c = b.ins(Op::UpvalCell(rb), &[]);
+            let c = b.upval_cell(rb);
             b.push(Op::CellStore, &[c, v]);
             let set = b.ty(v).set;
             if set.is_empty() || set.intersects(TypeSet::HEAP) {
-                b.push(Op::Helper(HelperId::UpvalBarrier(rb)), &[]);
+                b.push(Op::Helper(HelperId::UpvalBarrier), &[c]);
             }
         }
         CLOSURE => {
@@ -459,20 +459,30 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
                 })
                 .collect();
             b.store_regs(regs);
-            let f = b.ins(Op::Helper(HelperId::Closure { proto, dst: a }), &[]);
+            let f = match b.body_closure() {
+                Some(c) => {
+                    let at = b.slot_of(0);
+                    b.ins(Op::Helper(HelperId::ClosureOf { proto, dst: a, at }), &[c])
+                }
+                None => b.ins(Op::Helper(HelperId::Closure { proto, dst: a }), &[]),
+            };
             b.set(a, f);
         }
         CLOSE => {
-            // A `__close` runs Lua: the interpreter does it.
-            let s = b.snap_before();
-            b.ins_snap(
-                Op::GuardNoFlag(flag::HAS_TBC as u8),
-                &[],
-                s,
-                ExitTag::Unsupported,
-            );
+            // A `__close` runs Lua: the interpreter does it. An inlined body
+            // has no to-be-closed variable (`inline::needs_frame`).
+            if b.inline.is_none() {
+                let s = b.snap_before();
+                b.ins_snap(
+                    Op::GuardNoFlag(flag::HAS_TBC as u8),
+                    &[],
+                    s,
+                    ExitTag::Unsupported,
+                );
+            }
             let regs: Vec<usize> = b.cfg.captured.iter().filter(|&r| r >= a as usize).collect();
             b.store_regs(regs);
+            let a = b.slot_of(a);
             b.push(Op::Helper(HelperId::Close(a)), &[]);
         }
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => emit_call(b, pc, insn),

@@ -149,10 +149,11 @@ handler! {
             debug_assert_eq!(fr.delta as usize, fr.a as usize + frame::HDR);
             unsafe {
                 let nb = fbase.add(fr.delta as usize);
+                let open = if fr.open { frame::flag::HAS_OPEN } else { 0 };
                 frame::write_hdr(
                     nb.sub(frame::HDR),
                     frame::lua_func_word(callee, 0),
-                    crate::vm::abi::handler_bits(rt.ret(fr.c)),
+                    crate::vm::abi::handler_bits(rt.ret(fr.c)) | open,
                     fbase,
                     fclosure.code.add(fr.caller_pc as usize + 1),
                 );

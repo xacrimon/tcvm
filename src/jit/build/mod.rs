@@ -449,6 +449,26 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         (self.reg_base() + r as usize) as u8
     }
 
+    /// An inlined body's closure as a `Ptr`, which its upvalues and
+    /// closures are read from; none for the region's own frame, whose
+    /// closure the lowering has.
+    pub(crate) fn body_closure(&mut self) -> Option<Val> {
+        let i = self.inline.as_ref()?;
+        if let Some(c) = i.closure {
+            return Some(c);
+        }
+        let k = self.konst(Value::function(self.closure.function()));
+        Some(self.ins(Op::Unbox(Rep::Ptr), &[k]))
+    }
+
+    /// The cell of the frame's shared upvalue `k`.
+    pub(crate) fn upval_cell(&mut self, k: u8) -> Val {
+        match self.body_closure() {
+            Some(c) => self.ins(Op::UpvalCellOf(k), &[c]),
+            None => self.ins(Op::UpvalCell(k), &[]),
+        }
+    }
+
     /// An inlined body cannot hold what needs its frame on the stack (its
     /// closure's upvalues, a tail-out, a frame-relative helper) or a
     /// metamethod call, whose frame goes past the region's registers and
@@ -463,9 +483,16 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             op,
             Op::Load(_)
                 | Op::Store(_)
+                | Op::CellLoad
+                | Op::CellStore
                 | Op::Call { .. }
                 | Op::Resume { .. }
-                | Op::Helper(HelperId::TopArgs(_) | HelperId::SetList { .. })
+                | Op::Helper(
+                    HelperId::TopArgs(_)
+                        | HelperId::SetList { .. }
+                        | HelperId::ClosureOf { .. }
+                        | HelperId::Close(_)
+                )
         ) {
             return;
         }

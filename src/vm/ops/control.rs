@@ -109,7 +109,8 @@ pub(crate) fn vararg_table<'gc>(ctx: Context<'gc>, base: *mut Value<'gc>, np: us
 
 /// `CLOSURE` of prototype `idx` of `closure`, running at `base`, for `R[dst]`:
 /// by-value upvalues from the frame's slots, shared ones through cells,
-/// opened here (with `HAS_OPEN` set) when the slot has none.
+/// opened here when the slot has none (`HAS_OPEN` set if `mark`: an inlined
+/// frame has no header).
 #[inline(always)]
 pub(crate) fn new_closure<'gc>(
     ctx: Context<'gc>,
@@ -118,6 +119,7 @@ pub(crate) fn new_closure<'gc>(
     closure: LuaFn<'gc>,
     idx: usize,
     dst: u8,
+    mark: bool,
 ) -> Function<'gc> {
     let proto = closure.proto.prototypes[idx];
     let mut self_slot = None;
@@ -160,7 +162,7 @@ pub(crate) fn new_closure<'gc>(
             unsafe { slots.add(i).write(slot) };
         }
     });
-    if captured {
+    if captured && mark {
         unsafe { frame::set_flags(base, flag::HAS_OPEN) };
     }
     let f = unsafe { LuaFn::from_function_unchecked(func) };
@@ -768,7 +770,7 @@ handler! {
     /// `R[a] = closure(proto[d])`
     op fn op_closure {
         let (dst, proto_idx) = insn.ad();
-        let func = new_closure(rt, thread!(), base, closure, proto_idx as usize, dst);
+        let func = new_closure(rt, thread!(), base, closure, proto_idx as usize, dst, true);
         reg![dst] = Value::function(func);
         gc_check!();
         next!()

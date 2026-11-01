@@ -721,6 +721,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 c: x.c,
                 delta: x.a as u16 + 4,
                 caller_pc: x.caller_pc,
+                open: x.open,
             });
             frame = x.parent;
         }
@@ -857,7 +858,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let c = Operand::reg_use(self.closure.expect("the frame's closure"));
                 self.push(MInst::LoadUpvalOf(k), &[d, c], none);
             }
-            Op::UpvalValueOf(k) => {
+            Op::UpvalValueOf(k) | Op::UpvalCellOf(k) => {
                 let (d, c) = (self.def(res.unwrap()), self.use_(args[0]));
                 self.push(MInst::LoadUpvalOf(k), &[d, c], none);
             }

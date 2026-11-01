@@ -2332,6 +2332,72 @@ fn bodies_build_tables_and_strings() {
     );
 }
 
+/// Closures made in an inlined body (W3 step 4): `make`'s `get` and `inc`
+/// share `n`, open on the body's slot while it runs (`inc` writes it from
+/// a real call there) and closed when it returns: every `get` kept in
+/// `gets` reads its own `n` after the stack is reused. `bads[2500]` takes
+/// an arm that never ran, exiting inside the body with `n` open (the frame
+/// the exit writes must close it); a `false` raises inside `inc`, an error
+/// that unwinds through the body to the `pcall`, `saved` keeping `n`.
+#[test]
+fn bodies_make_closures() {
+    agrees(
+        "local saved
+        local gets = {}
+        local function make(k, bad)
+          local n = k
+          local function get() return n end
+          local function inc(d) n = n + d end
+          saved = get
+          inc(1)
+          inc(bad)
+          if bad == 2 then n = n + 10 end
+          return get, inc
+        end
+        local function use(i, bad)
+          local get, inc = make(i, bad)
+          inc(3)
+          gets[i] = get
+          return get()
+        end
+        local bads = {}
+        for i = 1, 3000 do bads[i] = 1 end
+        bads[2500] = 2
+        bads[2999] = false
+        local function run()
+          local s = 0
+          for i = 1, 3000 do s = s + use(i, bads[i]) end
+          return s
+        end
+        local ok, e = pcall(run)
+        local t = 0
+        for i = 1, 2998 do t = t + gets[i]() end
+        return tostring(ok) .. ' ' .. e .. ' ' .. saved() .. ' ' .. t",
+    );
+}
+
+/// An inlined body's cell store may write a slot of the frame it was
+/// inlined into: `bump` writes `count`, which `run` stored before it and
+/// reads back after, nothing forwarding the store across the cell's.
+#[test]
+fn cell_stores_in_bodies_write_their_slots() {
+    agrees(
+        "local function run(n)
+          local count, s = 0, 0
+          local function bump() count = count + 1 end
+          for i = 1, n do
+            count = count + i
+            bump()
+            s = s + count
+          end
+          return s .. ' ' .. count
+        end
+        local r
+        for k = 1, 30 do r = run(300) end
+        return r",
+    );
+}
+
 /// A panic in a native that compiled code called, under a chain of fast
 /// calls, unwinds through their frames (`unwind::Fde`) to the host.
 #[test]

@@ -203,6 +203,8 @@ pub(crate) struct InlineFrame {
     pub(crate) c: u8,
     pub(crate) caller_pc: u32,
     pub(crate) code: usize,
+    /// The callee captures locals (`SnapFrame::open`).
+    pub(crate) open: bool,
 }
 
 /// What a region was compiled from.
@@ -277,8 +279,8 @@ pub(crate) struct Func<'gc> {
     /// hold what they will be read as after it, which the collector traces
     /// while the call runs (H11); it clears the frame's other slots there.
     pub(crate) call_homes: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
-    /// The registers closures capture, whose slots a call may write through
-    /// their cells.
+    /// The region slots closures capture, of every frame the region inlines,
+    /// which a call may write through their cells.
     pub(crate) captured: crate::jit::build::cfg::RegSet,
     /// Exits whose miss belongs to another pc than their snapshot's: a
     /// guard hoisted out of a loop (E2), and the access it stands for.
