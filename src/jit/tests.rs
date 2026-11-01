@@ -648,6 +648,24 @@ fn field_loads_take_their_slot_kinds() {
     assert!(ir.contains("val:tab@s"), "{ir}");
 }
 
+/// Float keys with integral values index the array part (W2.6): no generic
+/// helper where the site saw only numbers.
+#[test]
+fn float_keys_index_arrays() {
+    let src = "function f(t, n)
+        local s, k = 0, 0.5
+        for i = 1, n do k = k + 1.0; t[k + 0.5] = s; s = s + t[i * 1.0] end
+        return s
+    end
+    keep = {}
+    for i = 1, 40 do keep[i] = i end
+    for r = 1, 300 do f(keep, 30) end";
+    let ir = ir_of(src, "f", 0);
+    assert!(!ir.contains("call.index"), "{ir}");
+    assert!(!ir.contains("call.newindex"), "{ir}");
+    assert!(ir.contains("ftoiexact"), "{ir}");
+}
+
 /// Callees storing through the table helpers inline (W2.7): `rawset`,
 /// `table.insert`, `table.remove`, `setmetatable` and a generic store touch
 /// table memory alone. (A tail call or a constructor still keeps a callee

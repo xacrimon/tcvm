@@ -1280,6 +1280,40 @@ fn float_modulo_edges() {
     );
 }
 
+/// Float keys of array accesses (W2.6): integral floats as the integers'
+/// keys, then fractions, -0.0, floats past i32 and NaN, read and written,
+/// at sites that saw only integral floats before.
+#[test]
+fn float_array_keys() {
+    agrees(
+        r##"
+        local function get(t, k) return t[k] end
+        local function put(t, k, v) t[k] = v end
+        local t = {}
+        for i = 1, 64 do t[i] = i * 10 end
+        local s = 0
+        for r = 1, 300 do
+          for i = 1, 64 do s = s + get(t, i / 1) end
+          for i = 1, 64 do put(t, i * 1.0, i) end
+        end
+        -- fractions, -0.0, huge floats, nan, mixed keys
+        local f = {}
+        f[0.5] = "half"; f[2^40] = "big"; f[0] = "zero"
+        for r = 1, 300 do s = s + (get(t, r % 64 + 1.0) or 0) end
+        local out = {s, get(f, 0.5), get(f, 2^40), get(f, -0.0), tostring(get(t, 0.0/0.0)), get(t, 3.0), get(t, 3)}
+        put(f, 1.5, "x"); put(f, -0.0, "negzero")
+        out[#out + 1] = f[1.5]; out[#out + 1] = f[0]
+        local ok, err = pcall(put, f, 0/0, 1)
+        out[#out + 1] = tostring(ok)
+        for r = 1, 300 do put(t, r % 64 + 0.5, r) end
+        out[#out + 1] = t[1.5]
+        local n = 0 for k in pairs(t) do if math.type(k) == "float" then n = n + 1 end end
+        out[#out + 1] = n
+        return table.concat(out, " ")
+"##,
+    );
+}
+
 /// Inlined callees that store through the table helpers (W2.7), where each
 /// helper fails over to the builtin or the interpreter: `__newindex` and
 /// `__len` under `table.insert`/`table.remove`, a protected metatable, a

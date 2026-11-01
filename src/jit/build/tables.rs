@@ -1270,23 +1270,47 @@ fn table_site(b: &mut Builder<'_, '_>, pc: u32, recv: Val) -> Option<Val> {
 
 /// The small-integer key of an array access: `Ok` its `I32`, guarded small
 /// unless the site's feedback saw other keys; then `Err(other)`, the block a
-/// test sends them to. `None` for a key never small: no array access.
+/// test sends them to. `None` for a key never small: no array access. A
+/// float with an integral value is that integer's key, so where the site saw
+/// floats a number key converts (W2.6), exiting (`Type`) at a fraction or
+/// past i32, after which the site's floats take the helper.
 fn int_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Result<Val, (Val, Block)>> {
     let ty = b.ty(k);
     if ty.rep == Rep::I32 || (!ty.set.is_empty() && ty.within(TypeSet::SMALL)) {
         return Some(Ok(b.as_i32(k)));
     }
-    if !ty.set.is_empty() && !ty.set.intersects(TypeSet::SMALL) {
-        return None;
-    }
-    let others = fb::FLOAT | fb::STR | fb::TAB | fb::OTHER;
-    if b.feedback(pc) & others == 0 {
+    let floats = b.feedback(pc) & fb::FLOAT != 0 && !b.kind_exited(pc);
+    if floats && ty.rep == Rep::F64 {
         return Some(Ok(b.as_i32(k)));
     }
+    let keys = if floats {
+        TypeSet::SMALL | TypeSet::FLOAT
+    } else {
+        TypeSet::SMALL
+    };
+    if !ty.set.is_empty() && !ty.set.intersects(keys) {
+        return None;
+    }
+    let conv = |b: &mut Builder<'_, '_>, kb: Val| {
+        if !floats {
+            return b.ins(Op::Unbox(Rep::I32), &[kb]);
+        }
+        let f = b.ins_exit(Op::ToF64, &[kb], ExitTag::Type);
+        let f = b.f.result(f);
+        b.as_i32(f)
+    };
+    let others = fb::STR | fb::TAB | fb::OTHER | if floats { 0 } else { fb::FLOAT };
+    if b.feedback(pc) & others == 0 {
+        if !floats {
+            return Some(Ok(b.as_i32(k)));
+        }
+        let kb = b.boxed(k);
+        return Some(Ok(conv(b, kb)));
+    }
     let kb = b.boxed(k);
-    let is = b.ins(Op::IsType(TypeSet::SMALL), &[kb]);
+    let is = b.ins(Op::IsType(keys), &[kb]);
     let other = branch_arm(b, is);
-    Some(Err((b.ins(Op::Unbox(Rep::I32), &[kb]), other)))
+    Some(Err((conv(b, kb), other)))
 }
 
 /// The array part's cell, where the site's feedback never saw a miss: `i`
