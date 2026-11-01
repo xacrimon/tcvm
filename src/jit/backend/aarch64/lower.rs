@@ -22,7 +22,9 @@ pub(crate) struct LExit {
     /// The inlined frames the exit rebuilds, outermost first (E1).
     pub(crate) frames: Vec<crate::jit::region::SnapFrame>,
     /// The pc whose feedback the exit records, when not `pc` (E2).
-    pub(crate) site: Option<u32>,
+    pub(crate) site: Option<crate::jit::ir::ExitSite>,
+    /// The snapshot's inlined frame, or `NO_FRAME`.
+    pub(crate) frame: u32,
     pub(crate) kind: ExitKind,
     pub(crate) tag: ExitTag,
     /// `(register, rep, source)`.
@@ -535,14 +537,15 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let store_failed = d.op == Op::GuardFalse
             && f.def_inst(f.args(i)[0]).is_some_and(|c| {
                 f.op(c) == Op::SameBits
-                    && f.args(c).iter().any(|&a| {
-                        matches!(f.def_op(a), Some(Op::Helper(h)) if h.sig().effects.writes())
-                    })
+                    && f.args(c).iter().any(
+                        |&a| matches!(f.def_op(a), Some(Op::Helper(h)) if h.sig().effects.writes()),
+                    )
             });
         self.exits.push(LExit {
             pc,
             frames,
             site: self.f.exit_sites.get(&i).copied(),
+            frame: s.frame,
             kind,
             tag,
             entries,

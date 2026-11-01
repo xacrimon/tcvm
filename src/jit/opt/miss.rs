@@ -98,11 +98,7 @@ pub(crate) fn expand(f: &mut Func<'_>) -> Option<Vec<Inst>> {
         let k = pos(f, g);
         let (v, has) = (f.args(g)[0], f.args(g)[1]);
         let miss = Snap(f.insts[g.idx()].snap);
-        let site = f
-            .exit_sites
-            .get(&g)
-            .copied()
-            .unwrap_or(f.snaps[miss.0 as usize].pc);
+        let site = f.exit_sites.get(&g).copied().unwrap_or(f.snap_site(miss));
         let mut guard = |f: &mut Func<'_>, arm: Block| {
             let x = f.make_inst(Op::GuardFalse, &[has], Some(miss), ExitTag::Bounds);
             f.exit_sites.insert(x, site);

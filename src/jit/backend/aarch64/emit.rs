@@ -64,7 +64,8 @@ pub(crate) struct SiteOut {
 pub(crate) struct ExitOut {
     pub(crate) pc: u32,
     pub(crate) frames: Vec<crate::jit::region::SnapFrame>,
-    pub(crate) site: Option<u32>,
+    pub(crate) site: Option<crate::jit::ir::ExitSite>,
+    pub(crate) frame: u32,
     pub(crate) kind: crate::jit::ir::ExitKind,
     pub(crate) tag: crate::jit::ir::ops::ExitTag,
     pub(crate) entries: Vec<SnapEntry>,
@@ -539,6 +540,7 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
         pc: e.pc,
         frames: e.frames.clone(),
         site: e.site,
+        frame: e.frame,
         kind: e.kind,
         tag: e.tag,
         entries,

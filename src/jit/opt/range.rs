@@ -126,8 +126,8 @@ fn hoist_bounds(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
         return false;
     }
     let params: Vec<Val> = f.params(h).to_vec();
-    // Each guard `idx < n` of a counter, with the access's pc.
-    let mut found: Vec<(Inst, usize, Val, u32)> = Vec::new();
+    // Each guard `idx < n` of a counter, with the access's site.
+    let mut found: Vec<(Inst, usize, Val, crate::jit::ir::ExitSite)> = Vec::new();
     for &b in body {
         for &i in f.insts_of(b) {
             if f.op(i) != Op::GuardTrue || f.insts[i.idx()].tag != ExitTag::Bounds {
@@ -146,8 +146,8 @@ fn hoist_bounds(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
             let Some(c) = ivs.iter().position(|iv| params[iv.param] == x) else {
                 continue;
             };
-            let pc = f.snaps[f.insts[i.idx()].snap as usize].pc;
-            found.push((i, c, n, pc));
+            let site = f.snap_site(crate::jit::ir::Snap(f.insts[i.idx()].snap));
+            found.push((i, c, n, site));
         }
     }
     if found.is_empty() {
@@ -171,7 +171,7 @@ fn hoist_bounds(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
         None => v,
     });
     let mut gone = vec![false; f.insts.len()];
-    for (g, c, n, pc) in found {
+    for (g, c, n, site) in found {
         let iv = &ivs[c];
         for x in [edge_args[iv.param], iv.last] {
             let cmp = f.make_inst(Op::ICmp(Cc::Lo), &[x, n], None, ExitTag::Type);
@@ -179,7 +179,7 @@ fn hoist_bounds(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
             let r = f.result(cmp);
             let guard = f.make_inst(Op::GuardTrue, &[r], Some(snap), ExitTag::Bounds);
             f.insert_before_term(pre, guard);
-            f.exit_sites.insert(guard, pc);
+            f.exit_sites.insert(guard, site);
         }
         gone[g.idx()] = true;
     }

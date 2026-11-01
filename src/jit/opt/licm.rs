@@ -87,13 +87,6 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
     let entry_snap = f.insts_of(h).iter().find_map(|&i| {
         (f.op(i) == Op::GcCheck).then(|| crate::jit::ir::Snap(f.insts[i.idx()].snap))
     });
-    let entry_frame = entry_snap.map(|s| f.snaps[s.0 as usize].frame);
-    // An exit recording at its own site (E2) moves only within its frame,
-    // as the site is a pc of that frame's function.
-    let site_kept = |i: Inst| {
-        !f.exit_sites.contains_key(&i)
-            || Some(f.snaps[f.insts[i.idx()].snap as usize].frame) == entry_frame
-    };
     let params: Vec<Val> = f.params(h).to_vec();
     let edge_args: Vec<Val> = f.edge_args(t, k as usize).to_vec();
     let memory_kept = |op: Op| {
@@ -137,7 +130,7 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
                         && on_spine
                         && (ordered || !reads_memory)
                         && memory_kept(op)
-                        && (!exits || entry_snap.is_some() && site_kept(i))
+                        && (!exits || entry_snap.is_some())
                 }
             };
             let ok = movable

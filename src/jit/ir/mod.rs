@@ -176,6 +176,15 @@ pub(crate) struct SnapData {
 
 pub(crate) const NO_FRAME: u32 = u32::MAX;
 
+/// The pc whose feedback an exit records, of the function of `frame` (an
+/// `inline_frames` index, or `NO_FRAME` for the region's): a moved exit's
+/// snapshot may be another frame's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExitSite {
+    pub(crate) pc: u32,
+    pub(crate) frame: u32,
+}
+
 /// An inlined call's frame (E1): the callee (a pool index, or
 /// `region::DYNAMIC` with a `Func::protos` index), the `CALL`'s `a` and `c`
 /// and pc in the enclosing frame, which is `parent` or the region's. Its
@@ -266,7 +275,7 @@ pub(crate) struct Func<'gc> {
     pub(crate) captured: crate::jit::build::cfg::RegSet,
     /// Exits whose miss belongs to another pc than their snapshot's: a
     /// guard hoisted out of a loop (E2), and the access it stands for.
-    pub(crate) exit_sites: crate::jit::FastMap<Inst, u32>,
+    pub(crate) exit_sites: crate::jit::FastMap<Inst, ExitSite>,
     pub(crate) inline_frames: Vec<InlineFrame>,
     /// The prototypes guards prove callees closures of, which the region
     /// keeps alive.
@@ -747,6 +756,15 @@ impl<'gc> Func<'gc> {
     }
 
     /// A new snapshot with `s`'s frame and its values mapped by `map`.
+    /// The site of an exit with snapshot `s` that stays where it is.
+    pub(crate) fn snap_site(&self, s: Snap) -> ExitSite {
+        let d = self.snaps[s.0 as usize];
+        ExitSite {
+            pc: d.pc,
+            frame: d.frame,
+        }
+    }
+
     pub(crate) fn map_snap(&mut self, s: Snap, mut map: impl FnMut(Val) -> Val) -> Snap {
         let d = self.snaps[s.idx()];
         let start = self.snap_pool.len();

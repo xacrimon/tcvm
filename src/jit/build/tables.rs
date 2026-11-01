@@ -1393,8 +1393,8 @@ fn nil_guard(b: &mut Builder<'_, '_>, t: Val, v: Val, bit: MetamethodBits) {
     let s = b.snap_before();
     let g = b.ins_snap(Op::GuardMiss, &[v, has], s, ExitTag::Bounds);
     // Kept where LICM moves it.
-    let pc = b.f.snaps[s.0 as usize].pc;
-    b.f.exit_sites.insert(g, pc);
+    let site = b.f.snap_site(s);
+    b.f.exit_sites.insert(g, site);
 }
 
 /// `R[a] = R[b][R[c]]`: a small integer key inside the array part loads

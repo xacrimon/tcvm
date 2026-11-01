@@ -660,7 +660,9 @@ fn on_exit<'gc>(
             };
         match e.site {
             // The frame is the loop header's: only the miss is the access's.
-            Some(s) => closure.proto.feedback.add_bits(s as usize, extra),
+            Some(s) => site_proto(region, e, closure)
+                .feedback
+                .add_bits(s as usize, extra),
             None => record_site(closure, base, pc, extra),
         }
         if e.tag == ExitTag::Shape {
@@ -698,8 +700,21 @@ fn on_exit<'gc>(
         // Feedback only grows (kinds, the overflow, misses and metamethod
         // bits, shapes up to `MAX_SHAPES + 1`), so a recompile that learns
         // some is outside the budget, as the never-executed rule's are.
-        let learned = exit_seen(closure.proto, e.site.unwrap_or(pc)) != e.seen;
+        let learned = exit_seen(site_proto(region, e, closure), e.site.unwrap_or(pc)) != e.seen;
         request_recompile(ctx, region_closure, region, learned);
+    }
+}
+
+/// The function whose pc `e.site` is: `closure`'s unless the exit moved out
+/// of an inlined body.
+fn site_proto<'gc>(
+    region: &Region<'gc>,
+    e: &ExitInfo,
+    closure: LuaFn<'gc>,
+) -> Gc<'gc, crate::env::function::Prototype<'gc>> {
+    match e.site_proto {
+        u16::MAX => closure.proto,
+        k => region.site_protos[k as usize],
     }
 }
 

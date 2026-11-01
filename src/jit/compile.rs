@@ -459,6 +459,7 @@ pub(crate) fn compile<'gc>(
         );
     }
     let mut exits = Vec::with_capacity(em.exits.len());
+    let mut site_protos: Vec<crate::dmm::Gc<'_, crate::env::function::Prototype<'_>>> = Vec::new();
     let mut snaps: Vec<u32> = Vec::new();
     let mut consts: Vec<u64> = Vec::new();
     let mut last: Option<(usize, usize)> = None;
@@ -487,25 +488,46 @@ pub(crate) fn compile<'gc>(
             }
         };
         // An exit in an inlined body is a site of its callee's.
-        let proto = match e.frames.last() {
-            Some(fr) if fr.func & crate::jit::region::DYNAMIC != 0 => {
-                f.protos[(fr.func & !crate::jit::region::DYNAMIC) as usize]
-            }
-            Some(fr) => {
-                f.pool[fr.func as usize]
+        let func_proto = |func: u32| {
+            if func & crate::jit::region::DYNAMIC != 0 {
+                f.protos[(func & !crate::jit::region::DYNAMIC) as usize]
+            } else {
+                f.pool[func as usize]
                     .get_function()
                     .and_then(|x| x.as_lua())
                     .expect("an inlined Lua closure")
                     .proto
             }
-            None => closure.proto,
         };
+        let proto = e
+            .frames
+            .last()
+            .map_or(closure.proto, |fr| func_proto(fr.func));
+        let (site_proto, seen_proto) = match e.site {
+            Some(s) if s.frame != e.frame => {
+                let p = match s.frame {
+                    crate::jit::ir::NO_FRAME => closure.proto,
+                    fr => func_proto(f.inline_frames[fr as usize].func),
+                };
+                let k = site_protos
+                    .iter()
+                    .position(|&q| crate::dmm::Gc::ptr_eq(q, p))
+                    .unwrap_or_else(|| {
+                        site_protos.push(p);
+                        site_protos.len() - 1
+                    });
+                (k as u16, p)
+            }
+            _ => (u16::MAX, proto),
+        };
+        let site = e.site.map(|s| s.pc);
         exits.push(ExitInfo {
             snap: at as u32,
             tag: e.tag,
             count: std::cell::Cell::new(0),
-            site: e.site,
-            seen: crate::jit::exit_seen(proto, e.site.unwrap_or(e.pc)),
+            site,
+            site_proto,
+            seen: crate::jit::exit_seen(seen_proto, site.unwrap_or(e.pc)),
         });
     }
     // The sites, their snapshots after the exits'.
@@ -555,6 +577,7 @@ pub(crate) fn compile<'gc>(
             entry_fails: std::cell::Cell::new(0),
             proto: closure.proto,
             protos: f.protos.clone().into_boxed_slice(),
+            site_protos: site_protos.into_boxed_slice(),
             entry_pc: pc,
             nest: nest.into_boxed_slice(),
             num_spills: em.num_spills,

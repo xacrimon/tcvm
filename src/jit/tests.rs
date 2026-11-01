@@ -209,6 +209,59 @@ fn back_edges_follow_loop_entries() {
     });
 }
 
+/// A bounds check moved out of an inlined accessor into its caller's loop
+/// (E2) records its miss at the accessor's site: its exit names the
+/// accessor's prototype, the snapshot being the caller's.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn hoisted_inlined_bounds_miss_at_the_callee() {
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(
+                "function at(t, i) return t[i] end
+                function f(t, n) local s = 0 for i = 1, n do s = s + (at(t, i) or 0) end return s end
+                local t = {}
+                for i = 1, 100 do t[i] = i end
+                for r = 1, 300 do f(t, 100) end",
+                Some("=t"),
+            )?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let get = |name: &[u8]| {
+            ctx.globals()
+                .raw_get(Value::string(LuaString::new(ctx, name)))
+                .get_function()
+                .and_then(|f| f.as_lua())
+                .unwrap()
+        };
+        let (at, f) = (get(b"at"), get(b"f"));
+        let state = f.proto.jit.get().expect("f compiled");
+        let st = state.borrow();
+        let hoisted: Vec<_> = st
+            .entries
+            .iter()
+            .filter_map(|e| e.region)
+            .flat_map(|r| {
+                r.exits
+                    .iter()
+                    .filter(|x| x.site.is_some() && x.site_proto != u16::MAX)
+                    .map(|x| r.site_protos[x.site_proto as usize])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Compiled at once (`TCVM_JIT_HOT_*`), no feedback makes the check.
+        let config = &ctx.jit().config;
+        assert!(config.hot_call <= 1 || config.hot_loop <= 1 || !hoisted.is_empty());
+        assert!(hoisted.iter().all(|&p| crate::dmm::Gc::ptr_eq(p, at.proto)));
+    });
+}
+
 /// One shape guard per receiver while nothing changes shapes, a field read
 /// again is the first read, and a read after a store is the stored value.
 #[test]

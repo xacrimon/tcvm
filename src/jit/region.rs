@@ -175,6 +175,10 @@ pub(crate) struct ExitInfo {
     /// The site, when not the snapshot's pc: a check hoisted out of a loop
     /// records its access's miss (E2).
     pub(crate) site: Option<u32>,
+    /// The `Region::site_protos` index of the site's function when it is
+    /// not the snapshot's (a check moved out of an inlined body), or
+    /// `u16::MAX`.
+    pub(crate) site_proto: u16,
 }
 
 /// A region of compiled code, owned by its prototype's `JitState`.
@@ -218,6 +222,8 @@ pub(crate) struct Region<'gc> {
     /// The prototypes of known callees (`Func::protos`), whose states
     /// repoint the code's direct calls of them.
     pub(crate) protos: Box<[Gc<'gc, Prototype<'gc>>]>,
+    /// The functions of exits' sites outside their snapshots' frames.
+    pub(crate) site_protos: Box<[Gc<'gc, Prototype<'gc>>]>,
     pub(crate) entry_pc: u32,
     /// The entry's loop nest, innermost first (`Entry::nest`).
     #[collect(require_static)]
