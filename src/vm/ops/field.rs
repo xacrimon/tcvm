@@ -287,6 +287,21 @@ fn get_fill_ic<'gc>(
         }
         return get_index_fill_ic(ctx, closure, ic, site, t, index, Some(shape), k);
     }
+    // The entry is this shape's slot already, and the hit left its nil to
+    // `__index`: the walk answers, and the entry stays as it is.
+    if let InlineCache::Own {
+        shape: cached, loc, ..
+    } = read_ic(closure, ic)
+        && Shape::ptr_eq(cached, shape)
+    {
+        let v = unsafe { t.load(&state, loc) };
+        if !v.is_nil() || !shape.has_mm(MetamethodBits::INDEX) {
+            return Ok(v);
+        }
+        let index = unsafe { shape.mt_cache().unwrap_unchecked() }.mm(MetamethodBits::INDEX);
+        drop(state);
+        return get_index_fill_ic(ctx, closure, ic, site, t, index, None, k);
+    }
     let slot = shape.find_slot(constant_key(k));
     fill_ic(ctx, closure, ic, site, shape_entry(shape, slot));
     let v = slot.map_or(Value::nil(), |s| state.named_get(s));

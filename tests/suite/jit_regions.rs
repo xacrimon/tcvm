@@ -2707,3 +2707,25 @@ fn stable_shapes_across_calls() {
         return table.concat(r, ',')",
     );
 }
+
+/// A nil own slot under `__index` walks the chain each time without
+/// refilling its entry, and sees the chain and the slot change.
+#[test]
+fn nil_own_slots_walk_without_refills() {
+    agrees(
+        "local P = {v = 5}
+        local mt = {__index = P}
+        local objs = {}
+        for i = 1, 4 do objs[i] = setmetatable({v = nil, w = i}, mt) end
+        local function get(o) return o.v end
+        local r = {}
+        for i = 1, 400 do r[#r + 1] = get(objs[i % 4 + 1]) end
+        P.v = 7
+        r[#r + 1] = get(objs[1])
+        mt.__index = function(t, k) return k end
+        r[#r + 1] = get(objs[2])
+        objs[3].v = 1
+        r[#r + 1] = get(objs[3])
+        return table.concat(r, ',')",
+    );
+}
