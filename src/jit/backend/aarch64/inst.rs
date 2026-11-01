@@ -207,6 +207,13 @@ pub(crate) enum MInst {
         cond: Cond,
         exit: u32,
     },
+    /// `[use v, snap..]`: a self-call result's type guard, right after its
+    /// `Resume`: out of line where the ways back but the fast return land
+    /// (`opt::selfcall`), else as a `Guard`.
+    GuardLanding {
+        set: TypeSet,
+        exit: u32,
+    },
     /// `[snap..]`: exit when the frame's header has any of the flags.
     GuardNoFlag {
         mask: u8,
@@ -309,6 +316,9 @@ pub(crate) enum MInst {
         pc_after: usize,
         /// A constant callee the call writes word 0 for itself.
         known: Option<Known>,
+        /// A self-call whose arguments pass the entry guards: it enters
+        /// past them (W4 §2).
+        typed: bool,
     },
     /// `[use f, use args.., site..]`: a metamethod call from a header at
     /// slot `hdr` (the frame's register count); succ 0 is the resume block.
@@ -385,6 +395,7 @@ impl MInst {
             | LToFExact { exit }
             | ToF64 { exit }
             | Guard { exit, .. }
+            | GuardLanding { exit, .. }
             | GuardNoFlag { exit, .. }
             | GuardShape { exit, .. }
             | GuardShapeIn { exit, .. }

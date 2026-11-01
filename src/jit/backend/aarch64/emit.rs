@@ -49,6 +49,9 @@ pub(crate) struct Emitted {
     /// What `Region::invalidate` patches: each place and the branch target
     /// written there, the entry's first (ws2 §5.4).
     pub(crate) lazy: Vec<(Label, Label)>,
+    /// A self-call's return addresses whose result guard runs out of line,
+    /// and its landing for a level returning there (`jit::jit_exit`).
+    pub(crate) landings: Vec<(Label, Label)>,
 }
 
 /// A call of the region: its return addresses, whether each is a level's
@@ -156,6 +159,21 @@ struct Em<'a> {
     /// `FMod`'s out-of-line paths: (entry, return, d, a, b).
     fmods: Vec<(Label, Label, Fpr, Fpr, Fpr)>,
     lazy: Vec<(Label, Label)>,
+    /// Where self-calls whose arguments pass the entry guards enter (the
+    /// entry block, past the fast entry's tests), checking the window
+    /// themselves.
+    typed_entry: Option<Label>,
+    own_max_stack: u8,
+    /// A resume block whose `GuardLanding` follows its `Resume` (with the
+    /// call's header slot): its slow resume is bound out of line, unless a
+    /// move comes between.
+    pending_based: Option<(usize, u16)>,
+    /// By resume block: the landing of a level returning to its call.
+    boxed_of: Vec<Option<Label>>,
+    landings: Vec<(Label, Label)>,
+    /// `tail_level`'s level path, shared (it rewrites typed return
+    /// addresses, all known only at the end).
+    level_tail: Label,
     /// Code out of the way of the fast paths, emitted after the blocks: a
     /// call's paths besides its fast one, so its callee returns into the
     /// resume block.
@@ -312,6 +330,7 @@ pub(crate) fn emit(
     let miss = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
     let resume_based = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
     let region_word = a.new_label();
+    let level_tail = a.new_label();
     let mut em = Em {
         a,
         v: &l.vcode,
@@ -337,6 +356,12 @@ pub(crate) fn emit(
         own_entry: None,
         direct: Vec::new(),
         lazy: Vec::new(),
+        typed_entry: None,
+        own_max_stack: 0,
+        pending_based: None,
+        boxed_of: vec![None; l.vcode.blocks.len()],
+        landings: Vec::new(),
+        level_tail,
         ool: Vec::new(),
     };
     em.a.bind(em.region_word);
@@ -378,6 +403,7 @@ pub(crate) fn emit(
             crate::jit::known_offset(true, fe.num_params)
         );
         em.own_entry = Some((fe.proto, known, regs));
+        em.own_max_stack = fe.max_stack;
         em.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
         em.a.add_imm(Sz::X, X17, BASE, fe.max_stack as u64 * 8);
         em.a.cmp(Sz::X, X17, X16);
@@ -386,6 +412,16 @@ pub(crate) fn emit(
         em.a.b_cond(Cond::Hi, if nreg > 0 { param_miss } else { fast_miss });
         l
     });
+    // The entry guards (on `x0`..), then the entry block, where typed
+    // self-calls enter; dispatch enters at the guards.
+    let guards = em.a.new_label();
+    em.a.bind(guards);
+    for &(r, set) in &l.entry_tests {
+        em.reg_type_guard(Gpr(r), set, em.entry_fail);
+    }
+    if l.prefix_guards {
+        em.typed_entry = Some(em.labels[0]);
+    }
     let laid: Vec<usize> = l
         .emit_order
         .iter()
@@ -405,7 +441,12 @@ pub(crate) fn emit(
                 regalloc2::InstOrEdit::Edit(_) if blk.resume && k == 0 => {
                     return Err("a move before a call's resume".into());
                 }
-                regalloc2::InstOrEdit::Edit(Edit::Move { from, to }) => em.mov(*from, *to),
+                regalloc2::InstOrEdit::Edit(Edit::Move { from, to }) => {
+                    if let Some((r, _)) = em.pending_based.take() {
+                        em.a.bind(em.resume_based[r]);
+                    }
+                    em.mov(*from, *to)
+                }
                 regalloc2::InstOrEdit::Inst(i) => {
                     let next = laid.get(at + 1).map(|&x| em.labels[x]);
                     em.inst(i.index(), b, next)?;
@@ -422,7 +463,7 @@ pub(crate) fn emit(
     for k in 0..l.params {
         em.a.ldr(Gpr(k), BASE, 8 * k as i32);
     }
-    em.a.adr(X16, em.labels[0]);
+    em.a.adr(X16, guards);
     em.a.b_far(em.helpers.level_enter);
     // Cold section: one stub per exit, the trampoline, and the prologue's
     // entry-fail stub, which needs no register image (6.4).
@@ -484,7 +525,9 @@ pub(crate) fn emit(
         for k in 0..l.params {
             em.a.str(Gpr(k), BASE, 8 * k as i32);
         }
-        em.close_frame();
+        if !l.prefix_guards {
+            em.close_frame();
+        }
         em.a.ldr_label(INSN, region_word);
         em.a.ldr_lit(X16, em.helpers.entry_fail as u64);
         em.tail_level();
@@ -537,6 +580,7 @@ pub(crate) fn emit(
         em.a.ldr_lit(LR, em.helpers.level_ret);
         em.a.b_far(em.helpers.enter);
     }
+    em.level_tail_stub();
     let exits = l
         .exits
         .iter()
@@ -556,6 +600,7 @@ pub(crate) fn emit(
         sites: em.sites,
         direct: em.direct,
         lazy: em.lazy,
+        landings: em.landings,
     })
 }
 
@@ -666,7 +711,7 @@ impl Em<'_> {
         self.a.ldr(X17, X16, layout::FN_PROTO as i32);
         self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
         self.a.cbz(Sz::X, X17, slow);
-        self.fast_enter(hdr, Target::Reg)
+        self.fast_enter(hdr, Target::Reg, None)
     }
 
     /// `fast_call` for a known callee (D2), word 0 its closure word: the
@@ -682,6 +727,7 @@ impl Em<'_> {
         slow: Label,
         (closure, proto, nparams): (Option<u64>, u64, u8),
         nargs: u8,
+        window: Option<Label>,
     ) -> (Label, Label, bool, Target) {
         // A static count passes the first arguments in x0.. (W4 §2), the
         // parameters left out nil; past eight they are in the callee's slots,
@@ -699,6 +745,8 @@ impl Em<'_> {
             }
         }
         let target = match self.direct_target(proto, nparams, known) {
+            // A typed self-call enters past the entry guards (W4 §2).
+            Some(_) if window.is_some() => Target::Own(self.typed_entry.unwrap()),
             Some(t) if known => t,
             _ => {
                 self.a.mov_imm(X17, proto);
@@ -731,7 +779,7 @@ impl Em<'_> {
                 self.a.and_imm(Sz::X, X16, X16, PTR_MASK);
             }
         }
-        let (ret, deep) = self.fast_enter(hdr, target);
+        let (ret, deep) = self.fast_enter(hdr, target, window);
         (ret, deep, known, target)
     }
 
@@ -774,7 +822,7 @@ impl Em<'_> {
     /// leaves, where the fast resume is when the resume block is laid out
     /// next (else a branch to it, `fall_into_resume`), and the deep path's
     /// label, for `deep_path`.
-    fn fast_enter(&mut self, hdr: i32, target: Target) -> (Label, Label) {
+    fn fast_enter(&mut self, hdr: i32, target: Target, window: Option<Label>) -> (Label, Label) {
         // Word 1 zero: the frame's flags, which helpers set there (a closure
         // capturing a register, `HAS_OPEN`) and `HasFlag` reads. Left stale,
         // a flag would land on a value of the caller's that the collector
@@ -786,6 +834,14 @@ impl Em<'_> {
             self.a.str(ZR, BASE, hdr + 8);
         }
         self.a.add_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
+        // The window check the typed entry leaves to its caller.
+        if let Some(w) = window {
+            self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
+            self.a
+                .add_imm(Sz::X, X17, BASE, self.own_max_stack as u64 * 8);
+            self.a.cmp(Sz::X, X17, X16);
+            self.a.b_cond(Cond::Hi, w);
+        }
         let deep = self.a.new_label();
         self.a.mov_sp(Gpr(9), SP);
         self.a.ldr(Gpr(10), THREAD, layout::NATIVE_DEEP as i32);
@@ -998,14 +1054,34 @@ impl Em<'_> {
     /// dispatch entered goes on in its level; a fast-called one starts a
     /// level returning to its caller, its header made to return through it.
     fn tail_level(&mut self) {
-        let level = self.a.new_label();
         self.handler_regs();
         self.a.ldr_lit(X17, self.helpers.level_land);
         self.a.cmp(Sz::X, LR, X17);
-        self.a.b_cond(Cond::Ne, level);
+        self.a.b_cond(Cond::Ne, self.level_tail);
         self.a.ldr_lit(LR, self.helpers.level_ret);
         self.a.br(X16);
-        self.a.bind(level);
+    }
+
+    /// `tail_level`'s level, once: a typed return address goes back as its
+    /// landing, which tests the result (the level's is any value).
+    fn level_tail_stub(&mut self) {
+        self.a.bind(self.level_tail);
+        if !self.landings.is_empty() {
+            let done = self.a.new_label();
+            self.a.and_imm(Sz::X, Gpr(10), LR, !1);
+            for (ret, boxed) in self.landings.clone() {
+                let next = self.a.new_label();
+                self.a.adr(Gpr(9), ret);
+                self.a.cmp(Sz::X, Gpr(10), Gpr(9));
+                self.a.b_cond(Cond::Ne, next);
+                self.a.adr(Gpr(9), boxed);
+                self.a.and_imm(Sz::X, LR, LR, 1);
+                self.a.orr(Sz::X, LR, LR, Gpr(9));
+                self.a.b(done);
+                self.a.bind(next);
+            }
+            self.a.bind(done);
+        }
         self.a.ldr(Gpr(9), BASE, -24);
         self.a
             .and_imm(Sz::X, Gpr(9), Gpr(9), crate::vm::frame::flag::MASK);
@@ -1250,6 +1326,33 @@ impl Em<'_> {
                 self.a.cmp(Sz::X, v, X16);
                 self.a.b_cond(Cond::Eq, ok);
             }
+        }
+    }
+
+    /// Go to `fail` unless `v` is in `set`.
+    fn reg_type_guard(&mut self, v: Gpr, set: TypeSet, fail: Label) {
+        if !is_single_test(set) {
+            let ok = self.a.new_label();
+            self.type_branch(v, set, ok);
+            self.a.b(fail);
+            self.a.bind(ok);
+        } else {
+            let c = self.type_flags(v, set);
+            self.a.b_cond(c.invert(), fail);
+        }
+    }
+
+    /// Exit unless instruction `i`'s operand 0 is in `set`.
+    fn type_guard(&mut self, i: usize, set: TypeSet, exit: u32) {
+        let l = self.exit(exit);
+        if !is_single_test(set) {
+            let (v, ok) = (self.r(i, 0), self.a.new_label());
+            self.type_branch(v, set, ok);
+            self.a.b(l);
+            self.a.bind(ok);
+        } else {
+            let c = self.test(i, 0, Test::Type(set), Cond::Eq);
+            self.a.b_cond(c.invert(), l);
         }
     }
 
@@ -1633,6 +1736,24 @@ impl Em<'_> {
                     self.a.b_cond(c.invert(), l);
                 }
             }
+            GuardLanding { set, exit } => match self.pending_based.take() {
+                // The fast return skips it: a self-call returns what its
+                // returns give. A level returning to the call (its callee's
+                // `BASE`, `jit_exit`) and the slow path land on it.
+                Some((r, hdr)) if r == block => {
+                    let (cont, boxed) = (self.a.new_label(), self.a.new_label());
+                    self.boxed_of[block] = Some(boxed);
+                    self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                        em.a.bind(boxed);
+                        em.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 * 8 + 32);
+                        em.a.bind(em.resume_based[block]);
+                        em.type_guard(i, set, exit);
+                        em.a.b(cont);
+                    }));
+                    self.a.bind(cont);
+                }
+                _ => self.type_guard(i, set, exit),
+            },
             GuardNoFlag { mask, exit } => {
                 self.a.ldr(X16, BASE, -24);
                 self.a.tst_imm(Sz::X, X16, mask as u64);
@@ -2008,6 +2129,7 @@ impl Em<'_> {
                 nargs,
                 pc_after,
                 known,
+                typed,
             } => {
                 let hdr = a as i32 * 8;
                 // A known native takes the count in x2 (`native_path`).
@@ -2032,12 +2154,13 @@ impl Em<'_> {
                 }
                 let (slow, common) = (self.a.new_label(), self.a.new_label());
                 let native = self.a.new_label();
+                let window = (typed && self.typed_entry.is_some()).then(|| self.a.new_label());
                 let (ret, deep, entered_known, target) = match known {
                     Some(Known::Lua {
                         closure,
                         proto,
                         nparams,
-                    }) => self.known_call(hdr, slow, (closure, proto, nparams), nargs),
+                    }) => self.known_call(hdr, slow, (closure, proto, nparams), nargs, window),
                     _ => {
                         let (r, d) = self.fast_call(hdr, slow, native);
                         (r, d, false, Target::Reg)
@@ -2049,6 +2172,14 @@ impl Em<'_> {
                     _ => None,
                 };
                 self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                    let resume = em.v.succs(block)[0].index();
+                    if let Some(w) = window {
+                        // The callee's window does not fit: its slow path
+                        // takes the arguments from its slots.
+                        em.a.bind(w);
+                        em.store_args(0, nargs);
+                        em.a.b(em.miss[resume]);
+                    }
                     em.miss_path(hdr, block, common);
                     em.deep_path(deep, block, nparams, nargs, target);
                     let mut keys = vec![(ret, false)];
@@ -2070,8 +2201,12 @@ impl Em<'_> {
                     }
                     em.a.bind(common);
                     let back = em.level_call(hdr, block, pc_after);
-                    let fast = em.fast_resume[em.v.succs(block)[0].index()];
+                    let fast = em.fast_resume[resume];
                     keys.extend([(fast, false), (back, true)]);
+                    if let Some(boxed) = em.boxed_of[resume] {
+                        keys.push((boxed, false));
+                        em.landings.extend([(ret, boxed), (fast, boxed)]);
+                    }
                     em.call_site(keys, i, block, a as u16, pc_after);
                 }));
             }
@@ -2160,7 +2295,11 @@ impl Em<'_> {
                 self.a.bind(self.fast_resume[block]);
                 // The callee's base is past the header at `hdr`.
                 self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 * 8 + 32);
-                self.a.bind(self.resume_based[block]);
+                if matches!(self.v.insts.get(i + 1), Some(GuardLanding { .. })) {
+                    self.pending_based = Some((block, hdr));
+                } else {
+                    self.a.bind(self.resume_based[block]);
+                }
                 match wanted {
                     0 if c == 1 => {}
                     0 => {

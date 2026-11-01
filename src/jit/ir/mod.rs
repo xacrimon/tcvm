@@ -274,6 +274,9 @@ pub(crate) struct Func<'gc> {
     /// The `After` snapshot of a value's definition, where a definition
     /// guard (9.1) may exit: call results, loads after a call, upvalues.
     pub(crate) def_snaps: Vec<(Val, Snap)>,
+    /// Guards of self-calls' results that only the ways back other than
+    /// the fast return run (`opt::selfcall`).
+    pub(crate) landings: Vec<Inst>,
     /// The call-boundary pass ran: what is live across a call is a value
     /// its snapshot names (C1).
     pub(crate) boundaries: bool,
@@ -370,6 +373,7 @@ impl<'gc> Func<'gc> {
             entry: Block(0),
             meta,
             def_snaps: Vec::new(),
+            landings: Vec::new(),
             boundaries: false,
             call_homes: Default::default(),
             captured: Default::default(),

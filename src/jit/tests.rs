@@ -889,6 +889,18 @@ fn recursion_inlines_one_copy() {
     assert_eq!(ir.matches("call r").count(), 4, "{ir}");
 }
 
+/// A self-call's result is what the region's returns give (W4 step 6):
+/// its guards are refinements, and one landing guard per call tests it
+/// where the ways back other than the fast return land.
+#[test]
+fn self_call_results_are_trusted() {
+    let src = "function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end
+    for k = 1, 300 do fib(10) end";
+    let ir = ir_of(src, "fib", 0);
+    assert_eq!(ir.matches("(landing)").count(), 4, "{ir}");
+    assert_eq!(ir.matches("guard val:small").count(), 5, "{ir}");
+}
+
 /// Callees known by their prototype alone inline (W3 step 8): closures of
 /// one prototype taking turns at a site, guarded by the prototype, and one
 /// the loop makes, without a guard.

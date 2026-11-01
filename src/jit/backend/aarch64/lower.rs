@@ -75,6 +75,11 @@ pub(crate) struct Lowered {
     pub(crate) invalidable: bool,
     /// The VCode blocks in the order the encoder lays them out.
     pub(crate) emit_order: Vec<u32>,
+    /// The entry guards, all on parameters, as tests the fast entry makes
+    /// before the entry block (`x0`.. and the set), which self-calls passing
+    /// them enter (W4 §2); none in the block's code.
+    pub(crate) prefix_guards: bool,
+    pub(crate) entry_tests: Vec<(u8, TypeSet)>,
 }
 
 struct Lower<'a, 'gc> {
@@ -103,6 +108,12 @@ struct Lower<'a, 'gc> {
     closure: Option<VReg>,
     /// The parameters entries pass in registers, by index (`Params`).
     params: Vec<VReg>,
+    /// The region's prototype (its box) when a compiled caller can enter
+    /// it, and the set each parameter's entry guard admits.
+    own: Option<u64>,
+    entry_sets: Vec<TypeSet>,
+    prefix_guards: bool,
+    entry_tests: Vec<(u8, TypeSet)>,
 }
 
 fn rep_class(rep: Rep) -> RegClass {
@@ -150,7 +161,11 @@ fn float_cond(cc: Cc) -> Cond {
 }
 
 /// The address of `Code[pc]` of the prototype being compiled.
-pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, String> {
+pub(crate) fn lower<'gc>(
+    f: &Func<'gc>,
+    code_base: usize,
+    own: Option<u64>,
+) -> Result<Lowered, String> {
     let cfg = f.cfg();
     let (order, emit_order) = crate::jit::backend::order::layout(f);
     let order = &order;
@@ -177,7 +192,37 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
         known: Default::default(),
         closure: None,
         params: Vec::new(),
+        own,
+        entry_sets: vec![TypeSet::ANY; f.meta.params as usize],
+        prefix_guards: false,
+        entry_tests: Vec::new(),
     };
+    // The entry's parameters and their guards lead its block (speculation
+    // puts them there); in a region a compiled caller enters, the fast
+    // entry tests them before the block, unless an entry guard comes later
+    // or tests something else.
+    let entry_insts = f.insts_of(f.entry);
+    let entry_guard = |i: Inst| {
+        matches!(f.op(i), Op::Guard(_))
+            && f.insts[i.idx()].tag == ExitTag::Entry
+            && matches!(f.def_op(f.args(i)[0]), Some(Op::Param(_)))
+    };
+    let lead = (entry_insts.iter())
+        .position(|&i| !matches!(f.op(i), Op::Param(_)) && !entry_guard(i))
+        .unwrap_or(entry_insts.len());
+    lw.prefix_guards = own.is_some()
+        && !(f.insts.iter().enumerate()).any(|(k, d)| {
+            d.tag == ExitTag::Entry
+                && matches!(d.op, Op::Guard(_))
+                && !entry_insts[..lead].contains(&Inst(k as u32))
+        });
+    for &i in &entry_insts[..lead] {
+        if let Op::Guard(set) = f.op(i)
+            && let Some(Op::Param(r)) = f.def_op(f.args(i)[0])
+        {
+            lw.entry_sets[r as usize] &= set;
+        }
+    }
     let closure_at = closure_block(f, &cfg, order);
     lw.find_fusions(order);
     lw.find_known_callees(order);
@@ -288,6 +333,8 @@ pub(crate) fn lower<'gc>(f: &Func<'gc>, code_base: usize) -> Result<Lowered, Str
             .collect(),
         invalidable: !f.deps.is_empty(),
         emit_order,
+        prefix_guards: lw.prefix_guards,
+        entry_tests: lw.entry_tests,
     })
 }
 
@@ -970,6 +1017,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     return Err("an entry guard of no entry load".into());
                 };
                 self.entry_regs.push(r);
+                if self.prefix_guards {
+                    self.entry_tests.push((r, set));
+                    return Ok(());
+                }
                 // The parameters stay where they came, for the failure.
                 let mut ops = vec![self.use_(args[0])];
                 for (k, &p) in self.params.iter().enumerate() {
@@ -984,6 +1035,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     &ops,
                     none,
                 );
+            }
+            Op::Guard(set) if f.landings.contains(&i) => {
+                let u = self.use_(args[0]);
+                self.push_exit(i, |exit| MInst::GuardLanding { set, exit }, vec![u], none);
             }
             Op::Guard(TypeSet::FLOAT) if self.float_guards >= 2 || self.box_reg.is_some() => {
                 let k = self.box_reg();
@@ -1550,6 +1605,20 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::Call { a, nargs, pc, .. } => {
                 let pc_after = self.pc_after(i, pc);
                 let known = self.known.get(&i).copied();
+                // Arguments the entry guards would pass, missing ones nil.
+                let typed = match known {
+                    Some(Known::Lua { proto, nparams, .. }) => {
+                        self.prefix_guards
+                            && Some(proto) == self.own
+                            && nargs != u8::MAX
+                            && nparams <= 8
+                            && (0..nparams as usize).all(|k| {
+                                let set = args.get(k).map_or(TypeSet::NIL, |&x| f.ty(x).set);
+                                self.entry_sets[k].contains(set)
+                            })
+                    }
+                    _ => false,
+                };
                 // A known Lua callee takes its first arguments in x0.. (W4
                 // §2); any other callee finds them in its slots.
                 let ops: Vec<Operand> = if nargs == u8::MAX {
@@ -1571,6 +1640,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         nargs,
                         pc_after,
                         known,
+                        typed,
                     },
                     ops,
                 );

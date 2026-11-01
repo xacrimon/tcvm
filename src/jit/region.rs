@@ -256,6 +256,11 @@ pub(crate) struct Region<'gc> {
     /// writes: (code offset, branch), the entry's and each lazy exit's.
     #[collect(require_static)]
     pub(crate) lazy: Box<[(u32, u32)]>,
+    /// Code offsets of self-calls' return addresses whose result guard runs
+    /// out of line, and of the landing that runs it: where a level started
+    /// for their callee returns instead (`jit::jit_exit`).
+    #[collect(require_static)]
+    pub(crate) landings: Box<[(u32, u32)]>,
     #[collect(require_static)]
     pub(crate) invalidated: Cell<bool>,
 }

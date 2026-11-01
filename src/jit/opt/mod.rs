@@ -9,6 +9,7 @@ pub(crate) mod licm;
 pub(crate) mod miss;
 pub(crate) mod peel;
 pub(crate) mod range;
+pub(crate) mod selfcall;
 pub(crate) mod simplify;
 pub(crate) mod sink;
 pub(crate) mod snaps;

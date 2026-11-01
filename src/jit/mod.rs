@@ -122,6 +122,20 @@ handler! {
         let mc = rt.mutation();
         let img = rt.jit().exit_regs();
         let snap = region.snap(e);
+        // A level returning to a self-call whose result guard runs out of
+        // line returns to its landing: the interpreter's result is any value.
+        if !region.landings.is_empty() {
+            let rec = thread!().record as *mut crate::vm::stack::EntryRecord;
+            let start = region.code.rx() as usize;
+            // SAFETY: the level `exit_common` runs in has its record there.
+            unsafe {
+                let lr = (*rec).lr;
+                let off = (lr & !1).wrapping_sub(start);
+                if let Some(&(_, to)) = region.landings.iter().find(|l| l.0 as usize == off) {
+                    (*rec).lr = (start + to as usize) | (lr & 1);
+                }
+            }
+        }
         for s in snap.entries() {
             let w = match s.loc {
                 Loc::Reg(i) => img[i as usize].get(),

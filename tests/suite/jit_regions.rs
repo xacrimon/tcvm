@@ -2678,6 +2678,22 @@ fn recursion_inlines_one_copy() {
     );
 }
 
+/// Typed self-calls (W4 step 6): `f`'s calls of itself enter past its
+/// entry guard and trust its integer result. `f(31)` overflows an i32 add
+/// and exits, and the interpreter returns a big integer to a typed call,
+/// which its landing tests.
+#[test]
+fn typed_self_calls() {
+    compiles_cleanly(
+        "local function f(n) if n == 0 then return 1 end local x = f(n - 1) return x + x end
+        local function depth(n) if n == 0 then return 0 end return depth(n - 1) + 1 end
+        local s = 0
+        for i = 1, 300 do s = s + f(i % 20) + depth(i % 30) end
+        return s .. ' ' .. f(40) .. ' ' .. f(62) .. ' ' .. depth(3000)",
+        true,
+    );
+}
+
 /// Known callees (W3 step 8): `fs`'s two closures of one prototype take
 /// turns at a site, inlined by the prototype with each one's `k` read from
 /// the closure called; `add` and `bump` are closures the loop makes, inlined

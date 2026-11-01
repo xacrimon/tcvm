@@ -161,6 +161,11 @@ pub(crate) fn build_ir<'gc>(
     times.timed("gc checks", || opt::prune_gc_checks(&mut f));
     times.timed("dce", || opt::dce(&mut f));
     times.timed("verify", || check(&f, "optimize"))?;
+    if times.timed("self calls", || {
+        opt::selfcall::trust_results(&mut f, closure.proto)
+    }) {
+        times.timed("verify", || check(&f, "self calls"))?;
+    }
     if let Err(e) = times.timed("calls", || opt::calls::call_boundaries(&mut f)) {
         return Err(CompileError::Verify(format!("{e}\n{}", f.print())));
     }
@@ -335,7 +340,11 @@ pub(crate) fn compile<'gc>(
         eprintln!("-- jit ir {} pc{pc}\n{}", chunk_name(closure), f.print());
     }
     let t = std::time::Instant::now();
-    let lowered = lower::lower(&f, closure.code as usize).map_err(CompileError::Backend)?;
+    // A function region of a prototype without varargs is what a compiled
+    // caller's `blr` can enter (5.4).
+    let enterable = pc == 0 && !f.meta.loop_entry && !closure.proto.is_vararg;
+    let own = enterable.then(|| closure.proto.ptr.as_ptr() as u64);
+    let lowered = lower::lower(&f, closure.code as usize, own).map_err(CompileError::Backend)?;
     times.lower = t.elapsed().as_micros();
     let t = std::time::Instant::now();
     let env = abi::machine_env();
@@ -423,14 +432,11 @@ pub(crate) fn compile<'gc>(
         Box::new([])
     };
     let fired_at = config.deopt_all.then(|| fired.as_ptr() as usize);
-    // A function region of a prototype without varargs is what a compiled
-    // caller's `blr` can enter (5.4).
-    let fast =
-        (pc == 0 && !f.meta.loop_entry && !closure.proto.is_vararg).then_some(emit::FastEntry {
-            max_stack: closure.proto.max_stack_size,
-            num_params: closure.proto.num_params,
-            proto: closure.proto.ptr.as_ptr() as u64,
-        });
+    let fast = enterable.then_some(emit::FastEntry {
+        max_stack: closure.proto.max_stack_size,
+        num_params: closure.proto.num_params,
+        proto: closure.proto.ptr.as_ptr() as u64,
+    });
     let mut em =
         emit::emit(&lowered, &out, helpers, fired_at, fast).map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
@@ -464,6 +470,14 @@ pub(crate) fn compile<'gc>(
         .direct
         .iter()
         .map(|&(l, p, regs)| (em.asm.label_offset(l) as u32, p, regs))
+        .collect();
+    let landings: Box<[(u32, u32)]> = (em.landings.iter())
+        .map(|&(at, to)| {
+            (
+                em.asm.label_offset(at) as u32,
+                em.asm.label_offset(to) as u32,
+            )
+        })
         .collect();
     // Each patch as the `b` it writes.
     let lazy: Box<[(u32, u32)]> = em
@@ -642,6 +656,7 @@ pub(crate) fn compile<'gc>(
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
             sites: sites.into_boxed_slice(),
             lazy,
+            landings,
             invalidated: std::cell::Cell::new(false),
         },
     );

@@ -35,6 +35,9 @@ impl Func<'_> {
                     let _ = write!(out, "{} = ", res.join(", "));
                 }
                 let _ = write!(out, "{}", d.op.name());
+                if self.landings.contains(&i) {
+                    let _ = write!(out, " (landing)");
+                }
                 let args: Vec<String> = self.args(i).iter().map(|a| format!("v{}", a.0)).collect();
                 if !args.is_empty() {
                     let _ = write!(out, " {}", args.join(", "));
