@@ -4,7 +4,7 @@
 use crate::env::value::Value;
 use crate::jit::ir::ops::{Cc, ExitTag, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
-use crate::jit::ir::{Block, Func, Inst, Val};
+use crate::jit::ir::{Block, BlockCall, Func, Inst, Val};
 
 fn konst_val(f: &Func<'_>, v: Val) -> Option<Value<'static>> {
     match f.def_op(v) {
@@ -388,6 +388,53 @@ fn fold_arith(f: &mut Func<'_>, i: Inst, op: Op, args: &[Val]) -> bool {
     let r = f.result(i);
     f.vals[r.idx()].ty = k.result_ty(&[]);
     true
+}
+
+/// Make jumps of the branches whose edges meet before anything runs, until
+/// none is left: a branch made a jump may leave its block empty once `dce`
+/// took its test. After the other passes, whose folds empty the arms.
+pub(crate) fn fold_one_destination(f: &mut Func<'_>) {
+    loop {
+        let mut changed = false;
+        for &b in &f.cfg().rpo {
+            if let Some(t) = f.terminator(b)
+                && f.op(t) == Op::Br
+                && let Some(e) = one_destination(f, t)
+            {
+                f.insts[t.idx()].op = Op::Jump;
+                f.insts[t.idx()].an = 0;
+                f.set_edges(t, &[e]);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        mark_unreachable(f);
+        crate::jit::opt::dce(f);
+    }
+}
+
+/// The edge both of `br`'s lead to through blocks that only jump on, when
+/// they meet with the same arguments: the branch decides nothing.
+fn one_destination(f: &Func<'_>, br: Inst) -> Option<BlockCall> {
+    let end = |mut e: BlockCall| {
+        // Bounded: empty blocks may jump in a cycle.
+        for _ in 0..8 {
+            match f.insts_of(e.target) {
+                &[j] if e.args.is_empty()
+                    && f.params(e.target).is_empty()
+                    && f.op(j) == Op::Jump =>
+                {
+                    e = f.edges(j)[0]
+                }
+                _ => break,
+            }
+        }
+        e
+    };
+    let (a, b) = (end(f.edges(br)[0]), end(f.edges(br)[1]));
+    (a.target == b.target && f.vl(a.args) == f.vl(b.args)).then_some(a)
 }
 
 fn set_b1(f: &mut Func<'_>, i: Inst, v: bool) {

@@ -1000,3 +1000,68 @@ fn merges_an_edge_decides_are_copied() {
     let ir = ir_of(src, "g", 0);
     assert!(!ir.contains("isfalsy"), "{ir}");
 }
+
+/// How many branches outside cold blocks reach the same block with the same
+/// arguments on both edges, through blocks that only jump on.
+fn idle_branches(ir: &str) -> usize {
+    let mut blocks: Vec<(String, bool, Vec<String>)> = Vec::new();
+    for l in ir.lines() {
+        if let Some(h) = l.strip_prefix('b').filter(|_| l.ends_with(':')) {
+            let name = format!("b{}", &h[..h.find('(').unwrap()]);
+            blocks.push((name, l.contains(" cold"), Vec::new()));
+        } else if l.starts_with("  ")
+            && let Some(b) = blocks.last_mut()
+        {
+            b.2.push(l.trim().to_string());
+        }
+    }
+    let find = |n: &str| blocks.iter().find(|b| b.0 == n);
+    let end = |mut t: String, mut args: String| {
+        for _ in 0..8 {
+            match find(&t) {
+                Some((_, _, body)) if args.is_empty() && body.len() == 1 => {
+                    let Some(j) = body[0].strip_prefix("jump -> ") else {
+                        break;
+                    };
+                    let (n, a) = j.split_once('(').unwrap();
+                    (t, args) = (n.to_string(), a.trim_end_matches(')').to_string());
+                }
+                _ => break,
+            }
+        }
+        (t, args)
+    };
+    let edge = |e: &str| {
+        let (n, a) = e.trim().split_once('(').unwrap();
+        (n.to_string(), a.trim_end_matches(')').to_string())
+    };
+    blocks
+        .iter()
+        .filter(|(_, cold, body)| {
+            let Some(br) = body.last().and_then(|l| l.strip_prefix("br ")) else {
+                return false;
+            };
+            let mut e = br.split(" -> ").skip(1).map(edge);
+            let (a, b) = (e.next().unwrap(), e.next().unwrap());
+            !cold && end(a.0, a.1) == end(b.0, b.1)
+        })
+        .count()
+}
+
+/// A branch whose edges meet before anything runs goes: here once the
+/// body of the `if` is dead.
+#[test]
+fn branches_deciding_nothing_fold() {
+    let src = "function f(x, n)
+        local s = 0
+        for i = 1, n do
+            if x < 3 then local y = x & 1 end
+            s = s + i
+        end
+        return s
+    end
+    for r = 1, 300 do f(r % 7, 10) end";
+    let ir = ir_of(src, "f", 0);
+    assert_eq!(idle_branches(&ir), 0, "{ir}");
+    assert_eq!(branches_on(&ir, "cmp.lt"), 0, "{ir}");
+}

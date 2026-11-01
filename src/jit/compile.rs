@@ -186,6 +186,7 @@ pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
         t.timed("gvn", || opt::gvn::gvn(f));
         t.timed("misses", || opt::miss::recompute(f, &arms));
     }
+    t.timed("one destination", || opt::simplify::fold_one_destination(f));
     t.timed("infer", || opt::infer::infer(f));
     t.timed("legalize", || opt::infer::legalize(f));
     t.timed("infer", || opt::infer::infer(f));
