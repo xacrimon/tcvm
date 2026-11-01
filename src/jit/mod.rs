@@ -388,6 +388,10 @@ fn try_compile<'gc>(
                     crate::jit::compile::chunk_name(closure)
                 )
             });
+            if e.internal() {
+                let n = &ctx.jit().internal_errors;
+                n.set(n.get() + 1);
+            }
             let mut st = state.borrow_mut(mc);
             if !matches!(e, crate::jit::compile::CompileError::Useless) {
                 st.strikes += 1;
@@ -1054,6 +1058,10 @@ fn recompile<'gc>(
                     crate::jit::compile::chunk_name(closure)
                 )
             });
+            if e.internal() {
+                let n = &ctx.jit().internal_errors;
+                n.set(n.get() + 1);
+            }
         })
     } else {
         Err(())

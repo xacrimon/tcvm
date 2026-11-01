@@ -24,6 +24,13 @@ pub(crate) enum CompileError {
     Useless,
 }
 
+impl CompileError {
+    /// A failure of the compiler rather than a refusal of the code.
+    pub(crate) fn internal(&self) -> bool {
+        matches!(self, CompileError::Verify(_) | CompileError::Backend(_))
+    }
+}
+
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

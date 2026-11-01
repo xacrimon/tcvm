@@ -137,6 +137,9 @@ pub(crate) struct JitRuntime {
     pub(crate) level_land: usize,
     /// What `abi::level_jump` branches to.
     pub(crate) jump_target: Cell<usize>,
+    /// Compiles that failed on a verifier or backend error, not a refusal
+    /// (`Lua::jit_internal_errors`).
+    pub(crate) internal_errors: Cell<u32>,
 }
 
 #[derive(Default)]
@@ -172,6 +175,7 @@ impl JitRuntime {
             level_ret: 0,
             level_land: crate::vm::stack::level_land(),
             jump_target: Cell::new(0),
+            internal_errors: Cell::new(0),
         };
         rt.grow_table(16);
         rt

@@ -334,18 +334,18 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     /// guard's failure stores them all for the interpreter.
     fn entry_params(&mut self) {
         let f = self.f;
-        for k in 0..f.meta.params {
-            let p = f
-                .insts_of(f.entry)
-                .iter()
-                .find(|&&i| f.op(i) == Op::Param(k))
-                .map(|&i| f.result(i));
-            let r = match p {
-                Some(v) => self.vr(v),
-                None => self.v.new_vreg(RegClass::Int),
-            };
-            self.params.push(r);
+        if f.meta.params == 0 {
+            return;
         }
+        let regs: Vec<VReg> = (0..f.meta.params)
+            .map(|_| self.v.new_vreg(RegClass::Int))
+            .collect();
+        for &i in f.insts_of(f.entry) {
+            if let Op::Param(k) = f.op(i) {
+                self.vreg[f.result(i).idx()] = Some(regs[k as usize]);
+            }
+        }
+        self.params = regs;
         if self.params.is_empty() {
             return;
         }
@@ -829,8 +829,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::LoadSlot(r), &[d], none);
             }
             Op::Store(r) => self.store_slot(r, args[0]),
-            // Defined by the entry's `Params`.
-            Op::Param(_) => {}
+            // Defined by the entry's `Params`; nothing moves it (its effect).
+            Op::Param(_) if f.insts[i.idx()].block == f.entry => {}
+            Op::Param(_) => return Err("a parameter outside the entry block".into()),
             Op::UpvalValue(k) => {
                 let d = self.def(res.unwrap());
                 let c = Operand::reg_use(self.closure.expect("the frame's closure"));

@@ -216,6 +216,13 @@ impl Lua {
             .mutate_root(|_, root| root.jit.config.enabled = on && cfg!(target_arch = "aarch64"));
     }
 
+    /// How many compiles failed on a verifier or backend error rather than
+    /// refusing the code. A hook for tests.
+    #[doc(hidden)]
+    pub fn jit_internal_errors(&mut self) -> u32 {
+        self.arena.mutate(|_, root| root.jit.internal_errors.get())
+    }
+
     /// Turn inlining (E1) on or off for regions compiled from now on: tests
     /// of the call protocol keep their calls real whatever the inliner takes.
     pub fn set_jit_inline(&mut self, on: bool) {

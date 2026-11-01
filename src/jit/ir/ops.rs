@@ -866,6 +866,9 @@ impl Op {
         let e = Effects::new;
         match self {
             Load(_) => Effects::reads(Mem::SLOT),
+            // Its register is the entry's: nothing may move or copy it
+            // (after a call no register or slot holds it).
+            Param(_) => Effects::flags(Flags::SIDE_EFFECT),
             Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
             Guard(_) | GuardTrue | GuardFalse | GuardMiss | GuardSame | GuardProto(_) | IAdd
             | ISub | IMul | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor

@@ -25,6 +25,22 @@ fn agrees(src: &str) {
     assert_eq!(result(src, true), result(src, false), "{src}");
 }
 
+/// `agrees`, every compile succeeding or refusing the code: none failing on
+/// a verifier or backend error, which runs the code interpreted unseen.
+fn compiles_cleanly(src: &str) {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = start_on(&mut lua, src);
+    lua.finish(&ex)
+        .unwrap_or_else(|e| panic!("{src:?} failed: {e:?}"));
+    let got = lua.enter(|ctx| {
+        let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        String::from_utf8_lossy(v.get_string().expect("a string result").as_bytes()).into_owned()
+    });
+    assert_eq!(got, result(src, false), "{src}");
+    assert_eq!(lua.jit_internal_errors(), 0, "{src}");
+}
+
 /// `agrees` with inlining off, for tests of real calls: what the inliner
 /// takes changes as it grows (W3).
 fn agrees_calling(src: &str) {
@@ -2134,6 +2150,27 @@ fn invalidated_entries_store_register_parameters() {
         local function h(i) if i == 1500 then C.val = function(self) return self.v + 1 end end end
         local function f(n) local s = 0 for i = 1, n do h(i) s = s + g(o, i, 3) end return s end
         return tostring(f(3000))",
+    );
+}
+
+/// Parameters are pure in all but where they live, and nothing may move or
+/// copy one: a call's boundary recomputing values after it would have read
+/// a parameter no register holds there, and this region (`depth - 1`
+/// across the recursive call) failed to compile, running interpreted.
+#[test]
+fn parameters_stay_at_the_entry() {
+    compiles_cleanly(
+        "local S = {} S.__index = S
+        function S:build(depth)
+          self.count = self.count + 1
+          if depth == 1 then return {n = 1} end
+          local arr = {n = 4}
+          for i = 1, 4 do arr[i] = self:build(depth - 1) end
+          return arr
+        end
+        local s = setmetatable({count = 0}, S)
+        for r = 1, 50 do s:build(6) end
+        return tostring(s.count)",
     );
 }
 
