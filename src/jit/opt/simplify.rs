@@ -1,10 +1,11 @@
 //! Local folds: redundant guards and conversions, constant compares and
-//! branches.
+//! branches, and the strength reductions of arithmetic.
 
 use crate::env::value::Value;
 use crate::jit::ir::ops::{Cc, ExitTag, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, BlockCall, Func, Inst, Val};
+use crate::vm::num::shift_left;
 
 fn konst_val(f: &Func<'_>, v: Val) -> Option<Value<'static>> {
     match f.def_op(v) {
@@ -41,6 +42,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
     let mut changed = false;
     let mut removed = vec![false; f.insts.len()];
     let mut any_removed = false;
+    let made = f.insts.len();
     let mut remove = |i: Inst| {
         removed[i.idx()] = true;
         any_removed = true;
@@ -58,6 +60,26 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
             args[..n].copy_from_slice(&f.args(i)[..n]);
             let args = &args[..n];
             let res = |f: &Func<'_>| f.result(i);
+            if fold_arith(f, i, op, args) {
+                changed = true;
+                continue;
+            }
+            // What a reduction makes before `i` waits for the next round.
+            if i.idx() < made {
+                match reduce(f, b, k, i, op, args) {
+                    Reduced::No => {}
+                    Reduced::To(v) => {
+                        map[res(f).idx()] = v;
+                        remove(i);
+                        changed = true;
+                        continue;
+                    }
+                    Reduced::Changed => {
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
             match op {
                 Op::Guard(set) => {
                     let t = f.ty(args[0]);
@@ -193,7 +215,6 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
-                op if fold_arith(f, i, op, args) => changed = true,
                 Op::ICmp(cc) | Op::LCmp(cc) => {
                     if let (Some(x), Some(y)) = (konst_int(f, args[0]), konst_int(f, args[1])) {
                         set_b1(f, i, cc.eval_i(x, y));
@@ -385,12 +406,57 @@ fn fold_arith(f: &mut Func<'_>, i: Inst, op: Op, args: &[Val]) -> bool {
         LAnd => int(0).zip(int(1)).map(|(x, y)| KI64(x & y)),
         LOr => int(0).zip(int(1)).map(|(x, y)| KI64(x | y)),
         LXor => int(0).zip(int(1)).map(|(x, y)| KI64(x ^ y)),
+        IShl => int(0)
+            .zip(int(1))
+            .and_then(|(x, y)| small(shift_left(x, y))),
+        IShr => int(0)
+            .zip(int(1))
+            .and_then(|(x, y)| small(shift_left(x, y.wrapping_neg()))),
+        IAsr => int(0)
+            .zip(int(1))
+            .map(|(x, y)| KI32((x as i32) >> (y & 31))),
+        IUMulShr(s) => int(0)
+            .zip(int(1))
+            .map(|(x, y)| KI32(((x as u32 as u64 * y as u32 as u64) >> s) as u32 as i32)),
+        INot => int(0).map(|x| KI32(!(x as i32))),
+        LNeg => int(0).map(|x| KI64(x.wrapping_neg())),
+        LNot => int(0).map(|x| KI64(!x)),
+        LShl => int(0).zip(int(1)).map(|(x, y)| KI64(shift_left(x, y))),
+        LShr => int(0)
+            .zip(int(1))
+            .map(|(x, y)| KI64(shift_left(x, y.wrapping_neg()))),
+        LAsr => int(0).zip(int(1)).map(|(x, y)| KI64(x >> (y & 63))),
+        LUDiv => int(0)
+            .zip(int(1))
+            .filter(|&(_, y)| y != 0)
+            .map(|(x, y)| KI64((x as u64 / y as u64) as i64)),
+        LDivFloor => int(0).zip(int(1)).filter(|&(_, y)| y != 0).map(|(x, y)| {
+            let q = x.wrapping_div(y);
+            KI64(if x.wrapping_rem(y) != 0 && (x ^ y) < 0 {
+                q - 1
+            } else {
+                q
+            })
+        }),
+        LModFloor => int(0).zip(int(1)).filter(|&(_, y)| y != 0).map(|(x, y)| {
+            let r = x.wrapping_rem(y);
+            KI64(if r != 0 && (r ^ y) < 0 { r + y } else { r })
+        }),
         IToL => int(0).map(KI64),
         LToI => int(0).and_then(small),
         IToF | LToF => int(0).map(|x| KF64((x as f64).to_bits())),
         FAdd => flt(0).zip(flt(1)).map(|(x, y)| KF64((x + y).to_bits())),
         FSub => flt(0).zip(flt(1)).map(|(x, y)| KF64((x - y).to_bits())),
         FMul => flt(0).zip(flt(1)).map(|(x, y)| KF64((x * y).to_bits())),
+        FDiv => flt(0).zip(flt(1)).map(|(x, y)| KF64((x / y).to_bits())),
+        FIDiv => flt(0)
+            .zip(flt(1))
+            .map(|(x, y)| KF64((x / y).floor().to_bits())),
+        FNeg => flt(0).map(|x| KF64((-x).to_bits())),
+        FAbs => flt(0).map(|x| KF64(x.abs().to_bits())),
+        FSqrt => flt(0).map(|x| KF64(x.sqrt().to_bits())),
+        FFloor => flt(0).map(|x| KF64(x.floor().to_bits())),
+        FCeil => flt(0).map(|x| KF64(x.ceil().to_bits())),
         _ => None,
     };
     let Some(k) = folded else {
@@ -403,6 +469,276 @@ fn fold_arith(f: &mut Func<'_>, i: Inst, op: Op, args: &[Val]) -> bool {
     let r = f.result(i);
     f.vals[r.idx()].ty = k.result_ty(&[]);
     true
+}
+
+/// What a reduction did with an instruction.
+enum Reduced {
+    No,
+    /// Its result is this value.
+    To(Val),
+    /// It became another instruction, maybe after new ones before it.
+    Changed,
+}
+
+/// Instructions made before one being reduced, in order.
+struct Before {
+    b: Block,
+    at: usize,
+}
+
+impl Before {
+    fn ins(&mut self, f: &mut Func<'_>, op: Op, args: &[Val]) -> Val {
+        let u = f.make_inst(op, args, None, ExitTag::Type);
+        f.insert(self.b, self.at, u);
+        self.at += 1;
+        f.result(u)
+    }
+}
+
+/// Make `i` the instruction `op` of `args`, no more than it had; it keeps
+/// its exit where `op` may take one.
+fn become_op(f: &mut Func<'_>, i: Inst, op: Op, args: &[Val]) {
+    debug_assert!(args.len() <= f.insts[i.idx()].an as usize);
+    let d = &mut f.insts[i.idx()];
+    d.op = op;
+    d.an = args.len() as u16;
+    if !op.may_deopt() {
+        d.snap = crate::jit::ir::NO_SNAP;
+    }
+    f.args_mut(i).copy_from_slice(args);
+    let r = f.result(i);
+    f.vals[r.idx()].ty = f.result_ty(op, args);
+}
+
+/// `n` as a constant of the integer operation `op`'s width.
+fn int_k(op: Op, n: i64) -> Op {
+    if op.result_ty(&[]).rep == Rep::I64 {
+        Op::KI64(n)
+    } else {
+        Op::KI32(n as i32)
+    }
+}
+
+/// The multiplier and shift dividing an `n` in `0..2^31` by `c` (3 or
+/// more, not a power of two) as `(n * m) >> s` (Granlund and Montgomery,
+/// 1994, theorem 4.2, with N = 31).
+fn magic(c: i64) -> (u32, u8) {
+    let l = 64 - (c - 1).leading_zeros();
+    let m = (1u64 << (31 + l)) / c as u64 + 1;
+    debug_assert!(m < 1 << 32);
+    (m as u32, (31 + l) as u8)
+}
+
+/// Strength reductions and identities of arithmetic, as V8's machine
+/// optimization reducer and JSC B3's strength reduction have them: each
+/// gives the same bits for every operand, NaNs included, and exits where
+/// the original would.
+fn reduce(f: &mut Func<'_>, b: Block, k: usize, i: Inst, op: Op, args: &[Val]) -> Reduced {
+    use Op::*;
+    use Reduced::*;
+    let n = args.len();
+    match op {
+        // Constants go right, where the rules and lowering look for them.
+        IAdd | IAddNo | IMul | IMulNo | IAnd | IOr | IXor | LAdd | LMul | LAnd | LOr | LXor
+            if konst_int(f, args[0]).is_some() && konst_int(f, args[1]).is_none() =>
+        {
+            f.args_mut(i).swap(0, 1);
+            return Changed;
+        }
+        ICmp(cc) | LCmp(cc) => {
+            if args[0] == args[1] {
+                become_op(f, i, KB1(cc.eval_i(0, 0)), &[]);
+                return Changed;
+            }
+            if konst_int(f, args[0]).is_some() && konst_int(f, args[1]).is_none() {
+                let swapped = if op == ICmp(cc) {
+                    ICmp(cc.swap())
+                } else {
+                    LCmp(cc.swap())
+                };
+                become_op(f, i, swapped, &[args[1], args[0]]);
+                return Changed;
+            }
+            return No;
+        }
+        Select if args[1] == args[2] => return To(args[1]),
+        _ => {}
+    }
+    let x = args.first().copied().unwrap_or(Val(0));
+    let inner = |f: &Func<'_>| {
+        let d = f.def_inst(x)?;
+        Some((f.op(d), *f.args(d).first()?))
+    };
+    // One operand.
+    if n == 1 {
+        match (op, inner(f)) {
+            (INot | LNot | LNeg | FNeg, Some((o, z))) if o == op => return To(z),
+            (FAbs, Some((FAbs, _))) => return To(x),
+            (FAbs, Some((FNeg, z))) => {
+                become_op(f, i, FAbs, &[z]);
+                return Changed;
+            }
+            (FFloor | FCeil, Some((IToF | LToF | FFloor | FCeil, _))) => return To(x),
+            (LToI, Some((IToL, z))) => return To(z),
+            (LToF, Some((IToL, z))) => {
+                become_op(f, i, IToF, &[z]);
+                return Changed;
+            }
+            _ => {}
+        }
+        return No;
+    }
+    if n != 2 {
+        return No;
+    }
+    let y = args[1];
+    if x == y {
+        match op {
+            IAnd | LAnd | IOr | LOr => return To(x),
+            ISub | ISubNo | LSub | IXor | LXor => {
+                become_op(f, i, int_k(op, 0), &[]);
+                return Changed;
+            }
+            _ => {}
+        }
+    }
+    if matches!(op, FDiv | FIDiv)
+        && let Some(c) = konst_f64(f, y)
+        && c.is_normal()
+        && c.to_bits() & ((1 << 52) - 1) == 0
+        && (1.0 / c).is_normal()
+    {
+        // A power of two's reciprocal is exact, and so the product.
+        let mut at = Before { b, at: k };
+        let r = at.ins(f, KF64((1.0 / c).to_bits()), &[]);
+        if op == FDiv {
+            become_op(f, i, FMul, &[x, r]);
+        } else {
+            let q = at.ins(f, FMul, &[x, r]);
+            become_op(f, i, FFloor, &[q]);
+        }
+        return Changed;
+    }
+    if op == FMul && konst_f64(f, y) == Some(2.0) {
+        become_op(f, i, FAdd, &[x, x]);
+        return Changed;
+    }
+    // Wrapping negations fold into the sum or difference.
+    let neg = |f: &Func<'_>, v: Val| match f.def_inst(v) {
+        Some(d) if f.op(d) == LNeg => Some(f.args(d)[0]),
+        _ => None,
+    };
+    match (op, neg(f, x), neg(f, y)) {
+        (LAdd, _, Some(z)) => {
+            become_op(f, i, LSub, &[x, z]);
+            return Changed;
+        }
+        (LAdd, Some(z), None) => {
+            become_op(f, i, LSub, &[y, z]);
+            return Changed;
+        }
+        (LSub, _, Some(z)) => {
+            become_op(f, i, LAdd, &[x, z]);
+            return Changed;
+        }
+        _ => {}
+    }
+    let Some(c) = konst_int(f, y) else {
+        return No;
+    };
+    let mut at = Before { b, at: k };
+    let pow2 = c > 1 && c & (c - 1) == 0;
+    let log2 = c.trailing_zeros() as i64;
+    let (to, with): (Op, &[Option<i64>]) = match (op, c) {
+        (
+            IAdd | IAddNo | LAdd | ISub | ISubNo | LSub | IOr | LOr | IXor | LXor | IShl | IShr
+            | LShl | LShr,
+            0,
+        )
+        | (IMul | IMulNo | LMul | IDivFloor | LDivFloor | LUDiv, 1)
+        | (IAnd | LAnd, -1) => return To(x),
+        (IAsr, c) if c & 31 == 0 => return To(x),
+        (LAsr, c) if c & 63 == 0 => return To(x),
+        (IMul | IMulNo | LMul | IAnd | LAnd, 0) | (IModFloor | LModFloor, 1 | -1) => {
+            (int_k(op, 0), &[])
+        }
+        (LShl | LShr, c) if !(-63..=63).contains(&c) => (int_k(op, 0), &[]),
+        (IOr | LOr, -1) => (int_k(op, -1), &[]),
+        (IXor, -1) => (INot, &[None]),
+        (LXor, -1) => (LNot, &[None]),
+        // These exit where the operation would: `MIN * -1`, `MIN // -1`.
+        (IMul | IDivFloor, -1) => (INeg, &[None]),
+        (LMul | LDivFloor, -1) => (LNeg, &[None]),
+        (IMul, 2) => (IAdd, &[None, None]),
+        (IMulNo, 2) => (IAddNo, &[None, None]),
+        (LMul, 2) => (LAdd, &[None, None]),
+        (LMul, _) if pow2 => (LShl, &[None, Some(log2)]),
+        (LSub, c) => (LAdd, &[None, Some(c.wrapping_neg())]),
+        (LShl, c) if c < 0 => (LShr, &[None, Some(-c)]),
+        (LShr, c) if c < 0 => (LShl, &[None, Some(-c)]),
+        // Floor division by 2^k shifts, and its remainder is the low bits.
+        (IDivFloor, _) if pow2 => (IAsr, &[None, Some(log2)]),
+        (LDivFloor, _) if pow2 => (LAsr, &[None, Some(log2)]),
+        (IModFloor | LModFloor, _) if pow2 => (
+            if op == IModFloor { IAnd } else { LAnd },
+            &[None, Some(c - 1)],
+        ),
+        (LUDiv, c) if (c as u64).is_power_of_two() => (LShr, &[None, Some(log2)]),
+        // x // c for c > 0 is ~(~x // c) for x < 0, so with s the sign mask
+        // ((x ^ s) // c) ^ s, the division of a non-negative i32 by magic.
+        (IDivFloor | IModFloor, 3..) => {
+            let (m, sh) = magic(c);
+            let k31 = at.ins(f, KI32(31), &[]);
+            let s = at.ins(f, IAsr, &[x, k31]);
+            let u = at.ins(f, IXor, &[x, s]);
+            let km = at.ins(f, KI32(m as i32), &[]);
+            let q = at.ins(f, IUMulShr(sh), &[u, km]);
+            if op == IDivFloor {
+                become_op(f, i, IXor, &[q, s]);
+            } else {
+                // r = u - q * c is x mod c for x >= 0; below, the floor's
+                // remainder is c - 1 - r, which (r ^ s) + (s & c) is.
+                let kc = at.ins(f, KI32(c as i32), &[]);
+                let p = at.ins(f, IMulNo, &[q, kc]);
+                let r = at.ins(f, ISubNo, &[u, p]);
+                let t = at.ins(f, IXor, &[r, s]);
+                let a = at.ins(f, IAnd, &[s, kc]);
+                become_op(f, i, IAddNo, &[t, a]);
+            }
+            return Changed;
+        }
+        (IAsr | LAsr | IAnd | LAnd | IOr | LOr | IXor | LXor | LAdd, c2) => {
+            // Constant chains combine.
+            let Some(d) = f.def_inst(x).filter(|&d| f.op(d) == op) else {
+                return No;
+            };
+            let (z, c1) = (f.args(d)[0], f.args(d)[1]);
+            let Some(c1) = konst_int(f, c1) else {
+                return No;
+            };
+            let k = match op {
+                IAsr => ((c1 & 31) + (c2 & 31)).min(31),
+                LAsr => ((c1 & 63) + (c2 & 63)).min(63),
+                IAnd | LAnd => c1 & c2,
+                IOr | LOr => c1 | c2,
+                IXor | LXor => c1 ^ c2,
+                _ => c1.wrapping_add(c2),
+            };
+            let kv = at.ins(f, int_k(op, k), &[]);
+            become_op(f, i, op, &[z, kv]);
+            return Changed;
+        }
+        _ => return No,
+    };
+    let mut ops = [Val(0); 2];
+    for (slot, w) in ops.iter_mut().zip(with) {
+        *slot = match *w {
+            None => x,
+            Some(n) => at.ins(f, int_k(op, n), &[]),
+        };
+    }
+    become_op(f, i, to, &ops[..with.len()]);
+    Changed
 }
 
 /// Make jumps of the branches whose edges meet before anything runs, until

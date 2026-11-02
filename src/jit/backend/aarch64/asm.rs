@@ -671,6 +671,11 @@ impl Asm {
         self.emit(0x9B20_7C00 | r(m) << 16 | r(n) << 5 | r(d));
     }
 
+    /// `umull xd, wn, wm`: the full 64-bit product of two unsigned `w` registers.
+    pub(crate) fn umull(&mut self, d: Gpr, n: Gpr, m: Gpr) {
+        self.emit(0x9BA0_7C00 | r(m) << 16 | r(n) << 5 | r(d));
+    }
+
     /// `smulh xd, xn, xm`: the high 64 bits of the 128-bit product.
     pub(crate) fn smulh(&mut self, d: Gpr, n: Gpr, m: Gpr) {
         self.emit(0x9B40_7C00 | r(m) << 16 | r(n) << 5 | r(d));

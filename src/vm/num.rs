@@ -471,7 +471,7 @@ impl BitOp for BXor {
 /// zeros. Negative displacements shift to the other direction; displacements with
 /// absolute values equal to or higher than the number of bits ... result in zero".)
 #[inline(always)]
-fn shift_left(x: i64, y: i64) -> i64 {
+pub(crate) fn shift_left(x: i64, y: i64) -> i64 {
     const NBITS: i64 = i64::BITS as i64;
     if y <= -NBITS || y >= NBITS {
         0

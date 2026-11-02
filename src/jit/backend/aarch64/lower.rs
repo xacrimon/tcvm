@@ -7,7 +7,7 @@ use regalloc2::{Block as RBlock, Operand, PRegSet, RegClass, VReg};
 
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, preg_int};
-use crate::jit::backend::aarch64::asm::{Asm, Cond, Sz};
+use crate::jit::backend::aarch64::asm::{Asm, Cond, Shift, Sz};
 use crate::jit::backend::aarch64::emit::is_single_test;
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
 use crate::jit::backend::vcode::VCode;
@@ -655,6 +655,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             ),
             Op::ShapeIn(k) => (Test::ShapeIn(k), Cond::Eq, args),
             op => panic!("test_of {op:?}"),
+        }
+    }
+
+    fn konst_int(&self, v: Val) -> Option<i64> {
+        match self.f.def_op(v)? {
+            Op::KI32(n) => Some(n as i64),
+            Op::KI64(n) => Some(n),
+            _ => None,
         }
     }
 
@@ -1322,9 +1330,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 } else {
                     Sz::X
                 };
-                let nonzero = self.imm12(args[1]).is_some_and(|k| k != 0)
-                    || matches!(f.def_op(args[1]), Some(Op::KI32(n)) if n != 0)
-                    || matches!(f.def_op(args[1]), Some(Op::KI64(n)) if n != 0);
+                let k = self.konst_int(args[1]);
+                let nonzero = k.is_some_and(|k| k != 0);
+                let minus1 = k.is_none_or(|k| k == -1);
                 let ops = vec![
                     self.def(res.unwrap()),
                     self.use_(args[0]),
@@ -1336,6 +1344,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         div,
                         sz,
                         nonzero,
+                        minus1,
                         exit,
                     },
                     ops,
@@ -1350,6 +1359,40 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     self.use_(args[1]),
                 ];
                 self.push_exit(i, |exit| MInst::ShiftI32 { left, exit }, ops, none);
+            }
+            Op::LShl | Op::LShr
+                if self
+                    .konst_int(args[1])
+                    .is_some_and(|k| (0..64).contains(&k)) =>
+            {
+                let k = self.konst_int(args[1]).unwrap() as u8;
+                let sh = if op == Op::LShl {
+                    Shift::Lsl
+                } else {
+                    Shift::Lsr
+                };
+                let ops = [self.def(res.unwrap()), self.use_(args[0])];
+                self.push(MInst::ShiftImm(sh, Sz::X, k), &ops, none);
+            }
+            Op::IAsr | Op::LAsr => {
+                let sz = if op == Op::IAsr { Sz::W } else { Sz::X };
+                let d = self.def(res.unwrap());
+                let n = self.use_(args[0]);
+                if let Some(k) = self.konst_int(args[1]) {
+                    let k = (k as u32 & (sz.bits() - 1)) as u8;
+                    self.push(MInst::ShiftImm(Shift::Asr, sz, k), &[d, n], none);
+                } else {
+                    let m = self.use_(args[1]);
+                    self.push(MInst::ShiftReg(Shift::Asr, sz), &[d, n, m], none);
+                }
+            }
+            Op::IUMulShr(k) => {
+                let ops = [
+                    self.def(res.unwrap()),
+                    self.use_(args[0]),
+                    self.use_(args[1]),
+                ];
+                self.push(MInst::UMulShr(k), &ops, none);
             }
             Op::LShl | Op::LShr => {
                 let ops = [

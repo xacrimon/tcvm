@@ -286,10 +286,10 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
         Helper(h) => h.sig().args,
         GuardTrue | GuardFalse | Br => &[B1],
         IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | IAnd | IOr | IXor | IShl | IShr
-        | IDivFloor | IModFloor | ICmp(_) => &[I32, I32],
+        | IDivFloor | IModFloor | IAsr | IUMulShr(_) | ICmp(_) => &[I32, I32],
         INeg | INot | IToF | IToL => &[I32],
         LAdd | LSub | LMul | LUDiv | LAnd | LOr | LXor | LShl | LShr | LDivFloor | LModFloor
-        | LCmp(_) => &[I64, I64],
+        | LAsr | LCmp(_) => &[I64, I64],
         LNeg | LNot | LToF | LToI | LToFExact => &[I64],
         StrLt | StrLe => &[Ptr, Ptr],
         UpvalValueOf(_) => &[Ptr],

@@ -554,6 +554,11 @@ pub(crate) enum Op {
     /// Floor division and modulo; exit on a zero divisor and `MIN // -1`.
     IDivFloor,
     IModFloor,
+    /// The machine's arithmetic shift right, by the amount mod 32.
+    IAsr,
+    /// The low half of `(a * b) >> s`, operands unsigned and the product
+    /// 64-bit: a division by a constant multiplying by its magic number.
+    IUMulShr(u8),
     ICmp(Cc),
     IToF,
     IToL,
@@ -574,6 +579,8 @@ pub(crate) enum Op {
     /// Exit on a zero divisor.
     LDivFloor,
     LModFloor,
+    /// The machine's arithmetic shift right, by the amount mod 64.
+    LAsr,
     LCmp(Cc),
     LToF,
     /// Exits when outside i32.
@@ -1038,11 +1045,13 @@ impl Op {
                 ..args[0]
             },
             IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | INeg | IAnd | IOr | IXor | INot
-            | IShl | IShr | IDivFloor | IModFloor | LToI | FToIExact => Ty::I32,
+            | IShl | IShr | IDivFloor | IModFloor | IAsr | IUMulShr(_) | LToI | FToIExact => {
+                Ty::I32
+            }
             IToF | LToF | LToFExact | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor
             | FCeil | FIDiv | ToF64 => Ty::F64,
             IToL | FToL | StrLenOf | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor
-            | LNot | LShl | LShr | LDivFloor | LModFloor => Ty::I64,
+            | LNot | LShl | LShr | LDivFloor | LModFloor | LAsr => Ty::I64,
             Helper(HelperId::ArithCoerce(ArithKind::Div | ArithKind::Pow)) => {
                 Ty::val(TypeSet::FLOAT)
             }
@@ -1069,6 +1078,7 @@ impl Op {
             KI64(v) => format!("ki64 {v}"),
             KB1(v) => format!("kb1 {v}"),
             KF64(b) => format!("kf64 {:?}", f64::from_bits(b)),
+            IUMulShr(s) => format!("iumulshr {s}"),
             Load(r) => format!("load r{r}"),
             Param(k) => format!("param {k}"),
             Store(r) => format!("store r{r}"),

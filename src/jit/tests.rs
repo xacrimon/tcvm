@@ -1326,11 +1326,22 @@ fn unboxed_registers_test_as_truthy() {
     assert!(!ir.contains("isfalsy"), "{ir}");
 }
 
-/// How many `br`s branch on a value an instruction containing `op` defines.
-fn branches_on(ir: &str, op: &str) -> usize {
+/// How many `br`s branch on a value an instruction containing `op` defines
+/// from the constant `k`, i32 or f64 (the program's compare, not a loop's).
+fn branches_on(ir: &str, op: &str, k: i32) -> usize {
+    let konst = [format!("= ki32 {k}"), format!("= kf64 {k}.0")];
+    let ks: Vec<&str> = ir
+        .lines()
+        .filter(|l| konst.iter().any(|c| l.trim_end().ends_with(c.as_str())))
+        .filter_map(|l| l.trim().split(':').next())
+        .collect();
     let defs: Vec<&str> = ir
         .lines()
         .filter(|l| l.contains(op))
+        .filter(|l| {
+            let args = l.split(op).nth(1).unwrap_or("");
+            args.split([',', ' ']).any(|a| ks.contains(&a.trim()))
+        })
         .filter_map(|l| l.trim().split(':').next())
         .collect();
     ir.lines()
@@ -1355,7 +1366,7 @@ fn dominated_branches_fold() {
     end
     for r = 1, 300 do f(r % 7, 10) end";
     let ir = ir_of(src, "f", 0);
-    assert_eq!(branches_on(&ir, "cmp.lt"), 2, "{ir}");
+    assert_eq!(branches_on(&ir, "cmp.lt", 3), 2, "{ir}");
 }
 
 /// A merge whose branch each incoming edge decides is copied into the
@@ -1382,7 +1393,7 @@ fn merges_an_edge_decides_are_copied() {
     local t = {5, 6, 7, 8}
     for r = 1, 300 do f(r % 7, t, 10); g(r % 7, 10) end";
     let ir = ir_of(src, "f", 0);
-    assert_eq!(branches_on(&ir, "cmp.lt"), 2, "{ir}");
+    assert_eq!(branches_on(&ir, "cmp.lt", 3), 2, "{ir}");
     let ir = ir_of(src, "g", 0);
     assert!(!ir.contains("isfalsy"), "{ir}");
 }
@@ -1449,7 +1460,7 @@ fn branches_deciding_nothing_fold() {
     for r = 1, 300 do f(r % 7, 10) end";
     let ir = ir_of(src, "f", 0);
     assert_eq!(idle_branches(&ir), 0, "{ir}");
-    assert_eq!(branches_on(&ir, "cmp.lt"), 0, "{ir}");
+    assert_eq!(branches_on(&ir, "cmp.lt", 3), 0, "{ir}");
 }
 
 /// Elements of two shapes, read in the caller then in an inlined body: the

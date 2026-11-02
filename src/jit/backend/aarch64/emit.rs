@@ -1460,6 +1460,27 @@ impl Em<'_> {
                     _ => return Err(format!("{op:?} with an immediate")),
                 }
             }
+            ShiftImm(sh, sz, k) => {
+                let (d, n) = (self.r(i, 0), self.r(i, 1));
+                match sh {
+                    Shift::Lsl => self.a.lsl_imm(sz, d, n, k as u32),
+                    Shift::Lsr => self.a.lsr_imm(sz, d, n, k as u32),
+                    Shift::Asr => self.a.asr_imm(sz, d, n, k as u32),
+                }
+            }
+            ShiftReg(sh, sz) => {
+                let (d, n, m) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                match sh {
+                    Shift::Lsl => self.a.lslv(sz, d, n, m),
+                    Shift::Lsr => self.a.lsrv(sz, d, n, m),
+                    Shift::Asr => self.a.asrv(sz, d, n, m),
+                }
+            }
+            UMulShr(k) => {
+                let (d, n, m) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                self.a.umull(d, n, m);
+                self.a.lsr_imm(Sz::X, d, d, k as u32);
+            }
             Neg(sz) => {
                 let (d, n) = (self.r(i, 0), self.r(i, 1));
                 self.a.neg(sz, d, n);
@@ -1506,8 +1527,9 @@ impl Em<'_> {
                 div,
                 sz,
                 nonzero,
+                minus1,
                 exit,
-            } => self.divmod(i, div, sz, nonzero, exit),
+            } => self.divmod(i, div, sz, nonzero, minus1, exit),
             ShiftI32 { left, exit } => {
                 let (d, n, m) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
                 self.a.sxtw(X16, n);
@@ -2507,13 +2529,13 @@ impl Em<'_> {
     }
 
     /// Floor division or modulo of `n` by `m`.
-    fn divmod(&mut self, i: usize, div: bool, sz: Sz, nonzero: bool, exit: u32) {
+    fn divmod(&mut self, i: usize, div: bool, sz: Sz, nonzero: bool, minus1: bool, exit: u32) {
         let (d, n, m) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
         let l = self.exit(exit);
         if !nonzero {
             self.a.cbz(sz, m, l);
         }
-        if div && sz == Sz::W {
+        if div && sz == Sz::W && minus1 {
             // MIN // -1 leaves i32.
             let ok = self.a.new_label();
             self.a.cmn_imm(Sz::W, m, 1);

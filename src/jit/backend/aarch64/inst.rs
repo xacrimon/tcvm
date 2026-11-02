@@ -3,7 +3,7 @@
 //! gives) are allocated by regalloc2; x16 and x17 are scratch inside one
 //! instruction, never allocated.
 
-use crate::jit::backend::aarch64::asm::{Cond, Sz};
+use crate::jit::backend::aarch64::asm::{Cond, Shift, Sz};
 use crate::jit::backend::vcode::TargetInst;
 use crate::jit::ir::ops::HelperId;
 use crate::jit::ir::types::TypeSet;
@@ -102,6 +102,12 @@ pub(crate) enum MInst {
     Alu(AluOp, Sz),
     /// `[def d, use n]`.
     AluImm(AluOp, Sz, u64),
+    /// `[def d, use n]`: a shift by a constant.
+    ShiftImm(Shift, Sz, u8),
+    /// `[def d, use n, use m]`: a shift by `m` mod the register size.
+    ShiftReg(Shift, Sz),
+    /// `[def d, use n, use m]`: `umull` then `lsr` by the amount.
+    UMulShr(u8),
     /// `[def d, use n]`: `neg` or `mvn`.
     Neg(Sz),
     Mvn(Sz),
@@ -125,11 +131,13 @@ pub(crate) enum MInst {
         exit: u32,
     },
     /// `[def d, use n, use m, snap..]`: floor division or modulo, exiting on
-    /// a zero divisor (unless `nonzero`) and, for i32 division, `MIN // -1`.
+    /// a zero divisor (unless `nonzero`) and, for i32 division, `MIN // -1`
+    /// (unless not `minus1`).
     DivMod {
         div: bool,
         sz: Sz,
         nonzero: bool,
+        minus1: bool,
         exit: u32,
     },
     /// `[def d, use n, use m, snap..]`: Lua's shift of an i32 (sign-extended),
