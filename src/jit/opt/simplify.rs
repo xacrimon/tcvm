@@ -562,6 +562,49 @@ fn reduce(f: &mut Func<'_>, b: Block, k: usize, i: Inst, op: Op, args: &[Val]) -
             return No;
         }
         Select if args[1] == args[2] => return To(args[1]),
+        Select => {
+            // `c ? k : w` where `c` is `v == k` picks `v`, which needs no `k`
+            // made; `c ? w : k` where `c` is `v != k` likewise.
+            if let Some(d) = f.def_inst(args[0]) {
+                let (top, ta) = (f.op(d), f.args(d));
+                let word = |f: &Func<'_>, v: Val| match f.def_op(v) {
+                    Some(KVal(bits)) => Some(bits),
+                    _ => None,
+                };
+                let single = |set: TypeSet| {
+                    [
+                        (TypeSet::NIL, crate::env::value::NIL),
+                        (TypeSet::FALSE, crate::env::value::FALSE),
+                        (TypeSet::TRUE, crate::env::value::TRUE),
+                    ]
+                    .into_iter()
+                    .find(|&(s, _)| s == set)
+                    .map(|(_, w)| w)
+                };
+                let same = |f: &Func<'_>, a: Val, b: Val| {
+                    a == b || word(f, a).is_some_and(|w| word(f, b) == Some(w))
+                };
+                let tested = match top {
+                    IsType(set) => single(set)
+                        .filter(|&w| word(f, args[1]) == Some(w))
+                        .map(|_| (ta[0], 1)),
+                    SameBits | ICmp(Cc::Eq) | LCmp(Cc::Eq) => (0..2)
+                        .find(|&k| same(f, ta[k], args[1]))
+                        .map(|k| (ta[1 - k], 1)),
+                    ICmp(Cc::Ne) | LCmp(Cc::Ne) => (0..2)
+                        .find(|&k| same(f, ta[k], args[2]))
+                        .map(|k| (ta[1 - k], 2)),
+                    _ => None,
+                };
+                if let Some((v, at)) = tested
+                    && f.ty(v).rep == f.ty(args[at]).rep
+                {
+                    f.args_mut(i)[at] = v;
+                    return Changed;
+                }
+            }
+            return No;
+        }
         _ => {}
     }
     let x = args.first().copied().unwrap_or(Val(0));

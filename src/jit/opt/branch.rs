@@ -16,7 +16,83 @@ use crate::jit::opt::DomTree;
 /// `kMaxOpCountForCloning`.
 const CLONE_LIMIT: usize = 13;
 
+/// A branch on a select of two booleans it alone uses branches on the
+/// select's condition, then in each arm on the boolean chosen there: no
+/// select, and a pure compare of the block only the select used moves to
+/// its arm, where the branch takes its flags. The float `for` loop's test,
+/// `select(step > 0, up, down)`, so branches on the step's sign, which
+/// never changes, then compares once. Not where it enters a loop: the
+/// loop would have two entries, which LICM and `range` take none of.
+fn split_selects(f: &mut Func<'_>) -> bool {
+    let uses = f.use_counts();
+    let cfg = f.cfg();
+    let enters_loop = |b: Block, t: Block| {
+        cfg.preds(t).iter().any(|&p| cfg.dominates(t, p)) && !cfg.dominates(t, b)
+    };
+    let mut changed = false;
+    for b in 0..f.blocks.len() as u32 {
+        let b = Block(b);
+        let Some(t) = f.terminator(b).filter(|&t| f.op(t) == Op::Br) else {
+            continue;
+        };
+        let s = f.args(t)[0];
+        let Some(d) = f.def_inst(s).filter(|&d| f.op(d) == Op::Select) else {
+            continue;
+        };
+        if f.blocks[b.idx()].dead
+            || uses[s.idx()] != 1
+            || f.edges(t).iter().any(|e| enters_loop(b, e.target))
+        {
+            continue;
+        }
+        let (c, chosen) = (f.args(d)[0], [f.args(d)[1], f.args(d)[2]]);
+        // Dead once the branch tests `c`, and its operands may move below it.
+        let db = f.insts[d.idx()].block;
+        f.retain(db, |_, j| j != d);
+        let targets: Vec<(Block, Vec<Val>)> = (f.edges(t).iter())
+            .map(|e| (e.target, f.vl(e.args).to_vec()))
+            .collect();
+        let tag = f.insts[t.idx()].tag;
+        let mut arms = Vec::new();
+        for v in chosen {
+            let nb = f.new_block();
+            f.blocks[nb.idx()].cold = f.blocks[b.idx()].cold;
+            if let Some(cmp) = f.def_inst(v)
+                && f.insts[cmp.idx()].block == b
+                && f.op(cmp).is_pure()
+                && uses[v.idx()] == 1
+                && v != c
+            {
+                f.retain(b, |_, j| j != cmp);
+                f.append(nb, cmp);
+            }
+            let br = f.make_inst(Op::Br, &[v], None, tag);
+            f.append(nb, br);
+            let edges: Vec<BlockCall> = (targets.iter())
+                .map(|(target, args)| BlockCall {
+                    target: *target,
+                    args: f.new_vlist(args),
+                })
+                .collect();
+            f.set_edges(br, &edges);
+            arms.push(BlockCall {
+                target: nb,
+                args: f.new_vlist(&[]),
+            });
+        }
+        f.args_mut(t)[0] = c;
+        f.set_edges(t, &arms);
+        changed = true;
+    }
+    changed
+}
+
 pub(crate) fn eliminate(f: &mut Func<'_>) -> bool {
+    let split = split_selects(f);
+    split | eliminate_merges(f)
+}
+
+fn eliminate_merges(f: &mut Func<'_>) -> bool {
     let cfg = f.cfg();
     let shaped = |f: &Func<'_>, m: Block| {
         let bd = &f.blocks[m.idx()];
