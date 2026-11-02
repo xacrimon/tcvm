@@ -664,7 +664,8 @@ fn emit_math<'gc>(
                 let x = b.as_i32(x);
                 abs_i32(b, x)
             } else {
-                // A float, a small integer, else the builtin.
+                // A float, a small integer, else the builtin where an exit
+                // saw a big integer; anything else exits, as for `sqrt`.
                 let xv = b.boxed(x);
                 let join = b.new_block();
                 let is_float = b.ins(Op::IsType(TypeSet::FLOAT), &[xv]);
@@ -678,8 +679,14 @@ fn emit_math<'gc>(
                 let i = b.ins(Op::Unbox(Rep::I32), &[xv]);
                 let r = abs_i32(b, i);
                 arm_end(b, join, a, r);
+                if seen & fb::BIGINT != 0 {
+                    enter_join(b, join);
+                    return Emitted::Fallback(other, k);
+                }
+                b.switch_to(other);
+                b.deopt(ExitTag::Type);
                 enter_join(b, join);
-                return Emitted::Fallback(other, k);
+                return Emitted::Done;
             }
         }
         Intrinsic::Pairs | Intrinsic::Ipairs => unreachable!("returned above"),
