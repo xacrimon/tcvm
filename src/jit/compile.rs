@@ -403,6 +403,14 @@ pub(crate) fn compile<'gc>(
             .map_err(|e| CompileError::Backend(format!("regalloc checker: {e:?}")))?;
     }
     times.regalloc = t.elapsed().as_micros();
+    if config.dump.vcode {
+        eprintln!(
+            "-- jit vcode {} pc{pc}, {} spill slots\n{}",
+            chunk_name(closure),
+            out.num_spillslots,
+            lowered.vcode.print(out, &lowered.emit_order)
+        );
+    }
     let t = std::time::Instant::now();
     let jit = ctx.jit();
     let tramp = |h: usize, f: bool| jit.trampoline(h, f);

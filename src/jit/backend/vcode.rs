@@ -149,6 +149,85 @@ impl<I: TargetInst> VCode<I> {
     }
 }
 
+impl<I: TargetInst + std::fmt::Debug> VCode<I> {
+    /// The allocated code, blocks in `order` (`TCVM_JIT_DUMP=vcode`): each
+    /// instruction's defs and uses with their locations, and the allocator's
+    /// moves between them.
+    pub(crate) fn print(&self, out: &regalloc2::Output, order: &[u32]) -> String {
+        use std::fmt::Write;
+
+        use regalloc2::{Allocation, AllocationKind, Edit, InstOrEdit};
+        let loc = |a: Allocation| match a.kind() {
+            AllocationKind::Reg => {
+                let r = a.as_reg().unwrap();
+                let c = match r.class() {
+                    RegClass::Int => 'x',
+                    RegClass::Float => 'd',
+                    RegClass::Vector => 'q',
+                };
+                format!("{c}{}", r.hw_enc())
+            }
+            AllocationKind::Stack => format!("[s{}]", a.as_stack().unwrap().index()),
+            AllocationKind::None => "-".into(),
+        };
+        let vregs = |vs: &[VReg]| {
+            vs.iter()
+                .map(|v| format!("v{}", v.vreg()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut s = String::new();
+        for &b in order {
+            let rb = RBlock::new(b as usize);
+            let preds: Vec<String> = (self.block_preds(rb).iter())
+                .map(|p| format!("b{}", p.index()))
+                .collect();
+            let resume = if self.blocks[b as usize].resume {
+                " resume"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                s,
+                "b{b}({}){resume} <- {}",
+                vregs(self.block_params(rb)),
+                preds.join(" ")
+            );
+            for ie in out.block_insts_and_edits(self, rb) {
+                match ie {
+                    InstOrEdit::Inst(i) => {
+                        let ops = self.inst_operands(i).iter().zip(out.inst_allocs(i));
+                        let side = |kind| {
+                            (ops.clone())
+                                .filter(|(o, _)| o.kind() == kind)
+                                .map(|(o, &a)| format!("v{}:{}", o.vreg().vreg(), loc(a)))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        };
+                        let _ = writeln!(
+                            s,
+                            "  {:>4}  {:?}  {} <- {}",
+                            i.index(),
+                            self.insts[i.index()],
+                            side(OperandKind::Def),
+                            side(OperandKind::Use)
+                        );
+                    }
+                    InstOrEdit::Edit(Edit::Move { from, to }) => {
+                        let _ = writeln!(s, "        move {} <- {}", loc(*to), loc(*from));
+                    }
+                }
+            }
+            for (k, succ) in self.block_succs(rb).iter().enumerate() {
+                let end = RInst::new(self.blocks[b as usize].end as usize - 1);
+                let args = self.branch_blockparams(rb, end, k);
+                let _ = writeln!(s, "  -> b{}({})", succ.index(), vregs(args));
+            }
+        }
+        s
+    }
+}
+
 impl<I: TargetInst> Function for VCode<I> {
     fn num_insts(&self) -> usize {
         self.insts.len()
