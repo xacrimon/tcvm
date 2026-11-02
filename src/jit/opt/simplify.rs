@@ -113,6 +113,21 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
+                Op::FToIExact => {
+                    let x = args[0];
+                    if let Some(Op::IToF) = f.def_op(x) {
+                        map[res(f).idx()] = f.args(f.def_inst(x).unwrap())[0];
+                        remove(i);
+                        changed = true;
+                    } else if let Some(c) = konst_f64(f, x)
+                        && c as i32 as f64 == c
+                    {
+                        f.insts[i.idx()].op = Op::KI32(c as i32);
+                        f.insts[i.idx()].an = 0;
+                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        changed = true;
+                    }
+                }
                 Op::Unbox(rep) => {
                     let x = args[0];
                     if f.ty(x).rep == rep {

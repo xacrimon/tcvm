@@ -824,6 +824,49 @@ fn float_keys_index_arrays() {
     assert!(ir.contains("ftoiexact"), "{ir}");
 }
 
+/// A float -0.0 converts to integer 0 as Lua's conversion does (a key,
+/// `ceil`'s and `floor`'s results, a bitwise operand), without an exit.
+#[test]
+fn negative_zero_converts_in_compiled_code() {
+    let src = "local ceil, floor = math.ceil, math.floor
+    function f(n)
+        local s, t = 0, {}
+        for i = 1, n do
+            local z = -0.0 * i
+            t[z] = i
+            s = s + ceil(-0.25 - (i % 2) * 0.5) + floor(z) + t[0] + (z | 0)
+        end
+        return s
+    end
+    r = 0
+    for k = 1, 20 do r = r + f(300) end";
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let g = |n: &str| {
+            ctx.globals()
+                .raw_get(Value::string(LuaString::new(ctx, n.as_bytes())))
+        };
+        // Reference Lua 5.5.1.
+        assert_eq!(g("r").get_integer(), Some(903000));
+        let f = g("f").get_function().and_then(|f| f.as_lua()).unwrap();
+        let st = f.proto.jit.get().expect("compiled").borrow();
+        let exits: u32 = (st.regions.iter())
+            .flat_map(|r| r.exits.iter())
+            .map(|e| e.count.get())
+            .sum();
+        assert!(exits < 50, "{exits} exits");
+    });
+}
+
 /// Closures and cell upvalues inline (W3 step 4): `make`'s closures come
 /// from `closure.of` with its closure, its cell store goes through that
 /// closure's cell, and its return closes what they opened.

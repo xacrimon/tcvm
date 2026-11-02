@@ -595,7 +595,9 @@ pub(crate) enum Op {
     /// Lua float `//`: `floor(a / b)`.
     FIDiv,
     FCmp(Cc),
-    /// The i32 an f64 holds exactly; exits otherwise.
+    /// The i32 an f64 holds exactly; exits otherwise. -0.0 gives 0: every
+    /// use is Lua's float-to-integer conversion (keys, bitwise operands,
+    /// `floor`/`ceil`, loop limits).
     FToIExact,
     /// The f64 of a `Val` small integer or float; exits otherwise.
     ToF64,

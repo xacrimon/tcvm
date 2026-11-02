@@ -1534,14 +1534,6 @@ impl Em<'_> {
                 self.a.fcmp(n, D31);
                 let l = self.exit(exit);
                 self.a.b_cond(Cond::Ne, l);
-                // -0.0 converts to 0 but is a float zero only by sign: keep it a float.
-                let ok = self.a.new_label();
-                self.a.cmp_imm(Sz::W, X16, 0);
-                self.a.b_cond(Cond::Ne, ok);
-                self.a.fmov_to_gpr(X17, n);
-                self.a.cmp_imm(Sz::X, X17, 0);
-                self.a.b_cond(Cond::Lt, l);
-                self.a.bind(ok);
                 self.a.mov_w(d, X16);
             }
             LToFExact { exit } => {
