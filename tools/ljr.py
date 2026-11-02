@@ -77,6 +77,8 @@ def main():
                     help="stdin of k-nucleotide and revcomp, made with luajit when missing")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
+    # Benchmarks run with the suite as cwd, so a relative path would not resolve.
+    a.suite = os.path.abspath(a.suite)
 
     bins = {"jit": os.path.abspath(a.bin)}
     for spec in a.tcvm:
@@ -121,7 +123,12 @@ def main():
                     continue
                 res = measure(cmd, a.suite, env, a.timeout, a.fasta if n in STDIN else None)
                 results[n][m].append(res)
-                tag = "timeout" if res is None else f"{res.get('cycles', 0) / 1e6:.1f}M cycles"
+                if res is None:
+                    tag = "timeout"
+                elif res["status"] != 0:
+                    tag = f"failed (status {res['status']})"
+                else:
+                    tag = f"{res.get('cycles', 0) / 1e6:.1f}M cycles"
                 print(f"round {r + 1} {n} {m}: {tag}", file=sys.stderr)
     if a.dry_run:
         return
