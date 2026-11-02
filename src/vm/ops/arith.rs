@@ -510,7 +510,8 @@ handler! {
         let closure = unsafe { frame::closure(base) };
         let site = unsafe { pc.sub(1) };
         feedback::record(closure, site, feedback::kind(v));
-        if let Some(i) = v.get_integer() {
+        let int = v.get_integer().or_else(|| v.get_float().and_then(num::exact_float_to_int));
+        if let Some(i) = int {
             reg![dst] = Value::integer(rt.mutation(), !i);
             next!()
         }
