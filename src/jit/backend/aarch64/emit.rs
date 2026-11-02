@@ -1295,8 +1295,53 @@ impl Em<'_> {
             self.a.asr_imm(Sz::X, X16, v, 48);
             self.a.cmn_imm(Sz::X, X16, 8 - tag as u64);
             Cond::Eq
+        } else if let [(a, z)] = kind_runs(set)[..] {
+            self.run_flags(v, a, z)
         } else {
             panic!("type test of {set:?} needs more than one compare")
+        }
+    }
+
+    /// Flags for kinds `a..=z` of `KIND_ORDER`, one range of words.
+    fn run_flags(&mut self, v: Gpr, a: usize, z: usize) -> Cond {
+        let lo = KIND_ORDER[a].1;
+        if z == SMALL_K {
+            if a == 0 {
+                self.a.cmp(Sz::X, v, v);
+                return Cond::Eq;
+            }
+            self.a.mov_imm(X16, lo);
+            self.a.cmp(Sz::X, v, X16);
+            return Cond::Hs;
+        }
+        // The first word past the run, the unused words after a thread or
+        // `true` taken in.
+        let end = match z {
+            THR_K => NIL,
+            TRUE_K => SMALL_BITS,
+            _ => KIND_ORDER[z + 1].1,
+        };
+        if a == 0 {
+            self.a.mov_imm(X16, end);
+            self.a.cmp(Sz::X, v, X16);
+            Cond::Lo
+        } else if z <= THR_K {
+            // The high 16 bits are `tag - 8`, and the index the tag.
+            self.a.asr_imm(Sz::X, X16, v, 48);
+            self.a.add_imm(Sz::X, X16, X16, 8 - a as u64);
+            self.a.cmp_imm(Sz::X, X16, (z - a) as u64);
+            Cond::Ls
+        } else if a > THR_K {
+            self.a.mov_imm(X16, lo);
+            self.a.sub(Sz::X, X16, v, X16);
+            self.a.cmp_imm(Sz::X, X16, (z - a) as u64);
+            Cond::Ls
+        } else {
+            self.a.mov_imm(X16, lo);
+            self.a.cmp(Sz::X, v, X16);
+            self.a.mov_imm(X17, end);
+            self.a.ccmp(Sz::X, v, X17, 0b0010, Cond::Hs);
+            Cond::Lo
         }
     }
 
@@ -1311,6 +1356,10 @@ impl Em<'_> {
     /// Go to `fail` unless `v` is in `set`, falling through otherwise.
     fn type_fail(&mut self, v: Gpr, set: TypeSet, fail: Label) {
         let parts = type_parts(set);
+        if parts.is_empty() {
+            self.a.b(fail);
+            return;
+        }
         let ok = self.a.new_label();
         for (k, &p) in parts.iter().enumerate() {
             let c = self.type_flags(v, p);
@@ -2521,35 +2570,57 @@ pub(crate) fn is_single_test(set: TypeSet) -> bool {
         || set == TypeSet::FALSE
         || set == TypeSet::TRUE
         || single_tag(set).is_some()
+        || kind_runs(set).len() == 1
 }
 
-/// The single tests `set` takes, in order.
+/// The kinds in the order of their words, each with its first word.
+/// Nothing has the words between threads and nil or between true and the
+/// small integers, so a run of kinds is one range.
+const KIND_ORDER: [(TypeSet, u64); 11] = [
+    (TypeSet::FLOAT, 0),
+    (TypeSet::UDATA, 0xFFF9 << 48),
+    (TypeSet::BIGINT, 0xFFFA << 48),
+    (TypeSet::STR, 0xFFFB << 48),
+    (TypeSet::TAB, 0xFFFC << 48),
+    (TypeSet::FUN, 0xFFFD << 48),
+    (TypeSet::THR, 0xFFFE << 48),
+    (TypeSet::NIL, NIL),
+    (TypeSet::FALSE, NIL + 1),
+    (TypeSet::TRUE, NIL + 2),
+    (TypeSet::SMALL, SMALL_BITS),
+];
+const THR_K: usize = 6;
+const TRUE_K: usize = 9;
+const SMALL_K: usize = 10;
+const SMALL_BITS: u64 = 0xFFFF_FFFF_0000_0000;
+
+/// `set`'s maximal runs of `KIND_ORDER`, first and last index.
+fn kind_runs(set: TypeSet) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut k = 0;
+    while k < KIND_ORDER.len() {
+        if set.contains(KIND_ORDER[k].0) {
+            let a = k;
+            while k + 1 < KIND_ORDER.len() && set.contains(KIND_ORDER[k + 1].0) {
+                k += 1;
+            }
+            runs.push((a, k));
+        }
+        k += 1;
+    }
+    runs
+}
+
+/// The single tests `set` takes, in order: its runs, small integers first.
 fn type_parts(set: TypeSet) -> Vec<TypeSet> {
     if is_single_test(set) {
         return vec![set];
     }
-    let mut rest = set;
-    let mut parts = Vec::new();
-    for p in [
-        TypeSet::SMALL,
-        TypeSet::FLOAT,
-        TypeSet::NIL,
-        TypeSet::BOOL,
-        TypeSet::BIGINT,
-        TypeSet::STR,
-        TypeSet::TAB,
-        TypeSet::FUN,
-        TypeSet::THR,
-        TypeSet::UDATA,
-        TypeSet::FALSE,
-        TypeSet::TRUE,
-    ] {
-        if rest.contains(p) {
-            parts.push(p);
-            rest.remove(p);
-        }
-    }
-    parts
+    let mut runs = kind_runs(set);
+    runs.sort_by_key(|&(_, z)| z != SMALL_K);
+    runs.into_iter()
+        .map(|(a, z)| (KIND_ORDER[a..=z].iter()).fold(TypeSet::empty(), |s, &(k, _)| s | k))
+        .collect()
 }
 
 #[allow(unused)]
