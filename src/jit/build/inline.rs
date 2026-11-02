@@ -37,8 +37,9 @@ const BUDGET: u32 = 1200;
 /// the most bytecodes (Turbolev's 0.15 and 460).
 const MIN_FREQ: f64 = 0.15;
 const MAX_BYTECODES: usize = 460;
-/// IR instructions per bytecode where no build measured a callee.
-const IR_PER_BC: u32 = 8;
+/// IR instructions per bytecode where no build measured a callee: inlined
+/// bodies over the LJR programs average 5.36 (1754 bodies, median 3.73).
+const IR_PER_BC: u32 = 5;
 
 /// Which call sites inline (W3 §12): ranked before the build by frequency
 /// over size, a site in a loop by half again, and taken greedily within the
