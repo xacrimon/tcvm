@@ -1,7 +1,7 @@
 pub(crate) mod basic;
 mod coroutine;
 mod debug;
-mod io;
+pub(crate) mod io;
 pub(crate) mod math;
 mod os;
 mod package;

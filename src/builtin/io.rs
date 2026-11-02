@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::sync::{Mutex, MutexGuard, Once, PoisonError};
 
 use crate::Context;
 use crate::builtin::util;
@@ -47,8 +48,8 @@ enum FileState {
 }
 
 /// The underlying byte stream. `Stdin`/`Stdout`/`Stderr` are markers — the
-/// process-global handles are locked per call, never owned here, so the
-/// real fds survive handle collection.
+/// process-global handles (stdout's buffer is [`stdout`]) are locked per
+/// call, never owned here, so the real fds survive handle collection.
 enum Stream {
     File(FileStream),
     Stdin,
@@ -57,11 +58,16 @@ enum Stream {
 }
 
 /// A regular file. Reads go through `reader`'s read-ahead; writes collect in
-/// `wbuf` per `mode` and reach the file before any read, seek or close, and
+/// `wbuf` and reach the file before any read, seek or close, and
 /// on drop, which covers collection and the host dropping the state.
 struct FileStream {
     reader: BufReader<File>,
-    wbuf: Vec<u8>,
+    wbuf: WBuf,
+}
+
+/// Bytes held back from a writer per a `setvbuf` mode.
+struct WBuf {
+    buf: Vec<u8>,
     mode: BufMode,
 }
 
@@ -83,25 +89,41 @@ impl FileStream {
     fn new(file: File) -> Self {
         FileStream {
             reader: BufReader::new(file),
-            wbuf: Vec::new(),
-            mode: BufMode::Full(DEFAULT_BUF_SIZE),
+            wbuf: WBuf::new(BufMode::Full(DEFAULT_BUF_SIZE)),
         }
     }
 
     fn flush_buf(&mut self) -> std::io::Result<()> {
-        if self.wbuf.is_empty() {
+        self.wbuf.flush(self.reader.get_mut())
+    }
+
+    fn write(&mut self, buf: &[u8]) -> (std::io::Result<()>, u64) {
+        self.wbuf.write(self.reader.get_mut(), buf)
+    }
+}
+
+impl WBuf {
+    const fn new(mode: BufMode) -> Self {
+        WBuf {
+            buf: Vec::new(),
+            mode,
+        }
+    }
+
+    fn flush(&mut self, w: &mut impl Write) -> std::io::Result<()> {
+        if self.buf.is_empty() {
             return Ok(());
         }
-        let (res, _) = count_write(self.reader.get_mut(), &self.wbuf);
+        let (res, _) = count_write(w, &self.buf);
         // Dropped even on failure, so one error isn't reported by every
         // later operation.
-        self.wbuf.clear();
+        self.buf.clear();
         res
     }
 
-    /// Buffer `buf`, or write it through once it no longer fits. The count is
-    /// the bytes of `buf` accepted before an error.
-    fn write(&mut self, buf: &[u8]) -> (std::io::Result<()>, u64) {
+    /// Buffer `buf`, or write it through to `w` once it no longer fits. The
+    /// count is the bytes of `buf` accepted before an error.
+    fn write(&mut self, w: &mut impl Write, buf: &[u8]) -> (std::io::Result<()>, u64) {
         let (cap, line) = match self.mode {
             BufMode::No => (0, false),
             BufMode::Line(cap) => (cap, true),
@@ -114,31 +136,111 @@ impl FileStream {
             false => 0,
         };
         let (head, tail) = buf.split_at(head_len);
-        if self.wbuf.len() + buf.len() > cap
-            && let Err(e) = self.flush_buf()
+        if self.buf.len() + buf.len() > cap
+            && let Err(e) = self.flush(w)
         {
             return (Err(e), 0);
         }
         if !head.is_empty() {
-            if self.wbuf.is_empty() {
-                let (res, n) = count_write(self.reader.get_mut(), head);
+            if self.buf.is_empty() {
+                let (res, n) = count_write(w, head);
                 if res.is_err() {
                     return (res, n);
                 }
             } else {
                 // Not flushed above, so `buf` fits: one write for both.
-                self.wbuf.extend_from_slice(head);
-                if let Err(e) = self.flush_buf() {
+                self.buf.extend_from_slice(head);
+                if let Err(e) = self.flush(w) {
                     return (Err(e), 0);
                 }
             }
         }
-        if self.wbuf.len() + tail.len() > cap {
-            let (res, n) = count_write(self.reader.get_mut(), tail);
+        if self.buf.len() + tail.len() > cap {
+            let (res, n) = count_write(w, tail);
             return (res, head_len as u64 + n);
         }
-        self.wbuf.extend_from_slice(tail);
+        self.buf.extend_from_slice(tail);
         (Ok(()), buf.len() as u64)
+    }
+}
+
+/// The process's one stdout buffer, which `print`, `io.write` and every
+/// `io.stdout` handle share, as C's `stdout`: line-buffered on a terminal,
+/// fully buffered otherwise, and drained at exit.
+static STDOUT: Mutex<WBuf> = Mutex::new(WBuf::new(BufMode::No));
+
+/// Fd 1, unbuffered.
+struct Fd1;
+
+impl Write for Fd1 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // SAFETY: `buf` is valid for `buf.len()` bytes.
+        let n = unsafe { libc::write(1, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) struct StdoutLock(MutexGuard<'static, WBuf>);
+
+/// Stdout's buffer, picking its mode on first use.
+pub(crate) fn stdout() -> StdoutLock {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // SAFETY: plain libc calls; `drain_stdout` only touches `STDOUT`.
+        let tty = unsafe { libc::isatty(1) } == 1;
+        unsafe { libc::atexit(drain_stdout) };
+        STDOUT.lock().unwrap_or_else(PoisonError::into_inner).mode = match tty {
+            true => BufMode::Line(DEFAULT_BUF_SIZE),
+            false => BufMode::Full(DEFAULT_BUF_SIZE),
+        };
+    });
+    StdoutLock(STDOUT.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Covers `exit` from anywhere, `os.exit` included. A lock held at exit
+/// (another thread mid-write) is left alone rather than waited on.
+extern "C" fn drain_stdout() {
+    let mut buf = match STDOUT.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    let _ = buf.flush(&mut Fd1);
+}
+
+impl StdoutLock {
+    fn write_counted(&mut self, buf: &[u8]) -> (std::io::Result<()>, u64) {
+        self.0.write(&mut Fd1, buf)
+    }
+
+    fn set_mode(&mut self, mode: BufMode) -> std::io::Result<()> {
+        self.0.mode = mode;
+        self.0.flush(&mut Fd1)
+    }
+
+    /// Before reading stdin, as stdio does, so a prompt shows on a terminal.
+    fn flush_if_interactive(&mut self) -> std::io::Result<()> {
+        match self.0.mode {
+            BufMode::Full(_) => Ok(()),
+            _ => self.0.flush(&mut Fd1),
+        }
+    }
+}
+
+impl Write for StdoutLock {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_counted(buf).0.map(|()| buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush(&mut Fd1)
     }
 }
 
@@ -402,7 +504,7 @@ fn write_bytes(fs: &mut FileState, buf: &[u8]) -> WriteOutcome {
     }
     let (res, written) = match stream {
         Stream::File(file) => file.write(buf),
-        Stream::Stdout => count_write(&mut std::io::stdout(), buf),
+        Stream::Stdout => stdout().write_counted(buf),
         Stream::Stderr => count_write(&mut std::io::stderr(), buf),
         Stream::Stdin => (Err(std::io::Error::from_raw_os_error(9)), 0),
     };
@@ -419,7 +521,7 @@ fn flush_stream(fs: &mut FileState) -> WriteOutcome {
     };
     let res = match stream {
         Stream::File(file) => file.flush_buf(),
-        Stream::Stdout => std::io::stdout().flush(),
+        Stream::Stdout => stdout().flush(),
         Stream::Stderr => std::io::stderr().flush(),
         Stream::Stdin => Ok(()),
     };
@@ -464,7 +566,10 @@ fn read_stream(fs: &mut FileState, fmt: ReadFmt) -> std::io::Result<ReadOne> {
                 file.flush_buf()?;
                 read_one(&mut file.reader, fmt)
             }
-            Stream::Stdin => read_one(&mut std::io::stdin().lock(), fmt),
+            Stream::Stdin => {
+                stdout().flush_if_interactive()?;
+                read_one(&mut std::io::stdin().lock(), fmt)
+            }
             Stream::Stdout | Stream::Stderr => ebadf(),
         },
     }
@@ -1163,9 +1268,13 @@ fn lua_file_setvbuf<'gc>(
             stream: Stream::File(file),
             ..
         } => {
-            file.mode = mode;
+            file.wbuf.mode = mode;
             file.flush_buf()
         }
+        FileState::Open {
+            stream: Stream::Stdout,
+            ..
+        } => stdout().set_mode(mode),
         _ => Ok(()),
     });
     match res {
