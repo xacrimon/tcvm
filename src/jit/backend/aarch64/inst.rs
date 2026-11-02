@@ -197,8 +197,11 @@ pub(crate) enum MInst {
         test: Test,
         cond: Cond,
     },
-    /// `[def d, use c (w), use a, use b]`: `c ? a : b`, int or float by `float`.
+    /// `[def d, use a, use b, test operands..]`: `test ? a : b`, int or
+    /// float by `float`.
     Select {
+        test: Test,
+        cond: Cond,
         float: bool,
     },
     /// `[test operands.., snap..]`: exit unless `cond` holds after the test.

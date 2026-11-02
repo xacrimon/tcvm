@@ -1664,15 +1664,14 @@ impl Em<'_> {
                     self.a.cset(Sz::W, d, c);
                 }
             }
-            Select { float } => {
-                let c = self.r(i, 1);
-                self.a.cmp_imm(Sz::W, c, 0);
+            Select { test, cond, float } => {
+                let c = self.test(i, 3, test, cond);
                 if float {
-                    let (d, x, y) = (self.fr(i, 0), self.fr(i, 2), self.fr(i, 3));
-                    self.a.fcsel(d, x, y, Cond::Ne);
+                    let (d, x, y) = (self.fr(i, 0), self.fr(i, 1), self.fr(i, 2));
+                    self.a.fcsel(d, x, y, c);
                 } else {
-                    let (d, x, y) = (self.r(i, 0), self.r(i, 2), self.r(i, 3));
-                    self.a.csel(Sz::X, d, x, y, Cond::Ne);
+                    let (d, x, y) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                    self.a.csel(Sz::X, d, x, y, c);
                 }
             }
             Guard { test, cond, exit } => {
@@ -2505,7 +2504,7 @@ fn single_tag(set: TypeSet) -> Option<u16> {
     })
 }
 
-fn is_single_test(set: TypeSet) -> bool {
+pub(crate) fn is_single_test(set: TypeSet) -> bool {
     set == TypeSet::SMALL
         || set == TypeSet::FLOAT
         || set == TypeSet::SMALL | TypeSet::FLOAT

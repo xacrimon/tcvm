@@ -8,6 +8,7 @@ use regalloc2::{Block as RBlock, Operand, PRegSet, RegClass, VReg};
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, preg_int};
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Sz};
+use crate::jit::backend::aarch64::emit::is_single_test;
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
 use crate::jit::backend::vcode::VCode;
 use crate::jit::ir::ops::{Cc, ExitTag, NO_PROTO, Op};
@@ -465,8 +466,6 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         i.index()
     }
 
-    /// Mark compares used once, by a branch, guard or select of the same
-    /// block, to be computed there.
     /// Calls of a constant Lua closure without varargs (D2) or native (I1),
     /// whose store to the call's slot nothing between reads, and of a Lua
     /// closure of a prototype a guard proved.
@@ -578,29 +577,32 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
     }
 
+    /// Mark compares used once, by a branch, guard or select of the same
+    /// block, to be computed there.
     fn find_fusions(&mut self, order: &[Block]) {
         for &b in order {
             for &i in self.f.insts_of(b) {
                 let op = self.f.op(i);
                 let cand = match op {
-                    Op::Br | Op::GuardTrue | Op::GuardFalse => Some(self.f.args(i)[0]),
+                    Op::Br | Op::GuardTrue | Op::GuardFalse | Op::Select => Some(self.f.args(i)[0]),
                     _ => None,
                 };
                 if let Some(c) = cand
                     && self.uses[c.idx()] == 1
                     && let Some(di) = self.f.def_inst(c)
                     && self.f.insts[di.idx()].block == b
-                    && matches!(
-                        self.f.op(di),
+                    && match self.f.op(di) {
                         Op::ICmp(_)
-                            | Op::LCmp(_)
-                            | Op::FCmp(_)
-                            | Op::IsType(_)
-                            | Op::IsFalsy
-                            | Op::SameBits
-                            | Op::ShapeIs(_)
-                            | Op::ShapeIn(_)
-                    )
+                        | Op::LCmp(_)
+                        | Op::FCmp(_)
+                        | Op::IsFalsy
+                        | Op::SameBits
+                        | Op::ShapeIs(_)
+                        | Op::ShapeIn(_) => true,
+                        // A select takes flags: no test that branches.
+                        Op::IsType(set) => op != Op::Select || is_single_test(set),
+                        _ => false,
+                    }
                 {
                     self.fused[c.idx()] = true;
                 }
@@ -1004,13 +1006,17 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::Select => {
                 let r = res.unwrap();
                 let float = f.ty(r).rep == Rep::F64;
-                let ops = [
-                    self.def(r),
-                    self.use_(args[0]),
-                    self.use_(args[1]),
-                    self.use_(args[2]),
-                ];
-                self.push(MInst::Select { float }, &ops, none);
+                let c = args[0];
+                let (test, cond, targs) = if self.fused[c.idx()] {
+                    self.test_of(c)
+                } else {
+                    (Test::B1, Cond::Ne, vec![c])
+                };
+                let mut ops = vec![self.def(r), self.use_(args[1]), self.use_(args[2])];
+                for a in targs {
+                    ops.push(self.use_(a));
+                }
+                self.push(MInst::Select { test, cond, float }, &ops, none);
             }
             Op::Guard(set) if f.insts[i.idx()].tag == ExitTag::Entry => {
                 let (Some(Op::Load(r)) | Some(Op::Param(r))) = f.def_op(args[0]) else {
