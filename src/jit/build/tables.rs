@@ -5,7 +5,7 @@
 
 use crate::dmm::Gc;
 use crate::env::function::InlineCache;
-use crate::env::shape::{Kind, kind_class};
+use crate::env::shape::Kind;
 use crate::env::string::LuaString;
 use crate::env::table::{SlotLoc, Table};
 use crate::env::value::Value;
@@ -52,25 +52,7 @@ fn table_of(b: &mut Builder<'_, '_>, v: Val) -> Val {
 
 /// The types a slot of `kind` holds.
 fn kind_types(kind: Kind) -> TypeSet {
-    use kind_class as c;
-    let k = kind.classes();
-    let mut set = TypeSet::empty();
-    for (bit, ts) in [
-        (c::FLOAT, TypeSet::FLOAT),
-        (c::UDATA, TypeSet::UDATA),
-        (c::BIGINT, TypeSet::BIGINT),
-        (c::STR, TypeSet::STR),
-        (c::TAB, TypeSet::TAB),
-        (c::FUN, TypeSet::FUN),
-        (c::THR, TypeSet::THR),
-        (c::NIL_BOOL, TypeSet::NIL | TypeSet::BOOL),
-        (c::SMALL, TypeSet::SMALL),
-    ] {
-        if k & bit != 0 {
-            set |= ts;
-        }
-    }
-    set
+    TypeSet::of_classes(kind.classes())
 }
 
 /// What tables of `shape` hold in `slot`, assumed (ws2 §6.1). A weak

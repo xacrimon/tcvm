@@ -1041,7 +1041,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     Rep::Ptr => {
                         let (d, u) = (self.def(r), self.use_(x));
                         self.push(
-                            MInst::AluImm(AluOp::And, Sz::X, (1 << 48) - 1),
+                            MInst::AluImm(AluOp::And, Sz::X, crate::env::value::PAYLOAD_MASK),
                             &[d, u],
                             none,
                         );

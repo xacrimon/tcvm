@@ -6,7 +6,11 @@ use regalloc2::{Allocation, Edit, Output, PReg, RegClass};
 
 use crate::env::function::NativeClosure;
 use crate::env::table::SlotLoc;
+pub(crate) use crate::env::value::BOX;
 use crate::env::value::Value;
+use crate::env::value::{
+    FALSE, NIL, PAYLOAD_MASK as PTR_MASK, SMALL_INT as SMALL_BITS, TRUE, TYPE_WORDS,
+};
 use crate::env::{MtCache, Shape};
 use crate::jit::backend::aarch64::abi::{
     BASE, CLOSURE, D31, IMAGE_SPILLS, INSN, MAX_SPILLS, PC, RT, THREAD, X16, X17, image_index,
@@ -20,13 +24,8 @@ use crate::jit::backend::vcode::VCode;
 use crate::jit::ir::ops::Ctx;
 use crate::jit::ir::types::TypeSet;
 use crate::jit::layout;
-use crate::jit::region::{Loc, SRep, SnapEntry};
-
-const NIL: u64 = 0xFFFF_FFFE_0000_0000;
-const FALSE: u64 = NIL | 1;
-pub(crate) const BOX: u64 = 0xFFF9_0000_0000_0000;
-const PTR_MASK: u64 = (1 << 48) - 1;
 use crate::jit::layout::FUNCTION_TAG;
+use crate::jit::region::{Loc, SRep, SnapEntry};
 /// The machine code of a region, before its address is known.
 pub(crate) struct Emitted {
     pub(crate) asm: Asm,
@@ -417,7 +416,7 @@ pub(crate) fn emit(
     let guards = em.a.new_label();
     em.a.bind(guards);
     for &(r, set) in &l.entry_tests {
-        em.type_fail(Gpr(r), set, em.entry_fail);
+        type_fail(&mut em.a, Gpr(r), set, em.entry_fail);
     }
     if l.prefix_guards {
         em.typed_entry = Some(em.labels[0]);
@@ -1244,138 +1243,16 @@ impl Em<'_> {
             // `cond` is `Eq` for in the set, `Ne` for not.
             Test::Type(set) => {
                 let v = self.r(i, k);
-                let c = self.type_flags(v, set);
+                let c = type_flags(&mut self.a, v, set);
                 if cond == Cond::Eq { c } else { c.invert() }
             }
         }
     }
 
-    /// Flags for a single-test type set; the condition meaning "in the set".
-    fn type_flags(&mut self, v: Gpr, set: TypeSet) -> Cond {
-        if set == TypeSet::SMALL {
-            self.a.lsr_imm(Sz::X, X16, v, 32);
-            self.a.cmn_imm(Sz::W, X16, 1);
-            Cond::Eq
-        } else if set == TypeSet::FLOAT {
-            self.a.mov_imm(X16, BOX);
-            self.a.cmp(Sz::X, v, X16);
-            Cond::Lo
-        } else if set == TypeSet::SMALL | TypeSet::FLOAT {
-            // Below `BOX` (a float), else the small-int high word.
-            self.a.mov_imm(X16, BOX);
-            self.a.cmp(Sz::X, v, X16);
-            self.a.lsr_imm(Sz::X, X17, v, 32);
-            self.a.ccmn_imm(Sz::W, X17, 1, 0b0100, Cond::Hs);
-            Cond::Eq
-        } else if set == TypeSet::NIL {
-            self.a.mov_imm(X16, NIL);
-            self.a.cmp(Sz::X, v, X16);
-            Cond::Eq
-        } else if set == TypeSet::FALSY {
-            self.a.mov_imm(X16, NIL);
-            self.a.sub(Sz::X, X16, v, X16);
-            self.a.cmp_imm(Sz::X, X16, 2);
-            Cond::Lo
-        } else if set == TypeSet::BOOL {
-            self.a.mov_imm(X16, FALSE);
-            self.a.sub(Sz::X, X16, v, X16);
-            self.a.cmp_imm(Sz::X, X16, 2);
-            Cond::Lo
-        } else if set == TypeSet::FALSE || set == TypeSet::TRUE {
-            let k = if set == TypeSet::FALSE {
-                FALSE
-            } else {
-                FALSE + 1
-            };
-            self.a.mov_imm(X16, k);
-            self.a.cmp(Sz::X, v, X16);
-            Cond::Eq
-        } else if let Some(tag) = single_tag(set) {
-            // The high 16 bits, sign extended, are `tag - 8`.
-            self.a.asr_imm(Sz::X, X16, v, 48);
-            self.a.cmn_imm(Sz::X, X16, 8 - tag as u64);
-            Cond::Eq
-        } else if let [(a, z)] = kind_runs(set)[..] {
-            self.run_flags(v, a, z)
-        } else {
-            panic!("type test of {set:?} needs more than one compare")
-        }
-    }
-
-    /// Flags for kinds `a..=z` of `KIND_ORDER`, one range of words.
-    fn run_flags(&mut self, v: Gpr, a: usize, z: usize) -> Cond {
-        let lo = KIND_ORDER[a].1;
-        if z == SMALL_K {
-            if a == 0 {
-                self.a.cmp(Sz::X, v, v);
-                return Cond::Eq;
-            }
-            self.a.mov_imm(X16, lo);
-            self.a.cmp(Sz::X, v, X16);
-            return Cond::Hs;
-        }
-        // The first word past the run, the unused words after a thread or
-        // `true` taken in.
-        let end = match z {
-            THR_K => NIL,
-            TRUE_K => SMALL_BITS,
-            _ => KIND_ORDER[z + 1].1,
-        };
-        if a == 0 {
-            self.a.mov_imm(X16, end);
-            self.a.cmp(Sz::X, v, X16);
-            Cond::Lo
-        } else if z <= THR_K {
-            // The high 16 bits are `tag - 8`, and the index the tag.
-            self.a.asr_imm(Sz::X, X16, v, 48);
-            self.a.add_imm(Sz::X, X16, X16, 8 - a as u64);
-            self.a.cmp_imm(Sz::X, X16, (z - a) as u64);
-            Cond::Ls
-        } else if a > THR_K {
-            self.a.mov_imm(X16, lo);
-            self.a.sub(Sz::X, X16, v, X16);
-            self.a.cmp_imm(Sz::X, X16, (z - a) as u64);
-            Cond::Ls
-        } else {
-            self.a.mov_imm(X16, lo);
-            self.a.cmp(Sz::X, v, X16);
-            self.a.mov_imm(X17, end);
-            self.a.ccmp(Sz::X, v, X17, 0b0010, Cond::Hs);
-            Cond::Lo
-        }
-    }
-
-    /// Branch to `ok` when `v` is in `set`, falling through otherwise.
-    fn type_branch(&mut self, v: Gpr, set: TypeSet, ok: Label) {
-        for p in type_parts(set) {
-            let c = self.type_flags(v, p);
-            self.a.b_cond(c, ok);
-        }
-    }
-
-    /// Go to `fail` unless `v` is in `set`, falling through otherwise.
-    fn type_fail(&mut self, v: Gpr, set: TypeSet, fail: Label) {
-        let parts = type_parts(set);
-        if parts.is_empty() {
-            self.a.b(fail);
-            return;
-        }
-        let ok = self.a.new_label();
-        for (k, &p) in parts.iter().enumerate() {
-            let c = self.type_flags(v, p);
-            if k + 1 < parts.len() {
-                self.a.b_cond(c, ok);
-            } else {
-                self.a.b_cond(c.invert(), fail);
-            }
-        }
-        self.a.bind(ok);
-    }
-
     /// Exit unless instruction `i`'s operand 0 is in `set`.
     fn type_guard(&mut self, i: usize, set: TypeSet, exit: u32) {
         let (l, v) = (self.exit(exit), self.r(i, 0));
-        self.type_fail(v, set, l);
+        type_fail(&mut self.a, v, set, l);
     }
 
     fn exit(&mut self, exit: u32) -> Label {
@@ -1659,7 +1536,7 @@ impl Em<'_> {
             }
             BoxI32 => {
                 let (d, n) = (self.r(i, 0), self.r(i, 1));
-                self.a.orr_imm(Sz::X, d, n, 0xFFFF_FFFF_0000_0000);
+                self.a.orr_imm(Sz::X, d, n, SMALL_BITS);
             }
             BoxB1 => {
                 let (d, n) = (self.r(i, 0), self.r(i, 1));
@@ -1673,7 +1550,7 @@ impl Em<'_> {
                 let slow = self.a.new_label();
                 self.a.cmp_ext(Gpr(1), Gpr(1), Extend::Sxtw);
                 self.a.b_cond(Cond::Ne, slow);
-                self.a.orr_imm(Sz::X, Gpr(0), Gpr(1), 0xFFFF_FFFF_0000_0000);
+                self.a.orr_imm(Sz::X, Gpr(0), Gpr(1), SMALL_BITS);
                 self.a.b(done);
                 self.a.bind(slow);
                 self.a.ldr_lit(Gpr(0), self.helpers.rt);
@@ -1739,7 +1616,7 @@ impl Em<'_> {
                     // `d` may share the tested value's register: written last.
                     let v = self.r(i, 1);
                     let (yes, done) = (self.a.new_label(), self.a.new_label());
-                    self.type_branch(v, set, yes);
+                    type_branch(&mut self.a, v, set, yes);
                     self.a.movz(Sz::W, d, (cond != Cond::Eq) as u16, 0);
                     self.a.b(done);
                     self.a.bind(yes);
@@ -1774,9 +1651,9 @@ impl Em<'_> {
                 {
                     let v = self.r(i, 0);
                     if cond == Cond::Eq {
-                        self.type_fail(v, set, l);
+                        type_fail(&mut self.a, v, set, l);
                     } else {
-                        self.type_branch(v, set, l);
+                        type_branch(&mut self.a, v, set, l);
                     }
                 } else {
                     let c = self.test(i, 0, test, cond);
@@ -2154,13 +2031,13 @@ impl Em<'_> {
                     let v = self.r(i, 0);
                     if Some(yes) == next {
                         match test {
-                            Test::Type(set) => self.type_fail(v, set, no),
+                            Test::Type(set) => type_fail(&mut self.a, v, set, no),
                             _ => self.a.cbz(Sz::W, v, no),
                         }
                         return Ok(());
                     }
                     match test {
-                        Test::Type(set) => self.type_branch(v, set, yes),
+                        Test::Type(set) => type_branch(&mut self.a, v, set, yes),
                         _ => self.a.cbnz(Sz::W, v, yes),
                     }
                     if Some(no) != next {
@@ -2578,16 +2455,11 @@ impl Em<'_> {
     }
 }
 
+/// The tag of a boxed type alone, its index in `TYPE_WORDS`.
 fn single_tag(set: TypeSet) -> Option<u16> {
-    Some(match set {
-        s if s == TypeSet::UDATA => 1,
-        s if s == TypeSet::BIGINT => 2,
-        s if s == TypeSet::STR => 3,
-        s if s == TypeSet::TAB => 4,
-        s if s == TypeSet::FUN => 5,
-        s if s == TypeSet::THR => 6,
-        _ => return None,
-    })
+    (1..=THR_K)
+        .find(|&k| TypeSet::BY_WORDS[k] == set)
+        .map(|k| k as u16)
 }
 
 pub(crate) fn is_single_test(set: TypeSet) -> bool {
@@ -2603,26 +2475,144 @@ pub(crate) fn is_single_test(set: TypeSet) -> bool {
         || kind_runs(set).len() == 1
 }
 
-/// The kinds in the order of their words, each with its first word.
-/// Nothing has the words between threads and nil or between true and the
-/// small integers, so a run of kinds is one range.
-const KIND_ORDER: [(TypeSet, u64); 11] = [
-    (TypeSet::FLOAT, 0),
-    (TypeSet::UDATA, 0xFFF9 << 48),
-    (TypeSet::BIGINT, 0xFFFA << 48),
-    (TypeSet::STR, 0xFFFB << 48),
-    (TypeSet::TAB, 0xFFFC << 48),
-    (TypeSet::FUN, 0xFFFD << 48),
-    (TypeSet::THR, 0xFFFE << 48),
-    (TypeSet::NIL, NIL),
-    (TypeSet::FALSE, NIL + 1),
-    (TypeSet::TRUE, NIL + 2),
-    (TypeSet::SMALL, SMALL_BITS),
-];
+/// The kinds in the order of their words (`TYPE_WORDS`), each with its
+/// first word. Nothing has the words between threads and nil or between
+/// true and the small integers, so a run of kinds is one range.
+const KIND_ORDER: [(TypeSet, u64); 11] = {
+    let mut o = [(TypeSet::empty(), 0); 11];
+    let mut k = 0;
+    while k < 11 {
+        o[k] = (TypeSet::BY_WORDS[k], TYPE_WORDS[k].0);
+        k += 1;
+    }
+    o
+};
 const THR_K: usize = 6;
 const TRUE_K: usize = 9;
 const SMALL_K: usize = 10;
-const SMALL_BITS: u64 = 0xFFFF_FFFF_0000_0000;
+const _: () = assert!(
+    KIND_ORDER[THR_K].0.bits() == TypeSet::THR.bits()
+        && KIND_ORDER[TRUE_K].0.bits() == TypeSet::TRUE.bits()
+        && KIND_ORDER[SMALL_K].0.bits() == TypeSet::SMALL.bits()
+);
+
+/// Flags for a single-test type set; the condition meaning "in the set".
+fn type_flags(asm: &mut Asm, v: Gpr, set: TypeSet) -> Cond {
+    if set == TypeSet::SMALL {
+        asm.lsr_imm(Sz::X, X16, v, 32);
+        asm.cmn_imm(Sz::W, X16, 1);
+        Cond::Eq
+    } else if set == TypeSet::FLOAT {
+        asm.mov_imm(X16, BOX);
+        asm.cmp(Sz::X, v, X16);
+        Cond::Lo
+    } else if set == TypeSet::SMALL | TypeSet::FLOAT {
+        // Below `BOX` (a float), else the small-int high word.
+        asm.mov_imm(X16, BOX);
+        asm.cmp(Sz::X, v, X16);
+        asm.lsr_imm(Sz::X, X17, v, 32);
+        asm.ccmn_imm(Sz::W, X17, 1, 0b0100, Cond::Hs);
+        Cond::Eq
+    } else if set == TypeSet::NIL {
+        asm.mov_imm(X16, NIL);
+        asm.cmp(Sz::X, v, X16);
+        Cond::Eq
+    } else if set == TypeSet::FALSY {
+        asm.mov_imm(X16, NIL);
+        asm.sub(Sz::X, X16, v, X16);
+        asm.cmp_imm(Sz::X, X16, 2);
+        Cond::Lo
+    } else if set == TypeSet::BOOL {
+        asm.mov_imm(X16, FALSE);
+        asm.sub(Sz::X, X16, v, X16);
+        asm.cmp_imm(Sz::X, X16, 2);
+        Cond::Lo
+    } else if set == TypeSet::FALSE || set == TypeSet::TRUE {
+        let k = if set == TypeSet::FALSE { FALSE } else { TRUE };
+        asm.mov_imm(X16, k);
+        asm.cmp(Sz::X, v, X16);
+        Cond::Eq
+    } else if let Some(tag) = single_tag(set) {
+        // The high 16 bits, sign extended, are `tag - 8`.
+        asm.asr_imm(Sz::X, X16, v, 48);
+        asm.cmn_imm(Sz::X, X16, 8 - tag as u64);
+        Cond::Eq
+    } else if let [(a, z)] = kind_runs(set)[..] {
+        run_flags(asm, v, a, z)
+    } else {
+        panic!("type test of {set:?} needs more than one compare")
+    }
+}
+
+/// Flags for kinds `a..=z` of `KIND_ORDER`, one range of words.
+fn run_flags(asm: &mut Asm, v: Gpr, a: usize, z: usize) -> Cond {
+    let lo = KIND_ORDER[a].1;
+    if z == SMALL_K {
+        if a == 0 {
+            asm.cmp(Sz::X, v, v);
+            return Cond::Eq;
+        }
+        asm.mov_imm(X16, lo);
+        asm.cmp(Sz::X, v, X16);
+        return Cond::Hs;
+    }
+    // The first word past the run, the unused words after a thread or
+    // `true` taken in.
+    let end = match z {
+        THR_K => NIL,
+        TRUE_K => SMALL_BITS,
+        _ => KIND_ORDER[z + 1].1,
+    };
+    if a == 0 {
+        asm.mov_imm(X16, end);
+        asm.cmp(Sz::X, v, X16);
+        Cond::Lo
+    } else if z <= THR_K {
+        // The high 16 bits are `tag - 8`, and the index the tag.
+        asm.asr_imm(Sz::X, X16, v, 48);
+        asm.add_imm(Sz::X, X16, X16, 8 - a as u64);
+        asm.cmp_imm(Sz::X, X16, (z - a) as u64);
+        Cond::Ls
+    } else if a > THR_K {
+        asm.mov_imm(X16, lo);
+        asm.sub(Sz::X, X16, v, X16);
+        asm.cmp_imm(Sz::X, X16, (z - a) as u64);
+        Cond::Ls
+    } else {
+        asm.mov_imm(X16, lo);
+        asm.cmp(Sz::X, v, X16);
+        asm.mov_imm(X17, end);
+        asm.ccmp(Sz::X, v, X17, 0b0010, Cond::Hs);
+        Cond::Lo
+    }
+}
+
+/// Branch to `ok` when `v` is in `set`, falling through otherwise.
+fn type_branch(asm: &mut Asm, v: Gpr, set: TypeSet, ok: Label) {
+    for p in type_parts(set) {
+        let c = type_flags(asm, v, p);
+        asm.b_cond(c, ok);
+    }
+}
+
+/// Go to `fail` unless `v` is in `set`, falling through otherwise.
+fn type_fail(asm: &mut Asm, v: Gpr, set: TypeSet, fail: Label) {
+    let parts = type_parts(set);
+    if parts.is_empty() {
+        asm.b(fail);
+        return;
+    }
+    let ok = asm.new_label();
+    for (k, &p) in parts.iter().enumerate() {
+        let c = type_flags(asm, v, p);
+        if k + 1 < parts.len() {
+            asm.b_cond(c, ok);
+        } else {
+            asm.b_cond(c.invert(), fail);
+        }
+    }
+    asm.bind(ok);
+}
 
 /// `set`'s maximal runs of `KIND_ORDER`, first and last index.
 fn kind_runs(set: TypeSet) -> Vec<(usize, usize)> {
@@ -2658,3 +2648,75 @@ fn unused(_: Value<'_>) {}
 
 #[allow(unused)]
 const _: usize = IMAGE_SPILLS;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jit::backend::code::{map_dual, sync_icache};
+
+    /// Words of each type of `TYPE_WORDS`, with its index: both ends, their
+    /// neighbours inside, the middle, and floats' special values.
+    fn samples() -> Vec<(u64, usize)> {
+        let mut out = Vec::new();
+        for (k, &(lo, hi)) in TYPE_WORDS.iter().enumerate() {
+            let mid = lo + (hi - lo) / 2;
+            for w in [lo, lo.saturating_add(1), mid, hi.saturating_sub(1), hi] {
+                if (lo..=hi).contains(&w) && !out.contains(&(w, k)) {
+                    out.push((w, k));
+                }
+            }
+        }
+        for x in [-0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -f64::NAN, 1.5] {
+            out.push((f64::to_bits(x), 0));
+        }
+        out
+    }
+
+    /// Every set of kinds, tested by `type_branch` and by `type_fail` on
+    /// every sample, against membership.
+    #[test]
+    fn type_tests_match_their_sets() {
+        const SIZE: usize = 1 << 16;
+        let (rw, rx) = map_dual(SIZE, (SIZE - 1) as u64).expect("map");
+        let samples = samples();
+        for bits in 0u32..1 << TypeSet::BY_WORDS.len() {
+            let set = (0..TypeSet::BY_WORDS.len())
+                .filter(|&k| bits >> k & 1 != 0)
+                .fold(TypeSet::empty(), |s, k| s | TypeSet::BY_WORDS[k]);
+            for fail in [false, true] {
+                let mut a = Asm::new();
+                let other = a.new_label();
+                if fail {
+                    type_fail(&mut a, Gpr(0), set, other);
+                } else {
+                    type_branch(&mut a, Gpr(0), set, other);
+                }
+                a.mov_imm(Gpr(0), fail as u64);
+                a.ret();
+                a.bind(other);
+                a.mov_imm(Gpr(0), !fail as u64);
+                a.ret();
+                let words = a.finish(rx.as_ptr() as usize).expect("assemble");
+                assert!(words.len() * 4 <= SIZE);
+                let f: extern "C" fn(u64) -> u64 = unsafe {
+                    std::ptr::copy_nonoverlapping(words.as_ptr(), rw.as_ptr().cast(), words.len());
+                    sync_icache(rw.as_ptr(), rx.as_ptr(), words.len() * 4);
+                    std::mem::transmute(rx.as_ptr())
+                };
+                for &(w, k) in &samples {
+                    let want = set.contains(TypeSet::BY_WORDS[k]);
+                    assert_eq!(
+                        f(w) != 0,
+                        want,
+                        "{set:?} ({}) on {w:#x}",
+                        if fail { "type_fail" } else { "type_branch" }
+                    );
+                }
+            }
+        }
+        unsafe {
+            libc::munmap(rw.as_ptr().cast(), SIZE);
+            libc::munmap(rx.as_ptr().cast(), SIZE);
+        }
+    }
+}

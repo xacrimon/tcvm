@@ -58,6 +58,40 @@ bitflags::bitflags! {
     }
 }
 
+impl TypeSet {
+    /// The types of `env::value::TYPE_WORDS`, by index.
+    pub(crate) const BY_WORDS: [TypeSet; 11] = [
+        TypeSet::FLOAT,
+        TypeSet::UDATA,
+        TypeSet::BIGINT,
+        TypeSet::STR,
+        TypeSet::TAB,
+        TypeSet::FUN,
+        TypeSet::THR,
+        TypeSet::NIL,
+        TypeSet::FALSE,
+        TypeSet::TRUE,
+        TypeSet::SMALL,
+    ];
+
+    /// The types of a slot kind's classes (`Kind::classes`): those of
+    /// `BY_WORDS` with nil and the booleans, which share an upper word, one.
+    pub(crate) fn of_classes(classes: u16) -> TypeSet {
+        let mut set = TypeSet::empty();
+        for (k, &t) in Self::BY_WORDS.iter().enumerate() {
+            let class = match k {
+                0..=6 => k,
+                7..=9 => 7,
+                _ => 8,
+            };
+            if classes >> class & 1 != 0 {
+                set |= t;
+            }
+        }
+        set
+    }
+}
+
 /// A fact about a value beyond its type set, valid for as long as the value
 /// exists. Shapes are not facts of a value (a store changes them), except
 /// a stable one's (ws2 §6.2).

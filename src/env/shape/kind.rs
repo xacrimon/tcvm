@@ -6,7 +6,7 @@ use core::cell::Cell;
 
 use crate::dmm::{Collect, Gc, Lock, Mutation};
 use crate::env::shape::Shape;
-use crate::env::value::Value;
+use crate::env::value::{TYPE_WORDS, Value};
 use crate::jit::deps::{self, DepSlot};
 
 /// The upper 32 bits of a value's encoding give each type a contiguous
@@ -20,18 +20,23 @@ pub struct Kind {
     span: u32,
 }
 
-/// A type's range of upper words, by `Class` order.
-const CLASSES: [(u32, u32); 9] = [
-    (0, 0xFFF8_FFFF),
-    (0xFFF9_0000, 0xFFF9_FFFF),
-    (0xFFFA_0000, 0xFFFA_FFFF),
-    (0xFFFB_0000, 0xFFFB_FFFF),
-    (0xFFFC_0000, 0xFFFC_FFFF),
-    (0xFFFD_0000, 0xFFFD_FFFF),
-    (0xFFFE_0000, 0xFFFE_FFFF),
-    (0xFFFF_FFFE, 0xFFFF_FFFE),
-    (0xFFFF_FFFF, 0xFFFF_FFFF),
-];
+/// A type's range of upper words, by `Class` order: `TYPE_WORDS`' with nil
+/// and the booleans one.
+const CLASSES: [(u32, u32); 9] = {
+    const fn up(w: u64) -> u32 {
+        (w >> 32) as u32
+    }
+    let t = &TYPE_WORDS;
+    let mut c = [(0, 0); 9];
+    let mut k = 0;
+    while k < 7 {
+        c[k] = (up(t[k].0), up(t[k].1));
+        k += 1;
+    }
+    c[7] = (up(t[7].0), up(t[9].1));
+    c[8] = (up(t[10].0), up(t[10].1));
+    c
+};
 
 /// The types a kind tells apart, bits of [`Kind::classes`].
 pub mod class {
@@ -64,7 +69,7 @@ impl Kind {
     /// Before any store: in the gap between threads and nil, which no value
     /// reaches.
     pub const NONE: Kind = Kind {
-        lo: 0xFFFF_0000,
+        lo: (TYPE_WORDS[6].1 >> 32) as u32 + 1,
         span: 0,
     };
     pub const ANY: Kind = Kind {

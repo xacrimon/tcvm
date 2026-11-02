@@ -97,8 +97,8 @@ pub(crate) const FN_IS_VARARG: usize =
 /// A native function's closure, from its function's payload.
 pub(crate) const FN_NATIVE: usize =
     offset_of!(crate::env::function::FunctionKind<'static>, Native.0);
-/// A function value's top 16 bits (`QNAN_NEG | TAG_FUNCTION << 48`).
-pub(crate) const FUNCTION_TAG: u16 = 0xFFF8 | 5;
+/// A function value's top 16 bits.
+pub(crate) const FUNCTION_TAG: u16 = (crate::env::value::FUNCTION_BITS >> 48) as u16;
 /// A Lua closure's prototype pointer (a `Gc`, so the box), and from that
 /// box the prototype's fast entry.
 pub(crate) const FN_PROTO: usize =
@@ -161,7 +161,7 @@ mod tests {
         lua.enter(|ctx| {
             let v: Value = ctx.fetch(&ex).take_result(ctx).unwrap();
             let t = v.get_table().unwrap();
-            let lock = (v.to_raw() & ((1 << 48) - 1)) as usize;
+            let lock = (v.to_raw() & crate::env::value::PAYLOAD_MASK) as usize;
             let word = |off: usize| unsafe { ((lock + off) as *const u64).read() };
             let shape = t.shape();
             assert_eq!(word(T_SHAPE), shape.as_word());
@@ -230,7 +230,7 @@ mod tests {
             let fun = |i: i32| {
                 let f = t.raw_get(Value::small(i));
                 assert_eq!((f.to_raw() >> 48) as u16, FUNCTION_TAG);
-                let p = (f.to_raw() & ((1 << 48) - 1)) as usize;
+                let p = (f.to_raw() & crate::env::value::PAYLOAD_MASK) as usize;
                 assert_eq!(p, Gc::as_ptr(f.get_function().unwrap().inner()) as usize);
                 p
             };
@@ -266,7 +266,7 @@ mod tests {
         let mut lua = Lua::new();
         lua.enter(|ctx| {
             let s = LuaString::new(ctx, b"hello, world");
-            let p = (Value::string(s).to_raw() & ((1 << 48) - 1)) as usize;
+            let p = (Value::string(s).to_raw() & crate::env::value::PAYLOAD_MASK) as usize;
             let len = unsafe { ((p + LuaString::LEN_OFFSET) as *const usize).read() };
             assert_eq!(len, 12);
         });
@@ -298,7 +298,7 @@ mod tests {
         lua.enter(|ctx| {
             let v: Value = ctx.fetch(&ex).take_result(ctx).unwrap();
             let t = v.get_table().unwrap();
-            let lock = (v.to_raw() & ((1 << 48) - 1)) as usize;
+            let lock = (v.to_raw() & crate::env::value::PAYLOAD_MASK) as usize;
             let rd = |a: usize| unsafe { (a as *const u64).read() } as usize;
             let rd32 = |a: usize| unsafe { (a as *const u32).read() } as usize;
             let shape = t.shape();
