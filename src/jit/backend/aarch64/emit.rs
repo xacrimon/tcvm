@@ -79,24 +79,47 @@ pub(crate) struct ExitOut {
     pub(crate) consts: Vec<u64>,
 }
 
-/// Each block's branch target and whether it is left out: a block that is
-/// only a `Jump` once allocated (an edge split for moves that needed none)
-/// is branched past, unless the chain is a loop.
-fn thread_jumps(l: &Lowered, out: &Output, labels: &[Label]) -> (Vec<Label>, Vec<bool>) {
+/// Where branches to each block go, whether it is left out, and where a
+/// resume block's other returns (`resume_based`) go when not into it.
+/// Branches go past a block that is only a `Jump` once allocated (an edge
+/// split for moves that needed none), unless the chain is a loop, and to
+/// the exit of one that is only a `Deopt`. A resume block that is only the
+/// `Resume` and a `Jump`, emitting nothing past its `BASE` fixup, has its
+/// slow and native returns go where the jump does.
+fn thread_jumps(
+    l: &Lowered,
+    out: &Output,
+    labels: &[Label],
+    exit_of: impl Fn(u32) -> Label,
+) -> (Vec<Label>, Vec<bool>, Vec<Option<Label>>) {
     let nb = l.vcode.blocks.len();
-    let bare: Vec<Option<usize>> = (0..nb)
+    // A block's `n` instructions that emit code, if it has no moves.
+    let only = |b: usize, n: usize| -> Option<Vec<usize>> {
+        if b == 0 {
+            return None;
+        }
+        let insts: Option<Vec<usize>> = out
+            .block_insts_and_edits(&l.vcode, regalloc2::Block::new(b))
+            .filter(|ie| !matches!(ie, regalloc2::InstOrEdit::Inst(i) if matches!(l.vcode.insts[i.index()], MInst::Elided)))
+            .map(|ie| match ie {
+                regalloc2::InstOrEdit::Inst(i) => Some(i.index()),
+                regalloc2::InstOrEdit::Edit(_) => None,
+            })
+            .collect();
+        insts.filter(|v| v.len() == n)
+    };
+    enum End {
+        Jump(usize),
+        Exit(u32),
+    }
+    let ends: Vec<Option<End>> = (0..nb)
         .map(|b| {
-            let blk = &l.vcode.blocks[b];
-            if b == 0 || blk.resume || blk.end - blk.start != 1 {
+            if l.vcode.blocks[b].resume {
                 return None;
             }
-            let mut it = out.block_insts_and_edits(&l.vcode, regalloc2::Block::new(b));
-            match (it.next(), it.next()) {
-                (Some(regalloc2::InstOrEdit::Inst(i)), None)
-                    if matches!(l.vcode.insts[i.index()], MInst::Jump) =>
-                {
-                    Some(l.vcode.succs(b)[0].index())
-                }
+            match l.vcode.insts[only(b, 1)?[0]] {
+                MInst::Jump => Some(End::Jump(l.vcode.succs(b)[0].index())),
+                MInst::Deopt { exit } => Some(End::Exit(exit)),
                 _ => None,
             }
         })
@@ -106,7 +129,7 @@ fn thread_jumps(l: &Lowered, out: &Output, labels: &[Label]) -> (Vec<Label>, Vec
     for b in 0..nb {
         let mut t = b;
         let mut n = 0;
-        while let Some(s) = bare[t] {
+        while let Some(End::Jump(s)) = ends[t] {
             t = s;
             n += 1;
             if n > nb {
@@ -114,10 +137,31 @@ fn thread_jumps(l: &Lowered, out: &Output, labels: &[Label]) -> (Vec<Label>, Vec
                 break;
             }
         }
-        dest[b] = labels[t];
-        skip[b] = t != b;
+        dest[b] = match ends[t] {
+            Some(End::Exit(exit)) => exit_of(exit),
+            _ => labels[t],
+        };
+        skip[b] = t != b || matches!(ends[b], Some(End::Exit(_)));
     }
-    (dest, skip)
+    let resume_to = (0..nb)
+        .map(|b| {
+            if !l.vcode.blocks[b].resume {
+                return None;
+            }
+            let i = only(b, 2)?;
+            let empty = matches!(
+                l.vcode.insts[i[0]],
+                MInst::Resume {
+                    wanted: 0,
+                    c: 1,
+                    ..
+                } | MInst::Resume { wanted: 1, .. }
+            );
+            (empty && matches!(l.vcode.insts[i[1]], MInst::Jump))
+                .then(|| dest[l.vcode.succs(b)[0].index()])
+        })
+        .collect();
+    (dest, skip, resume_to)
 }
 
 struct Em<'a> {
@@ -321,13 +365,23 @@ pub(crate) fn emit(
     let frame = (FRAME_SPILLS as u32 + 8 * out.num_spillslots as u32).next_multiple_of(16);
     let mut a = Asm::new();
     let labels: Vec<Label> = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
-    let (dest, skip) = thread_jumps(l, out, &labels);
     let exit_labels: Vec<Label> = (0..l.exits.len()).map(|_| a.new_label()).collect();
     let exit_region = a.new_label();
     let entry_fail = a.new_label();
+    let exit_of = |exit: u32| {
+        if exit == ENTRY_FAIL {
+            entry_fail
+        } else {
+            exit_labels[exit as usize]
+        }
+    };
+    let (dest, skip, resume_to) = thread_jumps(l, out, &labels, exit_of);
     let fast_resume = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
     let miss = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
-    let resume_based = (0..l.vcode.blocks.len()).map(|_| a.new_label()).collect();
+    // Bound in their block, but where its returns go elsewhere (`thread_jumps`).
+    let resume_based = (resume_to.iter())
+        .map(|t| t.unwrap_or_else(|| a.new_label()))
+        .collect();
     let region_word = a.new_label();
     let level_tail = a.new_label();
     let mut em = Em {
@@ -2245,7 +2299,10 @@ impl Em<'_> {
                 self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 * 8 + 32);
                 if matches!(self.v.insts.get(i + 1), Some(GuardLanding { .. })) {
                     self.pending_based = Some((block, hdr));
-                } else {
+                } else if !(self.v.succs(block).first())
+                    .is_some_and(|s| self.resume_based[block] == self.dest[s.index()])
+                {
+                    // Else `thread_jumps` sent its returns where it jumps.
                     self.a.bind(self.resume_based[block]);
                 }
                 match wanted {
