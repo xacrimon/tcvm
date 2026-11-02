@@ -236,7 +236,11 @@ fn back_edges_follow_loop_entries() {
         assert_eq!(target(back), header);
         let state = lf.proto.jit.get().unwrap();
         let mut st = state.borrow_mut(ctx.mutation());
-        let e = st.entries.remove(0);
+        // Under `TCVM_JIT_HOT_CALL=1` the function's entry comes first.
+        let k = (st.entries.iter())
+            .position(|e| e.original.op() == Op::LOOP)
+            .expect("the loop's entry");
+        let e = st.entries.remove(k);
         assert_eq!(&*e.back_edges, &[back as u32]);
         super::retire_entry(ctx, lf, &mut st, &e);
         drop(st);
