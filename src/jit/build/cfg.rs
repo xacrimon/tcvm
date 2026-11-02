@@ -427,9 +427,7 @@ impl Cfg {
         for pc in 1..=n {
             if leader[pc] || pc == n {
                 let id = blocks.len() as u32;
-                for p in start..pc {
-                    block_of[p] = id;
-                }
+                block_of[start..pc].fill(id);
                 blocks.push(BcBlock {
                     start: start as u32,
                     end: pc as u32,
@@ -486,12 +484,12 @@ impl Cfg {
             }
         }
         let mut live_in = vec![RegSet::EMPTY; n];
-        for b in 0..nb {
+        for block in &blocks {
             let mut cur = RegSet::EMPTY;
-            for &s in &blocks[b].succs {
+            for &s in &block.succs {
                 cur.union(&live_in_b[s as usize]);
             }
-            for pc in (blocks[b].start..blocks[b].end).rev() {
+            for pc in (block.start..block.end).rev() {
                 let ud = &uds[pc as usize];
                 cur.minus(&ud.defs);
                 cur.union(&ud.uses);

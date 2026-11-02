@@ -41,7 +41,7 @@ impl<'gc> Context<'gc> {
     #[inline(always)]
     pub(crate) unsafe fn from_state(state: *const State<'static>) -> Self {
         Context {
-            state: unsafe { &*(state as *const State<'gc>) },
+            state: unsafe { &*state.cast::<State<'gc>>() },
         }
     }
 

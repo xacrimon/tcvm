@@ -384,7 +384,7 @@ pub(crate) fn compile<'gc>(
         .map_err(|e| CompileError::Backend(format!("regalloc: {e:?}")))?;
     if opts.check {
         let mut checker = regalloc2::checker::Checker::new(&lowered.vcode, &env);
-        checker.prepare(&out);
+        checker.prepare(out);
         checker
             .run()
             .map_err(|e| CompileError::Backend(format!("regalloc checker: {e:?}")))?;
@@ -453,14 +453,14 @@ pub(crate) fn compile<'gc>(
     } else {
         Box::new([])
     };
-    let fired_at = config.deopt_all.then(|| fired.as_ptr() as usize);
+    let fired_at = config.deopt_all.then_some(fired.as_ptr() as usize);
     let fast = enterable.then_some(emit::FastEntry {
         max_stack: closure.proto.max_stack_size,
         num_params: closure.proto.num_params,
         proto: closure.proto.ptr.as_ptr() as u64,
     });
     let mut em =
-        emit::emit(&lowered, &out, helpers, fired_at, fast).map_err(CompileError::Backend)?;
+        emit::emit(&lowered, out, helpers, fired_at, fast).map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc

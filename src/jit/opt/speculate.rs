@@ -105,7 +105,7 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
     }
     // Each guard tests the value itself and exits with the frame of the
     // value's definition, which the replacements below must not touch.
-    let frames: Vec<(u32, ExitKind, Vec<(u8, Val)>, u32)> = cands
+    let frames: Vec<_> = cands
         .iter()
         .map(|c| match c.snap {
             Some(s) => (

@@ -149,8 +149,8 @@ pub(crate) fn prune_gc_checks(f: &mut Func<'_>) {
         .rpo
         .iter()
         .any(|&b| !in_loop[b.idx()] && allocates(f, b));
-    for b in 0..f.blocks.len() {
-        if keep[b] || f.blocks[b].cold {
+    for (b, &k) in keep.iter().enumerate() {
+        if k || f.blocks[b].cold {
             continue;
         }
         f.retain(Block(b as u32), |f, i| f.op(i) != Op::GcCheck);

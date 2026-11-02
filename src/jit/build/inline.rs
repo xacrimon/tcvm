@@ -310,10 +310,10 @@ fn inline_site(
         None => callee_of(b, pc, callee),
     };
     let (lf, proto, dynamic, made) = match known {
-        Callee::Const(f) | Callee::Same(f) => match f.as_lua() {
-            Some(lf) => (Some(lf), lf.proto, false, false),
-            None => return None,
-        },
+        Callee::Const(f) | Callee::Same(f) => {
+            let lf = f.as_lua()?;
+            (Some(lf), lf.proto, false, false)
+        }
         Callee::Proto(p, lf) if !in_region_place => (lf, p, true, false),
         Callee::Made(p) if !in_region_place => (None, p, true, true),
         Callee::Proto(..) | Callee::Made(_) | Callee::Unknown => return None,
@@ -339,18 +339,13 @@ fn inline_site(
             code
         }
     };
-    let Some(code) = code else {
-        return None;
-    };
+    let code = code?;
     let returns = code.returns.unwrap_or(u8::MAX);
     if multi && (code.tails || a as usize + returns as usize > b.nregs) {
         return None;
     }
     let top_args = if nb == 0 {
-        let Some(v) = top_args(b, pc, a, proto.num_params) else {
-            return None;
-        };
-        v
+        top_args(b, pc, a, proto.num_params)?
     } else {
         Vec::new()
     };

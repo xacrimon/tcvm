@@ -25,7 +25,7 @@ pub(crate) fn trust_results(f: &mut Func<'_>, own: Gc<'_, Prototype<'_>>) -> boo
         for &i in f.insts_of(b) {
             if let Op::Call { proto, c: 2, .. } = f.op(i)
                 && proto != NO_PROTO
-                && Gc::as_ptr(f.protos[proto as usize]) as usize == Gc::as_ptr(own) as usize
+                && std::ptr::addr_eq(Gc::as_ptr(f.protos[proto as usize]), Gc::as_ptr(own))
             {
                 sites.push(i);
             }

@@ -164,6 +164,8 @@ fn thread_jumps(
     (dest, skip, resume_to)
 }
 
+type OolPath<'a> = Box<dyn FnOnce(&mut Em<'a>) + 'a>;
+
 struct Em<'a> {
     a: Asm,
     v: &'a VCode<MInst>,
@@ -220,7 +222,7 @@ struct Em<'a> {
     /// Code out of the way of the fast paths, emitted after the blocks: a
     /// call's paths besides its fast one, so its callee returns into the
     /// resume block.
-    ool: Vec<Box<dyn FnOnce(&mut Em<'a>) + 'a>>,
+    ool: Vec<OolPath<'a>>,
 }
 
 /// A function region's fast entry: what `enter` would check of the callee.

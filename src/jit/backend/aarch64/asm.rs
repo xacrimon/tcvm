@@ -463,6 +463,7 @@ impl Asm {
         self.emit(sz.sf() | base | r(m) << 16 | r(n) << 5 | r(d));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rrr_shift(&mut self, base: u32, sz: Sz, d: Gpr, n: Gpr, m: Gpr, sh: Shift, amt: u32) {
         debug_assert!(amt < sz.bits());
         self.emit(sz.sf() | base | (sh as u32) << 22 | r(m) << 16 | amt << 10 | r(n) << 5 | r(d));
@@ -1482,7 +1483,7 @@ mod tests {
             0xD280_0000 => Some(imm << (hw * 16)),
             0x9280_0000 => Some(!(imm << (hw * 16))),
             0xF280_0000 => Some((x & !(0xffff << (hw * 16))) | imm << (hw * 16)),
-            _ if w & 0xff80_03e0 == 0xB200_03e0 => {
+            _ if w & 0xFF80_03E0 == 0xB200_03E0 => {
                 // orr x0, xzr, #imm: decode the logical immediate.
                 let n = (w >> 22) & 1;
                 let immr = (w >> 16) & 63;
