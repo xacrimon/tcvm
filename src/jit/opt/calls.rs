@@ -5,12 +5,15 @@
 //! from it again; constants, and pure computations of such values (raw
 //! pointers among them, which the collector does not see), are computed
 //! again after the resume. Later uses get whichever definition reaches them.
+//! A copy with all its uses in one later block goes there when no call
+//! comes between (`place_copies`).
 
 use crate::jit::FastMap;
 use crate::jit::ir::ops::{ExitTag, Mem, Op};
 use crate::jit::ir::types::Rep;
 use crate::jit::ir::verify::live_in;
 use crate::jit::ir::{Block, CfgInfo, Func, Inst, Val};
+use crate::jit::opt::natural_loops;
 
 pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
     f.boundaries = true;
@@ -22,13 +25,15 @@ pub(crate) fn call_boundaries(f: &mut Func<'_>) -> Result<(), String> {
     // Copies and repairing parameters by the value they stand for: equal to
     // it wherever both are defined.
     let mut origin: FastMap<Val, Val> = FastMap::default();
+    let mut made: Vec<Inst> = Vec::new();
     // A copy may make a value another call kept live across it instead.
     for _ in 0..16 {
-        if !boundaries_round(f, &mut origin)? {
+        if !boundaries_round(f, &mut origin, &mut made)? {
             // Repairs add a parameter wherever definitions might meet; most
             // join one value.
             crate::jit::build::remove_trivial_params(f);
             fold_constant_params(f);
+            place_copies(f, &made);
             return Ok(());
         }
     }
@@ -282,7 +287,11 @@ fn chain_eq(f: &Func<'_>, a: Val, b: Val) -> bool {
 
 /// Keep or copy what is live across each call, and give later uses the
 /// copies; whether anything changed.
-fn boundaries_round(f: &mut Func<'_>, origin: &mut FastMap<Val, Val>) -> Result<bool, String> {
+fn boundaries_round(
+    f: &mut Func<'_>,
+    origin: &mut FastMap<Val, Val>,
+    made: &mut Vec<Inst>,
+) -> Result<bool, String> {
     let cfg = f.cfg();
     let live = live_in(f, &cfg.rpo);
     // What the homes hold matters only where a call does not keep all.
@@ -312,6 +321,7 @@ fn boundaries_round(f: &mut Func<'_>, origin: &mut FastMap<Val, Val>) -> Result<
             kept: kept_across(f, &cfg, b),
             homes: contents.get(&b).map_or(&[][..], |h| &h[..]),
             origin: &mut *origin,
+            made: &mut *made,
             memo: FastMap::default(),
             // The copies go after the resume block's `Resume`.
             at: 1,
@@ -430,6 +440,101 @@ fn boundaries_round(f: &mut Func<'_>, origin: &mut FastMap<Val, Val>) -> Result<
     Ok(changed)
 }
 
+/// Move each pure copy whose uses, snapshot entries included, are all in one
+/// later block its resume block dominates to where that block starts, when
+/// no path between passes a call (nothing new is then live across one) and
+/// the block is in no loop the resume block is not.
+fn place_copies(f: &mut Func<'_>, made: &[Inst]) {
+    const NONE: u32 = u32::MAX;
+    const MANY: u32 = u32::MAX - 1;
+    let cfg = f.cfg();
+    let mut loops: Vec<Vec<Block>> = vec![Vec::new(); f.blocks.len()];
+    for (h, body) in natural_loops(f) {
+        for b in body {
+            if !loops[b.idx()].contains(&h) {
+                loops[b.idx()].push(h);
+            }
+        }
+    }
+    // Whether a block between `b` and `c` (reached from one, reaching the
+    // other, neither passing `b`) resumes from a call.
+    let call_between = |f: &Func<'_>, b: Block, c: Block| {
+        let mut fwd = vec![false; f.blocks.len()];
+        let mut work: Vec<Block> = f.succs(b).collect();
+        while let Some(x) = work.pop() {
+            if x != b && !fwd[x.idx()] {
+                fwd[x.idx()] = true;
+                if x != c {
+                    work.extend(f.succs(x));
+                }
+            }
+        }
+        let mut seen = vec![false; f.blocks.len()];
+        let mut work: Vec<Block> = cfg.preds(c).to_vec();
+        while let Some(x) = work.pop() {
+            if x == b || seen[x.idx()] {
+                continue;
+            }
+            seen[x.idx()] = true;
+            if fwd[x.idx()] && f.blocks[x.idx()].resume {
+                return true;
+            }
+            work.extend_from_slice(cfg.preds(x));
+        }
+        false
+    };
+    loop {
+        let mut used_in = vec![NONE; f.vals.len()];
+        for &b in &cfg.rpo {
+            for &i in f.insts_of(b) {
+                f.for_each_use(i, |v| {
+                    let u = &mut used_in[v.idx()];
+                    *u = match *u {
+                        NONE => b.0,
+                        x if x == b.0 => x,
+                        _ => MANY,
+                    };
+                });
+            }
+        }
+        let mut moves: Vec<(Inst, Block)> = Vec::new();
+        for &i in made {
+            let d = &f.insts[i.idx()];
+            let b = d.block;
+            if f.blocks[b.idx()].dead || !d.op.is_pure() || d.rn != 1 || !f.insts_of(b).contains(&i)
+            {
+                continue;
+            }
+            let u = used_in[f.result(i).idx()];
+            if u == NONE || u == MANY || u == b.0 {
+                continue;
+            }
+            let c = Block(u);
+            if !f.blocks[c.idx()].resume
+                && cfg.dominates(b, c)
+                && loops[c.idx()].iter().all(|h| loops[b.idx()].contains(h))
+                && !call_between(f, b, c)
+            {
+                moves.push((i, c));
+            }
+        }
+        if moves.is_empty() {
+            return;
+        }
+        let mut moved = vec![false; f.insts.len()];
+        for &(i, _) in &moves {
+            moved[i.idx()] = true;
+        }
+        for &b in &cfg.rpo {
+            f.retain(b, |_, i| !moved[i.idx()]);
+        }
+        // In reverse, so an operand moved with its use lands before it.
+        for &(i, c) in moves.iter().rev() {
+            f.insert(c, 0, i);
+        }
+    }
+}
+
 /// Name `v`, which no register holds after the call into `b`, in the call's
 /// snapshot as `KEPT`, so the collector traces its spill slot.
 fn keep_unnamed(f: &mut Func<'_>, cfg: &CfgInfo, b: Block, v: Val) -> Result<(), String> {
@@ -526,6 +631,8 @@ struct After<'a> {
     /// Values its home slots hold, by register.
     homes: &'a [(u8, Val)],
     origin: &'a mut FastMap<Val, Val>,
+    /// Every copy made, for `place_copies`.
+    made: &'a mut Vec<Inst>,
     /// Copies made so far.
     memo: FastMap<Val, Val>,
     /// Where the next copy goes.
@@ -536,6 +643,7 @@ impl After<'_> {
     fn insert(&mut self, f: &mut Func<'_>, i: Inst) {
         f.insert(self.b, self.at, i);
         self.at += 1;
+        self.made.push(i);
     }
 }
 
