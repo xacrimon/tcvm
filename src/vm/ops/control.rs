@@ -738,10 +738,15 @@ handler! {
         if unsafe { hdr.add(HDR + 1) }.cast_const() > thread!().stack_end {
             tail!(crate::vm::ops::meta::stage_grow)
         }
-        let (v, tm) = match pop_tbc(rt, thread!()) {
+        let ts = thread!();
+        let (v, tm) = match pop_tbc(rt, ts) {
             Ok(c) => c,
             Err(err) => throw!(err),
         };
+        // Compiled RETURNs and CLOSEs exit while the flag is set.
+        if !has_tbc_from(ts, ts.slot_index(base)) {
+            unsafe { frame::clear_flags(base, flag::HAS_TBC) };
+        }
         unsafe {
             frame::write_hdr(hdr, tm.to_raw(), crate::vm::abi::handler_bits(ret_close), base, pc);
             hdr.add(HDR).write(v);

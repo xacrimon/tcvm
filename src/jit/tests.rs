@@ -288,6 +288,53 @@ fn exhausted_code_memory_turns_the_jit_off() {
     });
 }
 
+/// A frame whose to-be-closed variables all closed runs its compiled CLOSEs
+/// and RETURN, which exit while `HAS_TBC` is set.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn closed_scopes_clear_has_tbc() {
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(
+                "local mt = {__close = function() end}
+                function f(n)
+                  do local x <close> = setmetatable({}, mt) end
+                  local s = 0
+                  for i = 1, n do
+                    local g = function() return i end
+                    s = s + g()
+                  end
+                  return s
+                end
+                return f(1000)",
+                Some("=t"),
+            )?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let r: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        assert_eq!(r.get_integer(), Some(500_500));
+        let f = ctx
+            .globals()
+            .raw_get(Value::string(LuaString::new(ctx, b"f")));
+        let lf = f.get_function().and_then(|f| f.as_lua()).unwrap();
+        let st = lf.proto.jit.get().expect("compiled").borrow();
+        assert!(!st.regions.is_empty());
+        // At most once each: `TCVM_JIT_DEOPT_ALL` takes every exit once.
+        let most = (st.regions.iter())
+            .flat_map(|r| r.exits.iter())
+            .filter(|e| e.tag == crate::jit::ir::ops::ExitTag::Unsupported)
+            .map(|e| e.count.get())
+            .max();
+        assert!(most.is_some_and(|n| n <= 1), "{most:?}");
+    });
+}
+
 /// A bounds check moved out of an inlined accessor into its caller's loop
 /// (E2) records its miss at the accessor's site: its exit names the
 /// accessor's prototype, the snapshot being the caller's.
