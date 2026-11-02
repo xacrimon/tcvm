@@ -48,10 +48,10 @@ pub(crate) enum Test {
     X { imm: Option<i64> },
     /// `fcmp` of two d registers: `[a, b]`.
     F64,
-    /// A `Val` in a type set: `[v]`.
-    Type(TypeSet),
-    /// A `Val` is nil or false: `[v]`.
-    Falsy,
+    /// A `Val` in a type set: `[v]`, then its `test_words` where `true`.
+    Type(TypeSet, bool),
+    /// A `Val` is nil or false: `[v]`, then nil's word where `true`.
+    Falsy(bool),
     /// A table's shape is the one at this address: `[t]`.
     Shape(u64),
     /// A table's shape is one of `Lowered::shape_sets[i]`: `[t]`.

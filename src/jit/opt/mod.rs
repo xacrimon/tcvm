@@ -15,6 +15,7 @@ pub(crate) mod sink;
 pub(crate) mod snaps;
 pub(crate) mod speculate;
 pub(crate) mod stable;
+pub(crate) mod words;
 
 use crate::jit::ir::ops::Op;
 use crate::jit::ir::{Block, CfgInfo, Func, Inst};

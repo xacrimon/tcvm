@@ -173,6 +173,7 @@ pub(crate) fn build_ir<'gc>(
     }) {
         times.timed("verify", || check(&f, "self calls"))?;
     }
+    times.timed("test words", || opt::words::place(&mut f));
     if let Err(e) = times.timed("calls", || opt::calls::call_boundaries(&mut f)) {
         return Err(CompileError::Verify(format!("{e}\n{}", f.print())));
     }

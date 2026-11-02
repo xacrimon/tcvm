@@ -695,6 +695,15 @@ impl<'gc> Func<'gc> {
         &self.vpool[d.a0 as usize..d.a0 as usize + d.an as usize]
     }
 
+    /// Give `inst` the operands `args`, however many it had.
+    pub(crate) fn set_args(&mut self, inst: Inst, args: &[Val]) {
+        let a0 = self.vpool.len() as u32;
+        self.vpool.extend_from_slice(args);
+        let d = &mut self.insts[inst.idx()];
+        d.a0 = a0;
+        d.an = args.len() as u16;
+    }
+
     #[inline]
     pub(crate) fn args_mut(&mut self, inst: Inst) -> &mut [Val] {
         let d = self.insts[inst.idx()];

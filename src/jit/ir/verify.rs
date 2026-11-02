@@ -320,5 +320,28 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
             ));
         }
     }
+    // A type test's other operands are its words (`opt::words`).
+    let tested = match op {
+        IsType(set) | Guard(set) => Some(set),
+        IsFalsy => Some(crate::jit::ir::types::TypeSet::FALSY),
+        ToF64 => Some(crate::jit::ir::types::TypeSet::FLOAT),
+        _ => None,
+    };
+    if let Some(set) = tested
+        && args.len() > 1
+    {
+        let words = crate::jit::backend::test_words(set);
+        let given = args[1..].iter().map(|&a| match f.def_op(a) {
+            Some(KI64(w)) => Some(w as u64),
+            _ => None,
+        });
+        if args.len() != 1 + words.len() || !given.eq(words.into_iter().map(Some)) {
+            return Err(format!(
+                "i{} ({}) has operands past its value that are not its words",
+                i.0,
+                op.name()
+            ));
+        }
+    }
     Ok(())
 }
