@@ -417,7 +417,7 @@ pub(crate) fn emit(
     let guards = em.a.new_label();
     em.a.bind(guards);
     for &(r, set) in &l.entry_tests {
-        em.reg_type_guard(Gpr(r), set, em.entry_fail);
+        em.type_fail(Gpr(r), set, em.entry_fail);
     }
     if l.prefix_guards {
         em.typed_entry = Some(em.labels[0]);
@@ -1281,6 +1281,15 @@ impl Em<'_> {
             self.a.sub(Sz::X, X16, v, X16);
             self.a.cmp_imm(Sz::X, X16, 2);
             Cond::Lo
+        } else if set == TypeSet::FALSE || set == TypeSet::TRUE {
+            let k = if set == TypeSet::FALSE {
+                FALSE
+            } else {
+                FALSE + 1
+            };
+            self.a.mov_imm(X16, k);
+            self.a.cmp(Sz::X, v, X16);
+            Cond::Eq
         } else if let Some(tag) = single_tag(set) {
             // The high 16 bits, sign extended, are `tag - 8`.
             self.a.asr_imm(Sz::X, X16, v, 48);
@@ -1293,67 +1302,31 @@ impl Em<'_> {
 
     /// Branch to `ok` when `v` is in `set`, falling through otherwise.
     fn type_branch(&mut self, v: Gpr, set: TypeSet, ok: Label) {
-        let mut rest = set;
-        let parts = [
-            TypeSet::SMALL,
-            TypeSet::FLOAT,
-            TypeSet::NIL,
-            TypeSet::BOOL,
-            TypeSet::BIGINT,
-            TypeSet::STR,
-            TypeSet::TAB,
-            TypeSet::FUN,
-            TypeSet::THR,
-            TypeSet::UDATA,
-        ];
-        for p in parts {
-            if rest.contains(p) {
-                let c = self.type_flags(v, p);
-                self.a.b_cond(c, ok);
-                rest.remove(p);
-            }
-        }
-        for p in [TypeSet::FALSE, TypeSet::TRUE] {
-            if rest.contains(p) {
-                self.a.mov_imm(
-                    X16,
-                    if p == TypeSet::FALSE {
-                        FALSE
-                    } else {
-                        FALSE + 1
-                    },
-                );
-                self.a.cmp(Sz::X, v, X16);
-                self.a.b_cond(Cond::Eq, ok);
-            }
+        for p in type_parts(set) {
+            let c = self.type_flags(v, p);
+            self.a.b_cond(c, ok);
         }
     }
 
-    /// Go to `fail` unless `v` is in `set`.
-    fn reg_type_guard(&mut self, v: Gpr, set: TypeSet, fail: Label) {
-        if !is_single_test(set) {
-            let ok = self.a.new_label();
-            self.type_branch(v, set, ok);
-            self.a.b(fail);
-            self.a.bind(ok);
-        } else {
-            let c = self.type_flags(v, set);
-            self.a.b_cond(c.invert(), fail);
+    /// Go to `fail` unless `v` is in `set`, falling through otherwise.
+    fn type_fail(&mut self, v: Gpr, set: TypeSet, fail: Label) {
+        let parts = type_parts(set);
+        let ok = self.a.new_label();
+        for (k, &p) in parts.iter().enumerate() {
+            let c = self.type_flags(v, p);
+            if k + 1 < parts.len() {
+                self.a.b_cond(c, ok);
+            } else {
+                self.a.b_cond(c.invert(), fail);
+            }
         }
+        self.a.bind(ok);
     }
 
     /// Exit unless instruction `i`'s operand 0 is in `set`.
     fn type_guard(&mut self, i: usize, set: TypeSet, exit: u32) {
-        let l = self.exit(exit);
-        if !is_single_test(set) {
-            let (v, ok) = (self.r(i, 0), self.a.new_label());
-            self.type_branch(v, set, ok);
-            self.a.b(l);
-            self.a.bind(ok);
-        } else {
-            let c = self.test(i, 0, Test::Type(set), Cond::Eq);
-            self.a.b_cond(c.invert(), l);
-        }
+        let (l, v) = (self.exit(exit), self.r(i, 0));
+        self.type_fail(v, set, l);
     }
 
     fn exit(&mut self, exit: u32) -> Label {
@@ -1716,10 +1689,7 @@ impl Em<'_> {
                 {
                     let v = self.r(i, 0);
                     if cond == Cond::Eq {
-                        let ok = self.a.new_label();
-                        self.type_branch(v, set, ok);
-                        self.a.b(l);
-                        self.a.bind(ok);
+                        self.type_fail(v, set, l);
                     } else {
                         self.type_branch(v, set, l);
                     }
@@ -2097,6 +2067,13 @@ impl Em<'_> {
                         (lf, lt)
                     };
                     let v = self.r(i, 0);
+                    if Some(yes) == next {
+                        match test {
+                            Test::Type(set) => self.type_fail(v, set, no),
+                            _ => self.a.cbz(Sz::W, v, no),
+                        }
+                        return Ok(());
+                    }
                     match test {
                         Test::Type(set) => self.type_branch(v, set, yes),
                         _ => self.a.cbnz(Sz::W, v, yes),
@@ -2535,7 +2512,38 @@ fn is_single_test(set: TypeSet) -> bool {
         || set == TypeSet::NIL
         || set == TypeSet::FALSY
         || set == TypeSet::BOOL
+        || set == TypeSet::FALSE
+        || set == TypeSet::TRUE
         || single_tag(set).is_some()
+}
+
+/// The single tests `set` takes, in order.
+fn type_parts(set: TypeSet) -> Vec<TypeSet> {
+    if is_single_test(set) {
+        return vec![set];
+    }
+    let mut rest = set;
+    let mut parts = Vec::new();
+    for p in [
+        TypeSet::SMALL,
+        TypeSet::FLOAT,
+        TypeSet::NIL,
+        TypeSet::BOOL,
+        TypeSet::BIGINT,
+        TypeSet::STR,
+        TypeSet::TAB,
+        TypeSet::FUN,
+        TypeSet::THR,
+        TypeSet::UDATA,
+        TypeSet::FALSE,
+        TypeSet::TRUE,
+    ] {
+        if rest.contains(p) {
+            parts.push(p);
+            rest.remove(p);
+        }
+    }
+    parts
 }
 
 #[allow(unused)]
