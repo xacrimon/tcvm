@@ -271,6 +271,9 @@ pub(crate) struct Func<'gc> {
     pub(crate) shape_sets: Vec<Vec<u32>>,
     pub(crate) entry: Block,
     pub(crate) meta: RegionMeta,
+    /// Instructions of inlined bodies that failed: dead, but still in
+    /// `insts`.
+    pub(crate) undone: usize,
     /// The `After` snapshot of a value's definition, where a definition
     /// guard (9.1) may exit: call results, loads after a call, upvalues.
     pub(crate) def_snaps: Vec<(Val, Snap)>,
@@ -372,6 +375,7 @@ impl<'gc> Func<'gc> {
             shape_sets: Vec::new(),
             entry: Block(0),
             meta,
+            undone: 0,
             def_snaps: Vec::new(),
             landings: Vec::new(),
             boundaries: false,
@@ -384,6 +388,12 @@ impl<'gc> Func<'gc> {
             stable_used: RefCell::new(Vec::new()),
             cfg: RefCell::new(None),
         }
+    }
+
+    /// The instructions built, less failed inlined bodies': what size limits
+    /// count.
+    pub(crate) fn built(&self) -> usize {
+        self.insts.len() - self.undone
     }
 
     // --- control flow ---------------------------------------------------------

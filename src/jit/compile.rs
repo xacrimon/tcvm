@@ -138,7 +138,7 @@ pub(crate) fn build_ir<'gc>(
     let mut f = b.build()?;
     // A function region's IR is what inlining the function costs (W3 §12).
     if !loop_entry {
-        closure.proto.ir_size.set(f.insts.len() as u32);
+        closure.proto.ir_size.set(f.built() as u32);
     }
     let check = |f: &Func<'gc>, stage: &str| -> Result<(), CompileError> {
         if opts.check {

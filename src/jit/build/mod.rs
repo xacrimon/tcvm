@@ -2105,7 +2105,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
                     self.seal(sb);
                 }
             }
-            if self.f.insts.len() > limit || self.inline.as_ref().is_some_and(|i| i.failed) {
+            if self.f.built() > limit || self.inline.as_ref().is_some_and(|i| i.failed) {
                 return Err(BuildError::TooLarge);
             }
         }

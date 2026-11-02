@@ -292,7 +292,7 @@ fn inline_site(
         return None;
     }
     let depth = b.inline.as_ref().map_or(0, |i| i.depth);
-    if depth >= MAX_DEPTH || b.f.insts.len() > MAX_INSTS {
+    if depth >= MAX_DEPTH || b.f.built() > MAX_INSTS {
         return None;
     }
     // A callee known by its prototype (several closures of it, or one this
@@ -490,11 +490,12 @@ fn inline_site(
         };
         let from = b.cur;
         let mut ib = Builder::new_inline(b, lf, proto, &code.cfg, inline);
-        let insts = ib.f.insts.len();
+        let insts = ib.f.built();
         let entry = ib.build_inline(&args, from, MAX_INSTS);
-        let grew = (ib.f.insts.len() - insts) as u32;
+        let grew = ib.f.built() - insts;
         let inline = ib.finish(b);
         let Some(entry) = entry else {
+            b.f.undone += grew;
             if !tail {
                 b.f.blocks[cont.idx()].dead = true;
             }
@@ -504,8 +505,9 @@ fn inline_site(
             return None;
         };
         // What its body came to, the plan's size of it from here on.
-        proto.ir_size.set(grew);
+        proto.ir_size.set(grew as u32);
         if inline.called && !sync && b.cfg.captured.iter().next().is_some() {
+            b.f.undone += grew;
             b.f.blocks[cont.idx()].dead = true;
             b.f.def_snaps.truncate(def_snaps);
             b.f.stable_used.borrow_mut().truncate(stable_used);
@@ -530,6 +532,7 @@ fn inline_site(
             }
         });
         if matches!(top, Some(None)) {
+            b.f.undone += grew;
             b.f.blocks[cont.idx()].dead = true;
             b.f.def_snaps.truncate(def_snaps);
             b.f.stable_used.borrow_mut().truncate(stable_used);
