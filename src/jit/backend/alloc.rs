@@ -219,11 +219,31 @@ pub(crate) struct CodeAllocator {
     inner: RefCell<Inner>,
 }
 
+/// Why `reserve` found no room.
+#[derive(Debug)]
+pub(crate) enum ReserveError {
+    /// More than one segment holds.
+    TooLarge,
+    /// No segment has room and no new one maps: none will.
+    Exhausted(io::Error),
+}
+
+impl std::fmt::Display for ReserveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReserveError::TooLarge => write!(f, "larger than a code segment"),
+            ReserveError::Exhausted(e) => write!(f, "code memory exhausted: {e}"),
+        }
+    }
+}
+
 struct Inner {
     segments: Vec<Segment>,
     primary: usize,
     /// Mapping failed once (no address in reach): refuse from then on.
     exhausted: bool,
+    /// Segments it may map (tests).
+    max_segments: usize,
 }
 
 impl CodeAllocator {
@@ -233,15 +253,21 @@ impl CodeAllocator {
                 segments: Vec::new(),
                 primary: usize::MAX,
                 exhausted: false,
+                max_segments: usize::MAX,
             }),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn limit_segments(&self, n: usize) {
+        self.inner.borrow_mut().max_segments = n;
+    }
+
     /// Room for `len` bytes, uninitialized.
-    pub(crate) fn reserve(&self, len: usize) -> io::Result<CodeBlock> {
+    pub(crate) fn reserve(&self, len: usize) -> Result<CodeBlock, ReserveError> {
         let units = len.max(1).div_ceil(UNIT);
         if units > DATA_UNITS {
-            return Err(io::Error::other("region too large for a code segment"));
+            return Err(ReserveError::TooLarge);
         }
         let mut inner = self.inner.borrow_mut();
         let (seg, start) = inner.reserve(units)?;
@@ -260,15 +286,22 @@ impl CodeAllocator {
 }
 
 impl Inner {
-    fn new_segment(&mut self) -> io::Result<usize> {
+    fn new_segment(&mut self) -> Result<usize, ReserveError> {
         if self.exhausted {
-            return Err(io::Error::other("code memory exhausted"));
+            return Err(ReserveError::Exhausted(io::Error::other(
+                "an earlier mapping failed",
+            )));
         }
-        let (rw, rx) = match map_dual(SEG_SIZE, (SEG_SIZE - 1) as u64) {
+        let mapped = if self.segments.len() < self.max_segments {
+            map_dual(SEG_SIZE, (SEG_SIZE - 1) as u64)
+        } else {
+            Err(io::Error::other("segment limit"))
+        };
+        let (rw, rx) = match mapped {
             Ok(p) => p,
             Err(e) => {
                 self.exhausted = true;
-                return Err(e);
+                return Err(ReserveError::Exhausted(e));
             }
         };
         // `block_start` masks executable addresses to their segment.
@@ -285,7 +318,7 @@ impl Inner {
         Ok(self.segments.len() - 1)
     }
 
-    fn reserve(&mut self, units: usize) -> io::Result<(usize, usize)> {
+    fn reserve(&mut self, units: usize) -> Result<(usize, usize), ReserveError> {
         if self.primary != usize::MAX
             && let Some(u) = self.segments[self.primary].header().find_free(units)
         {
@@ -314,7 +347,7 @@ impl Inner {
         let u = self.segments[i]
             .header()
             .find_free(units)
-            .ok_or_else(|| io::Error::other("region too large for a code segment"))?;
+            .ok_or(ReserveError::TooLarge)?;
         self.segments[i].header().mark(u, units);
         self.primary = i;
         Ok((i, u))

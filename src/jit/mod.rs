@@ -420,6 +420,10 @@ fn try_compile<'gc>(
                 let n = &ctx.jit().internal_errors;
                 n.set(n.get() + 1);
             }
+            if matches!(e, crate::jit::compile::CompileError::OutOfCode) {
+                ctx.jit().exhausted.set(true);
+                return None;
+            }
             let mut st = state.borrow_mut(mc);
             if !matches!(e, crate::jit::compile::CompileError::Useless) {
                 st.strikes += 1;
@@ -1078,7 +1082,8 @@ fn recompile<'gc>(
             e.seen.clone(),
         )
     };
-    let result = if budget_left && state.borrow().compiles < MAX_COMPILES {
+    let jit = ctx.jit();
+    let result = if budget_left && state.borrow().compiles < MAX_COMPILES && !jit.exhausted.get() {
         compile_caught(ctx, closure, at, frame, &seen).map_err(|e| {
             log(ctx, || {
                 format!(
@@ -1087,8 +1092,11 @@ fn recompile<'gc>(
                 )
             });
             if e.internal() {
-                let n = &ctx.jit().internal_errors;
+                let n = &jit.internal_errors;
                 n.set(n.get() + 1);
+            }
+            if matches!(e, crate::jit::compile::CompileError::OutOfCode) {
+                jit.exhausted.set(true);
             }
         })
     } else {

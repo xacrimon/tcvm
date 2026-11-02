@@ -245,6 +245,49 @@ fn back_edges_follow_loop_entries() {
     });
 }
 
+/// Running out of code memory turns the JIT off, rather than failing each
+/// later prototype's compile in turn.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn exhausted_code_memory_turns_the_jit_off() {
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    lua.enter(|ctx| ctx.jit().code_alloc().limit_segments(1));
+    let n = 400;
+    let mut src = String::new();
+    for k in 1..=n {
+        src += &format!(
+            "function f{k}(n) local s = 0 for i = 1, n do s = s + i * {k} end return s end\n"
+        );
+    }
+    src += &format!("local t = 0 for k = 1, {n} do t = t + _G['f' .. k](1000) end return t");
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(&src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let t: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        assert_eq!(t.get_integer(), Some(500_500 * n * (n + 1) / 2));
+        let jit = ctx.jit();
+        assert!(jit.exhausted.get());
+        assert_eq!(jit.internal_errors.get(), 0);
+        let entries = |k: i64| {
+            let f = ctx.globals().raw_get(Value::string(LuaString::new(
+                ctx,
+                format!("f{k}").as_bytes(),
+            )));
+            let lf = f.get_function().and_then(|f| f.as_lua()).unwrap();
+            lf.proto.jit.get().map_or(0, |s| s.borrow().entries.len())
+        };
+        assert!(entries(1) > 0);
+        assert_eq!(entries(n), 0);
+    });
+}
+
 /// A bounds check moved out of an inlined accessor into its caller's loop
 /// (E2) records its miss at the accessor's site: its exit names the
 /// accessor's prototype, the snapshot being the caller's.

@@ -235,18 +235,20 @@ impl JitRuntime {
     /// The trampoline that calls `helper` keeping the registers (A5), made
     /// on first use; `ret_float` for a helper returning in d0.
     #[cfg(target_arch = "aarch64")]
-    pub(crate) fn trampoline(&self, helper: usize, ret_float: bool) -> Result<usize, String> {
+    pub(crate) fn trampoline(
+        &self,
+        helper: usize,
+        ret_float: bool,
+    ) -> Result<usize, crate::jit::compile::CompileError> {
         if let Some(&(_, t)) = self.trampolines.borrow().iter().find(|(h, _)| *h == helper) {
             return Ok(t);
         }
         let (asm, frame) = crate::jit::backend::aarch64::emit::trampoline(helper, ret_float);
         let alloc = self.code_alloc();
-        let mut block = alloc
-            .reserve(asm.offset() + asm.pool_bytes() + 16)
-            .map_err(|e| format!("code memory: {e}"))?;
+        let mut block = alloc.reserve(asm.offset() + asm.pool_bytes() + 16)?;
         let words = asm
             .finish(block.rx() as usize)
-            .map_err(|e| format!("assembler: {e:?}"))?;
+            .map_err(|e| crate::jit::compile::CompileError::Backend(format!("assembler: {e:?}")))?;
         block.write(&words);
         block.describe_frame(frame);
         let t = block.rx() as usize;

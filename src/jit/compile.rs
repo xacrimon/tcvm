@@ -22,6 +22,8 @@ pub(crate) enum CompileError {
     Backend(String),
     /// No path does work before a deopt nothing widens (`opt::completes`).
     Useless,
+    /// Code memory ran out: the JIT turns off.
+    OutOfCode,
 }
 
 impl CompileError {
@@ -39,6 +41,7 @@ impl std::fmt::Display for CompileError {
             CompileError::Verify(s) => write!(f, "verifier: {s}"),
             CompileError::Backend(s) => write!(f, "backend: {s}"),
             CompileError::Useless => write!(f, "no path does work before a deopt"),
+            CompileError::OutOfCode => write!(f, "out of code memory"),
         }
     }
 }
@@ -47,6 +50,16 @@ impl From<CfgError> for CompileError {
     fn from(e: CfgError) -> Self {
         match e {
             CfgError::Irreducible => CompileError::Irreducible,
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl From<crate::jit::backend::alloc::ReserveError> for CompileError {
+    fn from(e: crate::jit::backend::alloc::ReserveError) -> Self {
+        match e {
+            crate::jit::backend::alloc::ReserveError::TooLarge => CompileError::TooLarge,
+            crate::jit::backend::alloc::ReserveError::Exhausted(_) => CompileError::OutOfCode,
         }
     }
 }
@@ -392,7 +405,7 @@ pub(crate) fn compile<'gc>(
     times.regalloc = t.elapsed().as_micros();
     let t = std::time::Instant::now();
     let jit = ctx.jit();
-    let tramp = |h: usize, f: bool| jit.trampoline(h, f).map_err(CompileError::Backend);
+    let tramp = |h: usize, f: bool| jit.trampoline(h, f);
     let mut trampolines: Vec<(usize, usize)> = Vec::new();
     for inst in &lowered.vcode.insts {
         let h = match inst {
@@ -463,9 +476,7 @@ pub(crate) fn compile<'gc>(
         emit::emit(&lowered, out, helpers, fired_at, fast).map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
     let alloc = ctx.jit().code_alloc();
-    let mut block = alloc
-        .reserve(size)
-        .map_err(|e| CompileError::Backend(format!("code memory: {e}")))?;
+    let mut block = alloc.reserve(size)?;
     let region_word = em.asm.label_offset(em.region_word);
     let start = block.rx();
     let entry = start.wrapping_add(em.asm.label_offset(em.entry));
