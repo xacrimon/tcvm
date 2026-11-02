@@ -626,13 +626,14 @@ fn body_tailcall(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
                 super::inline::inline_return(b, a, 1);
             }
         }
+        // The builtin runs only where the inline code gave up: cold.
         Emitted::Fallback(slow, f) => {
             if !b.terminated() {
                 b.flush();
                 super::inline::inline_return(b, a, 1);
             }
             b.switch_to(slow);
-            real(b, f);
+            cold(b, |b| real(b, f));
         }
         Emitted::No => {
             if !super::inline::try_inline(b, pc, insn, callee) {
@@ -1967,9 +1968,12 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
             b.flush();
             b.jump(join);
             b.switch_to(slow);
-            call(b, pc, insn, f);
-            b.flush();
-            b.jump(join);
+            // Only where the inline code gave up: cold.
+            cold(b, |b| {
+                call(b, pc, insn, f);
+                b.flush();
+                b.jump(join);
+            });
             enter_join(b, join);
             if let Some(to) = moved {
                 // After the call, which ran: its result in `R[A]`.

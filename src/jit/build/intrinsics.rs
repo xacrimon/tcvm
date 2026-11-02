@@ -664,8 +664,8 @@ fn emit_math<'gc>(
                 let x = b.as_i32(x);
                 abs_i32(b, x)
             } else {
-                // A float, a small integer, else the builtin where an exit
-                // saw a big integer; anything else exits, as for `sqrt`.
+                // A float, a small integer, a big integer where an exit saw
+                // one; anything else exits, as for `sqrt`.
                 let xv = b.boxed(x);
                 let join = b.new_block();
                 let is_float = b.ins(Op::IsType(TypeSet::FLOAT), &[xv]);
@@ -679,11 +679,19 @@ fn emit_math<'gc>(
                 let i = b.ins(Op::Unbox(Rep::I32), &[xv]);
                 let r = abs_i32(b, i);
                 arm_end(b, join, a, r);
-                if seen & fb::BIGINT != 0 {
-                    enter_join(b, join);
-                    return Emitted::Fallback(other, k);
-                }
                 b.switch_to(other);
+                if seen & fb::BIGINT != 0 {
+                    // Wrapping, as Lua's: `abs(math.mininteger)` is itself.
+                    let is_big = b.ins(Op::IsType(TypeSet::BIGINT), &[xv]);
+                    let rest = branch_arm(b, is_big);
+                    let x = b.as_i64(xv);
+                    let zero = b.ins(Op::KI64(0), &[]);
+                    let neg = b.ins(Op::LNeg, &[x]);
+                    let below = b.ins(Op::LCmp(Cc::Lt), &[x, zero]);
+                    let r = b.ins(Op::Select, &[below, neg, x]);
+                    arm_end(b, join, a, r);
+                    b.switch_to(rest);
+                }
                 b.deopt(ExitTag::Type);
                 enter_join(b, join);
                 return Emitted::Done;
