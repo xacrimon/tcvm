@@ -265,3 +265,17 @@ return table.concat(out, ' ')
 "#;
     assert_eq!(ok(src), "a b a b a b a b n1 n2 n3");
 }
+
+/// `global x = v` and `global function g` read and then write the name from
+/// two sites, each with its own slot (#309): a write's transition under a
+/// read quickened to `_INL` reached `unreachable_unchecked`.
+#[test]
+fn global_declarations_keep_their_own_slots() {
+    let src = r#"
+local out = {}
+for i = 1, 4 do global x = i; out[#out + 1] = x; x = nil end
+for i = 1, 4 do global function g() return i end; out[#out + 1] = g(); g = nil end
+return table.concat(out, ' ')
+"#;
+    assert_eq!(ok(src), "1 2 3 4 1 2 3 4");
+}
