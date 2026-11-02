@@ -216,6 +216,13 @@ impl Lua {
             .mutate_root(|_, root| root.jit.config.enabled = on && cfg!(target_arch = "aarch64"));
     }
 
+    /// Drop `TCVM_GC_STRESS`'s extra collections, for a test that counts
+    /// what one collection frees. A hook for tests.
+    #[doc(hidden)]
+    pub fn stop_gc_stress(&mut self) {
+        self.stress = None;
+    }
+
     /// How many compiles failed on a verifier or backend error rather than
     /// refusing the code. A hook for tests.
     #[doc(hidden)]

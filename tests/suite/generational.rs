@@ -11,6 +11,15 @@ fn run(src: &str) -> String {
     run_steps(&mut lua, src).0
 }
 
+/// [`run`] with only the collections `src` asks for: under
+/// `TCVM_GC_STRESS` others promote what the test means to stay young.
+fn run_exact(src: &str) -> String {
+    let mut lua = Lua::new();
+    lua.stop_gc_stress();
+    lua.load_all();
+    run_steps(&mut lua, src).0
+}
+
 #[test]
 fn old_table_keeps_young_values() {
     let src = r#"
@@ -81,7 +90,7 @@ w[2] = keep
 --minor
 return tostring(w[1] == nil) .. " " .. tostring(w[2] == keep)
 "#;
-    assert_eq!(run(src), "true true");
+    assert_eq!(run_exact(src), "true true");
 }
 
 #[test]
@@ -137,6 +146,7 @@ for i = 1, 20000 do local x = {i} end
 --full
 "#;
     let mut lua = Lua::new();
+    lua.stop_gc_stress();
     lua.load_all();
     let (_, live) = run_steps(&mut lua, src);
     let [(_, built), (young, minor), (_, full)] = live[..] else {
