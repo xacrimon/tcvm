@@ -1554,22 +1554,29 @@ impl Em<'_> {
                 self.a.cset(Sz::W, d, if le { Cond::Ls } else { Cond::Lo });
                 self.a.bind(done);
             }
-            ToF64 { exit } => {
+            // A float inline, a small integer out of line.
+            ToF64 { exit, kbox } => {
                 let (d, v) = (self.fr(i, 0), self.r(i, 1));
-                let done = self.a.new_label();
-                let not_small = self.a.new_label();
-                self.a.lsr_imm(Sz::X, X16, v, 32);
-                self.a.cmn_imm(Sz::W, X16, 1);
-                self.a.b_cond(Cond::Ne, not_small);
-                self.a.scvtf(Sz::W, d, v);
-                self.a.b(done);
-                self.a.bind(not_small);
-                self.a.mov_imm(X16, BOX);
-                self.a.cmp(Sz::X, v, X16);
-                let l = self.exit(exit);
-                self.a.b_cond(Cond::Hs, l);
+                if kbox {
+                    let k = self.r(i, 2);
+                    self.a.cmp(Sz::X, v, k);
+                } else {
+                    self.a.mov_imm(X16, BOX);
+                    self.a.cmp(Sz::X, v, X16);
+                }
+                let (small, done) = (self.a.new_label(), self.a.new_label());
+                self.a.b_cond(Cond::Hs, small);
                 self.a.fmov_from_gpr(d, v);
                 self.a.bind(done);
+                let l = self.exit(exit);
+                self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                    em.a.bind(small);
+                    em.a.lsr_imm(Sz::X, X16, v, 32);
+                    em.a.cmn_imm(Sz::W, X16, 1);
+                    em.a.b_cond(Cond::Ne, l);
+                    em.a.scvtf(Sz::W, d, v);
+                    em.a.b(done);
+                }));
             }
             BoxI32 => {
                 let (d, n) = (self.r(i, 0), self.r(i, 1));

@@ -238,6 +238,7 @@ pub(crate) fn lower<'gc>(
             .iter()
             .filter(|&&i| match f.op(i) {
                 Op::Guard(TypeSet::FLOAT) => f.insts[i.idx()].tag != ExitTag::Entry,
+                Op::ToF64 => true,
                 Op::Br => {
                     let c = f.args(i)[0];
                     lw.fused[c.idx()] && f.def_op(c) == Some(Op::IsType(TypeSet::FLOAT))
@@ -1470,8 +1471,12 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 );
             }
             Op::ToF64 => {
-                let ops = vec![self.def(res.unwrap()), self.use_(args[0])];
-                self.push_exit(i, |exit| MInst::ToF64 { exit }, ops, none);
+                let mut ops = vec![self.def(res.unwrap()), self.use_(args[0])];
+                let kbox = self.float_guards >= 2 || self.box_reg.is_some();
+                if kbox {
+                    ops.push(Operand::reg_use(self.box_reg()));
+                }
+                self.push_exit(i, |exit| MInst::ToF64 { exit, kbox }, ops, none);
             }
             Op::FAdd | Op::FSub | Op::FMul | Op::FDiv => {
                 let fop = match op {

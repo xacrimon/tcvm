@@ -169,10 +169,11 @@ pub(crate) enum MInst {
     StrCmp {
         le: bool,
     },
-    /// `[def d (float), use v, snap..]`: the f64 of a small integer or
-    /// float `Value`.
+    /// `[def d (float), use v, use BOX (with `kbox`), snap..]`: the f64 of
+    /// a small integer or float `Value`.
     ToF64 {
         exit: u32,
+        kbox: bool,
     },
     /// `[def d, use n]`: box an i32.
     BoxI32,
@@ -396,7 +397,7 @@ impl MInst {
             | LToI { exit }
             | FToIExact { exit }
             | LToFExact { exit }
-            | ToF64 { exit }
+            | ToF64 { exit, .. }
             | Guard { exit, .. }
             | GuardLanding { exit, .. }
             | GuardNoFlag { exit, .. }
