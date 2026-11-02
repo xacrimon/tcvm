@@ -1,6 +1,8 @@
 //! Chunk runners shared by the suite. Each loads every library and runs its
 //! source as the chunk `=c`.
 
+use std::path::{Path, PathBuf};
+
 use tcvm::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use tcvm::vm::async_native::Spawned;
 use tcvm::{Context, Executor, FromMultiValue, LoadError, Lua, RuntimeError, StashedExecutor};
@@ -157,4 +159,31 @@ pub fn run_steps(lua: &mut Lua, src: &str) -> (String, Vec<(usize, usize)>) {
         live.push((before, lua.live_bytes()));
     }
     (result, live)
+}
+
+/// An empty directory of this process's own, removed when dropped: the suite
+/// runs in several modes at once (`tmodes.sh`), each process with its files.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new(name: &str) -> Self {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        TempDir(dir)
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

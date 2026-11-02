@@ -1,7 +1,5 @@
 //! What a host sees from `Context::load` and `Context::load_file`.
 
-use std::path::PathBuf;
-
 use tcvm::{Executor, LoadError, Lua};
 
 fn load_err(src: &str) -> String {
@@ -36,9 +34,7 @@ fn compile_error_names_the_chunk() {
 
 #[test]
 fn load_file() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("host_load");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::common::TempDir::new("host_load");
     std::fs::write(
         dir.join("script.lua"),
         b"#!/usr/bin/env tcvm\nreturn true\n",

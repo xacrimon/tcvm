@@ -1,8 +1,6 @@
 //! String parameters accept numbers, converted as `luaL_checkstring` does.
 //! Expected strings come from `lua` 5.5.1 running the same chunk.
 
-use std::path::PathBuf;
-
 use crate::common::{err, ok};
 
 #[test]
@@ -42,9 +40,7 @@ fn os() {
 
 #[test]
 fn io() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("string_args");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::common::TempDir::new("string_args");
     std::fs::write(dir.join("12345"), "l1\nl2\n").unwrap();
     // `p(12345)` is `dir .. 12345`: a number concatenated onto the path.
     let in_dir = |src: &str| {
