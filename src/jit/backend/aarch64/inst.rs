@@ -83,6 +83,8 @@ pub(crate) enum MInst {
     /// `[def p0, def p1, ..]`, fixed in x0..: a function region's
     /// parameters, as every entry passes them (W4 §2). No code.
     Params,
+    /// No code: a constant nothing reads in a register.
+    Elided,
     /// `[def d]`, int.
     MovImm(u64),
     /// `[def d]`, float.
@@ -108,6 +110,11 @@ pub(crate) enum MInst {
     ShiftReg(Shift, Sz),
     /// `[def d, use n, use m]`: `umull` then `lsr` by the amount.
     UMulShr(u8),
+    /// `[def d, use n, use m, use a]`: `a + n * m`, or `a - n * m`.
+    MulAdd {
+        sub: bool,
+        sz: Sz,
+    },
     /// `[def d, use n]`: `neg` or `mvn`.
     Neg(Sz),
     Mvn(Sz),

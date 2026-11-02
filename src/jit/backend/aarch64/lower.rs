@@ -7,7 +7,7 @@ use regalloc2::{Block as RBlock, Operand, PRegSet, RegClass, VReg};
 
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, preg_int};
-use crate::jit::backend::aarch64::asm::{Asm, Cond, Shift, Sz};
+use crate::jit::backend::aarch64::asm::{Asm, Cond, Shift, Sz, logical_imm};
 use crate::jit::backend::aarch64::emit::is_single_test;
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
 use crate::jit::backend::vcode::VCode;
@@ -226,6 +226,7 @@ pub(crate) fn lower<'gc>(
     }
     let closure_at = closure_block(f, &cfg, order);
     lw.find_fusions(order);
+    lw.find_multiply_adds(order);
     lw.find_known_callees(order);
     lw.find_register_returns(order);
     // Float tests by block, then with those of the blocks entered from it
@@ -317,6 +318,16 @@ pub(crate) fn lower<'gc>(
         );
     }
     lw.v.entry = RBlock::new(0);
+    // Constants only immediates take are not made.
+    let read = lw.v.read_vregs();
+    for k in 0..lw.v.insts.len() {
+        if matches!(lw.v.insts[k], MInst::MovImm(_) | MInst::FImm(_))
+            && !read[lw.v.inst_operands_of(k)[0].vreg().vreg()]
+        {
+            lw.v.replace_bare(k, MInst::Elided);
+            lw.snap_ops[k] = 0;
+        }
+    }
     Ok(Lowered {
         vcode: lw.v,
         exits: lw.exits,
@@ -529,6 +540,48 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 }
             }
         }
+    }
+
+    /// Products a sum or difference in their block alone uses, which then
+    /// computes them with `madd` or `msub`.
+    fn find_multiply_adds(&mut self, order: &[Block]) {
+        let f = self.f;
+        for &b in order {
+            for &i in f.insts_of(b) {
+                let mul = match f.op(i) {
+                    Op::IAddNo | Op::ISubNo => Op::IMulNo,
+                    Op::LAdd | Op::LSub => Op::LMul,
+                    _ => continue,
+                };
+                let sub = matches!(f.op(i), Op::ISubNo | Op::LSub);
+                let args = f.args(i);
+                for (k, &a) in args.iter().enumerate().rev() {
+                    let other = args[1 - k];
+                    if (sub && k == 0) || self.imm12(other).is_some() || self.fused[a.idx()] {
+                        continue;
+                    }
+                    if let Some(d) = f.def_inst(a)
+                        && f.op(d) == mul
+                        && f.insts[d.idx()].block == b
+                        && self.uses[a.idx()] == 1
+                    {
+                        self.fused[a.idx()] = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The product a sum or difference computes with it, and its other operand.
+    fn fused_product(&self, args: &[Val]) -> Option<(Val, Val, Val)> {
+        let f = self.f;
+        (0..2).rev().find_map(|k| {
+            let a = args[k];
+            let d = f.def_inst(a)?;
+            (self.fused[a.idx()] && matches!(f.op(d), Op::IMulNo | Op::LMul))
+                .then(|| (f.args(d)[0], f.args(d)[1], args[1 - k]))
+        })
     }
 
     /// A return of one result passes it in x0 alone (W4 §4): its store to
@@ -1439,6 +1492,28 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let r = res.unwrap();
                 let d = self.def(r);
                 if matches!(alu, AluOp::Add | AluOp::Sub)
+                    && let Some((x, y, a)) = self.fused_product(&args)
+                {
+                    let (n, m, a) = (self.use_(x), self.use_(y), self.use_(a));
+                    let sub = alu == AluOp::Sub;
+                    self.push(MInst::MulAdd { sub, sz }, &[d, n, m, a], none);
+                    return Ok(());
+                }
+                let logical = matches!(alu, AluOp::And | AluOp::Orr | AluOp::Eor)
+                    .then(|| self.konst_int(args[1]))
+                    .flatten()
+                    .map(|k| {
+                        if sz == Sz::W {
+                            k as u32 as u64
+                        } else {
+                            k as u64
+                        }
+                    })
+                    .filter(|&k| logical_imm(k, sz.bits()).is_some());
+                if let Some(k) = logical {
+                    let n = self.use_(args[0]);
+                    self.push(MInst::AluImm(alu, sz, k), &[d, n], none);
+                } else if matches!(alu, AluOp::Add | AluOp::Sub)
                     && let Some(k) = self.imm12(args[1])
                 {
                     let (alu, k) = if k < 0 {

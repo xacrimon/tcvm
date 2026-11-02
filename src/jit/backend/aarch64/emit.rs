@@ -1400,7 +1400,7 @@ impl Em<'_> {
         use MInst::*;
         match inst {
             Prologue => self.open_frame(),
-            Params => {}
+            Params | Elided => {}
             MovImm(v) => {
                 let d = self.r(i, 0);
                 self.a.mov_imm(d, v);
@@ -1474,6 +1474,14 @@ impl Em<'_> {
                     Shift::Lsl => self.a.lslv(sz, d, n, m),
                     Shift::Lsr => self.a.lsrv(sz, d, n, m),
                     Shift::Asr => self.a.asrv(sz, d, n, m),
+                }
+            }
+            MulAdd { sub, sz } => {
+                let (d, n, m, a) = (self.r(i, 0), self.r(i, 1), self.r(i, 2), self.r(i, 3));
+                if sub {
+                    self.a.msub(sz, d, n, m, a);
+                } else {
+                    self.a.madd(sz, d, n, m, a);
                 }
             }
             UMulShr(k) => {
