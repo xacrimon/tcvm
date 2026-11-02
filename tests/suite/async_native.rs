@@ -282,21 +282,31 @@ fn waits_on_the_host_across_a_collection() {
     let ex = start(&mut lua, "return wait({41})[1] + 1");
     let waker = Waker::noop().clone();
     HOST.with(|h| h.0.set(false));
-    let pending = lua.enter(|ctx| {
-        matches!(
-            ctx.fetch(&ex).step_waker(ctx, &waker).unwrap(),
-            StepResult::Pending
-        )
-    });
-    assert!(pending);
+    let registered = || {
+        HOST.with(|h| {
+            let w = h.1.take();
+            h.1.set(w.clone());
+            w.is_some_and(|w| w.will_wake(&waker))
+        })
+    };
+    // Steps before the native's are the collector's (`TCVM_GC_STRESS`, a
+    // compiled region's collector exit).
+    for steps in 0.. {
+        if registered() {
+            break;
+        }
+        assert!(steps < 100, "the native never waited");
+        let pending = lua.enter(|ctx| {
+            matches!(
+                ctx.fetch(&ex).step_waker(ctx, &waker).unwrap(),
+                StepResult::Pending
+            )
+        });
+        assert!(pending);
+    }
     // The kept table survives a full collection while the native waits.
     lua.collect_all();
-    let registered = HOST.with(|h| {
-        let w = h.1.take();
-        h.1.set(w.clone());
-        w.is_some_and(|w| w.will_wake(&waker))
-    });
-    assert!(registered);
+    assert!(registered());
     HOST.with(|h| h.0.set(true));
     assert_eq!(lua.execute::<i64>(&ex).unwrap(), 42);
 }
