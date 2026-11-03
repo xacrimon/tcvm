@@ -175,7 +175,7 @@ fn any_f64(b: &mut Builder<'_, '_>, v: Val) -> Val {
     {
         return b.num_f64(v);
     }
-    let i = b.ins_exit(Op::ToF64, &[v], ExitTag::Type);
+    let i = b.ins_exit(Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT), &[v], ExitTag::Type);
     b.f.result(i)
 }
 
@@ -965,7 +965,7 @@ impl Operand {
             (Operand::Reg(v), NumKind::F64) => b.as_f64(v),
             (Operand::Reg(v), NumKind::Num) => {
                 let v = b.boxed(v);
-                let i = b.ins_exit(Op::ToF64, &[v], ExitTag::Type);
+                let i = b.ins_exit(Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT), &[v], ExitTag::Type);
                 b.f.result(i)
             }
             (Operand::Int(n), _) => b.kf64(n as f64),
@@ -1042,7 +1042,7 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
             let r = neg_int(b, i);
             arm_end(b, join, dst, r);
             enter_join(b, floats);
-            let f = b.ins_exit(Op::ToF64, &[x], ExitTag::Type);
+            let f = b.ins_exit(Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT), &[x], ExitTag::Type);
             let f = b.f.result(f);
             let r = b.ins(Op::FNeg, &[f]);
             arm_end(b, join, dst, r);
@@ -1695,7 +1695,7 @@ fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Blo
     let not_float = all_in(b, TypeSet::FLOAT, &[x]);
     let fx = b.ins(Op::Unbox(Rep::F64), &[x]);
     let other = all_in(b, TypeSet::SMALL | TypeSet::FLOAT, &[y]);
-    let fy = b.ins_exit(Op::ToF64, &[y], ExitTag::Type);
+    let fy = b.ins_exit(Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT), &[y], ExitTag::Type);
     let fy = b.f.result(fy);
     let c = b.ins(Op::FCmp(Cc::Eq), &[fx, fy]);
     b.br(c, yes, no);

@@ -187,6 +187,16 @@ pub(crate) extern "C" fn jit_len(rt: *const State<'static>, v: u64) -> u64 {
     Value::integer(ctx.mutation(), n as i64).to_raw()
 }
 
+/// The f64 of string `v` as Lua converts a numeric argument (`tonumber`'s
+/// rules), as bits; `HELPER_FAIL_VAL` (a NaN, which no conversion makes)
+/// when it is no number. Called through a trampoline (`ToF64`).
+pub(crate) extern "C" fn jit_str_to_f64(v: u64) -> u64 {
+    let v = unsafe { Value::from_raw(v) };
+    v.get_string()
+        .and_then(|s| crate::builtin::util::str_to_number(s.as_bytes()))
+        .map_or(HELPER_FAIL_VAL, |n| n.to_float().to_bits())
+}
+
 /// `a .. b` of strings and numbers, as `op_concat` builds it; fails past `MAX_LEN` too,
 /// for the interpreter to raise.
 pub(crate) extern "C" fn jit_concat(rt: *const State<'static>, a: u64, b: u64) -> u64 {

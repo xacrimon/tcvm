@@ -203,10 +203,12 @@ pub(crate) enum MInst {
         le: bool,
     },
     /// `[def d (float), use v, use BOX (with `kbox`), snap..]`: the f64 of
-    /// a small integer or float `Value`.
+    /// a `Value` of `kinds`, a float inline and the others out of line (a
+    /// string through `jit_str_to_f64`'s trampoline).
     ToF64 {
         exit: u32,
         kbox: bool,
+        kinds: TypeSet,
     },
     /// `[def d, use n]`: box an i32.
     BoxI32,

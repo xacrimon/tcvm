@@ -1837,28 +1837,76 @@ impl Em<'_> {
                 self.a.cset(Sz::W, d, if le { Cond::Ls } else { Cond::Lo });
                 self.a.bind(done);
             }
-            // A float inline, a small integer out of line.
-            ToF64 { exit, kbox } => {
+            // A float inline, the other kinds out of line.
+            ToF64 { exit, kbox, kinds } => {
                 let (d, v) = (self.fr(i, 0), self.r(i, 1));
-                if kbox {
+                let (other, done) = (self.a.new_label(), self.a.new_label());
+                if !kinds.contains(TypeSet::FLOAT) {
+                    self.a.b(other);
+                } else if kbox {
                     let k = self.r(i, 2);
                     self.a.cmp(Sz::X, v, k);
+                    self.a.b_cond(Cond::Hs, other);
+                    self.a.fmov_from_gpr(d, v);
                 } else {
                     self.a.mov_imm(X16, BOX);
                     self.a.cmp(Sz::X, v, X16);
+                    self.a.b_cond(Cond::Hs, other);
+                    self.a.fmov_from_gpr(d, v);
                 }
-                let (small, done) = (self.a.new_label(), self.a.new_label());
-                self.a.b_cond(Cond::Hs, small);
-                self.a.fmov_from_gpr(d, v);
                 self.a.bind(done);
                 let l = self.exit(exit);
+                let tramp = kinds.contains(TypeSet::STR).then(|| {
+                    let t = crate::jit::helpers::jit_str_to_f64 as *const () as usize;
+                    let t = self.helpers.trampolines.iter().find(|(h, _)| *h == t);
+                    t.expect("jit_str_to_f64's trampoline").1
+                });
                 self.ool.push(Box::new(move |em: &mut Em<'_>| {
-                    em.a.bind(small);
-                    em.a.lsr_imm(Sz::X, X16, v, 32);
-                    em.a.cmn_imm(Sz::W, X16, 1);
-                    em.a.b_cond(Cond::Ne, l);
-                    em.a.scvtf(Sz::W, d, v);
-                    em.a.b(done);
+                    em.a.bind(other);
+                    if kinds.contains(TypeSet::SMALL) {
+                        let next = em.a.new_label();
+                        em.a.lsr_imm(Sz::X, X16, v, 32);
+                        em.a.cmn_imm(Sz::W, X16, 1);
+                        em.a.b_cond(Cond::Ne, next);
+                        em.a.scvtf(Sz::W, d, v);
+                        em.a.b(done);
+                        em.a.bind(next);
+                    }
+                    // The tag, sign-extended: a big integer's is -6, a string's -5.
+                    if kinds.contains(TypeSet::BIGINT) {
+                        let next = em.a.new_label();
+                        em.a.asr_imm(Sz::X, X16, v, 48);
+                        em.a.cmn_imm(Sz::X, X16, 6);
+                        em.a.b_cond(Cond::Ne, next);
+                        em.a.and_imm(Sz::X, X16, v, PTR_MASK);
+                        em.a.ldr(X16, X16, 0);
+                        em.a.scvtf(Sz::X, d, X16);
+                        em.a.b(done);
+                        em.a.bind(next);
+                    }
+                    if let Some(t) = tramp {
+                        em.a.asr_imm(Sz::X, X16, v, 48);
+                        em.a.cmn_imm(Sz::X, X16, 5);
+                        em.a.b_cond(Cond::Ne, l);
+                        // The trampoline keeps every register but x0, its
+                        // result: the bits of the f64, or the failure
+                        // (`HELPER_FAIL_VAL`, a NaN no conversion makes).
+                        em.a.sub_imm(Sz::X, SP, SP, 16);
+                        em.a.str(Gpr(0), SP, 0);
+                        em.a.mov(Gpr(0), v);
+                        em.a.bl_far(t);
+                        em.a.mov(X16, Gpr(0));
+                        em.a.ldr(Gpr(0), SP, 0);
+                        em.a.add_imm(Sz::X, SP, SP, 16);
+                        let fail = crate::jit::ir::ops::HELPER_FAIL_VAL;
+                        em.a.movz(Sz::X, X17, (fail >> 48) as u16, 3);
+                        em.a.cmp(Sz::X, X16, X17);
+                        em.a.b_cond(Cond::Eq, l);
+                        em.a.fmov_from_gpr(d, X16);
+                        em.a.b(done);
+                    } else {
+                        em.a.b(l);
+                    }
                 }));
             }
             BoxI32 => {

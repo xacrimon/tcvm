@@ -628,8 +628,11 @@ pub(crate) enum Op {
     /// use is Lua's float-to-integer conversion (keys, bitwise operands,
     /// `floor`/`ceil`, loop limits).
     FToIExact,
-    /// The f64 of a `Val` small integer or float; exits otherwise.
-    ToF64,
+    /// The f64 of a `Val` of the kinds in the set, as Lua converts them: a
+    /// float inline, small and big integers and strings (`tonumber`'s
+    /// rules) in out-of-line arms; exits otherwise. Arithmetic does not
+    /// convert strings.
+    ToF64(TypeSet),
     /// The i64 of an f64 rounded toward zero, saturating; NaN gives 0.
     FToL,
 
@@ -927,7 +930,7 @@ impl Op {
             Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
             Guard(_) | GuardTrue | GuardFalse | GuardMiss | GuardSame | GuardProto(_) | IAdd
             | ISub | IMul | INeg | IShl | IShr | IDivFloor | IModFloor | LDivFloor | LModFloor
-            | LToI | LToFExact | FToIExact | ToF64 => Effects::flags(DEOPT),
+            | LToI | LToFExact | FToIExact | ToF64(_) => Effects::flags(DEOPT),
             GuardNoFlag(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) | GuardShapeIn(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
@@ -1071,7 +1074,7 @@ impl Op {
                 Ty::I32
             }
             IToF | LToF | LToFExact | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor
-            | FCeil | FIDiv | ToF64 => Ty::F64,
+            | FCeil | FIDiv | ToF64(_) => Ty::F64,
             IToL | FToL | StrLenOf | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor
             | LNot | LShl | LShr | LDivFloor | LModFloor | LAsr => Ty::I64,
             Helper(HelperId::ArithCoerce(ArithKind::Div | ArithKind::Pow)) => {

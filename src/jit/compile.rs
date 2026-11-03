@@ -428,19 +428,20 @@ pub(crate) fn compile<'gc>(
     let tramp = |h: usize, f: bool| jit.trampoline(h, f);
     let mut trampolines: Vec<(usize, usize)> = Vec::new();
     for inst in &lowered.vcode.insts {
-        let h = match inst {
-            crate::jit::backend::aarch64::inst::MInst::HelperCold(h) => Some(*h),
-            crate::jit::backend::aarch64::inst::MInst::FMod => {
-                Some(crate::jit::ir::ops::HelperId::FMod)
+        use crate::jit::backend::aarch64::inst::MInst;
+        let (a, float) = match inst {
+            MInst::HelperCold(h) => (
+                crate::jit::helpers::address(*h),
+                h.sig().ret == Some(crate::jit::ir::types::Rep::F64),
+            ),
+            MInst::FMod => (crate::jit::helpers::address(crate::jit::ir::ops::HelperId::FMod), true),
+            MInst::ToF64 { kinds, .. } if kinds.contains(crate::jit::ir::types::TypeSet::STR) => {
+                (crate::jit::helpers::jit_str_to_f64 as *const () as usize, false)
             }
-            _ => None,
+            _ => continue,
         };
-        if let Some(h) = h {
-            let a = crate::jit::helpers::address(h);
-            if !trampolines.iter().any(|&(x, _)| x == a) {
-                let float = h.sig().ret == Some(crate::jit::ir::types::Rep::F64);
-                trampolines.push((a, tramp(a, float)?));
-            }
+        if !trampolines.iter().any(|&(x, _)| x == a) {
+            trampolines.push((a, tramp(a, float)?));
         }
     }
     let helpers = emit::Helpers {

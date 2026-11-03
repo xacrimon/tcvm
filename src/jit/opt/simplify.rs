@@ -89,7 +89,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
-                Op::ToF64 => {
+                Op::ToF64(set) => {
                     let x = args[0];
                     if let Some(Op::Box) = f.def_op(x) {
                         let y = f.args(f.def_inst(x).unwrap())[0];
@@ -107,11 +107,21 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                                 changed = true;
                                 continue;
                             }
+                            Rep::I64 if set.contains(TypeSet::BIGINT) => {
+                                f.insts[i.idx()].op = Op::LToF;
+                                f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                                f.args_mut(i)[0] = y;
+                                changed = true;
+                                continue;
+                            }
                             _ => {}
                         }
                     }
                     if let Some(k) = konst_val(f, x)
-                        && let Some(n) = k.get_small().map(f64::from).or(k.get_float())
+                        && let Some(n) = k.get_small().map(f64::from).or(k.get_float()).or(k
+                            .get_integer()
+                            .filter(|_| set.contains(TypeSet::BIGINT))
+                            .map(|n| n as f64))
                     {
                         f.insts[i.idx()].op = Op::KF64(n.to_bits());
                         f.insts[i.idx()].an = 0;

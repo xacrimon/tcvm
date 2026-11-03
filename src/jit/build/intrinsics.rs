@@ -596,9 +596,14 @@ fn emit_math<'gc>(
 ) -> Emitted {
     let insn = b.code(pc);
     let iterators = matches!(intr, Intrinsic::Pairs | Intrinsic::Ipairs);
-    // An exit saw an argument the inline code does not take.
+    // An exit saw an argument the inline code of a builtin whose result
+    // type follows it does not take.
     let seen = b.feedback(pc) & fb::KINDS;
-    if !iterators && seen & !(fb::SMALL | fb::BIGINT | fb::FLOAT) != 0 {
+    let follows = matches!(
+        intr,
+        Intrinsic::Abs | Intrinsic::Floor | Intrinsic::Ceil | Intrinsic::FMod
+    );
+    if follows && seen & !(fb::SMALL | fb::BIGINT | fb::FLOAT) != 0 {
         return Emitted::No;
     }
     // A tail call or MULTRET wants all results; the iterators make up to
@@ -613,16 +618,6 @@ fn emit_math<'gc>(
         return Emitted::No;
     }
     let x = b.reg(a + 4);
-    // `log`'s base, taken as the constant it is; a varying one calls.
-    let base = if intr == Intrinsic::Log && nargs == 2 {
-        let v = b.reg(a + 5);
-        let Some(k) = const_f64(b, v) else {
-            return Emitted::No;
-        };
-        Some(k)
-    } else {
-        None
-    };
     if intr == Intrinsic::FMod {
         // Two integers take C's integer `%`, which stays with the builtin.
         let ty = b.ty(x);
@@ -663,41 +658,51 @@ fn emit_math<'gc>(
     }
     let r = match intr {
         Intrinsic::Sqrt => {
-            let x = number_f64(b, x, seen);
+            let x = float_arg(b, x);
             b.ins(Op::FSqrt, &[x])
         }
         Intrinsic::Unary(l) => {
-            let x = number_f64(b, x, seen);
+            let x = float_arg(b, x);
             b.ins(Op::Helper(HelperId::Libm(l)), &[x])
         }
         Intrinsic::Atan => {
-            let y = number_f64(b, x, seen);
+            let y = float_arg(b, x);
             let x = if nargs == 2 {
-                second_f64(b, pc, a)
+                let x = b.reg(a + 5);
+                float_arg(b, x)
             } else {
                 b.kf64(1.0)
             };
             b.ins(Op::Helper(HelperId::Libm(Libm::Atan2)), &[y, x])
         }
         Intrinsic::Log => {
-            let x = number_f64(b, x, seen);
-            let libm = |b: &mut Builder<'_, '_>, l| b.ins(Op::Helper(HelperId::Libm(l)), &[x]);
-            match base {
-                None => libm(b, Libm::Log),
-                Some(2.0) => libm(b, Libm::Log2),
-                Some(10.0) => libm(b, Libm::Log10),
-                // `log(base)` by the same libm the builtin calls.
-                Some(k) => {
-                    let ln = libm(b, Libm::Log);
-                    let d = b.kf64(k.ln());
-                    b.ins(Op::FDiv, &[ln, d])
+            let x = float_arg(b, x);
+            let libm = |b: &mut Builder<'_, '_>, l, x| b.ins(Op::Helper(HelperId::Libm(l)), &[x]);
+            if nargs == 1 {
+                libm(b, Libm::Log, x)
+            } else {
+                let base = b.reg(a + 5);
+                match const_f64(b, base) {
+                    Some(2.0) => libm(b, Libm::Log2, x),
+                    Some(10.0) => libm(b, Libm::Log10, x),
+                    // `log(base)` by the same libm the builtin calls.
+                    Some(k) => {
+                        let ln = libm(b, Libm::Log, x);
+                        let d = b.kf64(k.ln());
+                        b.ins(Op::FDiv, &[ln, d])
+                    }
+                    None => {
+                        log_arms(b, a, x, base);
+                        return Emitted::Done;
+                    }
                 }
             }
         }
         Intrinsic::FMod => {
             let g = b.guard(x, TypeSet::FLOAT);
             let x = b.as_f64(g);
-            let y = second_f64(b, pc, a);
+            let y = b.reg(a + 5);
+            let y = float_arg(b, y);
             b.ins(Op::Helper(HelperId::Libm(Libm::Fmod)), &[x, y])
         }
         Intrinsic::Floor | Intrinsic::Ceil => {
@@ -775,18 +780,59 @@ fn emit_math<'gc>(
     done(slow, k)
 }
 
-/// The second argument of the math CALL at `pc` as a float. Its kind is not
-/// the site's feedback (the first argument's): once the site exited on
-/// kinds, it leaves other numbers to the builtin without counting as a
-/// kind exit again.
-fn second_f64(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
-    let y = b.reg(a + 5);
-    let seen = if b.kind_exited(pc) {
-        fb::BIGINT | fb::FLOAT
-    } else {
-        0
+/// `R[a] = log(x, base)` of a base that varies, compared as the builtin
+/// does after converting it: 2 and 10 by their own functions, any other
+/// as `log(x) / log(base)`. The arms' floats join unboxed.
+fn log_arms(b: &mut Builder<'_, '_>, a: u8, x: Val, base: Val) {
+    let libm = |b: &mut Builder<'_, '_>, l, x| b.ins(Op::Helper(HelperId::Libm(l)), &[x]);
+    let rep = b.ty(base).rep;
+    let base = match rep {
+        Rep::I32 | Rep::I64 => base,
+        _ => float_arg(b, base),
     };
-    number_f64(b, y, seen)
+    let is = |b: &mut Builder<'_, '_>, n: i32| match rep {
+        Rep::I32 => {
+            let k = b.ki32(n);
+            b.ins(Op::ICmp(Cc::Eq), &[base, k])
+        }
+        Rep::I64 => {
+            let k = b.ins(Op::KI64(n as i64), &[]);
+            b.ins(Op::LCmp(Cc::Eq), &[base, k])
+        }
+        _ => {
+            let k = b.kf64(n as f64);
+            b.ins(Op::FCmp(Cc::Eq), &[base, k])
+        }
+    };
+    let join = b.new_block();
+    for (n, l) in [(2, Libm::Log2), (10, Libm::Log10)] {
+        let c = is(b, n);
+        let other = branch_arm(b, c);
+        let r = libm(b, l, x);
+        arm_end(b, join, a, r);
+        b.switch_to(other);
+    }
+    let ln = libm(b, Libm::Log, x);
+    let f = b.as_f64(base);
+    let lb = libm(b, Libm::Log, f);
+    let r = b.ins(Op::FDiv, &[ln, lb]);
+    arm_end(b, join, a, r);
+    enter_join(b, join);
+}
+
+/// The f64 of an argument of a builtin whose result is a float whatever it
+/// gets: converted by its representation, else in an arm per kind its type
+/// allows (strings by a call); only what the builtin raises on exits.
+fn float_arg(b: &mut Builder<'_, '_>, x: Val) -> Val {
+    let ty = b.ty(x);
+    if matches!(ty.rep, Rep::F64 | Rep::I32 | Rep::I64)
+        || (!ty.set.is_empty() && ty.within(TypeSet::SMALL | TypeSet::FLOAT))
+    {
+        return b.num_f64(x);
+    }
+    let xv = b.boxed(x);
+    let i = b.ins_exit(Op::ToF64(TypeSet::NUM | TypeSet::STR), &[xv], ExitTag::Slow);
+    b.f.result(i)
 }
 
 /// Go on where `cond` is `holds`, the returned block taking the other way.
@@ -840,6 +886,6 @@ fn number_f64(b: &mut Builder<'_, '_>, x: Val, seen: fb::Bits) -> Val {
     } else {
         ExitTag::Slow
     };
-    let i = b.ins_exit(Op::ToF64, &[xv], tag);
+    let i = b.ins_exit(Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT), &[xv], tag);
     b.f.result(i)
 }

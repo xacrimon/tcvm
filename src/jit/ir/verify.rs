@@ -285,7 +285,7 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
     let op = f.op(i);
     let args = f.args(i);
     let want: &[Rep] = match op {
-        Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | GuardProto(_) | ToF64 => &[Val],
+        Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | GuardProto(_) | ToF64(_) => &[Val],
         SameBits | GuardSame => &[Val, Val],
         GuardMiss => &[Val, B1],
         Helper(h) => h.sig().args,
@@ -329,7 +329,7 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
     let tested = match op {
         IsType(set) | Guard(set) => Some(set),
         IsFalsy => Some(crate::jit::ir::types::TypeSet::FALSY),
-        ToF64 => Some(crate::jit::ir::types::TypeSet::FLOAT),
+        ToF64(_) => Some(crate::jit::ir::types::TypeSet::FLOAT),
         _ => None,
     };
     if let Some(set) = tested

@@ -91,7 +91,7 @@ pub(crate) fn place(f: &mut Func<'_>) {
             let set = match f.op(i) {
                 Op::IsType(set) => set,
                 Op::IsFalsy => TypeSet::FALSY,
-                Op::ToF64 => TypeSet::FLOAT,
+                Op::ToF64(_) => TypeSet::FLOAT,
                 Op::Guard(set)
                     if f.insts[i.idx()].tag != ExitTag::Entry && !f.landings.contains(&i) =>
                 {

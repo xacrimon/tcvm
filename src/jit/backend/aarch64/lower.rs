@@ -1628,11 +1628,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     none,
                 );
             }
-            Op::ToF64 => {
+            Op::ToF64(set) => {
                 let mut ops = vec![self.def(res.unwrap())];
                 ops.extend(args.iter().map(|&a| self.use_(a)));
                 let kbox = args.len() > 1;
-                self.push_exit(i, |exit| MInst::ToF64 { exit, kbox }, ops, none);
+                // Arms only for the kinds the operand may have.
+                let t = f.ty(args[0]).set;
+                let kinds = if t.is_empty() { set } else { set & t };
+                self.push_exit(i, |exit| MInst::ToF64 { exit, kbox, kinds }, ops, none);
             }
             Op::FAdd | Op::FSub | Op::FMul | Op::FDiv => {
                 let fop = match op {
