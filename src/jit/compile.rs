@@ -492,8 +492,8 @@ pub(crate) fn compile<'gc>(
         num_params: closure.proto.num_params,
         proto: closure.proto.ptr.as_ptr() as u64,
     });
-    let mut em =
-        emit::emit(&lowered, out, helpers, fired_at, fast).map_err(CompileError::Backend)?;
+    let mut em = emit::emit(&lowered, out, helpers, fired_at, fast, config.dump.asm)
+        .map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc.reserve(size)?;
@@ -561,7 +561,25 @@ pub(crate) fn compile<'gc>(
         );
         let hot: Vec<String> = hot_at.iter().map(|(b, o)| format!("b{b}+{o:#x}")).collect();
         eprintln!("(hot blocks at {})", hot.join(" "));
-        dump_words(start as usize, &words);
+        // Each instruction's origin: its VCode instruction's kind.
+        let tags: Vec<(u32, String)> = (em.origins.iter())
+            .map(|&(at, o)| {
+                use emit::Origin;
+                let tag = match o {
+                    x if x == Origin::Move as u32 => "move".into(),
+                    x if x == Origin::Remat as u32 => "remat".into(),
+                    x if x == Origin::Entry as u32 => "entry".into(),
+                    x if x == Origin::OutOfLine as u32 => "out-of-line".into(),
+                    x if x == Origin::Stubs as u32 => "stubs".into(),
+                    i => {
+                        let d = format!("{:?}", lowered.vcode.insts[i as usize]);
+                        d.chars().take_while(|c| c.is_alphanumeric()).collect()
+                    }
+                };
+                (at, tag)
+            })
+            .collect();
+        dump_words(start as usize, &words, &tags);
     }
     times.emit = t.elapsed().as_micros();
     if config.time {
@@ -757,7 +775,15 @@ pub(crate) fn chunk_name(closure: LuaFn<'_>) -> String {
     )
 }
 
-fn dump_words(base: usize, words: &[u32]) {
+/// With each line tagged `@origin` after a `;` (`tags`: word index, origin,
+/// sorted).
+fn dump_words(base: usize, words: &[u32], tags: &[(u32, String)]) {
+    let tag = |line: &str| -> Option<&str> {
+        let off = line.trim_start().split(':').next()?;
+        let w = (usize::from_str_radix(off, 16).ok()? / 4) as u32;
+        let k = tags.partition_point(|t| t.0 <= w).checked_sub(1)?;
+        Some(&tags[k].1)
+    };
     // Through the system assembler: wrap the words in an object and disassemble it.
     let dir = std::env::temp_dir().join(format!("tcvm-jit-dump-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -786,7 +812,11 @@ fn dump_words(base: usize, words: &[u32]) {
         Some(o) if o.status.success() => {
             eprintln!("(offsets from {base:#x})");
             for line in String::from_utf8_lossy(&o.stdout).lines().skip(6) {
-                eprintln!("{line}");
+                match tag(line) {
+                    Some(t) if line.contains(';') => eprintln!("{line} @{t}"),
+                    Some(t) => eprintln!("{line}\t; @{t}"),
+                    None => eprintln!("{line}"),
+                }
             }
         }
         _ => {

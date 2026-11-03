@@ -57,6 +57,19 @@ pub(crate) struct Emitted {
     /// `blocks` and `cold`).
     pub(crate) hot: Vec<(u32, Label)>,
     pub(crate) cold: Label,
+    /// With `trace`: where each instruction's words start (word index) and
+    /// what it is, a VCode instruction's index or one of `Origin`'s.
+    pub(crate) origins: Vec<(u32, u32)>,
+}
+
+/// Code that is no VCode instruction, for `Emitted::origins`.
+#[repr(u32)]
+pub(crate) enum Origin {
+    Move = u32::MAX - 4,
+    Remat,
+    Entry,
+    OutOfLine,
+    Stubs,
 }
 
 /// A call of the region: its return addresses, whether each is a level's
@@ -427,7 +440,14 @@ pub(crate) fn emit(
     helpers: Helpers,
     fired: Option<usize>,
     fast: Option<FastEntry>,
+    trace: bool,
 ) -> Result<Emitted, String> {
+    let mut origins: Vec<(u32, u32)> = Vec::new();
+    let mut origin = |a: &Asm, o: u32| {
+        if trace {
+            origins.push(((a.offset() / 4) as u32, o));
+        }
+    };
     if out.num_spillslots > MAX_SPILLS {
         return Err(format!("{} spill slots", out.num_spillslots));
     }
@@ -486,6 +506,7 @@ pub(crate) fn emit(
         level_tail,
         ool: Vec::new(),
     };
+    origin(&em.a, Origin::Entry as u32);
     em.a.bind(em.region_word);
     em.a.emit(0);
     em.a.emit(0);
@@ -589,12 +610,19 @@ pub(crate) fn emit(
                         em.a.bind(em.resume_based[r]);
                     }
                     match *e {
-                        Edit::Move { from, to } => em.mov(from, to),
-                        Edit::Remat { to, vreg, src } => em.remat(to, vreg.vreg(), src),
+                        Edit::Move { from, to } => {
+                            origin(&em.a, Origin::Move as u32);
+                            em.mov(from, to)
+                        }
+                        Edit::Remat { to, vreg, src } => {
+                            origin(&em.a, Origin::Remat as u32);
+                            em.remat(to, vreg.vreg(), src)
+                        }
                     }
                 }
                 InstOrEdit::Inst(i) => {
                     let next = laid.get(at + 1).map(|&x| em.labels[x]);
+                    origin(&em.a, i.index() as u32);
                     em.inst(i.index(), b, next)?;
                 }
             }
@@ -603,9 +631,11 @@ pub(crate) fn emit(
     if !cold_bound {
         em.a.bind(cold);
     }
+    origin(&em.a, Origin::OutOfLine as u32);
     for f in std::mem::take(&mut em.ool) {
         f(&mut em);
     }
+    origin(&em.a, Origin::Stubs as u32);
     // Dispatch enters through `level_enter`, which returns to `level_land`.
     let dispatch = em.a.new_label();
     em.a.bind(dispatch);
@@ -752,6 +782,7 @@ pub(crate) fn emit(
         landings: em.landings,
         hot: hot_starts,
         cold,
+        origins,
     })
 }
 
