@@ -272,6 +272,22 @@ macro_rules! tfor_finish {
     }};
 }
 
+/// The generic FORLOOP before `pc` takes `form`, as its FORPREP would have
+/// written: one that ran in compiled code could not, and the loop would run
+/// generic, its feedback empty, never compiled (`emit`'s never-ran rule).
+#[inline(always)]
+fn take_form(pc: *const Instruction, form: Op) {
+    // SAFETY: `Code` keeps instructions in cells; the word may be a compiled
+    // entry's, which stays.
+    unsafe {
+        let site = pc.sub(1).cast_mut();
+        let word = *site;
+        if word.op() == Op::FORLOOP {
+            site.write(word.with_op(form));
+        }
+    }
+}
+
 /// Rewrite the FORLOOP a FORPREP at `pc - 1` guards (the instruction before
 /// its jump target) to `form` when it is not that already. Only on a
 /// change: a store to a word dispatch loads a few instructions later stalls
@@ -450,6 +466,7 @@ handler! {
         if let Some(s) = step.get_small()
             && let Some((last, idx)) = Value::both_small(&reg![a], &reg![a + 2])
         {
+            take_form(pc, Op::FORLOOP_I);
             // `idx` walks init, init+step, ..., last exactly, so `idx != last`
             // also guarantees `idx + step` stays in range.
             let go = idx != last;
@@ -461,6 +478,7 @@ handler! {
             }
             branch!(go, offset)
         } else if step.is_float() {
+            take_form(pc, Op::FORLOOP_F);
             let s = step.read_float();
             let lim = reg![a].read_float();
             let idx = reg![a + 2].read_float() + s;

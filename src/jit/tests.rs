@@ -126,10 +126,18 @@ fn builds_loop_entry_in_nest() {
                 .raw_get(Value::string(LuaString::new(ctx, b"mandel")));
             let lf = f.get_function().and_then(|f| f.as_lua()).unwrap();
             let code: Vec<_> = lf.proto.code.iter().collect();
+            // A compiled loop's word is its entry's.
+            let op = |i: &crate::instruction::Instruction| {
+                if i.is_jit_word() {
+                    super::original_of(lf, *i).generic_op()
+                } else {
+                    i.generic_op()
+                }
+            };
             let loops: Vec<u32> = code
                 .iter()
                 .enumerate()
-                .filter(|(_, i)| i.generic_op() == crate::instruction::Op::FORLOOP)
+                .filter(|(_, i)| op(i) == crate::instruction::Op::FORLOOP)
                 .map(|(pc, _)| pc as u32)
                 .collect();
             loops[0]
@@ -289,6 +297,60 @@ fn exhausted_code_memory_turns_the_jit_off() {
         };
         assert!(entries(1) > 0);
         assert_eq!(entries(n), 0);
+    });
+}
+
+/// A loop whose FORPREP ran in a region compiled for the loop before it
+/// takes the integer form when it runs, which that FORPREP could not write:
+/// a generic FORLOOP left no feedback, so every build saw a loop that never
+/// ran, and refused it.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn loops_entered_from_compiled_code_compile() {
+    use crate::instruction::Op;
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(
+                "function f(n)
+                  local t = {}
+                  for i = 1, n do t[i] = i end
+                  local s = 0
+                  for i = 1, n do s = s + t[i] end
+                  return s
+                end
+                local r = 0
+                for _ = 1, 3 do r = r + f(1000) end
+                return r",
+                Some("=t"),
+            )?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let r: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        assert_eq!(r.get_integer(), Some(3 * 500_500));
+        let f = ctx
+            .globals()
+            .raw_get(Value::string(LuaString::new(ctx, b"f")));
+        let lf = f.get_function().and_then(|f| f.as_lua()).unwrap();
+        let st = lf.proto.jit.get().expect("compiled").borrow();
+        assert!(st.refused.is_empty(), "refused {:?}", st.refused);
+        drop(st);
+        let forms: Vec<Op> = (lf.proto.code.iter())
+            .map(|w| {
+                if w.is_jit_word() {
+                    super::original_of(lf, w).op()
+                } else {
+                    w.op()
+                }
+            })
+            .filter(|op| matches!(op, Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F))
+            .collect();
+        assert_eq!(forms, [Op::FORLOOP_I, Op::FORLOOP_I]);
     });
 }
 
