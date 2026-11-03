@@ -2,9 +2,10 @@
 //! so a value live across it stays in the region's frame, and must then be
 //! one the call-site snapshot names: the collector traces those spill slots
 //! while the call runs. A value one of the call's home slots holds is loaded
-//! from it again; constants, and pure computations of such values (raw
-//! pointers among them, which the collector does not see), are computed
-//! again after the resume. Later uses get whichever definition reaches them.
+//! from it again; pure computations of such values (raw pointers among
+//! them, which the collector does not see) are computed again after the
+//! resume. Constants stay live (the allocator makes them where used). Later
+//! uses get whichever definition reaches them.
 //! A copy with all its uses in one later block goes there when no call
 //! comes between (`place_copies`).
 
@@ -380,7 +381,7 @@ fn boundaries_round(
         };
         for v in live[b.idx()].iter().collect::<Vec<_>>() {
             let v = Val(v as u32);
-            if cx.kept.contains(&same_reg(f, v)) {
+            if cx.kept.contains(&same_reg(f, v)) || is_const(f, v) {
                 continue;
             }
             let c = match remat(f, v, &mut cx) {
@@ -703,6 +704,9 @@ impl After<'_> {
 fn remat(f: &mut Func<'_>, v: Val, cx: &mut After<'_>) -> Option<Val> {
     if let Some(&c) = cx.memo.get(&v) {
         return Some(c);
+    }
+    if is_const(f, v) {
+        return Some(v);
     }
     if cx.kept.contains(&same_reg(f, v)) {
         return Some(v);
