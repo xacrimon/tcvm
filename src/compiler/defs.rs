@@ -373,7 +373,7 @@ impl<'gc> Chunk<'gc> {
         // Hot counters round-robin over the chunk's counting instructions.
         for instr in &mut self.tape {
             match instr.op() {
-                Op::FUNC | Op::LOOP | Op::JMP_BACK => instr.set_a(next_hot(hot)),
+                Op::FUNC | Op::JMP_BACK => instr.set_a(next_hot(hot)),
                 Op::FORLOOP | Op::TFORLOOP => instr.set_b(next_hot(hot)),
                 _ => {}
             }

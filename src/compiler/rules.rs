@@ -4522,7 +4522,7 @@ fn compile_branch_cond_false(ctx: &mut Ctx, cond_expr: Expr) -> Result<JumpList,
 fn compile_while(ctx: &mut Ctx, item: While) -> Result<(), CompileError> {
     scope_lexical_break(ctx, |ctx| {
         // The back edge counts and skips the `LOOP`, the entry's patch site.
-        ctx.emit(Instruction::loop_(0));
+        ctx.emit(Instruction::loop_());
         let loop_start = ctx.new_label();
         ctx.set_label(loop_start, ctx.next_offset());
 
@@ -4568,38 +4568,38 @@ fn compile_repeat(ctx: &mut Ctx, item: Repeat) -> Result<(), CompileError> {
         // locals defined in the body. So we wrap the body AND condition
         // in the same lexical scope.
         scope_lexical(ctx, |ctx| {
-            let loop_start_off = ctx.next_offset();
-            ctx.emit(Instruction::loop_(0));
+            // The back edge counts and skips the `LOOP`, the entry's patch site.
+            ctx.emit(Instruction::loop_());
+            let body = ctx.new_label();
+            ctx.set_label(body, ctx.next_offset());
 
-            // Compile body
             let stmts: Vec<_> = item.block().map(|b| b.collect()).unwrap_or_default();
             for stmt in stmts {
                 compile_stmt(ctx, stmt)?;
             }
 
-            // Compile condition — jumps from false_list (condition falsy)
-            // get patched back to the loop start. Truthy fall-through exits
-            // the loop.
+            // Truthy jumps out; falsy falls through to the back edge. A truthy
+            // constant falls out with no back edge at all.
             let cond_expr = item.cond().ok_or_else(|| ice("repeat without condition"))?;
-            let false_list = compile_branch_cond_false(ctx, cond_expr)?;
-            let depth = ctx.scope_marks.len() - 1;
-            match ctx.close_reg_from(depth) {
-                None => ctx.patch_to(false_list, loop_start_off),
-                // The condition can see the body's locals, so the back-edge
-                // must CLOSE after evaluating it; the truthy exit skips this
-                // and falls out through the scope-exit CLOSE.
-                Some(reg) => {
-                    let exit = ctx.new_label();
-                    let loop_start = ctx.new_label();
-                    ctx.set_label(loop_start, loop_start_off);
-                    ctx.emit_jump(exit);
-                    ctx.patch_to_here(false_list);
-                    ctx.emit(Instruction::close(reg));
-                    ctx.emit_jump(loop_start);
-                    ctx.set_label(exit, ctx.next_offset());
-                }
+            let mut desc = compile_expr(ctx, cond_expr, None)?;
+            if matches!(
+                desc.kind,
+                ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(true)
+            ) {
+                return Ok(());
             }
-
+            ctx.goiffalse(&mut desc)?;
+            let falsy = mem::take(&mut desc.false_list);
+            ctx.patch_to_here(falsy);
+            // The condition can see the body's locals, so the back edge
+            // CLOSEs after evaluating it; the truthy exit skips this and falls
+            // out through the scope-exit CLOSE.
+            let depth = ctx.scope_marks.len() - 1;
+            if let Some(reg) = ctx.close_reg_from(depth) {
+                ctx.emit(Instruction::close(reg));
+            }
+            ctx.emit_jump_instr(body, Instruction::jmp_back(0, Offset(0)));
+            ctx.patch_to_here(desc.true_list);
             Ok(())
         })
     })
@@ -4847,7 +4847,7 @@ fn compile_for_gen(ctx: &mut Ctx, item: ForGen) -> Result<(), CompileError> {
         ctx.emit_jump_instr(loop_test, Instruction::tforprep(base, Offset(0)));
 
         // Only an entry's back edge reaches the `LOOP`: TFORLOOP's skips it.
-        ctx.emit(Instruction::loop_(0));
+        ctx.emit(Instruction::loop_());
         ctx.set_label(loop_body, ctx.next_offset());
 
         // Loop variables live in the body scope (see `compile_for_num`).

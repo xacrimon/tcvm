@@ -1201,15 +1201,16 @@ instructions! {
     // `while`, `repeat` and generic `for` loop: the words a compiled entry
     // overwrites with `JIT_ENTRY`/`JIT_LOOP`, whose `entry` indexes the
     // runtime's entry table. Each counting site has a hot counter `hot`:
-    // calls count the callee's `FUNC` at the call, a `repeat` loop its
-    // `LOOP`; `while` and generic `for` loops count at their back edge
-    // (`JMP_BACK`, `TFORLOOP`'s `b`), which jumps past the `LOOP` until an
-    // entry is installed there; numeric loops count in their `FORLOOP` (`b`)
-    // and are overwritten there, as is the `JMP_BACK` of a backward `goto`
-    // (its loop's latch, as LuaJIT's `BC_LOOP` at the `goto`).
+    // calls count the callee's `FUNC` at the call; loops count iterations
+    // at their back edge, never entries: `while` and `repeat` loops at a
+    // `JMP_BACK`, generic `for` at `TFORLOOP`'s `b`, both jumping past the
+    // `LOOP` until an entry is installed there; numeric loops in their
+    // `FORLOOP` (`b`), overwritten there, as is the `JMP_BACK` of a
+    // backward `goto` (its loop's latch, as LuaJIT's `BC_LOOP` at the
+    // `goto`).
 
     0xcc FUNC         func        A      { hot: u8 }
-    0xcd LOOP         loop_       A      { hot: u8 }
+    0xcd LOOP         loop_       Nil    { }
     0xce JIT_ENTRY    jit_entry   Ad     { hot: u8, entry: u16 }
     0xcf JIT_LOOP     jit_loop    Ad     { hot: u8, entry: u16 }
     0xd0 JMP_BACK     jmp_back    AImm   { hot: u8, offset: Offset }
