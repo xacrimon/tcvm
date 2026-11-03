@@ -616,7 +616,13 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     | Op::IsFalsy
                     | Op::SameBits
                     | Op::ShapeIs(_)
-                    | Op::ShapeIn(_) => true,
+                    | Op::ShapeIn(_)
+                    | Op::HasFlag(_)
+                    | Op::NumMtSet
+                    | Op::TypeMtIs { .. }
+                    | Op::FnFixedLua
+                    | Op::FnFits
+                    | Op::TabHasRoom(_) => true,
                     // A select takes flags: no test that branches.
                     Op::IsType(set) => op != Op::Select || is_single_test(set),
                     _ => false,
@@ -720,6 +726,12 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 args,
             ),
             Op::ShapeIn(k) => (Test::ShapeIn(k), Cond::Eq, args),
+            Op::HasFlag(mask) => (Test::HasFlag(mask), Cond::Ne, args),
+            Op::NumMtSet => (Test::NumMtSet, Cond::Ne, args),
+            Op::TypeMtIs { slot, word } => (Test::TypeMtIs { slot, word }, Cond::Eq, args),
+            Op::FnFixedLua => (Test::FnFixedLua, Cond::Eq, args),
+            Op::FnFits => (Test::FnFits, Cond::Ls, args),
+            Op::TabHasRoom(loc) => (Test::TabHasRoom(loc), Cond::Hi, args),
             op => panic!("test_of {op:?}"),
         }
     }
@@ -1150,17 +1162,20 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::GuardNoFlag(mask) => {
                 self.push_exit(i, |exit| MInst::GuardNoFlag { mask, exit }, vec![], none)
             }
-            Op::HasFlag(mask) => {
-                let d = self.def(res.unwrap());
-                self.push(MInst::HasFlag(mask), &[d], none);
-            }
-            Op::NumMtSet => {
-                let d = self.def(res.unwrap());
-                self.push(MInst::NumMtSet, &[d], none);
-            }
-            Op::TypeMtIs { slot, word } => {
-                let d = self.def(res.unwrap());
-                self.push(MInst::TypeMtIs { slot, word }, &[d], none);
+            // Tests whose flags a branch did not take: a boolean.
+            Op::HasFlag(_)
+            | Op::NumMtSet
+            | Op::TypeMtIs { .. }
+            | Op::FnFixedLua
+            | Op::FnFits
+            | Op::TabHasRoom(_) => {
+                let r = res.unwrap();
+                let (test, cond, targs) = self.test_of(r);
+                let mut ops = vec![self.def(r)];
+                for a in targs {
+                    ops.push(self.use_(a));
+                }
+                self.push(MInst::Set { test, cond }, &ops, none);
             }
             Op::ClassMm(k) => {
                 let (d, t) = (self.def(res.unwrap()), self.use_(args[0]));
@@ -1174,15 +1189,6 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     MInst::StrLenOf
                 };
                 self.push(m, &[d, t], none);
-            }
-            Op::FnFixedLua | Op::FnFits => {
-                let (d, p) = (self.def(res.unwrap()), self.use_(args[0]));
-                let m = if op == Op::FnFits {
-                    MInst::FnFits
-                } else {
-                    MInst::FnFixedLua
-                };
-                self.push(m, &[d, p], none);
             }
             Op::UpvalCell(k) => {
                 let d = self.def(res.unwrap());
@@ -1226,14 +1232,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 };
                 self.push(m, &[d], none);
             }
-            Op::TabLoad { loc, .. } | Op::TabHasRoom(loc) => {
+            Op::TabLoad { loc, .. } => {
                 let (d, t) = (self.def(res.unwrap()), self.use_(args[0]));
-                let m = if matches!(op, Op::TabLoad { .. }) {
-                    MInst::TabLoad(loc)
-                } else {
-                    MInst::TabHasRoom(loc)
-                };
-                self.push(m, &[d, t], none);
+                self.push(MInst::TabLoad(loc), &[d, t], none);
             }
             Op::TabStore { loc, .. } => {
                 let (t, v) = (self.use_(args[0]), self.use_(args[1]));

@@ -1490,6 +1490,55 @@ impl Em<'_> {
                 self.a.tst_imm(Sz::W, x, 1 << b);
                 cond
             }
+            Test::HasFlag(mask) => {
+                self.a.ldr(X16, BASE, -24);
+                self.a.tst_imm(Sz::X, X16, mask as u64);
+                cond
+            }
+            Test::NumMtSet => {
+                self.a.ldr_lit(
+                    X16,
+                    self.helpers.type_mt_cells[layout::NUMBER_MT_SLOT as usize],
+                );
+                self.a.ldr(X16, X16, layout::NUMBER_MT as i32);
+                self.a.cmp_imm(Sz::X, X16, 0);
+                cond
+            }
+            Test::TypeMtIs { slot, word } => {
+                self.a
+                    .ldr_lit(X16, self.helpers.type_mt_cells[slot as usize]);
+                self.a.ldr(X16, X16, layout::NUMBER_MT as i32);
+                self.a.ldr_lit(X17, word);
+                self.a.cmp(Sz::X, X16, X17);
+                cond
+            }
+            // A native function has the niche value of `is_vararg` there.
+            Test::FnFixedLua => {
+                let f = self.r(i, k);
+                self.a.ldrb(X16, f, layout::FN_IS_VARARG as i32);
+                self.a.cmp_imm(Sz::W, X16, 0);
+                cond
+            }
+            Test::FnFits => {
+                let f = self.r(i, k);
+                self.a.ldrb(X16, f, layout::FN_MAX_STACK as i32);
+                self.a.add_shift(Sz::X, X16, BASE, X16, Shift::Lsl, 3);
+                self.a.ldr(X17, THREAD, layout::THREAD_STACK_END as i32);
+                self.a.cmp(Sz::X, X16, X17);
+                cond
+            }
+            Test::TabHasRoom(loc) => {
+                let t = self.r(i, k);
+                let slot = SlotLoc::from_raw(loc).offset() / 8;
+                self.a.ldr_w(X16, t, layout::T_SPILL_CAP as i32);
+                if slot < 4096 {
+                    self.a.cmp_imm(Sz::W, X16, slot as u64);
+                } else {
+                    self.a.mov_imm(X17, slot as u64);
+                    self.a.cmp(Sz::W, X16, X17);
+                }
+                cond
+            }
             Test::Shape(word) => {
                 let t = self.r(i, k);
                 self.a.ldr(X16, t, layout::T_SHAPE as i32);
@@ -1956,31 +2005,6 @@ impl Em<'_> {
                 let l = self.exit(exit);
                 self.a.b_cond(Cond::Ne, l);
             }
-            HasFlag(mask) => {
-                let d = self.r(i, 0);
-                self.a.ldr(X16, BASE, -24);
-                self.a.tst_imm(Sz::X, X16, mask as u64);
-                self.a.cset(Sz::W, d, Cond::Ne);
-            }
-            NumMtSet => {
-                let d = self.r(i, 0);
-                self.a.ldr_lit(
-                    X16,
-                    self.helpers.type_mt_cells[layout::NUMBER_MT_SLOT as usize],
-                );
-                self.a.ldr(X16, X16, layout::NUMBER_MT as i32);
-                self.a.cmp_imm(Sz::X, X16, 0);
-                self.a.cset(Sz::W, d, Cond::Ne);
-            }
-            TypeMtIs { slot, word } => {
-                let d = self.r(i, 0);
-                self.a
-                    .ldr_lit(X16, self.helpers.type_mt_cells[slot as usize]);
-                self.a.ldr(X16, X16, layout::NUMBER_MT as i32);
-                self.a.ldr_lit(X17, word);
-                self.a.cmp(Sz::X, X16, X17);
-                self.a.cset(Sz::W, d, Cond::Eq);
-            }
             ClassMm(k) => {
                 // Shape, class, the class's other metamethods: each may be
                 // missing (null), and then so is the metamethod.
@@ -2019,21 +2043,6 @@ impl Em<'_> {
                 self.a.bind(none);
                 self.a.movz(Sz::W, d, 0, 0);
                 self.a.bind(done);
-            }
-            FnFixedLua => {
-                // A native function has the niche value of `is_vararg` there.
-                let (d, f) = (self.r(i, 0), self.r(i, 1));
-                self.a.ldrb(X16, f, layout::FN_IS_VARARG as i32);
-                self.a.cmp_imm(Sz::W, X16, 0);
-                self.a.cset(Sz::W, d, Cond::Eq);
-            }
-            FnFits => {
-                let (d, f) = (self.r(i, 0), self.r(i, 1));
-                self.a.ldrb(X16, f, layout::FN_MAX_STACK as i32);
-                self.a.add_shift(Sz::X, X16, BASE, X16, Shift::Lsl, 3);
-                self.a.ldr(X17, THREAD, layout::THREAD_STACK_END as i32);
-                self.a.cmp(Sz::X, X16, X17);
-                self.a.cset(Sz::W, d, Cond::Ls);
             }
             LoadCell => {
                 let (d, c) = (self.r(i, 0), self.r(i, 1));
@@ -2103,14 +2112,6 @@ impl Em<'_> {
                 } else {
                     self.a.str(v, t, loc.offset() as i32);
                 }
-            }
-            TabHasRoom(loc) => {
-                let (d, t) = (self.r(i, 0), self.r(i, 1));
-                let slot = SlotLoc::from_raw(loc).offset() / 8;
-                self.a.ldr_w(X16, t, layout::T_SPILL_CAP as i32);
-                self.a.mov_imm(X17, slot as u64);
-                self.a.cmp(Sz::W, X16, X17);
-                self.a.cset(Sz::W, d, Cond::Hi);
             }
             TabSetShape(shape) => {
                 let t = self.r(i, 0);

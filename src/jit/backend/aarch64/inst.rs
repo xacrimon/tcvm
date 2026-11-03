@@ -60,6 +60,18 @@ pub(crate) enum Test {
     B1,
     /// Bit `k` of a w register is set (`Ne`) or clear (`Eq`): `[x]`.
     Bit(u8),
+    /// The frame's header has the flag (`Ne`): `[]`.
+    HasFlag(u8),
+    /// Numbers have a metatable (`Ne`): `[]`.
+    NumMtSet,
+    /// A type's metatable is the one with that word (`Eq`): `[]`.
+    TypeMtIs { slot: u8, word: u64 },
+    /// The function is a Lua closure without varargs (`Eq`): `[f]`.
+    FnFixedLua,
+    /// The Lua closure's window fits from `base` (`Ls`): `[f]`.
+    FnFits,
+    /// The table's spill cell has room for the spilled `loc` (`Hi`): `[t]`.
+    TabHasRoom(u32),
 }
 
 /// A call's callee, known at compile time.
@@ -238,25 +250,12 @@ pub(crate) enum MInst {
         mask: u8,
         exit: u32,
     },
-    /// `[def d]`: whether the frame's header has the flag.
-    HasFlag(u8),
-    /// `[def d]`: whether numbers have a metatable.
-    NumMtSet,
-    /// `[def d]`: whether a type's metatable is the one with that word.
-    TypeMtIs {
-        slot: u8,
-        word: u64,
-    },
     /// `[def d, use t]`: the metamethod of a bit index from the table's class.
     ClassMm(u8),
     /// `[def d, use t]`: the class bits of the table, 0 without a class.
     TabMmBits,
     /// `[def d, use s]`: a string's length.
     StrLenOf,
-    /// `[def d, use f]`: whether the function is a Lua closure without varargs.
-    FnFixedLua,
-    /// `[def d, use f]`: whether the Lua closure's window fits from `base`.
-    FnFits,
     /// `[def d, use c]`: the value of an upvalue cell.
     LoadCell,
     /// `[use c, use v]`: store into an upvalue cell.
@@ -285,8 +284,6 @@ pub(crate) enum MInst {
     /// `[def d, use t]` / `[use t, use v]`: a named slot.
     TabLoad(u32),
     TabStore(u32),
-    /// `[def d, use t]`: the spill cell has room for the spilled `loc`.
-    TabHasRoom(u32),
     /// `[use t]`: move the table to `shape`.
     TabSetShape(u64),
     /// `[def d, use t]`.
