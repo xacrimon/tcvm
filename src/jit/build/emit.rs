@@ -11,7 +11,7 @@ use crate::jit::build::cfg::RegSet;
 use crate::jit::build::intrinsics::Emitted;
 use crate::jit::build::{Builder, Top, intrinsics, iter, tables};
 use crate::jit::feedback as fb;
-use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, NO_PROTO, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Libm, NO_PROTO, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
 use crate::vm::frame::flag;
@@ -1234,7 +1234,7 @@ fn float_arith(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val, r: Oper
         Pow => match r.konst(b) {
             Some(0.0) => b.kf64(1.0),
             Some(1.0) => x,
-            _ => b.ins(Op::Helper(HelperId::FPow), &[x, y]),
+            _ => b.ins(Op::Helper(HelperId::Libm(Libm::Pow)), &[x, y]),
         },
         _ => unreachable!("{kind:?} on floats"),
     }

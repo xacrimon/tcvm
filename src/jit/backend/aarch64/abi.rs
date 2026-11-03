@@ -135,8 +135,8 @@ pub(crate) fn image_index(p: PReg) -> u8 {
     }
 }
 
-/// An island (`alloc::branch_target`): a far code range's branch on to
-/// `target` in the text, through a register free at the target's entry,
+/// An island (`alloc::branch_target`): a branch on to `target` out of the
+/// code range's reach, through a register free at the target's entry,
 /// which the caller's `b`/`bl` left everything else for.
 pub(crate) fn island(target: usize) -> [u32; 4] {
     // x16 is free at entry to Rust code (IP0); the stubs taking arguments

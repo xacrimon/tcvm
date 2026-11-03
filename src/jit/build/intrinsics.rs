@@ -13,7 +13,7 @@ use crate::jit::build::emit::{arm_end, branch_arm, enter_join};
 use crate::jit::feedback as fb;
 use crate::jit::ir::Block;
 use crate::jit::ir::Val;
-use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
+use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Libm, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::vm::abi::Handler;
 use crate::vm::ff;
@@ -629,8 +629,8 @@ fn emit_math<'gc>(
             let x = number_f64(b, x, seen);
             match intr {
                 Intrinsic::Sqrt => b.ins(Op::FSqrt, &[x]),
-                Intrinsic::Sin => b.ins(Op::Helper(HelperId::Sin), &[x]),
-                _ => b.ins(Op::Helper(HelperId::Cos), &[x]),
+                Intrinsic::Sin => b.ins(Op::Helper(HelperId::Libm(Libm::Sin)), &[x]),
+                _ => b.ins(Op::Helper(HelperId::Libm(Libm::Cos)), &[x]),
             }
         }
         Intrinsic::Floor | Intrinsic::Ceil => {

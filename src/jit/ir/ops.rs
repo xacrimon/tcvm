@@ -61,16 +61,28 @@ impl Cc {
     }
 }
 
+/// The libm functions regions call. Their NaNs are the hardware default or an operand's,
+/// both plain floats in a `Value`, so results need no canonicalizing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Libm {
+    Sin,
+    Cos,
+    Pow,
+}
+
+impl Libm {
+    pub(crate) fn binary(self) -> bool {
+        matches!(self, Libm::Pow)
+    }
+}
+
 /// Rust routines a region calls with the C ABI (`jit::helpers`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum HelperId {
     /// `(f64, f64) -> f64`: Lua's float `%`.
     FMod,
-    /// `(f64, f64) -> f64`: `pow`.
-    FPow,
-    /// `f64 -> f64`.
-    Sin,
-    Cos,
+    /// A libm function, called directly.
+    Libm(Libm),
     /// `(Val, Val) -> Val`: the arithmetic of numbers and numeric strings, for
     /// the slow arm of a site that saw them, or `HELPER_FAIL_VAL` (anything
     /// else, a zero integer divisor).
@@ -214,9 +226,7 @@ impl HelperId {
     pub(crate) fn name(self) -> String {
         match self {
             HelperId::FMod => "fmod".into(),
-            HelperId::FPow => "pow".into(),
-            HelperId::Sin => "sin".into(),
-            HelperId::Cos => "cos".into(),
+            HelperId::Libm(f) => format!("{f:?}").to_lowercase(),
             HelperId::ArithCoerce(k) => format!("arith_coerce.{k:?}").to_lowercase(),
             HelperId::Unm => "unm".into(),
             HelperId::BNot => "bnot".into(),
@@ -261,8 +271,11 @@ impl HelperId {
         let table_store = Effects::new(ALLOC, table_write, table_write);
         let e = Effects::new;
         let (ctx, imm, args, ret, effects): (_, _, &'static [Rep], _, _) = match self {
-            HelperId::FMod | HelperId::FPow => (&[][..], None, &[F64, F64], Some(F64), pure),
-            HelperId::Sin | HelperId::Cos => (&[][..], None, &[F64], Some(F64), pure),
+            HelperId::FMod => (&[][..], None, &[F64, F64], Some(F64), pure),
+            HelperId::Libm(f) => {
+                let args: &[Rep] = if f.binary() { &[F64, F64] } else { &[F64] };
+                (&[][..], None, args, Some(F64), pure)
+            }
             // Integers out of i32 are boxed.
             HelperId::ArithCoerce(k) => (
                 RT,

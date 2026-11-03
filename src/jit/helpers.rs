@@ -13,7 +13,7 @@ use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::ArithKind;
 use crate::instruction::TFOR_VARS;
-use crate::jit::ir::ops::{HELPER_FAIL_VAL, HelperId};
+use crate::jit::ir::ops::{HELPER_FAIL_VAL, HelperId, Libm};
 use crate::lua::{Context, State};
 use crate::vm::frame::{self, NativeHdr, land_results};
 use crate::vm::native::{caught, continued, invoke, ok, set_wait, tag};
@@ -27,9 +27,7 @@ use crate::vm::ops::meta::{
 pub(crate) fn address(h: HelperId) -> usize {
     match h {
         HelperId::FMod => jit_fmod as *const () as usize,
-        HelperId::FPow => jit_pow as *const () as usize,
-        HelperId::Sin => jit_sin as *const () as usize,
-        HelperId::Cos => jit_cos as *const () as usize,
+        HelperId::Libm(f) => libm_address(f),
         HelperId::ArithCoerce(_) => jit_arith as *const () as usize,
         HelperId::Unm => jit_unm as *const () as usize,
         HelperId::BNot => jit_bnot as *const () as usize,
@@ -87,16 +85,18 @@ pub(crate) extern "C" fn jit_fmod(a: f64, b: f64) -> f64 {
     canonical(<num::Mod as ArithOp>::float_raw(a, b))
 }
 
-pub(crate) extern "C" fn jit_pow(a: f64, b: f64) -> f64 {
-    canonical(<num::Pow as ArithOp>::float_raw(a, b))
+unsafe extern "C" {
+    safe fn sin(x: f64) -> f64;
+    safe fn cos(x: f64) -> f64;
+    safe fn pow(x: f64, y: f64) -> f64;
 }
 
-pub(crate) extern "C" fn jit_sin(x: f64) -> f64 {
-    canonical(x.sin())
-}
-
-pub(crate) extern "C" fn jit_cos(x: f64) -> f64 {
-    canonical(x.cos())
+fn libm_address(f: Libm) -> usize {
+    match f {
+        Libm::Sin => sin as *const () as usize,
+        Libm::Cos => cos as *const () as usize,
+        Libm::Pow => pow as *const () as usize,
+    }
 }
 
 /// `arith_slow`'s numeric cases; everything it would raise or hand to a

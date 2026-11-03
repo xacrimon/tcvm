@@ -10,16 +10,15 @@
 //! Every segment's executable alias is a slot of the process's one code
 //! range (`Range`), shared by every `Lua`: code reaches other code with
 //! `b`/`bl` wherever the range is, and the text too when the range is near
-//! it; a far range branches to the text through islands (`branch_target`).
+//! it; a far range branches to the text, and every range to shared
+//! libraries (libm), through islands (`branch_target`).
 
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::ptr::NonNull;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::jit::backend::code::{
-    in_reach, map_in, reserve as reserve_space, sync_icache, unmap_out,
-};
+use crate::jit::backend::code::{map_in, reserve as reserve_space, sync_icache, unmap_out};
 
 pub(crate) const SEG_SIZE: usize = 64 * 1024;
 const UNIT: usize = 64;
@@ -150,8 +149,9 @@ struct Range {
     base: usize,
     used: Vec<u64>,
     slots: usize,
+    #[cfg(test)]
     near: bool,
-    /// Text targets' islands of a far range: (target, island).
+    /// Islands of targets out of reach: (target, island).
     islands: Vec<(usize, usize)>,
     /// The slot islands are written in: executable and writable alias, next
     /// free byte.
@@ -189,7 +189,8 @@ impl Range {
             base,
             used: vec![0; slots.div_ceil(64)],
             slots,
-            near: in_reach(base, size),
+            #[cfg(test)]
+            near: crate::jit::backend::code::in_reach(base, size),
             islands: Vec::new(),
             island_slot: None,
         })
@@ -265,14 +266,14 @@ fn in_b26(from: usize, target: usize) -> bool {
 
 /// Where a `b`/`bl` at `from`, code in the range, goes for `target`: the
 /// target itself in reach, else its island (a far range's branch into the
-/// text); none if neither reaches.
+/// text, or any range's into a shared library); none if neither reaches.
 pub(crate) fn branch_target(from: usize, target: usize) -> Option<usize> {
     if in_b26(from, target) {
         return Some(target);
     }
     let mut g = range();
     let r = g.as_mut()?;
-    if r.near || !r.contains(from) {
+    if !r.contains(from) {
         return None;
     }
     let i = r.island(target)?;
