@@ -543,7 +543,9 @@ fn min_max<'gc>(
     } else if within(TypeSet::SMALL | TypeSet::FLOAT) {
         let num = |b: &mut Builder<'_, 'gc>, v: Val| {
             let t = b.ty(v);
-            if t.rep != Rep::Val || (!t.set.is_empty() && t.within(TypeSet::SMALL | TypeSet::FLOAT))
+            // One kind converts directly; small | float takes `ToF64`'s two arms.
+            if t.rep != Rep::Val
+                || (!t.set.is_empty() && (t.within(TypeSet::SMALL) || t.within(TypeSet::FLOAT)))
             {
                 return (b.num_f64(v), b.boxed(v));
             }
@@ -991,8 +993,9 @@ fn log_arms(b: &mut Builder<'_, '_>, a: u8, x: Val, base: Val) {
 /// allows (strings by a call); only what the builtin raises on exits.
 fn float_arg(b: &mut Builder<'_, '_>, x: Val) -> Val {
     let ty = b.ty(x);
+    // One kind converts directly; any other set takes `ToF64`'s arms for it.
     if matches!(ty.rep, Rep::F64 | Rep::I32 | Rep::I64)
-        || (!ty.set.is_empty() && ty.within(TypeSet::SMALL | TypeSet::FLOAT))
+        || (!ty.set.is_empty() && (ty.within(TypeSet::SMALL) || ty.within(TypeSet::FLOAT)))
     {
         return b.num_f64(x);
     }
