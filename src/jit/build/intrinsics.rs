@@ -62,10 +62,7 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         (base::lua_rawlen, Intrinsic::Builtin(HelperId::RawLen)),
         (base::lua_tonumber, Intrinsic::Builtin(HelperId::ToNumber)),
         (base::lua_select, Intrinsic::Select),
-        (
-            crate::builtin::string::lua_len,
-            Intrinsic::StrLen,
-        ),
+        (crate::builtin::string::lua_len, Intrinsic::StrLen),
         (
             crate::builtin::string::lua_byte,
             Intrinsic::Builtin(HelperId::StrByte),
@@ -399,7 +396,10 @@ fn builtin<'gc>(
         }
         return Emitted::Done;
     }
-    if h == HelperId::RawLen && TypeSet::STR.contains(b.ty(args[0]).set) && !b.ty(args[0]).set.is_empty() {
+    if h == HelperId::RawLen
+        && TypeSet::STR.contains(b.ty(args[0]).set)
+        && !b.ty(args[0]).set.is_empty()
+    {
         if c == 2 {
             let p = b.ins(Op::Unbox(Rep::Ptr), &[args[0]]);
             let n = b.ins(Op::StrLenOf, &[p]);
@@ -497,10 +497,13 @@ fn min_max<'gc>(
     let max = h == HelperId::Max;
     let bits = b.feedback(pc);
     let args: Vec<Val> = (0..nargs).map(|i| b.reg(a + 4 + i)).collect();
-    let all = args.iter().enumerate().fold(TypeSet::empty(), |s, (i, &v)| {
-        let group = if i == 0 { bits } else { bits >> fb::ARGS_SHIFT };
-        s | arg_kinds(b, v, group & fb::KINDS)
-    });
+    let all = args
+        .iter()
+        .enumerate()
+        .fold(TypeSet::empty(), |s, (i, &v)| {
+            let group = if i == 0 { bits } else { bits >> fb::ARGS_SHIFT };
+            s | arg_kinds(b, v, group & fb::KINDS)
+        });
     let within = |set: TypeSet| set.contains(all);
     if nargs > 1 && !within(TypeSet::SMALL | TypeSet::FLOAT) && !within(TypeSet::INT) {
         if !within(TypeSet::STR) {
@@ -514,7 +517,11 @@ fn min_max<'gc>(
     pin(b, f, callee);
     // The pick so far and the next argument, `x < y` deciding.
     let below = |b: &mut Builder<'_, 'gc>, op: Op, pick: Val, v: Val| {
-        if max { b.ins(op, &[pick, v]) } else { b.ins(op, &[v, pick]) }
+        if max {
+            b.ins(op, &[pick, v])
+        } else {
+            b.ins(op, &[v, pick])
+        }
     };
     let r = if nargs == 1 {
         args[0]
@@ -536,11 +543,16 @@ fn min_max<'gc>(
     } else if within(TypeSet::SMALL | TypeSet::FLOAT) {
         let num = |b: &mut Builder<'_, 'gc>, v: Val| {
             let t = b.ty(v);
-            if t.rep != Rep::Val || (!t.set.is_empty() && t.within(TypeSet::SMALL | TypeSet::FLOAT)) {
+            if t.rep != Rep::Val || (!t.set.is_empty() && t.within(TypeSet::SMALL | TypeSet::FLOAT))
+            {
                 return (b.num_f64(v), b.boxed(v));
             }
             let bv = b.boxed(v);
-            let i = b.ins_exit(Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT), &[bv], ExitTag::Type);
+            let i = b.ins_exit(
+                Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT),
+                &[bv],
+                ExitTag::Type,
+            );
             (b.f.result(i), bv)
         };
         let (mut at, mut pick) = num(b, args[0]);
@@ -602,7 +614,11 @@ fn string<'gc>(
     // string is a string and the positions integers, guarded.
     let kinds = |b: &Builder<'_, 'gc>, v: Val, seen: fb::Bits, guess: TypeSet| {
         let k = arg_kinds(b, v, seen);
-        if seen == 0 && k.contains(guess) { guess } else { k }
+        if seen == 0 && k.contains(guess) {
+            guess
+        } else {
+            k
+        }
     };
     let s = b.reg(a + 4);
     if kinds(b, s, bits & fb::KINDS, TypeSet::STR) != TypeSet::STR {
@@ -631,7 +647,10 @@ fn string<'gc>(
             b.ins(Op::Helper(HelperId::StrSub), &[p, pos[0], pos[1]])
         }
         _ => {
-            let i = pos.first().copied().unwrap_or_else(|| b.ins(Op::KI64(1), &[]));
+            let i = pos
+                .first()
+                .copied()
+                .unwrap_or_else(|| b.ins(Op::KI64(1), &[]));
             if bits & fb::OTHER_RESULT == 0 {
                 let r = b.ins_exit(Op::StrByteAt, &[p, i], ExitTag::OtherResult);
                 b.f.result(r)
@@ -1022,7 +1041,10 @@ fn arg_kinds(b: &Builder<'_, '_>, v: Val, seen: fb::Bits) -> TypeSet {
         (fb::FLOAT, TypeSet::FLOAT),
         (fb::STR, TypeSet::STR),
         (fb::TAB, TypeSet::TAB),
-        (fb::OTHER, TypeSet::ANY - TypeSet::NUM - TypeSet::STR - TypeSet::TAB),
+        (
+            fb::OTHER,
+            TypeSet::ANY - TypeSet::NUM - TypeSet::STR - TypeSet::TAB,
+        ),
     ] {
         if seen & bit != 0 {
             saw |= set;
@@ -1059,7 +1081,9 @@ fn dispatch<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, arms: &[Arm<'_, 'gc>],
         }
         _ => {}
     }
-    let boxed = arms.iter().any(|arm| arm.1 != arms[0].1 || arm.1 == Rep::Val);
+    let boxed = arms
+        .iter()
+        .any(|arm| arm.1 != arms[0].1 || arm.1 == Rep::Val);
     let join = b.new_block();
     for (n, &(set, _, f)) in arms.iter().enumerate() {
         let other = if n + 1 < arms.len() {
@@ -1218,7 +1242,11 @@ fn round<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits, ceil: boo
     let mut arms: Vec<Arm<'_, 'gc>> = Vec::new();
     let mut covered = TypeSet::empty();
     if k.intersects(TypeSet::INT) {
-        let set = if rep == Rep::I32 { TypeSet::SMALL } else { TypeSet::INT };
+        let set = if rep == Rep::I32 {
+            TypeSet::SMALL
+        } else {
+            TypeSet::INT
+        };
         arms.push((set, rep, &int));
         covered |= set;
     }

@@ -138,9 +138,12 @@ fn rounded(r: f64) -> Math1 {
     }
 }
 
-math1!(ff_sqrt, false, |x| Math1::Float(x.sqrt()), |i| Math1::Float(
-    f64::from(i).sqrt()
-));
+math1!(
+    ff_sqrt,
+    false,
+    |x| Math1::Float(x.sqrt()),
+    |i| Math1::Float(f64::from(i).sqrt())
+);
 math1!(ff_sin, false, |x| Math1::Float(x.sin()), |i| Math1::Float(
     f64::from(i).sin()
 ));
@@ -159,12 +162,18 @@ math1!(ff_exp, false, |x| Math1::Float(x.exp()), |i| Math1::Float(
 math1!(ff_tan, false, |x| Math1::Float(x.tan()), |i| Math1::Float(
     f64::from(i).tan()
 ));
-math1!(ff_asin, false, |x| Math1::Float(x.asin()), |i| Math1::Float(
-    f64::from(i).asin()
-));
-math1!(ff_acos, false, |x| Math1::Float(x.acos()), |i| Math1::Float(
-    f64::from(i).acos()
-));
+math1!(
+    ff_asin,
+    false,
+    |x| Math1::Float(x.asin()),
+    |i| Math1::Float(f64::from(i).asin())
+);
+math1!(
+    ff_acos,
+    false,
+    |x| Math1::Float(x.acos()),
+    |i| Math1::Float(f64::from(i).acos())
+);
 
 /// A float or inline integer argument as a float.
 #[inline(always)]

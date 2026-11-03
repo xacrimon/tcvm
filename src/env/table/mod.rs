@@ -59,7 +59,11 @@ impl<'gc> Table<'gc> {
         debug_assert!(shape.mt_cache().is_none() && shape.as_mt().is_none());
         let cap = shape.inline_cap() as usize;
         let (inline, spilled) = values.split_at(values.len().min(cap));
-        let asize = if items == 0 { 0 } else { items.min(MAX_ASIZE as usize - 1) + 1 };
+        let asize = if items == 0 {
+            0
+        } else {
+            items.min(MAX_ASIZE as usize - 1) + 1
+        };
         let state = TableState {
             shape,
             spill: match spilled.len() {

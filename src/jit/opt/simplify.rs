@@ -736,8 +736,7 @@ fn reduce(f: &mut Func<'_>, b: Block, k: usize, i: Inst, op: Op, args: &[Val]) -
         | (IAnd | LAnd, -1) => return To(x),
         (IAsr, c) if c & 31 == 0 => return To(x),
         (LAsr, c) if c & 63 == 0 => return To(x),
-        (IMul | IMulNo | LMul | IAnd | LAnd, 0)
-        | (IModFloor | LModFloor | IRem | LRem, 1 | -1) => {
+        (IMul | IMulNo | LMul | IAnd | LAnd, 0) | (IModFloor | LModFloor | IRem | LRem, 1 | -1) => {
             (int_k(op, 0), &[])
         }
         (LShl | LShr, c) if !(-63..=63).contains(&c) => (int_k(op, 0), &[]),

@@ -434,10 +434,14 @@ pub(crate) fn compile<'gc>(
                 crate::jit::helpers::address(*h),
                 h.sig().ret == Some(crate::jit::ir::types::Rep::F64),
             ),
-            MInst::FMod => (crate::jit::helpers::address(crate::jit::ir::ops::HelperId::FMod), true),
-            MInst::ToF64 { kinds, .. } if kinds.contains(crate::jit::ir::types::TypeSet::STR) => {
-                (crate::jit::helpers::jit_str_to_f64 as *const () as usize, false)
-            }
+            MInst::FMod => (
+                crate::jit::helpers::address(crate::jit::ir::ops::HelperId::FMod),
+                true,
+            ),
+            MInst::ToF64 { kinds, .. } if kinds.contains(crate::jit::ir::types::TypeSet::STR) => (
+                crate::jit::helpers::jit_str_to_f64 as *const () as usize,
+                false,
+            ),
             _ => continue,
         };
         if !trampolines.iter().any(|&(x, _)| x == a) {

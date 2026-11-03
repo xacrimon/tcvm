@@ -1050,7 +1050,9 @@ pub(crate) extern "C" fn jit_tonumber(rt: *const State<'static>, v: u64) -> u64 
 /// The string whose payload is `p`.
 fn payload_string<'gc>(p: u64) -> LuaString<'gc> {
     // SAFETY: compiled code passes a live string's payload.
-    LuaString::from_inner(unsafe { Gc::from_ptr(p as usize as *const crate::env::string::StringData) })
+    LuaString::from_inner(unsafe {
+        Gc::from_ptr(p as usize as *const crate::env::string::StringData)
+    })
 }
 
 /// `string.sub(s, i, j)`, `j` -1 when absent.

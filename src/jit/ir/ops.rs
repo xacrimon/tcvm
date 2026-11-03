@@ -949,9 +949,7 @@ impl Op {
             Guard(_) | GuardTrue | GuardFalse | GuardMiss | GuardSame | GuardProto(_) | IAdd
             | ISub | IMul | INeg | IShl | IShr | IDivFloor | IModFloor | IRem | LDivFloor
             | LModFloor | LRem | LToI | LToFExact | FToIExact | FToLExact | ToF64(_)
-            | StrByteAt => {
-                Effects::flags(DEOPT)
-            }
+            | StrByteAt => Effects::flags(DEOPT),
             GuardNoFlag(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) | GuardShapeIn(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
@@ -1096,8 +1094,8 @@ impl Op {
             IToF | LToF | LToFExact | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor
             | FCeil | FIDiv | ToF64(_) => Ty::F64,
             StrLenOf | StrByteAt => Ty::I32,
-            IToL | FToL | FToLExact | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr
-            | LXor | LNot | LShl | LShr | LDivFloor | LModFloor | LRem | LAsr => Ty::I64,
+            IToL | FToL | FToLExact | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor
+            | LNot | LShl | LShr | LDivFloor | LModFloor | LRem | LAsr => Ty::I64,
             Helper(HelperId::ArithCoerce(ArithKind::Div | ArithKind::Pow)) => {
                 Ty::val(TypeSet::FLOAT)
             }
@@ -1107,9 +1105,9 @@ impl Op {
             Helper(HelperId::ArithCoerce(_) | HelperId::BNot | HelperId::Len) => {
                 Ty::val(TypeSet::INT)
             }
-            Helper(
-                HelperId::Concat | HelperId::Type | HelperId::ToString | HelperId::StrSub,
-            ) => Ty::val(TypeSet::STR),
+            Helper(HelperId::Concat | HelperId::Type | HelperId::ToString | HelperId::StrSub) => {
+                Ty::val(TypeSet::STR)
+            }
             Helper(HelperId::RawLen) => Ty::val(TypeSet::INT),
             Helper(HelperId::StrByte) => Ty::val(TypeSet::SMALL | TypeSet::NIL),
             Helper(HelperId::Closure { .. } | HelperId::ClosureOf { .. }) => Ty::val(TypeSet::FUN),

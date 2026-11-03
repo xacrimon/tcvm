@@ -1282,7 +1282,11 @@ fn int_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Result<Val, (Val,
         if !floats {
             return b.ins(Op::Unbox(Rep::I32), &[kb]);
         }
-        let f = b.ins_exit(Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT), &[kb], ExitTag::Type);
+        let f = b.ins_exit(
+            Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT),
+            &[kb],
+            ExitTag::Type,
+        );
         let f = b.f.result(f);
         b.as_i32(f)
     };
