@@ -3727,3 +3727,47 @@ fn nil_own_slots_walk_without_refills() {
         return table.concat(r, ',')",
     );
 }
+
+/// binary-trees at depth 8: branch elimination clones `BottomUpTree`'s
+/// constructor into both arms, and its repair joined the table and its
+/// unboxed pointer, which the loop's next call kept live: a raw pointer
+/// across a call, failing the verifier (now folded into an unboxing of the
+/// joined table).
+#[test]
+fn joined_table_pointers_across_calls() {
+    compiles_cleanly(
+        "local function BottomUpTree(item, depth)
+          local left, right = nil, nil
+          if depth > 0 then
+            local i = item + item
+            depth = depth - 1
+            left = BottomUpTree(i-1, depth)
+            right = BottomUpTree(i, depth)
+          end
+          return { item = item, left = left, right = right }
+        end
+        local function ItemCheck(tree)
+          if tree.left then
+            return tree.item + ItemCheck(tree.left) - ItemCheck(tree.right)
+          else
+            return tree.item
+          end
+        end
+        local out = {}
+        local mindepth, maxdepth = 4, 8
+        out[#out + 1] = ItemCheck(BottomUpTree(0, maxdepth + 1))
+        local longlivedtree = BottomUpTree(0, maxdepth)
+        for depth = mindepth, maxdepth, 2 do
+          local iterations = 2 ^ (maxdepth - depth + mindepth)
+          local check = 0
+          for i = 1, iterations do
+            check = check + ItemCheck(BottomUpTree(1, depth)) +
+                    ItemCheck(BottomUpTree(-1, depth))
+          end
+          out[#out + 1] = iterations * 2 .. ' ' .. depth .. ' ' .. check
+        end
+        out[#out + 1] = ItemCheck(longlivedtree)
+        return table.concat(out, ' | ')",
+        true,
+    );
+}
