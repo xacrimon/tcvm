@@ -689,6 +689,10 @@ fn on_exit<'gc>(
     pc: u32,
 ) {
     use crate::jit::ir::ops::ExitTag;
+    // The interpreter raises on such an argument: the code is as it should be.
+    if e.tag == ExitTag::Arg && kind == ExitKind::Before && call_arg_raises(closure, base, pc) {
+        return;
+    }
     // A `Before` exit's operands are in their home slots; the other kinds
     // follow a completed instruction and have no failed guard, as a lazy
     // exit has none.
@@ -712,7 +716,7 @@ fn on_exit<'gc>(
             _ => 0,
         };
         let extra = extra
-            | if e.tag == ExitTag::Type {
+            | if matches!(e.tag, ExitTag::Type | ExitTag::Arg) {
                 crate::jit::feedback::KIND_EXIT
             } else {
                 0
@@ -870,6 +874,30 @@ fn record_shape<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, base: *mut Value<'g
     closure.proto.feedback.add_shape(pc as usize, t.shape());
     ctx.mutation()
         .backward_barrier(Gc::erase(closure.proto), None);
+}
+
+/// Whether the instruction at `pc` is a call with an argument that is no
+/// number and no string, which a builtin's `ExitTag::Arg` guard raises on.
+fn call_arg_raises<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32) -> bool {
+    let mut i = unsafe { *closure.code.add(pc as usize) };
+    if i.is_jit_word() {
+        i = original_of(closure, i);
+    }
+    let call = matches!(
+        i.op(),
+        Op::CALL
+            | Op::CALL_R0
+            | Op::CALL_R1
+            | Op::CALLS
+            | Op::CALLS_R0
+            | Op::CALLS_R1
+            | Op::TAILCALL
+    );
+    // SAFETY: the arguments are registers of the frame's window.
+    call && (4..i.b().saturating_add(3)).any(|r| {
+        let v = unsafe { *base.add((i.a() + r) as usize) };
+        !(v.is_float() || v.get_integer().is_some() || v.get_string().is_some())
+    })
 }
 
 /// Record the kinds of the operands of the site at `pc`, from the frame just

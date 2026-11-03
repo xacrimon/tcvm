@@ -478,6 +478,12 @@ pub(crate) enum ExitTag {
     Entry,
     /// A `LazyExit`: a dependency broke.
     Lazy,
+    /// A guard on a builtin's arguments, at its CALL: the exit takes an
+    /// argument the builtin raises on (no number, no string) to the
+    /// interpreter as `Slow` does, recording and counting nothing; any other
+    /// kind is a `Type` exit. One exit for both, which compiled code cannot
+    /// tell apart at a guard that covers some numbers.
+    Arg,
     /// A builtin's result was of a kind its inline code does not make, where
     /// the call's feedback never saw one (`floor` without an integer,
     /// `string.byte` out of range): the exit records `OTHER_RESULT`.
@@ -496,6 +502,7 @@ impl ExitTag {
                 | ExitTag::Bounds
                 | ExitTag::Const
                 | ExitTag::OtherResult
+                | ExitTag::Arg
         )
     }
 }

@@ -1063,11 +1063,11 @@ fn arg_kinds(b: &Builder<'_, '_>, v: Val, seen: fb::Bits) -> TypeSet {
 /// representation, and the code making the result of the argument.
 type Arm<'f, 'gc> = (TypeSet, Rep, &'f dyn Fn(&mut Builder<'_, 'gc>, Val) -> Val);
 
-/// `R[a] =` the arm of `x`'s kind: each tested in turn, the last guarded,
-/// exiting with `rest` for any other kind. Their results join as they are
+/// `R[a] =` the arm of `x`'s kind: each tested in turn, the last guarded
+/// (`ExitTag::Arg`: any other kind learns, or raises in the builtin). Their results join as they are
 /// when of one representation, else boxed. Without arms (the call saw only
 /// what the builtin raises on) it exits.
-fn dispatch<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, arms: &[Arm<'_, 'gc>], rest: ExitTag) {
+fn dispatch<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, arms: &[Arm<'_, 'gc>]) {
     let x = b.boxed(x);
     match arms {
         [] => {
@@ -1076,7 +1076,7 @@ fn dispatch<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, arms: &[Arm<'_, 'gc>],
         }
         // No join to go through.
         &[(set, _, f)] => {
-            let g = b.ins_exit(Op::Guard(set), &[x], rest);
+            let g = b.ins_exit(Op::Guard(set), &[x], ExitTag::Arg);
             let v = b.f.result(g);
             let r = f(b, v);
             b.set(a, r);
@@ -1098,7 +1098,7 @@ fn dispatch<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, arms: &[Arm<'_, 'gc>],
         let v = match other {
             Some(_) => b.ins(Op::Refine(set), &[x]),
             None => {
-                let g = b.ins_exit(Op::Guard(set), &[x], rest);
+                let g = b.ins_exit(Op::Guard(set), &[x], ExitTag::Arg);
                 b.f.result(g)
             }
         };
@@ -1110,16 +1110,6 @@ fn dispatch<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, arms: &[Arm<'_, 'gc>],
         }
     }
     enter_join(b, join);
-}
-
-/// The exit of a dispatch whose arms take `covered`: one that may learn a
-/// number or string kind they miss, or only what the builtin raises on.
-fn rest_tag(covered: TypeSet) -> ExitTag {
-    if covered.contains(TypeSet::NUM | TypeSet::STR) {
-        ExitTag::Slow
-    } else {
-        ExitTag::Type
-    }
 }
 
 /// Whether a type-following builtin's integers are i64 (no small | big
@@ -1158,10 +1148,8 @@ fn abs<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits) -> Option<V
         _ => {}
     }
     let mut arms: Vec<Arm<'_, 'gc>> = Vec::new();
-    let mut covered = TypeSet::empty();
     if k.contains(TypeSet::FLOAT) {
         arms.push((TypeSet::FLOAT, Rep::F64, &fabs));
-        covered |= TypeSet::FLOAT;
     }
     if k.intersects(TypeSet::INT) {
         let (set, rep, f): Arm<'_, 'gc> = if wide {
@@ -1170,13 +1158,11 @@ fn abs<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits) -> Option<V
             (TypeSet::SMALL, Rep::I32, &iabs)
         };
         arms.push((set, rep, f));
-        covered |= set;
     }
     if k.contains(TypeSet::STR) {
         arms.push((TypeSet::STR, Rep::F64, &sabs));
-        covered |= TypeSet::STR;
     }
-    dispatch(b, a, x, &arms, rest_tag(covered));
+    dispatch(b, a, x, &arms);
     None
 }
 
@@ -1243,7 +1229,6 @@ fn round<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits, ceil: boo
         _ => b.as_i64(v),
     };
     let mut arms: Vec<Arm<'_, 'gc>> = Vec::new();
-    let mut covered = TypeSet::empty();
     if k.intersects(TypeSet::INT) {
         let set = if rep == Rep::I32 {
             TypeSet::SMALL
@@ -1251,17 +1236,14 @@ fn round<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits, ceil: boo
             TypeSet::INT
         };
         arms.push((set, rep, &int));
-        covered |= set;
     }
     if k.contains(TypeSet::FLOAT) {
         arms.push((TypeSet::FLOAT, rep, &fround));
-        covered |= TypeSet::FLOAT;
     }
     if k.contains(TypeSet::STR) {
         arms.push((TypeSet::STR, rep, &sround));
-        covered |= TypeSet::STR;
     }
-    dispatch(b, a, x, &arms, rest_tag(covered));
+    dispatch(b, a, x, &arms);
     None
 }
 
@@ -1275,6 +1257,7 @@ fn fmod<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, y: Val, bits: fb::Bits) ->
     let ky = arg_kinds(b, y, bits >> fb::ARGS_SHIFT & fb::KINDS);
     let wide = (kx | ky).contains(TypeSet::BIGINT);
     let int = |b: &mut Builder<'_, 'gc>, v: Val| {
+        let v = arg_guard(b, v, if wide { TypeSet::INT } else { TypeSet::SMALL });
         if wide { b.as_i64(v) } else { b.as_i32(v) }
     };
     let irem = |b: &mut Builder<'_, 'gc>, x: Val, y: Val| {
@@ -1292,9 +1275,9 @@ fn fmod<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, y: Val, bits: fb::Bits) ->
         // Never two integers: the one that is not stays so.
         let not_int = TypeSet::ANY - TypeSet::INT;
         let (x, y) = if !ix {
-            (b.guard(x, not_int), y)
+            (arg_guard(b, x, not_int), y)
         } else {
-            (x, b.guard(y, not_int))
+            (x, arg_guard(b, y, not_int))
         };
         return Some(frem(b, x, y));
     }
@@ -1318,6 +1301,16 @@ fn fmod<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, y: Val, bits: fb::Bits) ->
     arm_end(b, join, a, r);
     enter_join(b, join);
     None
+}
+
+/// `v` guarded to `set` as a builtin's argument (`ExitTag::Arg`).
+fn arg_guard(b: &mut Builder<'_, '_>, v: Val, set: TypeSet) -> Val {
+    let t = b.ty(v);
+    if t.rep != Rep::Val || (!t.set.is_empty() && t.within(set)) {
+        return v;
+    }
+    let g = b.ins_exit(Op::Guard(set), &[v], ExitTag::Arg);
+    b.f.result(g)
 }
 
 /// `|x|` of an i32; `abs(i32::MIN)` leaves i32 and exits to learn it.

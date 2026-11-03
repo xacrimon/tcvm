@@ -9,7 +9,7 @@
 //! as i64 arithmetic and a narrowing exit (E3): it exits only where the
 //! interpreter's result would leave i32 anyway.
 
-use crate::jit::ir::ops::{Flags, Mem, Op};
+use crate::jit::ir::ops::{ExitTag, Flags, Mem, Op};
 use crate::jit::ir::{Block, Func, Inst, Val};
 use crate::jit::opt::calls::rematerializable;
 use crate::jit::opt::natural_loops;
@@ -121,6 +121,8 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
                 // Slots are loaded only where a region (re)starts; a
                 // refinement holds only where the test before it passed.
                 Op::Load(_) | Op::GcCheck | Op::Refine(_) => false,
+                // Its exit tells raising arguments by the call's registers.
+                Op::Guard(_) if f.insts[i.idx()].tag == ExitTag::Arg => false,
                 _ if e.is_pure() => true,
                 _ if !e.movable() || e.writes() || e.has(Flags::MAY_ALLOC) => false,
                 // A test of values alone needs no earlier guard; a read of
