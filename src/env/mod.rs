@@ -1,4 +1,5 @@
 pub mod error;
+pub mod feedback;
 pub mod function;
 pub mod shape;
 pub mod string;
@@ -7,6 +8,12 @@ pub mod table;
 pub mod thread;
 pub mod userdata;
 pub mod value;
+
+/// The collector's deferral queues ([`crate::dmm::Trace::defer`]): weak tables, and
+/// prototypes whose feedback holds weak references.
+pub(crate) const DEFER_TABLES: usize = 0;
+pub(crate) const DEFER_FEEDBACK: usize = 1;
+const _: () = assert!(DEFER_FEEDBACK < crate::dmm::DEFER_QUEUES);
 
 /// Master metamethod table — single source of truth for the set of
 /// names that drive bit positions in `MetamethodBits`, byte-name

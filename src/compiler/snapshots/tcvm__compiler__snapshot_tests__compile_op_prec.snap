@@ -9,9 +9,10 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  LOAD            R0 K1  ; 21.0
-0002  [  1]  SETTABUP        R0 U0 K0  ; "num"
-0003  [  2]  LOADI           R0 -5
-0004  [  2]  SETTABUP        R0 U0 K0  ; "num"
-0005  [  2]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  LOAD            R0 K1  ; 21.0
+0003  [  1]  SETTABUP        R0 U0 K0  ; "num"
+0004  [  2]  LOADI           R0 -5
+0005  [  2]  SETTABUP        R0 U0 K0  ; "num"
+0006  [  2]  RETURN          R0 count=1

@@ -9,47 +9,52 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  2]  CLOSURE         R0 P0
-0002  [  3]  CLOSURE         R1 P1
-0003  [  4]  CLOSURE         R2 P2
-0004  [  5]  CLOSURE         R3 P3
-0005  [  6]  LOADI           R8 1
-0006  [  6]  LOADI           R9 2
-0007  [  6]  LOADI           R10 3
-0008  [  6]  CALLS_R1        R4 args=4 f=R0
-0009  [  6]  LOADI           R9 10
-0010  [  6]  LOADI           R10 20
-0011  [  6]  CALLS_R1        R5 args=3 f=R1
-0012  [  6]  LOAD            R10 K0  ; true
-0013  [  6]  LOAD            R11 K1  ; false
-0014  [  6]  CALLS_R1        R6 args=3 f=R2
-0015  [  6]  CALLS           R7 args=1 ret=0 f=R3
-0016  [  6]  RETURN          R4 count=0
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  2]  CLOSURE         R0 P0
+0003  [  3]  CLOSURE         R1 P1
+0004  [  4]  CLOSURE         R2 P2
+0005  [  5]  CLOSURE         R3 P3
+0006  [  6]  LOADI           R8 1
+0007  [  6]  LOADI           R9 2
+0008  [  6]  LOADI           R10 3
+0009  [  6]  CALLS_R1        R4 args=4 f=R0
+0010  [  6]  LOADI           R9 10
+0011  [  6]  LOADI           R10 20
+0012  [  6]  CALLS_R1        R5 args=3 f=R1
+0013  [  6]  LOAD            R10 K0  ; true
+0014  [  6]  LOAD            R11 K1  ; false
+0015  [  6]  CALLS_R1        R6 args=3 f=R2
+0016  [  6]  CALLS           R7 args=1 ret=0 f=R3
+0017  [  6]  RETURN          R4 count=0
 
 ; prototype 0:
   ; function (params=2, vararg=true, stack=4, upvalues=0)
   ; code:
-  0000  [  2]  VARARGPREP      fixed=2
-  0001  [  2]  MOVE            R2 R0
-  0002  [  2]  MOVE            R3 R1
-  0003  [  2]  RETURN          R2 count=3
+  0000  [  2]  FUNC
+  0001  [  2]  VARARGPREP      fixed=2
+  0002  [  2]  MOVE            R2 R0
+  0003  [  2]  MOVE            R3 R1
+  0004  [  2]  RETURN          R2 count=3
 
 ; prototype 1:
   ; function (params=1, vararg=true, stack=2, upvalues=0)
   ; code:
-  0000  [  3]  VARARGPREP      fixed=1
-  0001  [  3]  RETURN          R1 count=2
+  0000  [  3]  FUNC
+  0001  [  3]  VARARGPREP      fixed=1
+  0002  [  3]  RETURN          R1 count=2
 
 ; prototype 2:
   ; function (params=0, vararg=true, stack=1, upvalues=0)
   ; code:
-  0000  [  4]  VARARGPREP      fixed=0
-  0001  [  4]  VARARG          R0 count=0
-  0002  [  4]  RETURN          R0 count=0
+  0000  [  4]  FUNC
+  0001  [  4]  VARARGPREP      fixed=0
+  0002  [  4]  VARARG          R0 count=0
+  0003  [  4]  RETURN          R0 count=0
 
 ; prototype 3:
   ; function (params=0, vararg=true, stack=1, upvalues=0)
   ; code:
-  0000  [  5]  VARARGPREP      fixed=0
-  0001  [  5]  RETURN          R0 count=2
+  0000  [  5]  FUNC
+  0001  [  5]  VARARGPREP      fixed=0
+  0002  [  5]  RETURN          R0 count=2

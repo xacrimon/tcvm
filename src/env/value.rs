@@ -30,8 +30,9 @@ pub enum ValueKind {
 // floats; only a NaN with a crafted payload can reach the box space, and `float` remaps it.
 const QNAN_NEG: u64 = 0xFFF8_0000_0000_0000;
 const TAG_SHIFT: u32 = 48;
-const BOX: u64 = QNAN_NEG | 1 << TAG_SHIFT;
-const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
+/// The first word of a box: every word below is a float.
+pub(crate) const BOX: u64 = QNAN_NEG | 1 << TAG_SHIFT;
+pub(crate) const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
 const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
 // Tag 7 holds the immediates. Small ints fill the payload's top half with ones so the whole top
@@ -40,15 +41,62 @@ const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 const TAG_USERDATA: u64 = 1;
 const TAG_BOXED_INT: u64 = 2;
 const TAG_STRING: u64 = 3;
+/// A string value's bits above its payload, the value address of its box.
+pub(crate) const STRING_BITS: u64 = QNAN_NEG | TAG_STRING << TAG_SHIFT;
 const TAG_TABLE: u64 = 4;
 const TAG_FUNCTION: u64 = 5;
+/// A function value's bits but its payload, the closure's address.
+pub(crate) const FUNCTION_BITS: u64 = QNAN_NEG | TAG_FUNCTION << TAG_SHIFT;
 const TAG_THREAD: u64 = 6;
 const TAG_IMMEDIATE: u64 = 7;
 
-const SMALL_INT: u64 = 0xFFFF_FFFF_0000_0000;
-const NIL: u64 = 0xFFFF_FFFE_0000_0000;
-const FALSE: u64 = NIL | 1;
-const TRUE: u64 = NIL | 2;
+/// A small integer's upper word: all ones.
+pub(crate) const SMALL_INT: u64 = 0xFFFF_FFFF_0000_0000;
+pub(crate) const NIL: u64 = 0xFFFF_FFFE_0000_0000;
+pub(crate) const FALSE: u64 = NIL | 1;
+pub(crate) const TRUE: u64 = NIL | 2;
+
+const fn tag_words(tag: u64) -> (u64, u64) {
+    let lo = QNAN_NEG | tag << TAG_SHIFT;
+    (lo, lo | PAYLOAD_MASK)
+}
+
+/// Each type's first and last word, in the order of their words: floats,
+/// userdata, boxed integers, strings, tables, functions, threads (index =
+/// tag), nil, false, true, small integers. Every value's word is in one;
+/// the JIT tests a run of them as one range, and slot kinds are arcs of it.
+pub(crate) const TYPE_WORDS: [(u64, u64); 11] = [
+    (0, BOX - 1),
+    tag_words(TAG_USERDATA),
+    tag_words(TAG_BOXED_INT),
+    tag_words(TAG_STRING),
+    tag_words(TAG_TABLE),
+    tag_words(TAG_FUNCTION),
+    tag_words(TAG_THREAD),
+    (NIL, NIL),
+    (FALSE, FALSE),
+    (TRUE, TRUE),
+    (SMALL_INT, u64::MAX),
+];
+
+// What the type tests compute with: ascending runs; floats to threads abut,
+// a tag's high 16 bits `0xFFF8 + tag` (`asr #48` gives `tag - 8`); nil,
+// false and true consecutive in one upper word.
+const _: () = {
+    let mut k = 0;
+    while k + 1 < TYPE_WORDS.len() {
+        assert!(TYPE_WORDS[k].1 < TYPE_WORDS[k + 1].0);
+        k += 1;
+    }
+    let mut t = 1;
+    while t <= TAG_THREAD as usize {
+        assert!(TYPE_WORDS[t].0 == TYPE_WORDS[t - 1].1 + 1);
+        assert!(TYPE_WORDS[t].0 >> TAG_SHIFT == 0xFFF8 + t as u64);
+        t += 1;
+    }
+    assert!(FALSE == NIL + 1 && TRUE == NIL + 2 && NIL >> 32 == TRUE >> 32);
+    assert!(SMALL_INT >> 32 == 0xFFFF_FFFF);
+};
 
 // Guarantees `bits` sits at offset 0 and spans the whole 8 bytes: read_float/
 // write_float cast `&Value`/`&mut Value` straight to `*const f64`/`*mut f64` and
@@ -436,6 +484,15 @@ impl<'gc> Value<'gc> {
     #[inline(always)]
     pub(crate) fn to_raw(self) -> u64 {
         self.bits
+    }
+
+    /// The value of a raw encoding.
+    ///
+    /// # Safety
+    /// `bits` came from `to_raw` of a value that is live.
+    #[inline(always)]
+    pub(crate) unsafe fn from_raw(bits: u64) -> Self {
+        Self::from_bits(bits)
     }
 
     /// An object a weak table may drop. Strings and boxed integers are collectable but count

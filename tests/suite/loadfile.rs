@@ -1,17 +1,13 @@
 //! `loadfile` and `dofile`. Expected strings come from `lua` 5.5.1 loading
 //! the same files.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::common::ok;
+use crate::common::{TempDir, ok};
 
 /// A fresh directory holding `files`, as `(name, contents)`.
-fn dir_with(test: &str, files: &[(&str, &[u8])]) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("loadfile")
-        .join(test);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn dir_with(test: &str, files: &[(&str, &[u8])]) -> TempDir {
+    let dir = TempDir::new(&format!("loadfile-{test}"));
     for (name, contents) in files {
         std::fs::write(dir.join(name), contents).unwrap();
     }

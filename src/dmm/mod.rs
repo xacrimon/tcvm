@@ -28,7 +28,7 @@ pub use self::{
     allocator_api::MetricsAlloc,
     arena::{Arena, Rootable},
     checked_cell::{BorrowError, BorrowMutError, Ref, RefMut},
-    collect::{Collect, Trace},
+    collect::{Collect, DEFER_QUEUES, Trace},
     context::{Finalization, Mutation},
     dynamic_roots::{DynamicRoot, DynamicRootSet},
     gc::Gc,

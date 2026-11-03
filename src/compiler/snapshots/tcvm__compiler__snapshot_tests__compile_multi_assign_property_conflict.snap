@@ -9,11 +9,12 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  1]  NEWTABLE        R0 T0  ; {}
-0002  [  2]  LOAD            R1 K0  ; "field"
-0003  [  3]  LOAD            R2 K1  ; "new"
-0004  [  3]  LOADI           R3 99
-0005  [  3]  SETTABLE        R3 R0 R1
-0006  [  3]  MOVE            R1 R2
-0007  [  3]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  1]  NEWTABLE        R0 T0  ; {}
+0003  [  2]  LOAD            R1 K0  ; "field"
+0004  [  3]  LOAD            R2 K1  ; "new"
+0005  [  3]  LOADI           R3 99
+0006  [  3]  SETTABLE        R3 R0 R1
+0007  [  3]  MOVE            R1 R2
+0008  [  3]  RETURN          R0 count=1

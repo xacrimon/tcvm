@@ -9,7 +9,7 @@ use std::{boxed::Box, vec::Vec};
 
 use crate::dmm::{
     Gc, GcWeak,
-    collect::{Collect, Trace},
+    collect::{Collect, DEFER_QUEUES, Trace},
     heap::{self, CELL, Heap},
     metrics::Metrics,
     types::{GcBox, GcBoxHeader, GcBoxInner, Invariant, TrailingBytes, trailing_layout},
@@ -163,16 +163,18 @@ impl<'gc> Finalization<'gc> {
         self.context.full
     }
 
-    /// The objects whose trace called [`Trace::defer`] this cycle, each once.
-    pub fn deferred(&self) -> Vec<Gc<'gc, ()>> {
-        let boxes = self.context.deferred.dedup();
+    /// The objects whose trace called [`Trace::defer`] on `queue` this cycle, each once.
+    pub fn deferred(&self, queue: usize) -> Vec<Gc<'gc, ()>> {
+        let boxes = self.context.deferred[queue].dedup();
         boxes.into_iter().map(|b| unsafe { b.as_gc() }).collect()
     }
 
-    /// Mark the [`Finalization::deferred`] objects handled; sweeping refuses to start until they
+    /// Mark every [`Finalization::deferred`] object handled; sweeping refuses to start until they
     /// are.
     pub fn clear_deferred(&self) {
-        self.context.deferred.clear()
+        for q in &self.context.deferred {
+            q.clear()
+        }
     }
 }
 
@@ -187,9 +189,9 @@ impl<'gc> Trace<'gc> for Context {
         Context::trace_weak(self, gc_box)
     }
 
-    fn defer(&mut self) {
+    fn defer(&mut self, queue: usize) {
         let gc_box = self.tracing.expect("`defer` outside of an object's trace");
-        self.deferred.push(gc_box);
+        self.deferred[queue].push(gc_box);
     }
 }
 
@@ -242,8 +244,8 @@ pub(crate) struct Context {
     // The object `mark_one` is tracing, for `Trace::defer`.
     tracing: Option<GcBox>,
 
-    // Objects queued by `Trace::defer`, with duplicates; see `Finalization::deferred`.
-    deferred: Queue<GcBox>,
+    // Objects queued by `Trace::defer`, per queue, with duplicates; see `Finalization::deferred`.
+    deferred: [Queue<GcBox>; DEFER_QUEUES],
 
     // Unmarked objects a `GcWeak` reached this cycle, each once (see `settle_weak`).
     weak: Queue<GcBox>,
@@ -272,7 +274,7 @@ impl Context {
             full: false,
             forced: None,
             tracing: None,
-            deferred: Queue::new(),
+            deferred: std::array::from_fn(|_| Queue::new()),
             weak: Queue::new(),
         }
     }
@@ -337,7 +339,7 @@ impl Context {
         }
         // A deferred object may hold pointers that sweeping is about to free.
         assert!(
-            cx.deferred.is_empty(),
+            cx.deferred.iter().all(Queue::is_empty),
             "deferred objects must be cleared in finalization before sweeping"
         );
         // Out of `Mark` before any drop runs: if one panics, the mutator must not go on with

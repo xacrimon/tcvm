@@ -121,8 +121,9 @@ where
     for<'a> Root<'a, R>: Sized,
 {
     // Dropped first: a root that owns a `MetricsAlloc` must free through it while the context,
-    // which owns the metrics, is still alive.
-    root: Root<'static, R>,
+    // which owns the metrics, is still alive. Boxed, so the root keeps its address when the
+    // arena moves: suspended Lua stacks hold pointers to it.
+    root: Box<Root<'static, R>>,
     context: Box<Context>,
 }
 
@@ -147,7 +148,7 @@ where
             // to the callback `f` (since it needs to handle an arbitrary lifetime),
             // and lets us stay compatible with older versions of Rust
             let mc: &'static Mutation<'_> = &*(context.mutation_context() as *const _);
-            let root: Root<'static, R> = f(mc);
+            let root = Box::new(f(mc));
             Arena { context, root }
         }
     }
@@ -160,7 +161,7 @@ where
         unsafe {
             let context = Box::new(Context::new());
             let mc: &'static Mutation<'_> = &*(context.mutation_context() as *const _);
-            let root: Root<'static, R> = f(mc)?;
+            let root = Box::new(f(mc)?);
             Ok(Arena { context, root })
         }
     }
@@ -177,11 +178,11 @@ where
         self.context.root_barrier();
         let new_root: Root<'static, R2> = unsafe {
             let mc: &'static Mutation<'_> = &*(self.context.mutation_context() as *const _);
-            f(mc, self.root)
+            f(mc, *self.root)
         };
         Arena {
             context: self.context,
-            root: new_root,
+            root: Box::new(new_root),
         }
     }
 
@@ -197,11 +198,11 @@ where
         self.context.root_barrier();
         let new_root: Root<'static, R2> = unsafe {
             let mc: &'static Mutation<'_> = &*(self.context.mutation_context() as *const _);
-            f(mc, self.root)?
+            f(mc, *self.root)?
         };
         Ok(Arena {
             context: self.context,
-            root: new_root,
+            root: Box::new(new_root),
         })
     }
 }
@@ -222,7 +223,7 @@ where
     {
         unsafe {
             let mc: &'static Mutation<'_> = &*(self.context.mutation_context() as *const _);
-            let root: &'static Root<'_, R> = &*(&self.root as *const _);
+            let root: &'static Root<'_, R> = &*(&*self.root as *const _);
             f(mc, root)
         }
     }
@@ -237,7 +238,7 @@ where
         self.context.root_barrier();
         unsafe {
             let mc: &'static Mutation<'_> = &*(self.context.mutation_context() as *const _);
-            let root: &'static mut Root<'_, R> = &mut *(&mut self.root as *mut _);
+            let root: &'static mut Root<'_, R> = &mut *(&mut *self.root as *mut _);
             f(mc, root)
         }
     }
@@ -280,7 +281,7 @@ where
             return;
         }
         unsafe {
-            self.context.do_collection(&self.root, Stop::FinishCycle);
+            self.context.do_collection(&*self.root, Stop::FinishCycle);
         }
     }
 
@@ -290,7 +291,7 @@ where
     #[inline]
     pub fn finish_marking(&mut self) -> MarkedArena<'_, R> {
         unsafe {
-            self.context.do_collection(&self.root, Stop::FullyMarked);
+            self.context.do_collection(&*self.root, Stop::FullyMarked);
         }
         debug_assert!(self.context.phase() == Phase::Mark && !self.context.gray_remaining());
         MarkedArena(self)
@@ -316,7 +317,7 @@ where
     #[inline]
     pub fn finish_cycle(&mut self) {
         unsafe {
-            self.context.do_collection(&self.root, Stop::FinishCycle);
+            self.context.do_collection(&*self.root, Stop::FinishCycle);
         }
     }
 }
@@ -347,7 +348,7 @@ where
         unsafe {
             let mc: &'static Finalization<'_> =
                 &*(self.0.context.finalization_context() as *const _);
-            let root: &'static Root<'_, R> = &*(&self.0.root as *const _);
+            let root: &'static Root<'_, R> = &*(&*self.0.root as *const _);
             f(mc, root)
         }
     }
@@ -358,7 +359,7 @@ where
         unsafe {
             self.0
                 .context
-                .do_collection(&self.0.root, Stop::FinishCycle);
+                .do_collection(&*self.0.root, Stop::FinishCycle);
         }
         assert_eq!(self.0.context.phase(), Phase::Sleep);
     }

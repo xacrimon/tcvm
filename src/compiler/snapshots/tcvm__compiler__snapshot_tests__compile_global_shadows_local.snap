@@ -9,11 +9,12 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  2]  LOADI           R0 1
-0002  [  5]  LOADI           R1 2
-0003  [  5]  SETTABUP        R1 U0 K0  ; "v"
-0004  [  7]  GETTABUP        R1 U0 K1  ; "print"
-0005  [  7]  MOVE            R5 R0
-0006  [  7]  CALL_R0         R1 args=2
-0007  [  7]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  2]  LOADI           R0 1
+0003  [  5]  LOADI           R1 2
+0004  [  5]  SETTABUP        R1 U0 K0  ; "v"
+0005  [  7]  GETTABUP        R1 U0 K1  ; "print"
+0006  [  7]  MOVE            R5 R0
+0007  [  7]  CALL_R0         R1 args=2
+0008  [  7]  RETURN          R0 count=1

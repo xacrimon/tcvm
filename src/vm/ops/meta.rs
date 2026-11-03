@@ -64,7 +64,6 @@ handler! {
         if !ts.ensure_frame_slots(bi + max_stack + frame::HDR + 4) {
             raise!(OpError::StackOverflow)
         }
-        base = ts.slot_ptr(bi);
         pc = unsafe { pc.sub(1) };
         next!()
     }

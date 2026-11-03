@@ -174,7 +174,7 @@ fn lua_dofile<'gc>(
 /// `error(message [, level])`. The position prefix for `level >= 1` is
 /// applied when the error is raised (`ThreadState::raise`); a negative level
 /// names no frame, like any level past the bottom of the stack.
-fn lua_error<'gc>(
+pub(crate) fn lua_error<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
@@ -188,7 +188,7 @@ fn lua_error<'gc>(
     Err(Error::new(ctx, stack.get(0)).with_level(level))
 }
 
-fn lua_getmetatable<'gc>(
+pub(crate) fn lua_getmetatable<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -368,7 +368,8 @@ fn push_loaded<'gc>(
 
 /// A load error as the Lua string `load` returns and `dofile` raises.
 fn load_error_value<'gc>(ctx: Context<'gc>, e: &LoadError) -> Value<'gc> {
-    Value::string(LuaString::new(ctx, e.to_string().as_bytes()))
+    let msg = crate::vm::stack::on_host(ctx, || e.to_string());
+    Value::string(LuaString::new(ctx, msg.as_bytes()))
 }
 
 /// `getMode` for text-only loading: `B` (fixed buffers) is only for the C API,
@@ -508,8 +509,7 @@ fn lua_print<'gc>(
     let n = stack.len();
     let has_tostring = |i| !ctx.mm_of(stack.get(i), MetamethodBits::TOSTRING).is_nil();
     if !(0..n).any(has_tostring) {
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
+        let mut out = crate::builtin::io::stdout();
         for i in 0..n {
             if i > 0 {
                 let _ = out.write_all(b"\t");
@@ -526,20 +526,20 @@ fn lua_print<'gc>(
     stack.spawn_action(ctx, move |cx| async move {
         for i in 0..n {
             let bytes = util::tolstring(&cx, i, n).await?;
-            let mut out = std::io::stdout().lock();
+            let mut out = crate::builtin::io::stdout();
             if i > 0 {
                 let _ = out.write_all(b"\t");
             }
             let _ = out.write_all(&bytes);
         }
-        let _ = std::io::stdout().write_all(b"\n");
+        let _ = crate::builtin::io::stdout().write_all(b"\n");
         cx.enter(|_, mut stack| stack.replace(&[]));
         Ok(())
     })
 }
 
 /// `rawequal(a, b)` — primitive equality, bypassing `__eq`.
-fn lua_rawequal<'gc>(
+pub(crate) fn lua_rawequal<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -551,7 +551,7 @@ fn lua_rawequal<'gc>(
     Ok(())
 }
 
-fn lua_rawget<'gc>(
+pub(crate) fn lua_rawget<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -569,7 +569,7 @@ fn lua_rawget<'gc>(
 
 /// `rawlen(v)` — length of a table (border) or string (byte count), bypassing
 /// `__len`.
-fn lua_rawlen<'gc>(
+pub(crate) fn lua_rawlen<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -592,7 +592,7 @@ fn lua_rawlen<'gc>(
     Ok(())
 }
 
-fn lua_rawset<'gc>(
+pub(crate) fn lua_rawset<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -621,7 +621,7 @@ fn lua_rawset<'gc>(
 /// `select('#', ...)` returns the count of extra arguments; `select(n, ...)`
 /// returns the arguments from position `n` onward (negative `n` counts from
 /// the end).
-fn lua_select<'gc>(
+pub(crate) fn lua_select<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -694,7 +694,7 @@ fn lua_setmetatable<'gc>(
     Ok(())
 }
 
-fn lua_tonumber<'gc>(
+pub(crate) fn lua_tonumber<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -729,7 +729,7 @@ fn lua_tonumber<'gc>(
 
 /// `tostring(v)` — `luaL_tolstring`: `__tostring`'s result, else the default
 /// representation (with a string `__name` in place of the type).
-fn lua_tostring<'gc>(
+pub(crate) fn lua_tostring<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
@@ -758,7 +758,7 @@ pub(crate) fn tostring_cont<'gc>(
 }
 
 /// `type(v)` — the type name of `v` as a string.
-fn lua_type<'gc>(
+pub(crate) fn lua_type<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,

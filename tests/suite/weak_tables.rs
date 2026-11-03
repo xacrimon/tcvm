@@ -202,11 +202,13 @@ return tostring(before) .. " " .. tostring(after) .. " " .. tostring(gone) .. " 
 }
 
 /// Cache entries whose `__index` table was collected stop holding its memory.
+/// The JIT is off: a region compiled for `f` would count its own memory.
 #[test]
 fn collected_index_tables_are_freed() {
     const SITES: usize = 2000;
     let live = |call: &str| {
         let mut lua = yielding_lua();
+        lua.set_jit(false);
         let src = format!(
             "fs = {{}} for i = 1, {SITES} do \
              local mt = setmetatable({{}}, {{__mode = 'v'}}) mt.__index = {{x = i}} \

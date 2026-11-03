@@ -6,20 +6,22 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  7]  CLOSURE         R0 P0
-0002  [ 38]  CLOSURE         R1 P1
-0003  [ 40]  LOADI           R6 100
-0004  [ 40]  LOADI           R7 200
-0005  [ 40]  CALLS_R0        R2 args=3 f=R1
-0006  [ 40]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  7]  CLOSURE         R0 P0
+0003  [ 38]  CLOSURE         R1 P1
+0004  [ 40]  LOADI           R6 100
+0005  [ 40]  LOADI           R7 200
+0006  [ 40]  CALLS_R0        R2 args=3 f=R1
+0007  [ 40]  RETURN          R0 count=1
 
 ; prototype 0:
   ; function (params=0, vararg=false, stack=2, upvalues=0)
   ; code:
-  0000  [  6]  LOADI           R0 10
-  0001  [  6]  LOADI           R1 20
-  0002  [  6]  RETURN          R0 count=3
+  0000  [  5]  FUNC
+  0001  [  6]  LOADI           R0 10
+  0002  [  6]  LOADI           R1 20
+  0003  [  6]  RETURN          R0 count=3
 
 ; prototype 1:
   ; function (params=0, vararg=true, stack=17, upvalues=2)
@@ -42,83 +44,85 @@ expression: output
   ;   U0 = upvalue U0
   ;   U1 = local R0
   ; code:
-  0000  [  9]  VARARGPREP      fixed=0
-  0001  [ 11]  GETUPVAL        R0 U1
-  0002  [ 11]  CALL            R0 args=1 ret=3
-  0003  [ 11]  GETTABUP        R2 U0 K0  ; "a"
-  0004  [ 11]  ERRNNIL         R2 name=K0
-  0005  [ 11]  SETTABUP        R0 U0 K0  ; "a"
-  0006  [ 11]  GETTABUP        R2 U0 K1  ; "b"
-  0007  [ 11]  ERRNNIL         R2 name=K1
-  0008  [ 11]  SETTABUP        R1 U0 K1  ; "b"
-  0009  [ 13]  GETUPVAL        R0 U1
-  0010  [ 13]  CALL_R1         R0 args=1
-  0011  [ 13]  LOADNIL         R1 count=1
-  0012  [ 13]  GETTABUP        R2 U0 K2  ; "c"
-  0013  [ 13]  ERRNNIL         R2 name=K2
-  0014  [ 13]  SETTABUP        R0 U0 K2  ; "c"
-  0015  [ 13]  GETTABUP        R2 U0 K3  ; "d"
-  0016  [ 13]  ERRNNIL         R2 name=K3
-  0017  [ 13]  SETTABUP        R1 U0 K3  ; "d"
-  0018  [ 15]  VARARG          R0 count=3
-  0019  [ 15]  GETTABUP        R2 U0 K4  ; "e"
-  0020  [ 15]  ERRNNIL         R2 name=K4
-  0021  [ 15]  SETTABUP        R0 U0 K4  ; "e"
-  0022  [ 15]  GETTABUP        R2 U0 K5  ; "g"
-  0023  [ 15]  ERRNNIL         R2 name=K5
-  0024  [ 15]  SETTABUP        R1 U0 K5  ; "g"
-  0025  [ 17]  VARARG          R0 count=2
-  0026  [ 17]  LOADNIL         R1 count=1
-  0027  [ 17]  GETTABUP        R2 U0 K6  ; "h"
-  0028  [ 17]  ERRNNIL         R2 name=K6
-  0029  [ 17]  SETTABUP        R0 U0 K6  ; "h"
-  0030  [ 17]  GETTABUP        R2 U0 K7  ; "i"
-  0031  [ 17]  ERRNNIL         R2 name=K7
-  0032  [ 17]  SETTABUP        R1 U0 K7  ; "i"
-  0033  [ 19]  NEWTABLE        R0 T0  ; {}
-  0034  [ 22]  CLOSURE         R1 P0
-  0035  [ 22]  SETFIELD        R1 R0 K8  ; "m"
-  0036  [ 23]  SELF            R1 R0 K8  ; "m"
-  0037  [ 23]  CALL            R1 args=2 ret=3
-  0038  [ 23]  GETTABUP        R3 U0 K9  ; "j"
-  0039  [ 23]  ERRNNIL         R3 name=K9
-  0040  [ 23]  SETTABUP        R1 U0 K9  ; "j"
-  0041  [ 23]  GETTABUP        R3 U0 K10  ; "k"
-  0042  [ 23]  ERRNNIL         R3 name=K10
-  0043  [ 23]  SETTABUP        R2 U0 K10  ; "k"
-  0044  [ 25]  SELF            R1 R0 K8  ; "m"
-  0045  [ 25]  CALL_R1         R1 args=2
-  0046  [ 25]  LOADNIL         R2 count=1
-  0047  [ 25]  GETTABUP        R3 U0 K11  ; "l"
-  0048  [ 25]  ERRNNIL         R3 name=K11
-  0049  [ 25]  SETTABUP        R1 U0 K11  ; "l"
-  0050  [ 25]  GETTABUP        R3 U0 K12  ; "n"
-  0051  [ 25]  ERRNNIL         R3 name=K12
-  0052  [ 25]  SETTABUP        R2 U0 K12  ; "n"
-  0053  [ 26]  GETTABUP        R1 U0 K13  ; "print"
-  0054  [ 26]  GETTABUP        R5 U0 K0  ; "a"
-  0055  [ 26]  GETTABUP        R6 U0 K1  ; "b"
-  0056  [ 26]  GETTABUP        R7 U0 K2  ; "c"
-  0057  [ 26]  GETTABUP        R8 U0 K3  ; "d"
-  0058  [ 26]  GETTABUP        R9 U0 K4  ; "e"
-  0059  [ 26]  GETTABUP        R10 U0 K5  ; "g"
-  0060  [ 26]  GETTABUP        R11 U0 K6  ; "h"
-  0061  [ 26]  GETTABUP        R12 U0 K7  ; "i"
-  0062  [ 26]  GETTABUP        R13 U0 K9  ; "j"
-  0063  [ 26]  GETTABUP        R14 U0 K10  ; "k"
-  0064  [ 26]  GETTABUP        R15 U0 K11  ; "l"
-  0065  [ 26]  GETTABUP        R16 U0 K12  ; "n"
-  0066  [ 26]  CALL_R0         R1 args=13
-  0067  [ 36]  CLOSURE         R1 P1
-  0068  [ 37]  CALLS_R0        R2 args=1 f=R1
-  0069  [ 38]  RETURN          R0 count=1
+  0000  [  9]  FUNC
+  0001  [  9]  VARARGPREP      fixed=0
+  0002  [ 11]  GETUPVAL        R0 U1
+  0003  [ 11]  CALL            R0 args=1 ret=3
+  0004  [ 11]  GETTABUP        R2 U0 K0  ; "a"
+  0005  [ 11]  ERRNNIL         R2 name=K0
+  0006  [ 11]  SETTABUP        R0 U0 K0  ; "a"
+  0007  [ 11]  GETTABUP        R2 U0 K1  ; "b"
+  0008  [ 11]  ERRNNIL         R2 name=K1
+  0009  [ 11]  SETTABUP        R1 U0 K1  ; "b"
+  0010  [ 13]  GETUPVAL        R0 U1
+  0011  [ 13]  CALL_R1         R0 args=1
+  0012  [ 13]  LOADNIL         R1 count=1
+  0013  [ 13]  GETTABUP        R2 U0 K2  ; "c"
+  0014  [ 13]  ERRNNIL         R2 name=K2
+  0015  [ 13]  SETTABUP        R0 U0 K2  ; "c"
+  0016  [ 13]  GETTABUP        R2 U0 K3  ; "d"
+  0017  [ 13]  ERRNNIL         R2 name=K3
+  0018  [ 13]  SETTABUP        R1 U0 K3  ; "d"
+  0019  [ 15]  VARARG          R0 count=3
+  0020  [ 15]  GETTABUP        R2 U0 K4  ; "e"
+  0021  [ 15]  ERRNNIL         R2 name=K4
+  0022  [ 15]  SETTABUP        R0 U0 K4  ; "e"
+  0023  [ 15]  GETTABUP        R2 U0 K5  ; "g"
+  0024  [ 15]  ERRNNIL         R2 name=K5
+  0025  [ 15]  SETTABUP        R1 U0 K5  ; "g"
+  0026  [ 17]  VARARG          R0 count=2
+  0027  [ 17]  LOADNIL         R1 count=1
+  0028  [ 17]  GETTABUP        R2 U0 K6  ; "h"
+  0029  [ 17]  ERRNNIL         R2 name=K6
+  0030  [ 17]  SETTABUP        R0 U0 K6  ; "h"
+  0031  [ 17]  GETTABUP        R2 U0 K7  ; "i"
+  0032  [ 17]  ERRNNIL         R2 name=K7
+  0033  [ 17]  SETTABUP        R1 U0 K7  ; "i"
+  0034  [ 19]  NEWTABLE        R0 T0  ; {}
+  0035  [ 22]  CLOSURE         R1 P0
+  0036  [ 22]  SETFIELD        R1 R0 K8  ; "m"
+  0037  [ 23]  SELF            R1 R0 K8  ; "m"
+  0038  [ 23]  CALL            R1 args=2 ret=3
+  0039  [ 23]  GETTABUP        R3 U0 K9  ; "j"
+  0040  [ 23]  ERRNNIL         R3 name=K9
+  0041  [ 23]  SETTABUP        R1 U0 K9  ; "j"
+  0042  [ 23]  GETTABUP        R3 U0 K10  ; "k"
+  0043  [ 23]  ERRNNIL         R3 name=K10
+  0044  [ 23]  SETTABUP        R2 U0 K10  ; "k"
+  0045  [ 25]  SELF            R1 R0 K8  ; "m"
+  0046  [ 25]  CALL_R1         R1 args=2
+  0047  [ 25]  LOADNIL         R2 count=1
+  0048  [ 25]  GETTABUP        R3 U0 K11  ; "l"
+  0049  [ 25]  ERRNNIL         R3 name=K11
+  0050  [ 25]  SETTABUP        R1 U0 K11  ; "l"
+  0051  [ 25]  GETTABUP        R3 U0 K12  ; "n"
+  0052  [ 25]  ERRNNIL         R3 name=K12
+  0053  [ 25]  SETTABUP        R2 U0 K12  ; "n"
+  0054  [ 26]  GETTABUP        R1 U0 K13  ; "print"
+  0055  [ 26]  GETTABUP        R5 U0 K0  ; "a"
+  0056  [ 26]  GETTABUP        R6 U0 K1  ; "b"
+  0057  [ 26]  GETTABUP        R7 U0 K2  ; "c"
+  0058  [ 26]  GETTABUP        R8 U0 K3  ; "d"
+  0059  [ 26]  GETTABUP        R9 U0 K4  ; "e"
+  0060  [ 26]  GETTABUP        R10 U0 K5  ; "g"
+  0061  [ 26]  GETTABUP        R11 U0 K6  ; "h"
+  0062  [ 26]  GETTABUP        R12 U0 K7  ; "i"
+  0063  [ 26]  GETTABUP        R13 U0 K9  ; "j"
+  0064  [ 26]  GETTABUP        R14 U0 K10  ; "k"
+  0065  [ 26]  GETTABUP        R15 U0 K11  ; "l"
+  0066  [ 26]  GETTABUP        R16 U0 K12  ; "n"
+  0067  [ 26]  CALL_R0         R1 args=13
+  0068  [ 36]  CLOSURE         R1 P1
+  0069  [ 37]  CALLS_R0        R2 args=1 f=R1
+  0070  [ 38]  RETURN          R0 count=1
 
   ; prototype 0:
     ; function (params=1, vararg=false, stack=3, upvalues=0)
     ; code:
-    0000  [ 21]  LOADI           R1 10
-    0001  [ 21]  LOADI           R2 20
-    0002  [ 21]  RETURN          R1 count=3
+    0000  [ 20]  FUNC
+    0001  [ 21]  LOADI           R1 10
+    0002  [ 21]  LOADI           R2 20
+    0003  [ 21]  RETURN          R1 count=3
 
   ; prototype 1:
     ; function (params=0, vararg=false, stack=7, upvalues=2)
@@ -132,18 +136,19 @@ expression: output
     ;   U0 = upvalue U0
     ;   U1 = local R0
     ; code:
-    0000  [ 34]  GETUPVAL        R0 U1
-    0001  [ 34]  SELF            R0 R0 K0  ; "m"
-    0002  [ 34]  CALL            R0 args=2 ret=3
-    0003  [ 34]  GETTABUP        R2 U0 K1  ; "o"
-    0004  [ 34]  ERRNNIL         R2 name=K1
-    0005  [ 34]  SETTABUP        R0 U0 K1  ; "o"
-    0006  [ 34]  GETTABUP        R2 U0 K2  ; "p"
-    0007  [ 34]  ERRNNIL         R2 name=K2
-    0008  [ 34]  SETTABUP        R1 U0 K2  ; "p"
-    0009  [ 35]  GETTABUP        R0 U0 K3  ; "print"
-    0010  [ 35]  LOAD            R4 K4  ; "up_recv"
-    0011  [ 35]  GETTABUP        R5 U0 K1  ; "o"
-    0012  [ 35]  GETTABUP        R6 U0 K2  ; "p"
-    0013  [ 35]  CALL_R0         R0 args=4
-    0014  [ 36]  RETURN0
+    0000  [ 33]  FUNC
+    0001  [ 34]  GETUPVAL        R0 U1
+    0002  [ 34]  SELF            R0 R0 K0  ; "m"
+    0003  [ 34]  CALL            R0 args=2 ret=3
+    0004  [ 34]  GETTABUP        R2 U0 K1  ; "o"
+    0005  [ 34]  ERRNNIL         R2 name=K1
+    0006  [ 34]  SETTABUP        R0 U0 K1  ; "o"
+    0007  [ 34]  GETTABUP        R2 U0 K2  ; "p"
+    0008  [ 34]  ERRNNIL         R2 name=K2
+    0009  [ 34]  SETTABUP        R1 U0 K2  ; "p"
+    0010  [ 35]  GETTABUP        R0 U0 K3  ; "print"
+    0011  [ 35]  LOAD            R4 K4  ; "up_recv"
+    0012  [ 35]  GETTABUP        R5 U0 K1  ; "o"
+    0013  [ 35]  GETTABUP        R6 U0 K2  ; "p"
+    0014  [ 35]  CALL_R0         R0 args=4
+    0015  [ 36]  RETURN0

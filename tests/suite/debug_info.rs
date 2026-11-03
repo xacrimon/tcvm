@@ -1,6 +1,7 @@
 //! Prototype debug info: per-instruction lines, function line spans, local
 //! variable ranges, upvalue names, and the chunk name from `load`.
-//! Expected values were taken from `luac -l -l` on the same source.
+//! Expected values were taken from `luac -l -l` on the same source, shifted
+//! by tcvm's `FUNC` at pc 0 and `LOOP` at loop headers.
 
 use tcvm::Lua;
 use tcvm::env::Prototype;
@@ -31,8 +32,8 @@ fn lines_per_instruction() {
         let lines: Vec<u32> = (0..proto.code.len())
             .map(|pc| proto.line_for_pc(pc).unwrap())
             .collect();
-        // VARARGPREP LOAD LOAD ADD GETTABUP MOVE CALL CLOSURE RETURN
-        assert_eq!(lines, [1, 1, 2, 4, 5, 5, 5, 9, 9]);
+        // FUNC VARARGPREP LOAD LOAD ADD GETTABUP MOVE CALL CLOSURE RETURN
+        assert_eq!(lines, [1, 1, 1, 2, 4, 5, 5, 5, 9, 9]);
         assert_eq!(proto.line_for_pc(proto.code.len()), None);
     });
 }
@@ -45,7 +46,8 @@ fn function_line_span_and_source() {
         let f = &proto.prototypes[0];
         assert_eq!((f.line_defined, f.last_line_defined), (7, 9));
         assert_eq!(f.source.as_bytes(), b"=locs");
-        assert_eq!(f.line_for_pc(0), Some(8));
+        assert_eq!(f.line_for_pc(0), Some(7));
+        assert_eq!(f.line_for_pc(1), Some(8));
     });
 }
 
@@ -60,14 +62,14 @@ fn local_variable_ranges() {
         let end = proto.code.len() as u32;
         assert_eq!(
             &vars[..3],
-            [(&b"a"[..], 2, end), (b"b", 3, end), (b"c", 4, 7)]
+            [(&b"a"[..], 3, end), (b"b", 4, end), (b"c", 5, 8)]
         );
         // `local function f` is visible to debug info only after CLOSURE.
-        assert_eq!((vars[3].0, vars[3].1, vars[3].2), (&b"f"[..], 8, end));
+        assert_eq!((vars[3].0, vars[3].1, vars[3].2), (&b"f"[..], 9, end));
         let f = &proto.prototypes[0];
         assert_eq!(f.locvars.len(), 1);
         assert_eq!(f.locvars[0].name.as_bytes(), b"x");
-        assert_eq!(f.locvars[0].start_pc, 0);
+        assert_eq!(f.locvars[0].start_pc, 1);
     });
 }
 
@@ -113,14 +115,14 @@ fn loop_control_slots_are_recorded() {
         let fs = &b"(for state)"[..];
         // A generic loop has a fourth, for its traversal position (`TFOR_VARS`).
         assert_eq!(names, [fs, fs, fs, b"i", fs, fs, fs, fs, b"k", b"v"]);
-        // Control slots live from FORPREP (pc 4) through FORLOOP (pc 5);
+        // Control slots live from FORPREP (pc 5) through FORLOOP (pc 6);
         // the visible variable only inside the (empty) body.
-        assert_eq!((proto.locvars[0].start_pc, proto.locvars[0].end_pc), (4, 6));
-        assert_eq!((proto.locvars[3].start_pc, proto.locvars[3].end_pc), (5, 5));
-        // Generic loop: TFORPREP at 10, TFORLOOP at 12.
+        assert_eq!((proto.locvars[0].start_pc, proto.locvars[0].end_pc), (5, 7));
+        assert_eq!((proto.locvars[3].start_pc, proto.locvars[3].end_pc), (6, 6));
+        // Generic loop: TFORPREP at 11, TFORLOOP at 14.
         assert_eq!(
             (proto.locvars[4].start_pc, proto.locvars[4].end_pc),
-            (10, 13)
+            (11, 15)
         );
     });
 }

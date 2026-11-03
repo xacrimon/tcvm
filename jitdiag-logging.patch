@@ -1,0 +1,78 @@
+diff --git i/src/jit/mod.rs w/src/jit/mod.rs
+index 7caa3ad..082c629 100644
+--- i/src/jit/mod.rs
++++ w/src/jit/mod.rs
+@@ -274,9 +274,10 @@ fn try_compile<'gc>(
+             let entry = install(ctx, closure, state, at, word, region)?;
+             log(ctx, || {
+                 format!(
+-                    "compiled {} pc{at} ({}), {} bytes, {} exits",
++                    "compiled {} pc{at} ({}) at {:p}, {} bytes, {} exits",
+                     crate::jit::compile::chunk_name(closure),
+                     word.op().name(),
++                    entry,
+                     region.code.len(),
+                     region.exits.len()
+                 )
+@@ -472,14 +473,16 @@ fn on_exit<'gc>(
+     }
+     let n = e.count.get() + 1;
+     e.count.set(n);
+-    if n == 1 {
++    if n.is_power_of_two() {
+         log(ctx, || {
+             format!(
+-                "first exit {} pc{} ({:?}) of the region at pc{}",
++                "exit#{n} {} pc{} ({:?} {:?}) of the region at pc{} {:p}",
+                 crate::jit::compile::chunk_name(closure),
+                 pc,
+                 e.tag,
+-                region.entry_pc
++                kind,
++                region.entry_pc,
++                region.entry
+             )
+         });
+     }
+@@ -641,9 +644,9 @@ fn on_entry_fail<'gc>(
+     let n = region.entry_fails.get() + 1;
+     region.entry_fails.set(n);
+     let name = || crate::jit::compile::chunk_name(closure);
+-    if n == 1 {
++    if n.is_power_of_two() {
+         log(ctx, || {
+-            format!("first entry fail {} pc{}", name(), region.entry_pc)
++            format!("entry fail#{n} {} pc{}", name(), region.entry_pc)
+         });
+     }
+     if n == EXIT_HOT && !region.retired.get() {
+@@ -737,8 +740,10 @@ fn recompile<'gc>(
+             ctx.jit().set_slot(slot, region.entry);
+             log(ctx, || {
+                 format!(
+-                    "recompiled {} pc{at}",
+-                    crate::jit::compile::chunk_name(closure)
++                    "recompiled {} pc{at} at {:p}, {} bytes",
++                    crate::jit::compile::chunk_name(closure),
++                    region.entry,
++                    region.code.len()
+                 )
+             });
+             Ok(region.entry)
+diff --git i/src/jit/state.rs w/src/jit/state.rs
+index 157125c..e0c6101 100644
+--- i/src/jit/state.rs
++++ w/src/jit/state.rs
+@@ -76,6 +76,12 @@ impl JitConfig {
+                 }
+             }
+         }
++        if flag("TCVM_JIT_LOG") {
++            eprintln!(
++                "jit: anchor jit_box_i64 at {:p}",
++                crate::jit::helpers::jit_box_i64 as *const ()
++            );
++        }
+         JitConfig {
+             enabled: var("TCVM_JIT").is_none_or(|v| v != "off" && v != "0")
+                 && cfg!(target_arch = "aarch64"),

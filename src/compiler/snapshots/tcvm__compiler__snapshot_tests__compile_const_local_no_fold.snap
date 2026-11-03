@@ -10,10 +10,11 @@ expression: output
 ; upvalues:
 ;   U0 = local R0
 ; code:
-0000  [  1]  VARARGPREP      fixed=0
-0001  [  6]  NEWTABLE        R0 T0  ; {}
-0002  [  7]  LOAD            R1 K0  ; "abc"
-0003  [  7]  LEN             R1 R1
-0004  [  9]  SETTABUP        R0 U0 K1  ; "b"
-0005  [ 10]  SETTABUP        R1 U0 K2  ; "c"
-0006  [ 10]  RETURN          R0 count=1
+0000  [  1]  FUNC
+0001  [  1]  VARARGPREP      fixed=0
+0002  [  6]  NEWTABLE        R0 T0  ; {}
+0003  [  7]  LOAD            R1 K0  ; "abc"
+0004  [  7]  LEN             R1 R1
+0005  [  9]  SETTABUP        R0 U0 K1  ; "b"
+0006  [ 10]  SETTABUP        R1 U0 K2  ; "c"
+0007  [ 10]  RETURN          R0 count=1

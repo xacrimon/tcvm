@@ -82,16 +82,11 @@ impl Slot {
     }
 }
 
-/// Why the dispatch chain returned to the trampoline.
+/// Why the dispatch chain returned to the trampoline: the thread's entry
+/// frame returned, or an error nothing caught ended it. Everything else that
+/// needs the host parks the thread instead (`vm::stack::park`).
 pub(crate) enum Exit {
-    /// The executor takes over from the thread state (the entry frame
-    /// returned, a suspension, an uncaught error).
     End,
-    /// Allocation crossed the GC check threshold; the host collects before
-    /// stepping again.
-    Gc,
-    /// An async native waits on the host.
-    Pending,
 }
 
 /// A dispatch target. Every one carries `#[rustc_align(32)]`: an unaligned
@@ -132,11 +127,6 @@ pub(crate) unsafe fn handler_from_bits(bits: u64) -> Handler {
 /// Where a cold Rust routine (unwinder, native driver, coroutine switch)
 /// tells its handler to go next; the handler `become`s it with `jump!`.
 pub(crate) enum Jump<'gc> {
-    /// Dispatch the instruction at `pc` in the Lua frame at `base`.
-    Dispatch {
-        pc: *const Instruction,
-        base: *mut Value<'gc>,
-    },
     /// Run `ret` with `nret` results at `values`; `base` is the finished
     /// frame's base, so `base - 4` is its header.
     Ret {
@@ -251,6 +241,12 @@ macro_rules! handler_impl {
                 (unsafe { &mut *$th })
             };
         }
+        /// The thread as the raw pointer routines that may switch stacks take.
+        macro_rules! thread_ptr {
+            () => {
+                $th
+            };
+        }
         /// Make `$$ts` the running thread, in the slot and the runtime.
         macro_rules! switch {
             ($$ts:expr) => {{
@@ -270,6 +266,11 @@ macro_rules! handler_impl {
         macro_rules! thread {
             () => {
                 (unsafe { &mut *$rt.thread_ptr() })
+            };
+        }
+        macro_rules! thread_ptr {
+            () => {
+                $rt.thread_ptr()
             };
         }
         macro_rules! switch {
@@ -432,11 +433,12 @@ macro_rules! handler_impl {
             }};
         }
 
-        /// After an allocation: leave for the collector if it is owed work.
+        /// After an allocation, before `next!()`: park for the collector if
+        /// it is owed work (`gc_park` dispatches the next instruction).
         macro_rules! gc_check {
             () => {{
                 if ::std::hint::unlikely($rt.gc_due()) {
-                    exit!($crate::vm::abi::Exit::Gc);
+                    tail!($crate::vm::dispatch::gc_park);
                 }
             }};
         }
@@ -490,42 +492,37 @@ macro_rules! handler_impl {
             }};
         }
 
-        /// Go where a cold routine says.
+        /// Go where a cold routine says, at the start of the thread's
+        /// current level: the unwinder may have dropped levels above it.
         macro_rules! jump {
             ($$j:expr) => {{
                 let __j: $crate::vm::abi::Jump<'gc> = $$j;
                 reload_thread!();
-                match __j {
-                    $crate::vm::abi::Jump::Dispatch { pc: __p, base: __b } => {
-                        resume!(__b, __p)
-                    }
+                let (__h, __i, __p, __b): ($crate::vm::abi::Handler, $crate::vm::abi::Slot, *const $crate::instruction::Instruction, *mut $crate::env::value::Value<'gc>) = match __j {
                     $crate::vm::abi::Jump::Ret { ret: __r, nret: __n, values: __v, base: __b } => {
-                        become __r(
-                            $crate::vm::abi::Slot::nret(__n),
-                            __v as *const $crate::instruction::Instruction,
-                            __b,
-                            $rt,
-                            closure_slot!()
-                            $(, $th)?
-                        )
+                        (__r, $crate::vm::abi::Slot::nret(__n), __v as *const _, __b)
                     }
                     $crate::vm::abi::Jump::Enter { hdr: __h, nargs: __n, base: __b } => {
-                        become $crate::vm::ops::call::enter(
-                            $crate::vm::abi::Slot::nret(__n),
-                            __h as *const $crate::instruction::Instruction,
-                            __b,
-                            $rt,
-                            closure_slot!()
-                            $(, $th)?
-                        )
+                        ($crate::vm::ops::call::enter, $crate::vm::abi::Slot::nret(__n), __h as *const _, __b)
                     }
-                    $crate::vm::abi::Jump::Exit(__e) => return __e,
-                }
+                    $crate::vm::abi::Jump::Exit($crate::vm::abi::Exit::End) => {
+                        ($crate::vm::dispatch::exit_end, $crate::vm::abi::Slot::from_raw(0), $pc, $base)
+                    }
+                };
+                $crate::vm::abi::handler_impl!(@jump __h, __i, __p, __b, $rt, [$($th)?], closure_slot!())
             }};
         }
 
         $crate::vm::abi::handler_impl!(@kind_body $kind, $insn, $pc, $base, $rt, $closure, $thread);
     };
+
+    (@jump $h:ident, $i:ident, $p:ident, $b:ident, $rt:ident, [$th:ident], $c:expr) => {{
+        $rt.jit().jump_target.set($h as usize);
+        become $crate::jit::backend::aarch64::abi::level_jump($i, $p, $b, $rt, $c, $th)
+    }};
+    (@jump $h:ident, $i:ident, $p:ident, $b:ident, $rt:ident, [], $c:expr) => {{
+        become $h($i, $p, $b, $rt, $c)
+    }};
 
     (@kind_body op, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident) => {
         /// Constant `$$i` of the running prototype.
@@ -619,8 +616,8 @@ pub(crate) fn check_sync<'gc>(ts: &ThreadState<'gc>) {
     );
 }
 
-/// Debug: at the first dispatch after a `sync!`, the published base still
-/// points into the stack (growth in between must have rebased it). The
+/// Debug: at the first dispatch after a `sync!`, the published base points
+/// into the stack. The
 /// pair itself may be stale by now: a tail call replaces the frame in place,
 /// and D10 reads the published state only at exits, which publish again.
 #[cfg(debug_assertions)]

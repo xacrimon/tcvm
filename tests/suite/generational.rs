@@ -1,56 +1,21 @@
 //! Minor collections: everything that survived a collection is old and kept, so whatever old
 //! objects were given since must survive too, and only objects allocated since can be freed.
 
-use tcvm::env::LuaString;
-use tcvm::{Lua, RuntimeError};
+use tcvm::Lua;
 
-use crate::common::start_on;
-
-/// Run each chunk of `src`, separated by `--full` or `--minor` lines, to completion, then that
-/// collection. Returns the last chunk's string result and the live bytes before and after each
-/// collection.
-fn run_steps(lua: &mut Lua, src: &str) -> (String, Vec<(usize, usize)>) {
-    let mut result = String::new();
-    let mut live = Vec::new();
-    let mut chunk = String::new();
-    for line in src.lines().chain(["--end"]) {
-        let full = match line {
-            "--full" => true,
-            "--minor" | "--end" => false,
-            _ => {
-                chunk.push_str(line);
-                chunk.push('\n');
-                continue;
-            }
-        };
-        let ex = start_on(lua, &chunk);
-        lua.finish(&ex).expect("run");
-        result = lua
-            .try_enter(|ctx| {
-                let r = ctx.fetch(&ex).take_result::<Option<LuaString>>(ctx)?;
-                Ok::<_, RuntimeError>(r.map_or(String::new(), |s| {
-                    String::from_utf8_lossy(s.as_bytes()).into_owned()
-                }))
-            })
-            .expect("take result");
-        drop(ex);
-        chunk.clear();
-        if line == "--end" {
-            break;
-        }
-        let before = lua.live_bytes();
-        if full {
-            lua.collect_all();
-        } else {
-            lua.collect_young();
-        }
-        live.push((before, lua.live_bytes()));
-    }
-    (result, live)
-}
+use crate::common::run_steps;
 
 fn run(src: &str) -> String {
     let mut lua = Lua::new();
+    lua.load_all();
+    run_steps(&mut lua, src).0
+}
+
+/// [`run`] with only the collections `src` asks for: under
+/// `TCVM_GC_STRESS` others promote what the test means to stay young.
+fn run_exact(src: &str) -> String {
+    let mut lua = Lua::new();
+    lua.stop_gc_stress();
     lua.load_all();
     run_steps(&mut lua, src).0
 }
@@ -125,7 +90,7 @@ w[2] = keep
 --minor
 return tostring(w[1] == nil) .. " " .. tostring(w[2] == keep)
 "#;
-    assert_eq!(run(src), "true true");
+    assert_eq!(run_exact(src), "true true");
 }
 
 #[test]
@@ -181,6 +146,7 @@ for i = 1, 20000 do local x = {i} end
 --full
 "#;
     let mut lua = Lua::new();
+    lua.stop_gc_stress();
     lua.load_all();
     let (_, live) = run_steps(&mut lua, src);
     let [(_, built), (young, minor), (_, full)] = live[..] else {

@@ -136,6 +136,24 @@ return table.concat(t, ' | ')
 }
 
 /// A site that misses three times locks, and keeps computing every case.
+/// `~` takes a float with an integer value as that integer, as the binary
+/// bitwise operators do.
+#[test]
+fn bitwise_not_of_integral_floats() {
+    let src = r#"
+local out = {}
+for _, v in ipairs({3.0, -0.0, 0.0, 2^53, -2^63, 1.5, 2^63, 0/0, 1e308}) do
+  local ok, r = pcall(function() return ~v end)
+  out[#out + 1] = ok and math.type(r) .. ":" .. r or "E"
+end
+return table.concat(out, " ")
+"#;
+    assert_eq!(
+        ok(src),
+        "integer:-4 integer:-1 integer:-1 integer:-9007199254740993 integer:9223372036854775807 E E E E"
+    );
+}
+
 #[test]
 fn a_flipping_site_locks_and_still_computes() {
     let src = r#"

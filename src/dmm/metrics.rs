@@ -77,6 +77,12 @@ struct MetricsInner {
 pub struct Metrics(MetricsInner);
 
 impl Metrics {
+    /// Offset of the allocation counter, followed by the threshold
+    /// `gc_check_due` compares it with, for compiled code.
+    pub(crate) const GC_CHECK_OFFSET: usize = std::mem::offset_of!(Metrics, 0.gc_check);
+}
+
+impl Metrics {
     pub(crate) fn new() -> Self {
         Self(Default::default())
     }
@@ -177,7 +183,8 @@ impl Metrics {
         self.set_gc_check_in(DEFERRED_GC_CHECK);
     }
 
-    fn set_gc_check_in(&self, bytes: usize) {
+    /// Fire [`Metrics::gc_check_due`] after `bytes` more bytes.
+    pub(crate) fn set_gc_check_in(&self, bytes: usize) {
         let c = &self.0.gc_check;
         c.gc_check_at
             .set(c.allocated_bytes_total.get().saturating_add(bytes));
