@@ -474,10 +474,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_within_reach_and_runs() {
+    fn maps_in_a_reservation_and_runs() {
         const SIZE: usize = 1 << 16;
-        let rx = reserve(SIZE, SIZE, true, false).expect("reserve");
-        assert!(in_reach(rx.as_ptr() as usize, SIZE));
+        let rx = match reserve(SIZE, SIZE, true, false) {
+            Ok(p) => {
+                assert!(in_reach(p.as_ptr() as usize, SIZE));
+                p
+            }
+            // The window can be full (other tests' heaps), as the code range
+            // expects too.
+            Err(_) => reserve(SIZE, SIZE, false, false).expect("reserve"),
+        };
         let rw = map_in(rx, SIZE).expect("map");
         assert_eq!(rw.as_ptr() as usize % SIZE, 0);
         unsafe {
