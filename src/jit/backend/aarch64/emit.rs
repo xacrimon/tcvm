@@ -2796,7 +2796,7 @@ const _: usize = IMAGE_SPILLS;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jit::backend::code::{map_dual, sync_icache};
+    use crate::jit::backend::alloc::CodeAllocator;
 
     /// Words of each type of `TYPE_WORDS`, with its index: both ends, their
     /// neighbours inside, the middle, and floats' special values.
@@ -2828,8 +2828,9 @@ mod tests {
     /// against membership.
     #[test]
     fn type_tests_match_their_sets() {
-        const SIZE: usize = 1 << 16;
-        let (rw, rx) = map_dual(SIZE, (SIZE - 1) as u64).expect("map");
+        const SIZE: usize = 1 << 15;
+        let alloc = CodeAllocator::new();
+        let block = alloc.reserve(SIZE).expect("code memory");
         let samples = samples();
         for bits in 0u32..1 << TypeSet::BY_WORDS.len() {
             let set = (0..TypeSet::BY_WORDS.len())
@@ -2856,13 +2857,9 @@ mod tests {
                 a.bind(other);
                 a.mov_imm(Gpr(0), !fail as u64);
                 a.ret();
-                let words = a.finish(rx.as_ptr() as usize).expect("assemble");
-                assert!(words.len() * 4 <= SIZE);
-                let f: extern "C" fn(u64) -> u64 = unsafe {
-                    std::ptr::copy_nonoverlapping(words.as_ptr(), rw.as_ptr().cast(), words.len());
-                    sync_icache(rw.as_ptr(), rx.as_ptr(), words.len() * 4);
-                    std::mem::transmute(rx.as_ptr())
-                };
+                let words = a.finish(block.rx() as usize).expect("assemble");
+                block.write(&words);
+                let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(block.rx()) };
                 for &(w, k) in &samples {
                     let want = set.contains(TypeSet::BY_WORDS[k]);
                     assert_eq!(
@@ -2873,10 +2870,6 @@ mod tests {
                     );
                 }
             }
-        }
-        unsafe {
-            libc::munmap(rw.as_ptr().cast(), SIZE);
-            libc::munmap(rx.as_ptr().cast(), SIZE);
         }
     }
 }

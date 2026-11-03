@@ -292,6 +292,37 @@ fn exhausted_code_memory_turns_the_jit_off() {
     });
 }
 
+/// Under `TCVM_JIT_FAR` (a test mode, `tmodes.sh`'s `far`) the code range
+/// lies out of the text's reach, and compiled code calls into the text
+/// through islands.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn far_code_reaches_the_text_through_islands() {
+    if std::env::var_os("TCVM_JIT_FAR").is_none() {
+        return;
+    }
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(
+                "local t = {} for i = 1, 1000 do t[i] = {i} end return #t",
+                Some("=t"),
+            )?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let n: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        assert_eq!(n.get_integer(), Some(1000));
+        assert_eq!(ctx.jit().internal_errors.get(), 0);
+    });
+    let (near, islands) = crate::jit::backend::alloc::range_state().expect("a code range");
+    assert!(!near && islands > 0, "near {near}, {islands} islands");
+}
+
 /// A frame whose to-be-closed variables all closed runs its compiled CLOSEs
 /// and RETURN, which exit while `HAS_TBC` is set.
 #[cfg(target_arch = "aarch64")]

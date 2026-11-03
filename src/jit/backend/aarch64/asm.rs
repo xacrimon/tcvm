@@ -305,11 +305,10 @@ impl Asm {
             }
         }
         for &(at, target) in &self.externs {
-            let here = base as i64 + at as i64 * 4;
-            let delta = (target as i64 - here) / 4;
-            if !(-(1 << 25)..(1 << 25)).contains(&delta) || (target as i64 - here) % 4 != 0 {
-                return Err(AsmError::ExternRange);
-            }
+            let here = base + at as usize * 4;
+            let target = crate::jit::backend::alloc::branch_target(here, target)
+                .ok_or(AsmError::ExternRange)?;
+            let delta = (target as i64 - here as i64) / 4;
             self.words[at as usize] |= (delta as u32) & 0x03ff_ffff;
         }
         Ok(self.words)

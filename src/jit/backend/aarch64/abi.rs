@@ -113,6 +113,29 @@ pub(crate) fn image_index(p: PReg) -> u8 {
     }
 }
 
+/// An island (`alloc::branch_target`): a far code range's branch on to
+/// `target` in the text, through a register free at the target's entry,
+/// which the caller's `b`/`bl` left everything else for.
+pub(crate) fn island(target: usize) -> [u32; 4] {
+    // x16 is free at entry to Rust code (IP0); the stubs taking arguments
+    // in it, and `jit_level` in x17 too, have their own.
+    let s = if target == exit_common as *const () as usize
+        || target == level_enter as *const () as usize
+    {
+        17
+    } else if target == jit_level as *const () as usize {
+        9
+    } else {
+        16
+    };
+    [
+        0x5800_0040 | s,      // ldr xs, #8
+        0xD61F_0000 | s << 5, // br xs
+        target as u32,
+        (target >> 32) as u32,
+    ]
+}
+
 /// The spill slots a region may have, all copied to the image.
 pub(crate) const MAX_SPILLS: usize = 256;
 const _: () = assert!(IMAGE_SPILLS + MAX_SPILLS <= EXIT_REGS);

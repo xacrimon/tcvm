@@ -6,12 +6,20 @@
 //! aligned too, and a second bitmap marks where blocks start, so an address
 //! in a block finds the block's first word (`block_start`), where a region
 //! keeps its pointer.
+//!
+//! Every segment's executable alias is a slot of the process's one code
+//! range (`Range`), shared by every `Lua`: code reaches other code with
+//! `b`/`bl` wherever the range is, and the text too when the range is near
+//! it; a far range branches to the text through islands (`branch_target`).
 
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::ptr::NonNull;
+use std::sync::{Mutex, MutexGuard};
 
-use crate::jit::backend::code::{map_dual, sync_icache};
+use crate::jit::backend::code::{
+    in_reach, map_in, reserve as reserve_space, sync_icache, unmap_out,
+};
 
 pub(crate) const SEG_SIZE: usize = 64 * 1024;
 const UNIT: usize = 64;
@@ -120,11 +128,155 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.rw.as_ptr().cast(), SEG_SIZE);
-            libc::munmap(self.rx.as_ptr().cast(), SEG_SIZE);
+        unsafe { libc::munmap(self.rw.as_ptr().cast(), SEG_SIZE) };
+        unmap_out(self.rx, SEG_SIZE);
+        if let Some(r) = range().as_mut() {
+            r.give(self.rx.as_ptr() as usize);
         }
     }
+}
+
+/// Sizes tried for a range within reach of the text, largest first; a far
+/// range is the first of them.
+const NEAR_SIZES: [usize; 3] = [64 << 20, 32 << 20, 16 << 20];
+
+/// Bytes of an island: `ldr` of its target, `br`, the target.
+const ISLAND: usize = 16;
+
+/// The process's code range: one reservation, made on first use, near the
+/// text if any of `NEAR_SIZES` fits in reach, else anywhere (beyond reach
+/// under `TCVM_JIT_FAR`, for tests of far code). Never given back.
+struct Range {
+    base: usize,
+    used: Vec<u64>,
+    slots: usize,
+    near: bool,
+    /// Text targets' islands of a far range: (target, island).
+    islands: Vec<(usize, usize)>,
+    /// The slot islands are written in: executable and writable alias, next
+    /// free byte.
+    island_slot: Option<(usize, usize, usize)>,
+}
+
+static RANGE: Mutex<Option<Range>> = Mutex::new(None);
+
+fn range() -> MutexGuard<'static, Option<Range>> {
+    RANGE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Range {
+    fn new() -> io::Result<Range> {
+        let far = std::env::var_os("TCVM_JIT_FAR").is_some_and(|v| v != "0");
+        let near = (!far)
+            .then(|| {
+                NEAR_SIZES.iter().find_map(|&size| {
+                    reserve_space(size, SEG_SIZE, true, false)
+                        .ok()
+                        .map(|p| (p, size))
+                })
+            })
+            .flatten();
+        let (p, size) = match near {
+            Some(r) => r,
+            None => (
+                reserve_space(NEAR_SIZES[0], SEG_SIZE, false, far)?,
+                NEAR_SIZES[0],
+            ),
+        };
+        let base = p.as_ptr() as usize;
+        let slots = size / SEG_SIZE;
+        Ok(Range {
+            base,
+            used: vec![0; slots.div_ceil(64)],
+            slots,
+            near: in_reach(base, size),
+            islands: Vec::new(),
+            island_slot: None,
+        })
+    }
+
+    /// A free slot's executable address.
+    fn take(&mut self) -> Option<usize> {
+        let i = (0..self.slots).find(|&i| self.used[i / 64] >> (i % 64) & 1 == 0)?;
+        self.used[i / 64] |= 1 << (i % 64);
+        Some(self.base + i * SEG_SIZE)
+    }
+
+    fn give(&mut self, rx: usize) {
+        let i = (rx - self.base) / SEG_SIZE;
+        debug_assert!(
+            self.used[i / 64] >> (i % 64) & 1 != 0,
+            "a free code slot freed"
+        );
+        self.used[i / 64] &= !(1 << (i % 64));
+    }
+
+    fn contains(&self, a: usize) -> bool {
+        (self.base..self.base + self.slots * SEG_SIZE).contains(&a)
+    }
+
+    /// The island branching on to `target`, made on first use.
+    #[cfg(target_arch = "aarch64")]
+    fn island(&mut self, target: usize) -> Option<usize> {
+        if let Some(&(_, i)) = self.islands.iter().find(|i| i.0 == target) {
+            return Some(i);
+        }
+        if self
+            .island_slot
+            .is_none_or(|(_, _, next)| next + ISLAND > SEG_SIZE)
+        {
+            let rx = self.take()?;
+            let slot = NonNull::new(rx as *mut u8).expect("a slot at 0");
+            let Ok(rw) = map_in(slot, SEG_SIZE) else {
+                self.give(rx);
+                return None;
+            };
+            self.island_slot = Some((rx, rw.as_ptr() as usize, 0));
+        }
+        let (rx, rw, next) = self.island_slot.as_mut().expect("an island slot");
+        let words = crate::jit::backend::aarch64::abi::island(target);
+        let (at_rx, at_rw) = (*rx + *next, *rw + *next);
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr(), at_rw as *mut u32, words.len());
+            sync_icache(at_rw as *mut u8, at_rx as *mut u8, ISLAND);
+        }
+        *next += ISLAND;
+        self.islands.push((target, at_rx));
+        Some(at_rx)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn island(&mut self, _target: usize) -> Option<usize> {
+        None
+    }
+}
+
+/// Whether the code range is near the text, and its islands (tests).
+#[cfg(test)]
+pub(crate) fn range_state() -> Option<(bool, usize)> {
+    range().as_ref().map(|r| (r.near, r.islands.len()))
+}
+
+/// Whether a `b`/`bl` at `from` reaches `target`.
+fn in_b26(from: usize, target: usize) -> bool {
+    let d = target as i64 - from as i64;
+    d % 4 == 0 && (-(1 << 27)..(1 << 27)).contains(&d)
+}
+
+/// Where a `b`/`bl` at `from`, code in the range, goes for `target`: the
+/// target itself in reach, else its island (a far range's branch into the
+/// text); none if neither reaches.
+pub(crate) fn branch_target(from: usize, target: usize) -> Option<usize> {
+    if in_b26(from, target) {
+        return Some(target);
+    }
+    let mut g = range();
+    let r = g.as_mut()?;
+    if r.near || !r.contains(from) {
+        return None;
+    }
+    let i = r.island(target)?;
+    in_b26(from, i).then_some(i)
 }
 
 /// One region's code in a segment.
@@ -172,11 +324,13 @@ impl CodeBlock {
         ));
     }
 
-    /// Point the `b` or `bl` at byte `off` at `target` and publish it.
+    /// Point the `b` or `bl` at byte `off` at `target` (or its island) and
+    /// publish it.
     pub(crate) fn repoint_branch(&self, off: usize, target: usize) {
         assert!(off + 4 <= self.len() && off.is_multiple_of(4));
-        let d = target as i64 - (self.rx() as usize + off) as i64;
-        assert!(d.unsigned_abs() < 1 << 27, "a branch target out of reach");
+        let at = self.rx() as usize + off;
+        let target = branch_target(at, target).expect("a branch target out of reach");
+        let d = target as i64 - at as i64;
         unsafe {
             let p = self.rw.as_ptr().add(off).cast::<u32>();
             p.write(p.read() & 0xfc00_0000 | (d >> 2) as u32 & 0x03ff_ffff);
@@ -240,7 +394,8 @@ impl std::fmt::Display for ReserveError {
 struct Inner {
     segments: Vec<Segment>,
     primary: usize,
-    /// Mapping failed once (no address in reach): refuse from then on.
+    /// No segment could be had once (the code range full, or mapping
+    /// failed): refuse from then on.
     exhausted: bool,
     /// Segments it may map (tests).
     max_segments: usize,
@@ -285,6 +440,29 @@ impl CodeAllocator {
     }
 }
 
+/// A slot of the range, mapped: its writable and executable aliases.
+fn map_segment() -> io::Result<(NonNull<u8>, NonNull<u8>)> {
+    let rx = {
+        let mut g = range();
+        if g.is_none() {
+            *g = Some(Range::new()?);
+        }
+        let r = g.as_mut().expect("the code range");
+        r.take()
+            .ok_or_else(|| io::Error::other("the code range is full"))?
+    };
+    let rx = NonNull::new(rx as *mut u8).expect("a slot at 0");
+    match map_in(rx, SEG_SIZE) {
+        Ok(rw) => Ok((rw, rx)),
+        Err(e) => {
+            if let Some(r) = range().as_mut() {
+                r.give(rx.as_ptr() as usize);
+            }
+            Err(e)
+        }
+    }
+}
+
 impl Inner {
     fn new_segment(&mut self) -> Result<usize, ReserveError> {
         if self.exhausted {
@@ -293,7 +471,7 @@ impl Inner {
             )));
         }
         let mapped = if self.segments.len() < self.max_segments {
-            map_dual(SEG_SIZE, (SEG_SIZE - 1) as u64)
+            map_segment()
         } else {
             Err(io::Error::other("segment limit"))
         };

@@ -1,8 +1,9 @@
 //! Executable memory: every page mapped twice, a read/write alias the JIT
 //! writes through and a read/execute alias the CPU fetches from, so no page
-//! is ever both. The executable alias is placed within direct-branch reach
-//! of tcvm's text (as LuaJIT's `mcode_alloc`), so regions branch to handlers
-//! and helpers with `b`/`bl`.
+//! is ever both. The executable aliases go into one reservation per process
+//! (`alloc`'s code range), placed within direct-branch reach of tcvm's text
+//! when there is room, so regions branch to handlers and helpers with
+//! `b`/`bl`; a range out of reach branches to them through islands.
 //!
 //! After writing, the instruction cache must be invalidated over the
 //! executable range (`sync_icache`): aarch64 does not keep it coherent.
@@ -92,6 +93,7 @@ pub(crate) fn in_reach(addr: usize, len: usize) -> bool {
 
 /// Candidate executable addresses for a mapping of `size`, nearest the text
 /// first, alternating above and below, in `step` increments.
+#[cfg(target_os = "linux")]
 fn candidates(size: usize, step: usize) -> impl Iterator<Item = usize> {
     let (lo, hi) = text_range();
     let up = hi.next_multiple_of(step);
@@ -134,11 +136,143 @@ unsafe extern "C" {
 #[cfg(target_os = "macos")]
 const VM_INHERIT_NONE: libc::vm_inherit_t = 2;
 
-/// Map `size` bytes twice: a read/write alias aligned to `align_mask + 1`, and
-/// a read/execute alias within branch reach of the text. Returns `(rw, rx)`.
+/// Reserve `size` bytes of address space, aligned to `align`, mapping
+/// nothing: within reach of the text if `near`, else anywhere or, with
+/// `out_of_reach`, beyond it (tests of far code).
+pub(crate) fn reserve(
+    size: usize,
+    align: usize,
+    near: bool,
+    out_of_reach: bool,
+) -> io::Result<NonNull<u8>> {
+    if near {
+        // Mach finds the first gap from a hint in one call; Linux takes a
+        // hint only when the space there is free, so it probes.
+        #[cfg(target_os = "macos")]
+        {
+            let (lo, hi) = text_range();
+            for hint in [hi, lo.saturating_sub(BRANCH_REACH)] {
+                let Some(p) = reserve_at(Place::From(hint.next_multiple_of(align)), size, align)
+                else {
+                    continue;
+                };
+                if in_reach(p.as_ptr() as usize, size) {
+                    return Ok(p);
+                }
+                unsafe { libc::munmap(p.as_ptr().cast(), size) };
+            }
+        }
+        #[cfg(target_os = "linux")]
+        for cand in candidates(size, align) {
+            if let Some(p) = reserve_at(Place::Fixed(cand), size, align) {
+                return Ok(p);
+            }
+        }
+        return Err(io::Error::other(
+            "no code address within branch reach of the text",
+        ));
+    }
+    if out_of_reach {
+        let (_, hi) = text_range();
+        let p = reserve_at(Place::From(hi + 2 * BRANCH_REACH), size, align)
+            .ok_or_else(io::Error::last_os_error)?;
+        if in_reach(p.as_ptr() as usize, size) {
+            return Err(io::Error::other("no code address out of reach"));
+        }
+        return Ok(p);
+    }
+    reserve_at(Place::Any, size, align).ok_or_else(io::Error::last_os_error)
+}
+
+#[derive(Clone, Copy)]
+enum Place {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Fixed(usize),
+    /// The first free address from there on.
+    From(usize),
+    Any,
+}
+
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
-pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
+fn reserve_at(at: Place, size: usize, align: usize) -> Option<NonNull<u8>> {
+    let (mut addr, flags) = match at {
+        Place::Fixed(a) => (a, libc::VM_FLAGS_FIXED),
+        Place::From(a) => (a, libc::VM_FLAGS_ANYWHERE),
+        Place::Any => (0, libc::VM_FLAGS_ANYWHERE),
+    };
+    let mut a = addr as libc::mach_vm_address_t;
+    let kr = unsafe {
+        libc::mach_vm_map(
+            libc::mach_task_self(),
+            &mut a,
+            size as libc::mach_vm_size_t,
+            (align - 1) as libc::mach_vm_offset_t,
+            flags,
+            0,
+            0,
+            0,
+            libc::VM_PROT_NONE,
+            libc::VM_PROT_NONE,
+            VM_INHERIT_NONE,
+        )
+    };
+    addr = a as usize;
+    (kr == libc::KERN_SUCCESS)
+        .then(|| NonNull::new(addr as *mut u8))
+        .flatten()
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_at(at: Place, size: usize, align: usize) -> Option<NonNull<u8>> {
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE;
+    if let Place::Fixed(a) = at {
+        let p = unsafe {
+            libc::mmap(
+                a as *mut libc::c_void,
+                size,
+                libc::PROT_NONE,
+                flags | libc::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        if p as usize != a {
+            unsafe { libc::munmap(p, size) };
+            return None;
+        }
+        return NonNull::new(p.cast());
+    }
+    // A hint the kernel takes when it is free, aligned up after.
+    let hint = match at {
+        Place::From(a) => a as *mut libc::c_void,
+        _ => std::ptr::null_mut(),
+    };
+    let p = unsafe { libc::mmap(hint, size + align, libc::PROT_NONE, flags, -1, 0) };
+    if p == libc::MAP_FAILED {
+        return None;
+    }
+    let base = p as usize;
+    let aligned = base.next_multiple_of(align);
+    unsafe {
+        if aligned > base {
+            libc::munmap(p, aligned - base);
+        }
+        let tail = aligned + size;
+        libc::munmap(tail as *mut libc::c_void, base + size + align - tail);
+    }
+    NonNull::new(aligned as *mut u8)
+}
+
+/// Map `size` bytes twice: a read/write alias anywhere, aligned to `size`,
+/// and a read/execute alias over `rx`, a slot of a reservation. Returns
+/// the read/write alias.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+pub(crate) fn map_in(rx: NonNull<u8>, size: usize) -> io::Result<NonNull<u8>> {
     let task = unsafe { libc::mach_task_self() };
     let mut rw_addr: libc::mach_vm_address_t = 0;
     let kr = unsafe {
@@ -146,7 +280,7 @@ pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>,
             task,
             &mut rw_addr,
             size as libc::mach_vm_size_t,
-            align_mask as libc::mach_vm_offset_t,
+            (size - 1) as libc::mach_vm_offset_t,
             libc::VM_FLAGS_ANYWHERE,
             0,
             0,
@@ -162,42 +296,32 @@ pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>,
     let unmap_rw = || unsafe {
         libc::munmap(rw_addr as *mut libc::c_void, size);
     };
-    // The executable alias, at the first free address in reach.
-    let mut rx_addr = None;
-    for cand in candidates(size, 64 << 10) {
-        let mut addr = cand as libc::mach_vm_address_t;
-        let mut cur: libc::vm_prot_t = 0;
-        let mut max: libc::vm_prot_t = 0;
-        let kr = unsafe {
-            mach_vm_remap(
-                task,
-                &mut addr,
-                size as libc::mach_vm_size_t,
-                0,
-                libc::VM_FLAGS_FIXED,
-                task,
-                rw_addr,
-                0,
-                &mut cur,
-                &mut max,
-                VM_INHERIT_NONE,
-            )
-        };
-        if kr == libc::KERN_SUCCESS {
-            rx_addr = Some(addr);
-            break;
-        }
-    }
-    let Some(rx_addr) = rx_addr else {
-        unmap_rw();
-        return Err(io::Error::other(
-            "no code address within branch reach of the text",
-        ));
+    let mut addr = rx.as_ptr() as libc::mach_vm_address_t;
+    let mut cur: libc::vm_prot_t = 0;
+    let mut max: libc::vm_prot_t = 0;
+    let kr = unsafe {
+        mach_vm_remap(
+            task,
+            &mut addr,
+            size as libc::mach_vm_size_t,
+            0,
+            libc::VM_FLAGS_FIXED | libc::VM_FLAGS_OVERWRITE,
+            task,
+            rw_addr,
+            0,
+            &mut cur,
+            &mut max,
+            VM_INHERIT_NONE,
+        )
     };
+    if kr != libc::KERN_SUCCESS {
+        unmap_rw();
+        return Err(io::Error::other(format!("mach_vm_remap failed: {kr}")));
+    }
     let kr = unsafe {
         mach_vm_protect(
             task,
-            rx_addr,
+            addr,
             size as libc::mach_vm_size_t,
             0,
             libc::VM_PROT_READ | libc::VM_PROT_EXECUTE,
@@ -205,19 +329,16 @@ pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>,
     };
     if kr != libc::KERN_SUCCESS {
         unmap_rw();
-        unsafe { libc::munmap(rx_addr as *mut libc::c_void, size) };
+        unmap_out(rx, size);
         return Err(io::Error::other(format!("mach_vm_protect failed: {kr}")));
     }
-    Ok((
-        NonNull::new(rw_addr as *mut u8).expect("mach_vm_map returned null"),
-        NonNull::new(rx_addr as *mut u8).expect("mach_vm_remap returned null"),
-    ))
+    Ok(NonNull::new(rw_addr as *mut u8).expect("mach_vm_map returned null"))
 }
 
-/// Linux: two `MAP_SHARED` views of one `memfd`, the executable one placed
-/// with `MAP_FIXED_NOREPLACE` in reach of the text.
+/// Linux: two `MAP_SHARED` views of one `memfd`, the executable one over the
+/// slot with `MAP_FIXED`.
 #[cfg(target_os = "linux")]
-pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>, NonNull<u8>)> {
+pub(crate) fn map_in(rx: NonNull<u8>, size: usize) -> io::Result<NonNull<u8>> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let fd = unsafe { libc::memfd_create(c"tcvm-jit".as_ptr(), libc::MFD_CLOEXEC) };
@@ -229,70 +350,69 @@ pub(crate) fn map_dual(size: usize, align_mask: u64) -> io::Result<(NonNull<u8>,
     if unsafe { libc::ftruncate(raw, size as libc::off_t) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let align = align_mask as usize + 1;
-    let reserve = size + align;
-    let base = unsafe {
+    let rw = reserve_at(Place::Any, size, size).ok_or_else(io::Error::last_os_error)?;
+    let map = |at: NonNull<u8>, prot| unsafe {
         libc::mmap(
-            std::ptr::null_mut(),
-            reserve,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        )
-    };
-    if base == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
-    }
-    let base = base as usize;
-    let aligned = (base + align_mask as usize) & !(align_mask as usize);
-    let rw = unsafe {
-        libc::mmap(
-            aligned as *mut libc::c_void,
+            at.as_ptr().cast(),
             size,
-            libc::PROT_READ | libc::PROT_WRITE,
+            prot,
             libc::MAP_SHARED | libc::MAP_FIXED,
             raw,
             0,
         )
     };
-    if rw == libc::MAP_FAILED {
+    if map(rw, libc::PROT_READ | libc::PROT_WRITE) == libc::MAP_FAILED {
         let err = io::Error::last_os_error();
-        unsafe { libc::munmap(base as *mut libc::c_void, reserve) };
+        unsafe { libc::munmap(rw.as_ptr().cast(), size) };
         return Err(err);
     }
-    if aligned > base {
-        unsafe { libc::munmap(base as *mut libc::c_void, aligned - base) };
+    if map(rx, libc::PROT_READ | libc::PROT_EXEC) == libc::MAP_FAILED {
+        let err = io::Error::last_os_error();
+        unsafe { libc::munmap(rw.as_ptr().cast(), size) };
+        unmap_out(rx, size);
+        return Err(err);
     }
-    let tail = aligned + size;
-    unsafe { libc::munmap(tail as *mut libc::c_void, base + reserve - tail) };
-    for cand in candidates(size, 64 << 10) {
-        let rx = unsafe {
+    Ok(rw)
+}
+
+/// Put a slot `map_in` mapped back into its reservation: reserved address
+/// space nothing else is given.
+#[allow(deprecated)]
+pub(crate) fn unmap_out(rx: NonNull<u8>, size: usize) {
+    #[cfg(target_os = "macos")]
+    {
+        let mut addr = rx.as_ptr() as libc::mach_vm_address_t;
+        let kr = unsafe {
+            libc::mach_vm_map(
+                libc::mach_task_self(),
+                &mut addr,
+                size as libc::mach_vm_size_t,
+                0,
+                libc::VM_FLAGS_FIXED | libc::VM_FLAGS_OVERWRITE,
+                0,
+                0,
+                0,
+                libc::VM_PROT_NONE,
+                libc::VM_PROT_NONE,
+                VM_INHERIT_NONE,
+            )
+        };
+        assert_eq!(kr, libc::KERN_SUCCESS, "re-reserving a code slot");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let p = unsafe {
             libc::mmap(
-                cand as *mut libc::c_void,
+                rx.as_ptr().cast(),
                 size,
-                libc::PROT_READ | libc::PROT_EXEC,
-                libc::MAP_SHARED | libc::MAP_FIXED_NOREPLACE,
-                raw,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_FIXED,
+                -1,
                 0,
             )
         };
-        if rx == libc::MAP_FAILED {
-            continue;
-        }
-        if rx as usize != cand {
-            unsafe { libc::munmap(rx, size) };
-            continue;
-        }
-        return Ok((
-            NonNull::new(rw.cast()).expect("mmap returned null"),
-            NonNull::new(rx.cast()).expect("mmap returned null"),
-        ));
+        assert!(p != libc::MAP_FAILED, "re-reserving a code slot");
     }
-    unsafe { libc::munmap(rw, size) };
-    Err(io::Error::other(
-        "no code address within branch reach of the text",
-    ))
 }
 
 /// Make bytes written through `rw` fetchable through `rx`. Apple Silicon has
@@ -355,9 +475,11 @@ mod tests {
 
     #[test]
     fn maps_within_reach_and_runs() {
-        let (rw, rx) = map_dual(1 << 16, (1 << 16) - 1).expect("map");
-        assert!(in_reach(rx.as_ptr() as usize, 1 << 16));
-        assert_eq!(rw.as_ptr() as usize % (1 << 16), 0);
+        const SIZE: usize = 1 << 16;
+        let rx = reserve(SIZE, SIZE, true, false).expect("reserve");
+        assert!(in_reach(rx.as_ptr() as usize, SIZE));
+        let rw = map_in(rx, SIZE).expect("map");
+        assert_eq!(rw.as_ptr() as usize % SIZE, 0);
         unsafe {
             let w = rw.as_ptr().cast::<u32>();
             w.write(0xD280_0540); // mov x0, #42
@@ -365,8 +487,9 @@ mod tests {
             sync_icache(rw.as_ptr(), rx.as_ptr(), 8);
             let f: extern "C" fn() -> u64 = std::mem::transmute(rx.as_ptr());
             assert_eq!(f(), 42);
-            libc::munmap(rw.as_ptr().cast(), 1 << 16);
-            libc::munmap(rx.as_ptr().cast(), 1 << 16);
+            libc::munmap(rw.as_ptr().cast(), SIZE);
         }
+        unmap_out(rx, SIZE);
+        unsafe { libc::munmap(rx.as_ptr().cast(), SIZE) };
     }
 }
