@@ -24,6 +24,9 @@ enum NumKind {
     F64,
     /// A small integer or a float, told apart where the result depends on it.
     Num,
+    /// An integer of either size or a float, for arithmetic only (D2):
+    /// integers in i64, a float converting a big integer as Lua does.
+    Wide,
 }
 
 /// The kind a value has for certain.
@@ -65,7 +68,8 @@ fn num_kind(b: &Builder<'_, '_>, v: Val, form: Option<NumKind>, bits: fb::Bits) 
 
 /// The operand kinds a site's feedback bits give both its operands, or
 /// `None` when it saw values no number kind covers (non-numbers, a
-/// metamethod, big integers with floats): those take the slow arm.
+/// metamethod, big integers with floats): those take the slow arm, but in
+/// arithmetic big integers with floats are `Wide` (`arith_wide`).
 fn bits_num_kind(bits: fb::Bits) -> Option<NumKind> {
     let kinds = bits & fb::KINDS;
     if bits & fb::MM != 0 || kinds & (fb::STR | fb::TAB | fb::OTHER) != 0 {
@@ -80,6 +84,24 @@ fn bits_num_kind(bits: fb::Bits) -> Option<NumKind> {
         (false, true) => Some(NumKind::F64),
         (true, true) if kinds & fb::BIGINT != 0 => None,
         (true, true) => Some(NumKind::Num),
+    }
+}
+
+/// Whether arithmetic takes an operand `num_kind` has no kind for as `Wide`:
+/// a number for certain, or one at a site that saw numbers only, big
+/// integers and floats among them.
+fn arith_wide(b: &Builder<'_, '_>, o: Operand, bits: fb::Bits) -> bool {
+    let kinds = bits & fb::KINDS;
+    let seen = bits & fb::MM == 0
+        && kinds & !(fb::INT | fb::FLOAT) == 0
+        && kinds & fb::BIGINT != 0
+        && kinds & fb::FLOAT != 0;
+    match o {
+        Operand::Reg(v) => {
+            let t = b.ty(v);
+            seen || (t.rep == Rep::Val && !t.set.is_empty() && t.within(TypeSet::NUM))
+        }
+        _ => false,
     }
 }
 
@@ -777,7 +799,15 @@ fn emit_arith(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     };
     let bits = b.feedback(pc);
     let (fl, fr) = form_kinds(b, pc).unwrap_or((None, None));
-    let (lk, rk) = (l.kind(b, fl, bits), r.kind(b, fr, bits));
+    let bitwise = matches!(
+        kind,
+        ArithKind::BAnd | ArithKind::BOr | ArithKind::BXor | ArithKind::Shl | ArithKind::Shr
+    );
+    let kind_of = |b: &Builder<'_, '_>, o: Operand, form| {
+        o.kind(b, form, bits)
+            .or_else(|| (!bitwise && arith_wide(b, o, bits)).then_some(NumKind::Wide))
+    };
+    let (lk, rk) = (kind_of(b, l, fl), kind_of(b, r, fr));
     let wide = bits & (fb::OVERFLOW | fb::BIGINT) != 0;
     if let (Some(lk), Some(rk)) = (lk, rk) {
         arith_kinds(b, kind, dst, (l, lk), (r, rk), wide, None);
@@ -831,6 +861,27 @@ fn arith_kinds(
     } else if float {
         let (x, y) = (l.f64(b, lk), r.f64(b, rk));
         float_arith(b, kind, x, y, r)
+    } else if lk == Wide || rk == Wide {
+        // Integers of either size (and the small ones of a `Num`) make an
+        // i64, anything else a float.
+        let to = join.unwrap_or_else(|| b.new_block());
+        let nums: Vec<Val> = [(l, lk), (r, rk)]
+            .into_iter()
+            .filter(|&(_, k)| matches!(k, Num | Wide))
+            .map(|(o, _)| o.val(b))
+            .collect();
+        let floats = all_in(b, TypeSet::INT, &nums);
+        let (x, y) = (l.small(b, lk), r.small(b, rk));
+        let v = int_arith(b, kind, x, y, true);
+        arm_end(b, to, dst, v);
+        enter_join(b, floats);
+        let (x, y) = (l.f64(b, lk), r.f64(b, rk));
+        let v = float_arith(b, kind, x, y, r);
+        arm_end(b, to, dst, v);
+        if join.is_none() {
+            enter_join(b, to);
+        }
+        return;
     } else if lk == Num || rk == Num {
         // Two small integers make an integer, anything else a float.
         let to = join.unwrap_or_else(|| b.new_block());
@@ -927,7 +978,7 @@ impl Operand {
     fn int(self, b: &mut Builder<'_, '_>, k: NumKind) -> Val {
         match (self, k) {
             (Operand::Reg(v), NumKind::I32 | NumKind::Num) => b.as_i32(v),
-            (Operand::Reg(v), NumKind::I64) => b.as_i64(v),
+            (Operand::Reg(v), NumKind::I64 | NumKind::Wide) => b.as_i64(v),
             // Exits where the float has no integer representation in i32.
             (Operand::Reg(v), NumKind::F64) => {
                 let x = b.as_f64(v);
@@ -939,12 +990,17 @@ impl Operand {
         }
     }
 
-    /// The integer of an operand that is a small integer here.
+    /// The integer of an operand that is an integer here: a small one for a
+    /// `Num`, either size for a `Wide`.
     fn small(self, b: &mut Builder<'_, '_>, k: NumKind) -> Val {
         match (self, k) {
             (Operand::Reg(v), NumKind::Num) => {
                 let v = b.boxed(v);
                 b.ins(Op::Unbox(Rep::I32), &[v])
+            }
+            (Operand::Reg(v), NumKind::Wide) => {
+                let v = b.boxed(v);
+                b.ins(Op::Unbox(Rep::I64), &[v])
             }
             (o, k) => o.int(b, k),
         }
@@ -966,6 +1022,11 @@ impl Operand {
             (Operand::Reg(v), NumKind::Num) => {
                 let v = b.boxed(v);
                 let i = b.ins_exit(Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT), &[v], ExitTag::Type);
+                b.f.result(i)
+            }
+            (Operand::Reg(v), NumKind::Wide) => {
+                let v = b.boxed(v);
+                let i = b.ins_exit(Op::ToF64(TypeSet::NUM), &[v], ExitTag::Type);
                 b.f.result(i)
             }
             (Operand::Int(n), _) => b.kf64(n as f64),
@@ -1016,7 +1077,9 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
     };
     // The interpreter's fast path, which records nothing, takes small
     // integers and floats: `bits_num_kind` makes empty bits `Num`.
-    let r = match num_kind(b, v, None, bits) {
+    let kind = num_kind(b, v, None, bits)
+        .or_else(|| arith_wide(b, Operand::Reg(v), bits).then_some(NumKind::Wide));
+    let r = match kind {
         Some(NumKind::F64) => {
             let x = b.as_f64(v);
             b.ins(Op::FNeg, &[x])
@@ -1028,6 +1091,21 @@ fn emit_unm(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
         Some(NumKind::I64) => {
             let x = b.as_i64(v);
             b.ins(Op::LNeg, &[x])
+        }
+        Some(NumKind::Wide) => {
+            let x = b.boxed(v);
+            let join = b.new_block();
+            let floats = all_in(b, TypeSet::INT, &[x]);
+            let i = b.ins(Op::Unbox(Rep::I64), &[x]);
+            let r = b.ins(Op::LNeg, &[i]);
+            arm_end(b, join, dst, r);
+            enter_join(b, floats);
+            let f = b.ins_exit(Op::ToF64(TypeSet::FLOAT), &[x], ExitTag::Type);
+            let f = b.f.result(f);
+            let r = b.ins(Op::FNeg, &[f]);
+            arm_end(b, join, dst, r);
+            enter_join(b, join);
+            return;
         }
         k => {
             let x = b.boxed(v);
@@ -1930,6 +2008,7 @@ fn emit_eqi(b: &mut Builder<'_, '_>, _pc: u32, insn: Instruction, succs: &[Block
             let kk = b.ins(Op::KI64(k), &[]);
             b.ins(Op::LCmp(Cc::Eq), &[x, kk])
         }
+        Some(NumKind::Wide) => unreachable!("arithmetic only"),
         Some(NumKind::I32) => {
             let x = b.as_i32(v);
             let kk = b.ki32(k as i32);
