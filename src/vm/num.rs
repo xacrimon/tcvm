@@ -321,17 +321,18 @@ pub struct Pow;
 impl ArithOp for Pow {
     #[inline(always)]
     fn small<'gc>(lhs: i32, rhs: i32) -> Option<Value<'gc>> {
-        Some(Value::float((lhs as f64).powf(rhs as f64)))
+        Some(Value::float(Self::float_raw(lhs as f64, rhs as f64)))
     }
 
     #[inline(always)]
     fn int<'gc>(_mc: &Mutation<'gc>, lhs: i64, rhs: i64) -> Value<'gc> {
-        Value::float((lhs as f64).powf(rhs as f64))
+        Value::float(Self::float_raw(lhs as f64, rhs as f64))
     }
 
+    /// Lua's `luai_numpow`: a square is `x * x`.
     #[inline(always)]
     fn float_raw(lhs: f64, rhs: f64) -> f64 {
-        lhs.powf(rhs)
+        if rhs == 2.0 { lhs * lhs } else { lhs.powf(rhs) }
     }
 }
 

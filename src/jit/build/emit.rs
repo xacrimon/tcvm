@@ -1219,8 +1219,9 @@ fn int_arith(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val, wide: boo
     }
 }
 
-/// Float arithmetic; `^` by the constant 0 or 1 folds. Not 2: libm's `pow`,
-/// which the interpreter calls, differs from `x * x` in the last bit.
+/// Float arithmetic; `^` by the constant 0, 1 or 2 folds. A square found at
+/// run time calls `pow`, which on Apple's libm equals `x * x`, as Lua's
+/// `luai_numpow` computes it.
 fn float_arith(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val, r: Operand) -> Val {
     use ArithKind::*;
     match kind {
@@ -1234,6 +1235,7 @@ fn float_arith(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val, r: Oper
         Pow => match r.konst(b) {
             Some(0.0) => b.kf64(1.0),
             Some(1.0) => x,
+            Some(2.0) => b.ins(Op::FMul, &[x, x]),
             _ => b.ins(Op::Helper(HelperId::Libm(Libm::Pow)), &[x, y]),
         },
         _ => unreachable!("{kind:?} on floats"),
