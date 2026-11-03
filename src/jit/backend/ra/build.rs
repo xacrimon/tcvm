@@ -263,9 +263,18 @@ impl<I: TargetInst> Ra<'_, I> {
                         continue;
                     }
                     let (gq, ga) = (gq as usize, ga as usize);
+                    // A constant stays out (it is made again on the edge); a
+                    // derived value joins and is spilled as any value.
+                    let konst = |v: usize| {
+                        matches!(
+                            f.remat[v],
+                            crate::jit::backend::vcode::Remat::Int(_)
+                                | crate::jit::backend::vcode::Remat::Float(_)
+                        ) && self.vregs[v].remat
+                    };
                     if self.vregs[gq].class != self.vregs[ga].class
-                        || self.vregs[gq].remat
-                        || self.vregs[ga].remat
+                        || konst(gq)
+                        || konst(ga)
                         || merged[gq].is_empty()
                         || merged[ga].is_empty()
                         || super::intersect(&merged[gq], &merged[ga], 0).is_some()
@@ -274,6 +283,17 @@ impl<I: TargetInst> Ra<'_, I> {
                         continue;
                     }
                     self.rep[ga] = gq as u32;
+                    for x in [gq, ga] {
+                        if self.vregs[x].remat {
+                            self.vregs[x].remat = false;
+                            let def = self.vregs[x].def;
+                            for u in uses[x].iter_mut() {
+                                if u.pos == def {
+                                    u.need = Need::Reg;
+                                }
+                            }
+                        }
+                    }
                     let mut iv = std::mem::take(&mut merged[ga]);
                     iv.extend_from_slice(&merged[gq]);
                     iv.sort_unstable_by_key(|x| x.0);

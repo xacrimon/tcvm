@@ -271,7 +271,8 @@ struct Ra<'a, I: TargetInst> {
     vregs: Vec<VInfo>,
     /// Each value's group (`build`): itself, or the parameter it joined.
     rep: Vec<u32>,
-    /// Per group: spilled in cold code only, stored on its way in there.
+    /// Per group: stored where it goes from a register to the stack, not
+    /// after its definitions.
     deferred: Vec<bool>,
     /// Per `PReg::index()`: points it is reserved over, `(from, to, owner)`
     /// sorted by `from`; the owner vreg may sit there (a fixed operand of

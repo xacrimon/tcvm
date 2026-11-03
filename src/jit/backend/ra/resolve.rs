@@ -35,22 +35,13 @@ const FIXED_COPY: u8 = 6;
 impl<I: TargetInst> Ra<'_, I> {
     pub(super) fn resolve(&mut self) -> Result<Output, String> {
         self.slot_derived();
-        // A group spilled only in cold code (none of its uses wanting the
-        // slot) is stored on its way in there (V8's deferred spilling);
-        // any other spilled group once after each definition, its slot
+        // A group is stored where it goes from a register to the stack when
+        // that runs no more often than storing after its definitions (V8's
+        // `DecideSpillingMode`; cold-only spills always), its slot uses
+        // falling in stack pieces; else once after each definition, its slot
         // holding it from there on.
         self.deferred = (0..self.vregs.len())
-            .map(|g| {
-                let gi = &self.vregs[g];
-                self.rep[g] == g as u32
-                    && gi.slot != NONE
-                    && gi.pieces.iter().all(|&x| {
-                        let p = &self.pieces[x as usize];
-                        p.ivs.is_empty()
-                            || (p.loc != Loc::Stack || p.start() >= self.cold_start)
-                                && p.uses.iter().all(|u| u.need != Need::Stack)
-                    })
-            })
+            .map(|g| self.stores_at_transitions(g))
             .collect();
         self.color_slots();
         for x in 0..self.pieces.len() as u32 {
@@ -193,6 +184,38 @@ impl<I: TargetInst> Ra<'_, I> {
             allocs: std::mem::take(&mut self.allocs),
             inst_alloc_offsets: std::mem::take(&mut self.alloc_base),
         })
+    }
+
+    fn stores_at_transitions(&self, g: usize) -> bool {
+        let gi = &self.vregs[g];
+        if self.rep[g] != g as u32 || gi.slot == NONE {
+            return false;
+        }
+        let mut at_transitions = 0f32;
+        for &x in &gi.pieces {
+            let p = &self.pieces[x as usize];
+            if p.ivs.is_empty() {
+                continue;
+            }
+            if p.loc == Loc::Stack {
+                at_transitions += self.freq_at(p.start());
+            } else if p.uses.iter().any(|u| u.need == Need::Stack) {
+                return false;
+            }
+        }
+        let mut at_defs = 0f32;
+        for v in 0..self.vregs.len() {
+            if self.rep[v] != g as u32 {
+                continue;
+            }
+            let vi = &self.vregs[v];
+            if vi.def != NONE {
+                at_defs += self.freq_at(vi.def);
+            } else if vi.param_of != NONE && !vi.args_in_group {
+                at_defs += self.freq_at(self.block_start(vi.param_of));
+            }
+        }
+        at_transitions <= at_defs
     }
 
     /// A value computed from one on the stack costs a load and the

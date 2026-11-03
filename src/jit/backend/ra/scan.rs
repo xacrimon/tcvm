@@ -106,17 +106,14 @@ impl<I: TargetInst> Ra<'_, I> {
         best
     }
 
-    /// The register `c` would like: that of the fixed use it first benefits
-    /// from, else its previous piece's.
+    /// The register `c` would like: that of its first fixed use, else its
+    /// previous piece's.
     fn hint(&self, c: u32) -> Option<usize> {
         let p = &self.pieces[c as usize];
-        let fixed = match p.next_use(p.start(), reg_beneficial) {
-            Some(u) => match u.need {
-                super::Need::Fixed(r) => Some(r),
-                _ => None,
-            },
-            None => None,
-        };
+        let fixed = p.uses.iter().find_map(|u| match u.need {
+            super::Need::Fixed(r) => Some(r),
+            _ => None,
+        });
         let prev = || {
             let ps = &self.vregs[p.vreg as usize].pieces;
             let k = ps.iter().position(|&x| x == c)?;
@@ -149,6 +146,18 @@ impl<I: TargetInst> Ra<'_, I> {
         self.pieces[c as usize]
             .next_use(from, reg_beneficial)
             .is_some_and(|u| u.pos < p)
+    }
+
+    /// Where a piece holding its register up to `until` (a late point)
+    /// can let it go: the gap after its last use wanting it before there.
+    fn cut_after_last_use(&self, c: u32, until: Pos) -> Pos {
+        let p = &self.pieces[c as usize];
+        let k = p.uses.partition_point(|u| u.pos < until);
+        p.uses[..k]
+            .iter()
+            .rev()
+            .find(|u| reg_beneficial(u.need))
+            .map_or(until, |u| ((u.pos & !1) + 2).min(until))
     }
 
     fn needs_reg_at(&self, c: u32, p: Pos) -> bool {
@@ -212,6 +221,44 @@ impl<I: TargetInst> Ra<'_, I> {
             self.active.push(c);
             return Ok(());
         }
+        // The hinted register held by pieces that want no register again:
+        // take it from them (they would be spilled by the next clobber).
+        if let Some(h) = hint {
+            let r = self.env.regs[cls][h];
+            let idle = |x: &u32| {
+                self.reg_of(*x) != Some(r)
+                    || self.pieces[*x as usize]
+                        .next_use(s, reg_beneficial)
+                        .is_none()
+            };
+            let (_, block_pos) = self.blocked_pos(c);
+            if free[h] < e
+                && block_pos[h] >= e
+                && self.active.iter().all(idle)
+                && self.inactive.iter().all(idle)
+            {
+                self.assign(c, h);
+                self.split_and_spill_intersecting(c)?;
+                self.active.push(c);
+                return Ok(());
+            }
+        }
+        // The fixed register a use wants first, free through that use: hold
+        // it to there (an argument made in its register), the rest after.
+        if let Some(h) = hint
+            && let Some(u) = (self.pieces[c as usize].uses.iter())
+                .find(|u| u.need == super::Need::Fixed(self.env.regs[cls][h]))
+                .copied()
+        {
+            let cut = (u.pos & !1) + 2;
+            if free[h] >= cut && cut < e {
+                let tail = self.split_at(c, cut).expect("a split inside the piece");
+                self.queue(tail);
+                self.assign(c, h);
+                self.active.push(c);
+                return Ok(());
+            }
+        }
         let k = self.pick_longest(hint, &free);
         let until = free[k];
         // Free only part of the way: losing it costs a reload at the next
@@ -234,7 +281,9 @@ impl<I: TargetInst> Ra<'_, I> {
             // register still serves its early uses, the stack the rest.
             if until & 1 != 0 && !self.needs_reg_at(c, until) && self.used_in_block_before(c, until)
             {
-                let tail = self.split_at(c, until).expect("a split inside the piece");
+                let tail = self
+                    .split_at(c, self.cut_after_last_use(c, until))
+                    .expect("a split inside the piece");
                 self.assign(c, k);
                 self.active.push(c);
                 return self.spill_tail(tail);
@@ -349,8 +398,10 @@ impl<I: TargetInst> Ra<'_, I> {
             && self.used_in_block_before(c, new_end)
         {
             // Blocked at a late point after its register use: hold the
-            // register to there, the stack after.
-            let t = self.split_at(c, new_end).expect("a split inside the piece");
+            // register to its last use before there, the stack after.
+            let t = self
+                .split_at(c, self.cut_after_last_use(c, new_end))
+                .expect("a split inside the piece");
             self.assign(c, k);
             self.split_and_spill_intersecting(c)?;
             return self.spill_tail(t);
