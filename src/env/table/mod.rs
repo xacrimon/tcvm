@@ -40,7 +40,12 @@ impl<'gc> Table<'gc> {
     /// an array part in its own cell, and `nrec` inline named slots, as
     /// far as either can grow.
     pub fn with_capacity(ctx: Context<'gc>, nseq: usize, nrec: usize) -> Self {
-        Self::alloc(ctx.mutation(), ctx.root_shape(nrec), &[], nseq)
+        Self::alloc(
+            ctx.mutation(),
+            ctx.root_shape(nrec),
+            &[],
+            nseq.min(MAX_ITEMS),
+        )
     }
 
     /// A constructor's table, as `NEWTABLE` makes it from `t`.
@@ -50,8 +55,8 @@ impl<'gc> Table<'gc> {
     }
 
     /// A table in `shape` holding `values` in its slots, with nil in keys
-    /// `1..=items` of an array part kept in the table's own cell, as far as
-    /// `MAX_ASIZE` allows.
+    /// `1..=items` (at most `MAX_ITEMS`) of an array part kept in the table's
+    /// own cell.
     #[inline(always)]
     fn alloc(mc: &Mutation<'gc>, shape: Shape<'gc>, values: &[Value<'gc>], items: usize) -> Self {
         debug_assert_eq!(values.len(), shape.slot_count() as usize);
@@ -59,11 +64,8 @@ impl<'gc> Table<'gc> {
         debug_assert!(shape.mt_cache().is_none() && shape.as_mt().is_none());
         let cap = shape.inline_cap() as usize;
         let (inline, spilled) = values.split_at(values.len().min(cap));
-        let asize = if items == 0 {
-            0
-        } else {
-            items.min(MAX_ASIZE as usize - 1) + 1
-        };
+        debug_assert!(items <= MAX_ITEMS);
+        let asize = if items == 0 { 0 } else { items + 1 };
         let state = TableState {
             shape,
             spill: match spilled.len() {
@@ -1825,6 +1827,9 @@ fn int_key(key: Value) -> Option<i64> {
 const MAX_ABITS: usize = 28;
 /// LuaJIT's `LJ_MAX_ASIZE`.
 const MAX_ASIZE: i64 = (1 << (MAX_ABITS - 1)) + 1;
+/// The most keys `1..=n` a new table's array part holds (constructors, whose
+/// templates the compiler caps, and `table.create`).
+pub(crate) const MAX_ITEMS: usize = MAX_ASIZE as usize - 1;
 
 /// LuaJIT's `countint`: bin `b` holds keys in `(2^b, 2^(b+1)]`, with 0..=2 in bin 0.
 fn count_int(key: i64, bins: &mut [u32; MAX_ABITS]) -> u32 {

@@ -1496,7 +1496,7 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 templates.push(Template {
                     shape: draft.shape,
                     values: draft.values.into_boxed_slice(),
-                    items: draft.items,
+                    items: draft.items.min(crate::env::table::MAX_ITEMS as u32),
                 });
                 templates.len() - 1
             }
