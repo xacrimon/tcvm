@@ -23,11 +23,16 @@ pub(crate) const FLOAT_LIMIT: Bits = OTHER;
 /// for a receiver that is no table): a small key was outside the array part,
 /// or over a nil there with the class having `__index`/`__newindex`.
 pub(crate) const ARR_MISS: Bits = BIGINT;
-/// At a call (whose kinds are its first argument's): a callee a region took
-/// as constant differed (`ExitTag::Const`).
+/// At a call (whose kinds are its first argument's, `ARGS_SHIFT` above them
+/// the later ones'): a callee a region took as constant differed
+/// (`ExitTag::Const`). `OVERFLOW` there: a builtin's integer result left i32.
 pub(crate) const CONST_MISS: Bits = MM;
 /// Compiled code exited on operand kinds the site's form does not cover.
 pub(crate) const KIND_EXIT: Bits = 256;
+/// At a call, the kinds of the arguments after the first, shifted by this.
+pub(crate) const ARGS_SHIFT: u32 = 9;
+/// At a call of `floor` or `ceil`: a result had no integer representation.
+pub(crate) const FLOAT_RESULT: Bits = 1 << 15;
 
 pub(crate) const INT: Bits = SMALL | BIGINT;
 pub(crate) const KINDS: Bits = SMALL | BIGINT | FLOAT | STR | TAB | OTHER;

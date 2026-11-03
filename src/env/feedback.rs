@@ -406,6 +406,18 @@ impl<'gc> FeedbackVector<'gc> {
         }
     }
 
+    /// OR `bits` into the site word of the call whose `d` is `d`, through `base`, a
+    /// closure's cached `as_ptr`: a fast entry's recording, stored on every call as the call
+    /// count is. The null slot's site word takes them unread.
+    ///
+    /// # Safety
+    /// `d` is a call instruction's `d` in this vector's prototype, `base` its `as_ptr`.
+    #[inline(always)]
+    pub(crate) unsafe fn add_call_bits(base: *const Cell<u64>, d: u16, bits: Bits) {
+        let s = unsafe { &*base.add(d as usize) };
+        s.set(s.get() | (bits as u64) << 1);
+    }
+
     /// OR `bits` into the site at `pc`'s, stored only on a change: slow paths
     /// record on every run.
     #[inline]

@@ -905,15 +905,18 @@ fn record_site<'gc>(
             }
         }
         Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => kind(i.a() + 1) | kind(i.a() + 2),
-        // An intrinsic's argument (12): one it did not cover makes the next
-        // compile a call.
+        // An intrinsic's arguments (12): kinds it did not cover make the next
+        // compile take them. A variable count records only the first.
         Op::CALL
         | Op::CALL_R0
         | Op::CALL_R1
         | Op::CALLS
         | Op::CALLS_R0
         | Op::CALLS_R1
-        | Op::TAILCALL => kind(i.a() + 4),
+        | Op::TAILCALL => {
+            let rest = (5..i.b().saturating_add(3)).fold(0, |k, r| k | kind(i.a() + r));
+            kind(i.a() + 4) | rest << fb::ARGS_SHIFT
+        }
         Op::GETTABLE | Op::SETTABLE => {
             let recv = if reg(i.b()).get_table().is_some() {
                 0
