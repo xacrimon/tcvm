@@ -104,8 +104,12 @@ struct Lower<'a, 'gc> {
     entry_regs: Vec<u8>,
     block_of: Vec<u32>,
     pc_base: usize,
-    /// Stores a known call writes itself, and its callee (D2).
+    /// Stores a known call writes itself, and its callee (D2); the
+    /// negation of an `abs`.
     absorbed: Vec<bool>,
+    /// Selects that are an `abs` (`x < 0 ? -x : x`): the negation, whose
+    /// exit an i32's takes (`find_abs`).
+    abs_of: crate::jit::FastMap<Inst, Inst>,
     known: crate::jit::FastMap<Inst, Known>,
     /// The frame's closure, defined in the entry block when the region
     /// reads its upvalues.
@@ -196,6 +200,7 @@ pub(crate) fn lower<'gc>(
         block_of,
         pc_base: code_base,
         absorbed: vec![false; f.insts.len()],
+        abs_of: Default::default(),
         known: Default::default(),
         closure: None,
         params: Vec::new(),
@@ -232,6 +237,7 @@ pub(crate) fn lower<'gc>(
     }
     let closure_at = closure_block(f, &cfg, order);
     lw.find_fusions(order);
+    lw.find_abs(order);
     lw.find_multiply_adds(order);
     lw.find_known_callees(order);
     lw.find_register_returns(order);
@@ -660,6 +666,47 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         }
     }
 
+    /// Selects `x < 0 ? -x : x` whose negation only they use, in their
+    /// block with nothing but pure instructions between: `cmp; cneg` (an
+    /// i32's exit on `MIN` moves to the select, which no effect separates
+    /// it from).
+    fn find_abs(&mut self, order: &[Block]) {
+        let f = self.f;
+        for &b in order {
+            let insts = f.insts_of(b);
+            for (k, &s) in insts.iter().enumerate() {
+                if f.op(s) != Op::Select {
+                    continue;
+                }
+                let (c, neg, x) = (f.args(s)[0], f.args(s)[1], f.args(s)[2]);
+                let below = match f.def_op(c) {
+                    Some(Op::ICmp(Cc::Lt)) => Op::INeg,
+                    Some(Op::LCmp(Cc::Lt)) => Op::LNeg,
+                    _ => continue,
+                };
+                let ca = f.args(f.def_inst(c).unwrap());
+                let zero = matches!(f.def_op(ca[1]), Some(Op::KI32(0) | Op::KI64(0)));
+                let Some(n) = f.def_inst(neg) else {
+                    continue;
+                };
+                let Some(at) = insts[..k].iter().position(|&j| j == n) else {
+                    continue;
+                };
+                if ca[0] != x
+                    || !zero
+                    || f.op(n) != below
+                    || f.args(n)[0] != x
+                    || self.uses[neg.idx()] != 1
+                    || !insts[at + 1..k].iter().all(|&j| f.op(j).is_pure())
+                {
+                    continue;
+                }
+                self.absorbed[n.idx()] = true;
+                self.abs_of.insert(s, n);
+            }
+        }
+    }
+
     /// `v` as `x & (1 << k)`: `x` and `k`.
     fn bit_of(&self, v: Val) -> Option<(Val, u8)> {
         let d = self.f.def_inst(v)?;
@@ -1073,6 +1120,15 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     ops.push(self.use_(a));
                 }
                 self.push(MInst::Set { test, cond }, &ops, none);
+            }
+            Op::Select if self.abs_of.contains_key(&i) => {
+                let n = self.abs_of[&i];
+                let ops = vec![self.def(res.unwrap()), self.use_(args[2])];
+                if f.op(n) == Op::INeg {
+                    self.push_exit(n, |exit| MInst::AbsOvf { exit }, ops, none);
+                } else {
+                    self.push(MInst::Abs, &ops, none);
+                }
             }
             Op::Select => {
                 let r = res.unwrap();

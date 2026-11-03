@@ -149,6 +149,12 @@ pub(crate) enum MInst {
     NegOvf {
         exit: u32,
     },
+    /// `[def d, use n, snap..]`: i32 `abs` exiting on `MIN`.
+    AbsOvf {
+        exit: u32,
+    },
+    /// `[def d, use n]`: i64 `abs`, wrapping.
+    Abs,
     /// `[def d, use n, use m, snap..]`: floor division or modulo, exiting on
     /// a zero divisor (unless `nonzero`) and, for i32 division, `MIN // -1`
     /// (unless not `minus1`).
@@ -404,6 +410,7 @@ impl MInst {
             | AddImmOvf { exit, .. }
             | MulOvf { exit }
             | NegOvf { exit }
+            | AbsOvf { exit }
             | DivMod { exit, .. }
             | ShiftI32 { exit, .. }
             | LToI { exit }

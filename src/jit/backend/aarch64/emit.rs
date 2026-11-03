@@ -1716,6 +1716,25 @@ impl Em<'_> {
                 let l = self.exit(exit);
                 self.a.b_cond(Cond::Vs, l);
             }
+            // `cneg` is `csneg` of the operand with itself, inverted.
+            AbsOvf { exit } => {
+                let (d, n) = (self.r(i, 0), self.r(i, 1));
+                self.a.cmp_imm(Sz::W, n, 0);
+                self.a.csneg(Sz::W, d, n, n, Cond::Ge);
+                // Negative only for `MIN`, which has no i32 absolute value.
+                let l = self.exit(exit);
+                if self.bit_branches {
+                    self.a.tbnz(d, 31, l);
+                } else {
+                    self.a.cmp_imm(Sz::W, d, 0);
+                    self.a.b_cond(Cond::Lt, l);
+                }
+            }
+            Abs => {
+                let (d, n) = (self.r(i, 0), self.r(i, 1));
+                self.a.cmp_imm(Sz::X, n, 0);
+                self.a.csneg(Sz::X, d, n, n, Cond::Ge);
+            }
             DivMod {
                 div,
                 sz,
