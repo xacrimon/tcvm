@@ -12,8 +12,9 @@
 use crate::jit::ir::ops::Op;
 use crate::jit::ir::{Block, CfgInfo, Func};
 
-/// The allocator's order, and the encoder's as indices into it.
-pub(crate) fn layout(f: &Func<'_>) -> (Vec<Block>, Vec<u32>) {
+/// The allocator's order, the encoder's as indices into it, and how many of
+/// the encoder's come before the first block ending in a deopt or cold.
+pub(crate) fn layout(f: &Func<'_>) -> (Vec<Block>, Vec<u32>, usize) {
     let cfg = f.cfg();
     let n = f.blocks.len();
     let mut rpo_num = vec![u32::MAX; n];
@@ -80,7 +81,11 @@ pub(crate) fn layout(f: &Func<'_>) -> (Vec<Block>, Vec<u32>) {
     };
     let mut emit: Vec<u32> = (0..order.len() as u32).collect();
     emit.sort_by_key(|&k| rank(order[k as usize]));
-    (order, emit)
+    let hot = emit
+        .iter()
+        .take_while(|&&k| rank(order[k as usize]) == 0)
+        .count();
+    (order, emit, hot)
 }
 
 struct Loops<'a> {

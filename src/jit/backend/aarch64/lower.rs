@@ -76,6 +76,11 @@ pub(crate) struct Lowered {
     pub(crate) invalidable: bool,
     /// The VCode blocks in the order the encoder lays them out.
     pub(crate) emit_order: Vec<u32>,
+    /// How many of `emit_order` are hot: the rest end in a deopt or are
+    /// cold.
+    pub(crate) hot_blocks: usize,
+    /// The IR block of each VCode block (the asm dump's names).
+    pub(crate) ir_blocks: Vec<u32>,
     /// The entry guards, all on parameters, as tests the fast entry makes
     /// before the entry block (`x0`.. and the set), which self-calls passing
     /// them enter (W4 §2); none in the block's code.
@@ -163,7 +168,7 @@ pub(crate) fn lower<'gc>(
     own: Option<u64>,
 ) -> Result<Lowered, String> {
     let cfg = f.cfg();
-    let (order, emit_order) = crate::jit::backend::order::layout(f);
+    let (order, emit_order, hot_blocks) = crate::jit::backend::order::layout(f);
     let order = &order;
     let mut block_of = vec![u32::MAX; f.blocks.len()];
     for (k, b) in order.iter().enumerate() {
@@ -308,6 +313,8 @@ pub(crate) fn lower<'gc>(
             .collect(),
         invalidable: !f.deps.is_empty(),
         emit_order,
+        hot_blocks,
+        ir_blocks: order.iter().map(|b| b.0).collect(),
         prefix_guards: lw.prefix_guards,
         entry_tests: lw.entry_tests,
     })

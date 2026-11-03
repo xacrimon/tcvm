@@ -51,6 +51,11 @@ pub(crate) struct Emitted {
     /// A self-call's return addresses whose result guard runs out of line,
     /// and its landing for a level returning there (`jit::jit_exit`).
     pub(crate) landings: Vec<(Label, Label)>,
+    /// Where each hot block starts, in layout order, and where the hot ones
+    /// end: deopt blocks, cold arms and stubs after (the asm dump's
+    /// `blocks` and `cold`).
+    pub(crate) hot: Vec<(u32, Label)>,
+    pub(crate) cold: Label,
 }
 
 /// A call of the region: its return addresses, whether each is a level's
@@ -483,7 +488,21 @@ pub(crate) fn emit(
         .map(|&b| b as usize)
         .filter(|&b| !skip[b])
         .collect();
+    let mut hot = vec![false; l.vcode.blocks.len()];
+    for &b in &l.emit_order[..l.hot_blocks] {
+        hot[b as usize] = true;
+    }
+    let cold = em.a.new_label();
+    let mut cold_bound = false;
+    let mut hot_starts = Vec::new();
     for (at, &b) in laid.iter().enumerate() {
+        if !cold_bound && !hot[b] {
+            em.a.bind(cold);
+            cold_bound = true;
+        }
+        if !cold_bound {
+            hot_starts.push((l.ir_blocks[b], em.labels[b]));
+        }
         let blk = &l.vcode.blocks[b];
         em.a.bind(em.labels[b]);
         for (k, ie) in out
@@ -508,6 +527,9 @@ pub(crate) fn emit(
                 }
             }
         }
+    }
+    if !cold_bound {
+        em.a.bind(cold);
     }
     for f in std::mem::take(&mut em.ool) {
         f(&mut em);
@@ -656,6 +678,8 @@ pub(crate) fn emit(
         direct: em.direct,
         lazy: em.lazy,
         landings: em.landings,
+        hot: hot_starts,
+        cold,
     })
 }
 

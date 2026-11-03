@@ -488,6 +488,10 @@ pub(crate) fn compile<'gc>(
     let region_word = em.asm.label_offset(em.region_word);
     let start = block.rx();
     let entry = start.wrapping_add(em.asm.label_offset(em.entry));
+    let cold_at = em.asm.label_offset(em.cold);
+    let hot_at: Vec<(u32, usize)> = (em.hot.iter())
+        .map(|&(b, l)| (b, em.asm.label_offset(l)))
+        .collect();
     let fast_entry = em.fast.map_or(std::ptr::null(), |l| {
         start.wrapping_add(em.asm.label_offset(l))
     });
@@ -538,11 +542,13 @@ pub(crate) fn compile<'gc>(
     block.describe_frame(em.frame_size);
     if config.dump.asm {
         eprintln!(
-            "-- jit asm {} pc{pc} at {start:p}, {} bytes, entry +{:#x}",
+            "-- jit asm {} pc{pc} at {start:p}, {} bytes, entry +{:#x}, cold +{cold_at:#x}",
             chunk_name(closure),
             words.len() * 4,
             entry as usize - start as usize
         );
+        let hot: Vec<String> = hot_at.iter().map(|(b, o)| format!("b{b}+{o:#x}")).collect();
+        eprintln!("(hot blocks at {})", hot.join(" "));
         dump_words(start as usize, &words);
     }
     times.emit = t.elapsed().as_micros();
