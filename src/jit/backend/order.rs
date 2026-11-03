@@ -7,14 +7,27 @@
 //! are intervals of that order, so every block stays where it falls, cold
 //! arms included. The encoder emits blocks that end in a deopt (at most once
 //! per entry) after the rest, then cold arms (A5), so loop bodies fall
-//! through. Irreducible graphs never get here (`cfg.rs` refuses them).
+//! through, and rotates hot loops so the back edge is a branch out of the
+//! loop inverted (`emit::rotate_loops`). Irreducible graphs never get here
+//! (`cfg.rs` refuses them).
 
 use crate::jit::ir::ops::Op;
 use crate::jit::ir::{Block, CfgInfo, Func};
 
-/// The allocator's order, the encoder's as indices into it, and how many of
-/// the encoder's come before the first block ending in a deopt or cold.
-pub(crate) fn layout(f: &Func<'_>) -> (Vec<Block>, Vec<u32>, usize) {
+pub(crate) struct Layout {
+    /// The allocator's order.
+    pub(crate) order: Vec<Block>,
+    /// The encoder's, as indices into `order`.
+    pub(crate) emit: Vec<u32>,
+    /// How many of `emit` come before the first block ending in a deopt or
+    /// cold.
+    pub(crate) hot: usize,
+    /// Each loop as the first and last index of its blocks in `order` (its
+    /// header first), innermost loops first.
+    pub(crate) loops: Vec<(u32, u32)>,
+}
+
+pub(crate) fn layout(f: &Func<'_>) -> Layout {
     let cfg = f.cfg();
     let n = f.blocks.len();
     let mut rpo_num = vec![u32::MAX; n];
@@ -85,7 +98,27 @@ pub(crate) fn layout(f: &Func<'_>) -> (Vec<Block>, Vec<u32>, usize) {
         .iter()
         .take_while(|&&k| rank(order[k as usize]) == 0)
         .count();
-    (order, emit, hot)
+    let mut at = vec![0u32; n];
+    for (k, b) in order.iter().enumerate() {
+        at[b.idx()] = k as u32;
+    }
+    let loops = bodies
+        .iter()
+        .map(|(h, body)| {
+            let last = (body.iter().enumerate())
+                .filter(|&(_, &inside)| inside)
+                .map(|(x, _)| at[x])
+                .max()
+                .unwrap_or(at[h.idx()]);
+            (at[h.idx()], last)
+        })
+        .collect();
+    Layout {
+        order,
+        emit,
+        hot,
+        loops,
+    }
 }
 
 struct Loops<'a> {

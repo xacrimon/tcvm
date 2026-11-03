@@ -79,6 +79,9 @@ pub(crate) struct Lowered {
     /// How many of `emit_order` are hot: the rest end in a deopt or are
     /// cold.
     pub(crate) hot_blocks: usize,
+    /// Each loop's first and last VCode block (its blocks lie between, the
+    /// header first), innermost loops first.
+    pub(crate) loops: Vec<(u32, u32)>,
     /// The IR block of each VCode block (the asm dump's names).
     pub(crate) ir_blocks: Vec<u32>,
     /// The entry guards, all on parameters, as tests the fast entry makes
@@ -168,7 +171,12 @@ pub(crate) fn lower<'gc>(
     own: Option<u64>,
 ) -> Result<Lowered, String> {
     let cfg = f.cfg();
-    let (order, emit_order, hot_blocks) = crate::jit::backend::order::layout(f);
+    let crate::jit::backend::order::Layout {
+        order,
+        emit: emit_order,
+        hot: hot_blocks,
+        loops,
+    } = crate::jit::backend::order::layout(f);
     let order = &order;
     let mut block_of = vec![u32::MAX; f.blocks.len()];
     for (k, b) in order.iter().enumerate() {
@@ -304,6 +312,7 @@ pub(crate) fn lower<'gc>(
         invalidable: !f.deps.is_empty(),
         emit_order,
         hot_blocks,
+        loops,
         ir_blocks: order.iter().map(|b| b.0).collect(),
         prefix_guards: lw.prefix_guards,
         entry_tests: lw.entry_tests,

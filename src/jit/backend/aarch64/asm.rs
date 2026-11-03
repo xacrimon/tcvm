@@ -228,6 +228,14 @@ impl Asm {
         w as usize * 4
     }
 
+    /// Whether the last word is an unconditional `b`: what follows is
+    /// reached only by a branch.
+    pub(crate) fn after_jump(&self) -> bool {
+        self.words
+            .last()
+            .is_some_and(|&w| w & 0xfc00_0000 == 0x1400_0000)
+    }
+
     /// Pad with `brk` to a multiple of `align` bytes.
     pub(crate) fn align(&mut self, align: usize) {
         while !self.offset().is_multiple_of(align) {

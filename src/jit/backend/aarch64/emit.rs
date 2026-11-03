@@ -96,6 +96,56 @@ fn emits_nothing(l: &Lowered, out: &Output, i: usize) -> bool {
     }
 }
 
+/// Loop rotation (V8's `ComputeAssemblyOrder`, with any exiting block as the
+/// cut): a hot loop whose last block jumps back to its first is laid out
+/// from the block after one that branches out to the block following the
+/// loop, so that branch becomes the back edge and the jump a fall-through
+/// into the header; entering then takes a jump to the header. Returns the
+/// rotated loops' new first blocks.
+fn rotate_loops(
+    l: &Lowered,
+    labels: &[Label],
+    dest: &[Label],
+    laid: &mut [usize],
+    hot: usize,
+) -> Vec<usize> {
+    let mut tops = Vec::new();
+    let term = |b: usize| &l.vcode.insts[l.vcode.blocks[b].end as usize - 1];
+    for &(first, last) in &l.loops {
+        let inside = |b: usize| (first as usize..=last as usize).contains(&b);
+        let Some(s) = laid[..hot].iter().position(|&b| inside(b)) else {
+            continue;
+        };
+        let e = s + laid[s..hot].iter().take_while(|&&b| inside(b)).count();
+        if e == laid.len() || laid[e..hot].iter().any(|&b| inside(b)) {
+            continue;
+        }
+        let latch = laid[e - 1];
+        if !matches!(term(latch), MInst::Jump)
+            || dest[l.vcode.succs(latch)[0].index()] != labels[laid[s]]
+        {
+            continue;
+        }
+        let after = labels[laid[e]];
+        // The cut nearest the latch.
+        let cut = (s..e - 1).rev().find(|&k| {
+            let b = laid[k];
+            if !matches!(term(b), MInst::Br { .. }) {
+                return false;
+            }
+            let ss = l.vcode.succs(b);
+            let (t, f) = (dest[ss[0].index()], dest[ss[1].index()]);
+            let next = labels[laid[k + 1]];
+            (t, f) == (after, next) || (t, f) == (next, after)
+        });
+        if let Some(k) = cut {
+            laid[s..e].rotate_left(k + 1 - s);
+            tops.push(laid[s]);
+        }
+    }
+    tops
+}
+
 /// Where branches to each block go, whether it is left out, and where a
 /// resume block's other returns (`resume_based`) go when not into it.
 /// Branches go past a block that is only a `Jump` once allocated (an edge
@@ -494,7 +544,7 @@ pub(crate) fn emit(
     if l.prefix_guards {
         em.typed_entry = Some(em.labels[0]);
     }
-    let laid: Vec<usize> = l
+    let mut laid: Vec<usize> = l
         .emit_order
         .iter()
         .map(|&b| b as usize)
@@ -504,6 +554,8 @@ pub(crate) fn emit(
     for &b in &l.emit_order[..l.hot_blocks] {
         hot[b as usize] = true;
     }
+    let hot_laid = laid.iter().take_while(|&&b| hot[b]).count();
+    let tops = rotate_loops(l, &em.labels, &em.dest, &mut laid, hot_laid);
     let cold = em.a.new_label();
     let mut cold_bound = false;
     let mut hot_starts = Vec::new();
@@ -516,6 +568,11 @@ pub(crate) fn emit(
             hot_starts.push((l.ir_blocks[b], em.labels[b]));
         }
         let blk = &l.vcode.blocks[b];
+        // A rotated loop's top, past the jump into its header: padding
+        // there never runs (V8 aligns these too; 16 measured as well as 64).
+        if tops.contains(&b) && em.a.after_jump() {
+            em.a.align(16);
+        }
         em.a.bind(em.labels[b]);
         for (k, ie) in out
             .block_insts_and_edits(&l.vcode, regalloc2::Block::new(b))
