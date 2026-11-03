@@ -25,6 +25,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 def: NONE,
                 param_of: NONE,
                 args_in_group: false,
+                defs: Vec::new(),
             })
             .collect();
         let mut ivs: Vec<Vec<(Pos, Pos)>> = vec![Vec::new(); nv];
@@ -180,15 +181,65 @@ impl<I: TargetInst> Ra<'_, I> {
                 coalesce(iv)
             })
             .collect();
+        // Groups: a block parameter shares one allocation unit with each
+        // argument passed to it whose range stays clear of the group's
+        // (V8's `BundleBuilder`, allocated as one range as regalloc2 does), so
+        // the edge needs no move unless a split moves one of them.
         self.rep = (0..nv as u32).collect();
         let mut fixed: Vec<Vec<(Pos, regalloc2::PReg)>> = fixed_def
             .iter()
             .enumerate()
             .map(|(v, r)| r.map(|r| (self.vregs[v].def, r)).into_iter().collect())
             .collect();
+        for bi in 0..self.order.len() {
+            let b = self.order[bi];
+            for (k, q) in f.block_params(b).iter().enumerate() {
+                let mut all = true;
+                for &p in f.block_preds(b) {
+                    let pk = f
+                        .block_succs(p)
+                        .iter()
+                        .position(|&x| x == b)
+                        .expect("an edge");
+                    let term = self.at_lin[self.last[p.index()] as usize];
+                    let a = f.branch_blockparams(p, term, pk)[k];
+                    let (gq, ga) = (self.find(q.vreg() as u32), self.find(a.vreg() as u32));
+                    if gq == ga {
+                        continue;
+                    }
+                    let (gq, ga) = (gq as usize, ga as usize);
+                    if self.vregs[gq].class != self.vregs[ga].class
+                        || merged[gq].is_empty()
+                        || merged[ga].is_empty()
+                        || super::intersect(&merged[gq], &merged[ga], 0).is_some()
+                    {
+                        all = false;
+                        continue;
+                    }
+                    self.rep[ga] = gq as u32;
+                    let mut iv = std::mem::take(&mut merged[ga]);
+                    iv.extend_from_slice(&merged[gq]);
+                    iv.sort_unstable_by_key(|x| x.0);
+                    merged[gq] = coalesce(iv);
+                    let u = std::mem::take(&mut uses[ga]);
+                    uses[gq].extend(u);
+                    let fx = std::mem::take(&mut fixed[ga]);
+                    fixed[gq].extend(fx);
+                    stack_use[gq] |= stack_use[ga];
+                }
+                self.vregs[q.vreg()].args_in_group = all;
+            }
+        }
         for v in 0..nv as u32 {
             let r = self.find(v);
             self.rep[v as usize] = r;
+            let d = self.vregs[v as usize].def;
+            if d != NONE {
+                self.vregs[r as usize].defs.push(d);
+            }
+        }
+        for vi in &mut self.vregs {
+            vi.defs.sort_unstable();
         }
         let mut queue = Vec::new();
         for v in 0..nv {
@@ -206,6 +257,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 ivs: std::mem::take(&mut merged[v]),
                 uses: us,
                 loc: super::Loc::None,
+                fixed: false,
             });
             self.vregs[v].pieces.push(x);
             // Each fixed definition's own point in its register; the rest is
@@ -224,6 +276,7 @@ impl<I: TargetInst> Ra<'_, I> {
                     None => unreachable!("a definition past its range"),
                 };
                 self.pieces[at as usize].loc = super::Loc::Reg(r);
+                self.pieces[at as usize].fixed = true;
                 rest = self.split_at(at, (def & !1) + 2);
             }
             if let Some(cur) = rest {

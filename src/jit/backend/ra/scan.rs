@@ -130,6 +130,12 @@ impl<I: TargetInst> Ra<'_, I> {
         reg
     }
 
+    fn needs_reg_at(&self, c: u32, p: Pos) -> bool {
+        self.pieces[c as usize]
+            .next_use(p, needs_reg)
+            .is_some_and(|u| u.pos == p)
+    }
+
     fn assign(&mut self, c: u32, k: usize) {
         let r = self.env.regs[self.class_of(c)][k];
         self.pieces[c as usize].loc = Loc::Reg(r);
@@ -186,7 +192,7 @@ impl<I: TargetInst> Ra<'_, I> {
             }
             // Taken at an instruction's late point (a clobber, a def): the
             // register still serves its early uses, the stack the rest.
-            if until & 1 != 0 {
+            if until & 1 != 0 && !self.needs_reg_at(c, until) {
                 let tail = self.split_at(c, until).expect("a split inside the piece");
                 self.assign(c, k);
                 self.active.push(c);
@@ -194,11 +200,12 @@ impl<I: TargetInst> Ra<'_, I> {
             }
             // Free at the start, taken before the end: split in the gap
             // before it is taken.
-            if until > s {
-                let tail = self.split_at(c, until).expect("a split inside the piece");
+            let gap = until & !1;
+            if gap > s {
+                let tail = self.split_at(c, gap).expect("a split inside the piece");
                 self.queue(tail);
                 let k = match hint {
-                    Some(h) if free[h] >= until => h,
+                    Some(h) if free[h] >= gap => h,
                     _ => k,
                 };
                 self.assign(c, k);
@@ -213,20 +220,13 @@ impl<I: TargetInst> Ra<'_, I> {
         Ok(())
     }
 
-    fn allocate_blocked(&mut self, c: u32) -> Result<(), String> {
+    /// Per register of `c`'s class: where its holders next want it
+    /// (V8's `use_pos`), and where a fixed reservation takes it
+    /// (`block_pos`).
+    fn blocked_pos(&self, c: u32) -> (Vec<Pos>, Vec<Pos>) {
         let cls = self.class_of(c);
         let n = self.env.regs[cls].len();
-        let (s, e) = {
-            let p = &self.pieces[c as usize];
-            (p.start(), p.end())
-        };
-        let Some(ru) = self.pieces[c as usize].next_use(s, needs_reg) else {
-            // Nothing here needs a register.
-            let (begin, at) = self.optimal_spilling_pos(c, s);
-            self.maybe_spill_previous(begin, at, c);
-            self.spill(c);
-            return Ok(());
-        };
+        let s = self.pieces[c as usize].start();
         let mut use_pos = vec![Pos::MAX; n];
         let mut block_pos = vec![Pos::MAX; n];
         for &a in &self.active {
@@ -259,14 +259,36 @@ impl<I: TargetInst> Ra<'_, I> {
                 use_pos[k] = use_pos[k].min(block_pos[k]);
             }
         }
+        (use_pos, block_pos)
+    }
+
+    fn allocate_blocked(&mut self, c: u32) -> Result<(), String> {
+        let (s, e) = {
+            let p = &self.pieces[c as usize];
+            (p.start(), p.end())
+        };
+        let Some(ru) = self.pieces[c as usize].next_use(s, needs_reg) else {
+            // Nothing here needs a register.
+            let (begin, at) = self.optimal_spilling_pos(c, s);
+            self.maybe_spill_previous(begin, at, c);
+            self.spill(c);
+            return Ok(());
+        };
+        let (use_pos, block_pos) = self.blocked_pos(c);
         let k = self.pick_longest(self.hint(c), &use_pos);
         // Everyone needs their register before this piece does: spill it
         // until its use, if a gap before the use can take the reload.
-        if use_pos[k] < ru.pos && (ru.pos & !1) > s {
+        let g = self.pieces[c as usize].vreg;
+        if use_pos[k] < ru.pos && self.reload_room(g, s, ru.pos) {
             return self.spill_between(c, s, ru.pos);
         }
         let mut new_end = e.min(block_pos[k]);
-        if new_end < e && new_end & 1 != 0 && new_end > s && ru.pos < new_end {
+        if new_end < e
+            && new_end & 1 != 0
+            && new_end > s
+            && ru.pos < new_end
+            && !self.needs_reg_at(c, new_end)
+        {
             // Blocked at a late point after its register use: hold the
             // register to there, the stack after.
             let t = self.split_at(c, new_end).expect("a split inside the piece");
@@ -278,7 +300,7 @@ impl<I: TargetInst> Ra<'_, I> {
             new_end &= !1;
         }
         if new_end <= s {
-            if (ru.pos & !1) > s {
+            if self.reload_room(g, s, ru.pos) {
                 return self.spill_between(c, s, ru.pos);
             }
             return Err(format!(
@@ -380,11 +402,27 @@ impl<I: TargetInst> Ra<'_, I> {
             ivs: tail,
             uses,
             loc: Loc::None,
+            fixed: false,
         });
         let ps = &mut self.vregs[v as usize].pieces;
         let at = ps.iter().position(|&y| y == x).expect("the piece's value") + 1;
         ps.insert(at, n);
         Some(n)
+    }
+
+    /// Undo the split of `x` that made `y`, its next piece.
+    fn merge_back(&mut self, x: u32, y: u32) {
+        let tail = std::mem::take(&mut self.pieces[y as usize]);
+        let p = &mut self.pieces[x as usize];
+        if p.end() == tail.ivs[0].0 {
+            p.ivs.last_mut().expect("an interval").1 = tail.ivs[0].1;
+            p.ivs.extend_from_slice(&tail.ivs[1..]);
+        } else {
+            p.ivs.extend_from_slice(&tail.ivs);
+        }
+        p.uses.extend_from_slice(&tail.uses);
+        let ps = &mut self.vregs[p.vreg as usize].pieces;
+        ps.retain(|&z| z != y);
     }
 
     fn split_between(&mut self, x: u32, start: Pos, end: Pos) -> Option<u32> {
@@ -464,7 +502,7 @@ impl<I: TargetInst> Ra<'_, I> {
             return;
         }
         let v = self.pieces[begin as usize].vreg;
-        if self.pieces[begin as usize].loc != Loc::Stack {
+        if self.pieces[begin as usize].loc != Loc::Stack && !self.pieces[begin as usize].fixed {
             self.spill_after(begin, pos);
         }
         let ps = self.vregs[v as usize].pieces.clone();
@@ -473,7 +511,7 @@ impl<I: TargetInst> Ra<'_, I> {
             if y == end {
                 break;
             }
-            if self.pieces[y as usize].loc != Loc::Stack {
+            if self.pieces[y as usize].loc != Loc::Stack && !self.pieces[y as usize].fixed {
                 self.spill(y);
             }
         }
@@ -502,6 +540,11 @@ impl<I: TargetInst> Ra<'_, I> {
                 Ok(())
             }
             Some(u) if u.pos > p.start() => self.spill_between(t, p.start(), u.pos),
+            // A member defined right there: a piece of its own.
+            Some(_) if self.is_def(p.vreg, p.start()) => {
+                self.queue(t);
+                Ok(())
+            }
             Some(u) => Err(format!(
                 "v{} needs a register at {} where none is free",
                 p.vreg, u.pos
@@ -538,6 +581,18 @@ impl<I: TargetInst> Ra<'_, I> {
             self.queue(second);
             return Ok(());
         }
+        // A member defined at `end` starts its own piece, with no reload.
+        let g = self.pieces[second as usize].vreg;
+        if self.is_def(g, end) && end >= until {
+            let third = self
+                .split_at(second, end)
+                .expect("a split inside the piece");
+            self.queue(third);
+            if third != second {
+                self.spill(second);
+            }
+            return Ok(());
+        }
         let split_start = (s2 + 1).max(until);
         let mut third_end = split_start.max(end & !1);
         if end == self.block_start(self.block_of_pos(end)) {
@@ -551,6 +606,15 @@ impl<I: TargetInst> Ra<'_, I> {
             }
         };
         if self.pieces[third as usize].start() & 1 != 0 {
+            // No gap to reload in before `end`: a piece not yet reached goes
+            // back unallocated instead.
+            if s2 >= until {
+                if third != second {
+                    self.merge_back(second, third);
+                }
+                self.queue(second);
+                return Ok(());
+            }
             return Err(format!(
                 "no gap to reload v{} before {end}",
                 self.pieces[x as usize].vreg

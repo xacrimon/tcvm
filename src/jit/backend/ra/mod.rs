@@ -43,8 +43,9 @@ fn class_index(c: RegClass) -> usize {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum Loc {
+    #[default]
     None,
     Reg(PReg),
     Stack,
@@ -72,13 +73,15 @@ struct Use {
 }
 
 /// One piece of a value's live range, with one location.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Piece {
     vreg: u32,
     /// Sorted, disjoint, not adjacent.
     ivs: Vec<(Pos, Pos)>,
     uses: Vec<Use>,
     loc: Loc,
+    /// A fixed definition's point in its register: never moved or spilled.
+    fixed: bool,
 }
 
 impl Piece {
@@ -142,6 +145,9 @@ struct VInfo {
     /// A parameter every argument of which is in its group: their stores
     /// after their definitions already filled the slot.
     args_in_group: bool,
+    /// A group's members' definition points, sorted: a piece may start at
+    /// one without a move.
+    defs: Vec<Pos>,
 }
 
 struct Ra<'a, I: TargetInst> {
@@ -195,6 +201,10 @@ pub(crate) fn run<I: TargetInst + std::fmt::Debug>(
         ra.liveness()?;
         ra.build()?;
         ra.scan()?;
+        #[cfg(test)]
+        if std::env::var_os("TCVM_RA_PIECES").is_some() {
+            ra.dump_pieces();
+        }
         ra.resolve()
     })();
     if r.is_err() && std::env::var_os("TCVM_RA_DEBUG").is_some() {
@@ -415,6 +425,27 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn dump_pieces(&self) {
+        for (g, gi) in self.vregs.iter().enumerate() {
+            if gi.pieces.is_empty() {
+                continue;
+            }
+            let members: Vec<usize> = (0..self.rep.len())
+                .filter(|&v| self.rep[v] == g as u32)
+                .collect();
+            eprintln!(
+                "g{g} {members:?} slot {} defs {:?}",
+                gi.slot as i64, gi.defs
+            );
+            for &x in &gi.pieces {
+                let p = &self.pieces[x as usize];
+                let us: Vec<_> = p.uses.iter().map(|u| (u.pos, u.need)).collect();
+                eprintln!("    {:?} {:?} {us:?}", p.loc, p.ivs);
+            }
+        }
+    }
+
     fn is_header(&self, b: u32) -> bool {
         self.inner[b as usize] == b
     }
@@ -532,6 +563,17 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         }
         let x = ps[k - 1];
         self.pieces[x as usize].covers(p).then_some(x)
+    }
+
+    /// Whether a member of group `g` is defined at `p`.
+    fn is_def(&self, g: u32, p: Pos) -> bool {
+        self.vregs[g as usize].defs.binary_search(&p).is_ok()
+    }
+
+    /// Whether a piece of `g` spilled from `s` can be back in a register
+    /// for `p`: a gap lies between, or a member is defined there.
+    fn reload_room(&self, g: u32, s: Pos, p: Pos) -> bool {
+        (p & !1) > s || p > s && self.is_def(g, p)
     }
 
     /// `v`'s location at `p` as an allocation.

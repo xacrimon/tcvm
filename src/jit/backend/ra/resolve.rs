@@ -31,6 +31,10 @@ impl<I: TargetInst> Ra<'_, I> {
     pub(super) fn resolve(&mut self) -> Result<Output, String> {
         for x in 0..self.pieces.len() as u32 {
             let p = &self.pieces[x as usize];
+            // Merged back into the piece it was split from.
+            if p.ivs.is_empty() {
+                continue;
+            }
             if p.loc == Loc::None {
                 return Err(format!("v{} left unallocated", p.vreg));
             }
@@ -49,11 +53,12 @@ impl<I: TargetInst> Ra<'_, I> {
                 self.allocs[u.alloc as usize] = a;
             }
         }
-        let mut moves: Vec<(u32, u8, Mv)> = Vec::new();
         // The stores after definitions: a spilled group's slot holds each
         // member from its definition on.
+        let mut moves: Vec<(u32, u8, Mv)> = Vec::new();
         for v in 0..self.vregs.len() as u32 {
-            let g = &self.vregs[self.rep[v as usize] as usize];
+            let gr = self.rep[v as usize];
+            let g = &self.vregs[gr as usize];
             if g.slot == NONE || g.pieces.is_empty() {
                 continue;
             }
@@ -105,7 +110,7 @@ impl<I: TargetInst> Ra<'_, I> {
             for w in gi.pieces.windows(2) {
                 let (a, b) = (&self.pieces[w[0] as usize], &self.pieces[w[1] as usize]);
                 let at = b.start();
-                if a.end() != at || b.loc == Loc::Stack || a.loc == b.loc {
+                if a.end() != at || b.loc == Loc::Stack || a.loc == b.loc || self.is_def(g, at) {
                     continue;
                 }
                 let bb = self.block_of_pos(at);
