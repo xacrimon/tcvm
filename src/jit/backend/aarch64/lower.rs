@@ -285,16 +285,6 @@ pub(crate) fn lower<'gc>(
         );
     }
     lw.v.entry = RBlock::new(0);
-    // Constants only immediates take are not made.
-    let read = lw.v.read_vregs();
-    for k in 0..lw.v.insts.len() {
-        if matches!(lw.v.insts[k], MInst::MovImm(_) | MInst::FImm(_))
-            && !read[lw.v.inst_operands_of(k)[0].vreg().vreg()]
-        {
-            lw.v.replace_bare(k, MInst::Elided);
-            lw.snap_ops[k] = 0;
-        }
-    }
     Ok(Lowered {
         vcode: lw.v,
         exits: lw.exits,

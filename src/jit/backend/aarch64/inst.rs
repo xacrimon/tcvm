@@ -83,8 +83,6 @@ pub(crate) enum MInst {
     /// `[def p0, def p1, ..]`, fixed in x0..: a function region's
     /// parameters, as every entry passes them (W4 §2). No code.
     Params,
-    /// No code: a constant nothing reads in a register.
-    Elided,
     /// `[def d]`, int.
     MovImm(u64),
     /// `[def d]`, float.

@@ -143,30 +143,6 @@ impl<I: TargetInst> VCode<I> {
         let (a, b) = self.ops[i];
         &self.operands[a as usize..b as usize]
     }
-
-    /// Which vregs an operand or a branch argument reads.
-    pub(crate) fn read_vregs(&self) -> Vec<bool> {
-        let mut read = vec![false; self.vreg_classes.len()];
-        for k in 0..self.insts.len() {
-            for op in self.inst_operands_of(k) {
-                if op.kind() == OperandKind::Use {
-                    read[op.vreg().vreg()] = true;
-                }
-            }
-        }
-        for &(s, e) in &self.args {
-            for v in &self.rpool[s as usize..e as usize] {
-                read[v.vreg()] = true;
-            }
-        }
-        read
-    }
-
-    /// Make instruction `i` `by`, which has no operands.
-    pub(crate) fn replace_bare(&mut self, i: usize, by: I) {
-        self.insts[i] = by;
-        self.ops[i].1 = self.ops[i].0;
-    }
 }
 
 impl<I: TargetInst + std::fmt::Debug> VCode<I> {

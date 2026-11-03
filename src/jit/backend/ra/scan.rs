@@ -163,6 +163,15 @@ impl<I: TargetInst> Ra<'_, I> {
     }
 
     fn process(&mut self, c: u32) -> Result<(), String> {
+        // A constant wanted in no register here is made where it is.
+        if self.vregs[self.pieces[c as usize].vreg as usize].remat
+            && self.pieces[c as usize]
+                .next_use(0, reg_beneficial)
+                .is_none()
+        {
+            self.spill(c);
+            return Ok(());
+        }
         let cls = self.class_of(c);
         let n = self.env.regs[cls].len();
         let (s, e) = {

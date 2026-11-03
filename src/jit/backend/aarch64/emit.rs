@@ -85,6 +85,17 @@ pub(crate) struct ExitOut {
     pub(crate) consts: Vec<u64>,
 }
 
+/// An instruction with no code: a value left for the allocator to make
+/// where used.
+fn emits_nothing(l: &Lowered, out: &Output, i: usize) -> bool {
+    match l.vcode.insts[i] {
+        MInst::MovImm(_) | MInst::FImm(_) | MInst::AluImm(..) => {
+            out.inst_allocs(regalloc2::Inst::new(i))[0].is_none()
+        }
+        _ => false,
+    }
+}
+
 /// Where branches to each block go, whether it is left out, and where a
 /// resume block's other returns (`resume_based`) go when not into it.
 /// Branches go past a block that is only a `Jump` once allocated (an edge
@@ -106,7 +117,7 @@ fn thread_jumps(
         }
         let insts: Option<Vec<usize>> = out
             .block_insts_and_edits(&l.vcode, regalloc2::Block::new(b))
-            .filter(|ie| !matches!(ie, InstOrEdit::Inst(i) if matches!(l.vcode.insts[i.index()], MInst::Elided)))
+            .filter(|ie| !matches!(ie, InstOrEdit::Inst(i) if emits_nothing(l, out, i.index())))
             .map(|ie| match ie {
                 InstOrEdit::Inst(i) => Some(i.index()),
                 InstOrEdit::Edit(_) => None,
@@ -1403,7 +1414,7 @@ impl Em<'_> {
         use MInst::*;
         match inst {
             Prologue => self.open_frame(),
-            Params | Elided => {}
+            Params => {}
             // A value the allocator computes again where used.
             MovImm(_) | FImm(_) | AluImm(..) if self.allocs(i)[0].is_none() => {}
             MovImm(v) => {
