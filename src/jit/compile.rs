@@ -394,8 +394,13 @@ pub(crate) fn compile<'gc>(
         regalloc2::run_with_ctx(&lowered.vcode, &env, &ra, &mut rctx)
             .map_err(|e| CompileError::Backend(format!("regalloc: {e:?}")))?
     } else {
-        own = crate::jit::backend::ra::run(&lowered.vcode, &abi::ra_env())
-            .map_err(|e| CompileError::Backend(format!("regalloc: {e}")))?;
+        own = crate::jit::backend::ra::run(
+            &lowered.vcode,
+            &abi::ra_env(),
+            &lowered.emit_order,
+            lowered.hot_blocks,
+        )
+        .map_err(|e| CompileError::Backend(format!("regalloc: {e}")))?;
         &own
     };
     if config.dump.vcode {
@@ -412,6 +417,8 @@ pub(crate) fn compile<'gc>(
         checker
             .run()
             .map_err(|e| CompileError::Backend(format!("regalloc checker: {e:?}")))?;
+        crate::jit::backend::ra::check_operands(&lowered.vcode, out)
+            .map_err(|e| CompileError::Backend(format!("regalloc checker: {e}")))?;
     }
     times.regalloc = t.elapsed().as_micros();
     let t = std::time::Instant::now();

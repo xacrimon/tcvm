@@ -11,7 +11,13 @@ use crate::jit::backend::vcode::TargetInst;
 
 impl<I: TargetInst> Ra<'_, I> {
     pub(super) fn scan(&mut self) -> Result<(), String> {
+        // Every step moves forward, so a function of `n` instructions takes
+        // far fewer; past this the scan is going round in circles.
+        let mut budget = 64 * self.at_lin.len() + 10_000;
         while let Some(Reverse((s, c))) = self.unhandled.pop() {
+            budget = budget
+                .checked_sub(1)
+                .ok_or_else(|| format!("the scan made no progress at {s}"))?;
             let p = &self.pieces[c as usize];
             // Spilled while queued (`maybe_spill_previous`) or split since.
             if p.loc != Loc::None || p.start() != s {
@@ -21,6 +27,12 @@ impl<I: TargetInst> Ra<'_, I> {
                 continue;
             }
             self.advance(s);
+            // A piece starting at a late point (not a definition) holds its
+            // value where the cut left it: the stack, until a gap can reload.
+            if s & 1 != 0 && !self.is_def(self.pieces[c as usize].vreg, s) {
+                self.spill_tail(c)?;
+                continue;
+            }
             self.process(c)?;
         }
         Ok(())
@@ -130,6 +142,15 @@ impl<I: TargetInst> Ra<'_, I> {
         reg
     }
 
+    /// Whether `c` wants a register in `p`'s block before `p`: what a
+    /// register held up to an instruction's late point is for.
+    fn used_in_block_before(&self, c: u32, p: Pos) -> bool {
+        let from = self.block_start(self.block_of_pos(p));
+        self.pieces[c as usize]
+            .next_use(from, reg_beneficial)
+            .is_some_and(|u| u.pos < p)
+    }
+
     fn needs_reg_at(&self, c: u32, p: Pos) -> bool {
         self.pieces[c as usize]
             .next_use(p, needs_reg)
@@ -184,6 +205,16 @@ impl<I: TargetInst> Ra<'_, I> {
         }
         let k = self.pick_longest(hint, &free);
         let until = free[k];
+        // Free only part of the way: losing it costs a reload at the next
+        // use after; evicting a holder of a register free longer costs its
+        // reload. Take whichever runs less often.
+        if until > s && until < e && self.evicting_is_cheaper(c, until) {
+            self.allocate_blocked(c)?;
+            if self.reg_of(c).is_some() {
+                self.active.push(c);
+            }
+            return Ok(());
+        }
         if until > s {
             if until >= e {
                 self.assign(c, k);
@@ -192,7 +223,8 @@ impl<I: TargetInst> Ra<'_, I> {
             }
             // Taken at an instruction's late point (a clobber, a def): the
             // register still serves its early uses, the stack the rest.
-            if until & 1 != 0 && !self.needs_reg_at(c, until) {
+            if until & 1 != 0 && !self.needs_reg_at(c, until) && self.used_in_block_before(c, until)
+            {
                 let tail = self.split_at(c, until).expect("a split inside the piece");
                 self.assign(c, k);
                 self.active.push(c);
@@ -262,6 +294,23 @@ impl<I: TargetInst> Ra<'_, I> {
         (use_pos, block_pos)
     }
 
+    fn evicting_is_cheaper(&self, c: u32, until: Pos) -> bool {
+        let Some(after) = self.pieces[c as usize].next_use(until, reg_beneficial) else {
+            return false;
+        };
+        let (use_pos, block_pos) = self.blocked_pos(c);
+        let k = self.pick_longest(self.hint(c), &use_pos);
+        if use_pos[k] <= until || block_pos[k] <= until {
+            return false;
+        }
+        let evict = if use_pos[k] == Pos::MAX {
+            0.0
+        } else {
+            self.freq_at(use_pos[k])
+        };
+        evict < self.freq_at(after.pos)
+    }
+
     fn allocate_blocked(&mut self, c: u32) -> Result<(), String> {
         let (s, e) = {
             let p = &self.pieces[c as usize];
@@ -288,6 +337,7 @@ impl<I: TargetInst> Ra<'_, I> {
             && new_end > s
             && ru.pos < new_end
             && !self.needs_reg_at(c, new_end)
+            && self.used_in_block_before(c, new_end)
         {
             // Blocked at a late point after its register use: hold the
             // register to there, the stack after.
@@ -440,10 +490,15 @@ impl<I: TargetInst> Ra<'_, I> {
         if sb == eb {
             return end;
         }
+        // Headers inside (start, end] only: cold blocks laid out last can
+        // put a loop's header after blocks of its body.
         let mut b = eb;
         loop {
             let h = self.containing_loop(b);
-            if h == NONE || self.rank[h as usize] <= self.rank[sb as usize] {
+            if h == NONE
+                || self.rank[h as usize] <= self.rank[sb as usize]
+                || !(start + 1..=end).contains(&self.block_start(h))
+            {
                 break;
             }
             b = h;
@@ -461,6 +516,10 @@ impl<I: TargetInst> Ra<'_, I> {
         let v = self.pieces[x as usize].vreg;
         let first = self.pieces[self.vregs[v as usize].pieces[0] as usize].start();
         let (mut begin, mut pos) = (x, pos);
+        // Spilled in cold code: it stays there.
+        if pos >= self.cold_start {
+            return (begin, pos);
+        }
         let b = self.block_of_pos(pos);
         let mut h = if self.is_header(b) {
             b
@@ -469,8 +528,9 @@ impl<I: TargetInst> Ra<'_, I> {
         };
         while h != NONE {
             let ls = self.block_start(h);
-            // Defined at or after the header: spilling there buys nothing.
-            if first >= ls {
+            // Defined at or after the header: spilling there buys nothing;
+            // a header laid out after the spill is no earlier place.
+            if first >= ls || ls > pos {
                 return (begin, pos);
             }
             if let Some(live) = self.piece_at(v, ls)

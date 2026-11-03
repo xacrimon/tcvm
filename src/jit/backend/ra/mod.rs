@@ -163,6 +163,9 @@ struct Ra<'a, I: TargetInst> {
     /// The block of each linear index, and its instruction.
     lin_block: Vec<u32>,
     at_lin: Vec<Inst>,
+    /// Each block's static frequency, and where cold code starts.
+    freq: Vec<f32>,
+    cold_start: Pos,
     /// Header of the innermost loop holding each block (itself for a
     /// header), else `NONE`; the enclosing loop's header of each header.
     inner: Vec<u32>,
@@ -174,6 +177,8 @@ struct Ra<'a, I: TargetInst> {
     vregs: Vec<VInfo>,
     /// Each value's group (`build`): itself, or the parameter it joined.
     rep: Vec<u32>,
+    /// Per group: spilled in cold code only, stored on its way in there.
+    deferred: Vec<bool>,
     /// Per `PReg::index()`: points it is reserved over, `(from, to, owner)`
     /// sorted by `from`; the owner vreg may sit there (a fixed operand of
     /// its own), `NONE` owns a clobber.
@@ -191,13 +196,17 @@ struct Ra<'a, I: TargetInst> {
 }
 
 /// Allocate `f`'s registers.
+/// Allocate `f`'s registers, its blocks taken in `order`: the first `hot`
+/// of them hot, the rest (exits, cold arms) after them all.
 pub(crate) fn run<I: TargetInst + std::fmt::Debug>(
     f: &VCode<I>,
     env: &Env,
+    order: &[u32],
+    hot: usize,
 ) -> Result<Output, String> {
     let mut ra = Ra::new(f, env);
     let r = (|| {
-        ra.layout()?;
+        ra.layout(order, hot)?;
         ra.liveness()?;
         ra.build()?;
         ra.scan()?;
@@ -211,6 +220,38 @@ pub(crate) fn run<I: TargetInst + std::fmt::Debug>(
         eprintln!("{}", dump(f));
     }
     r
+}
+
+/// Operands of one instruction that may not share a register: an early
+/// definition with any use, a late definition with a late use, two
+/// definitions.
+pub(crate) fn check_operands<I: TargetInst>(v: &VCode<I>, out: &Output) -> Result<(), String> {
+    use regalloc2::OperandKind::{Def, Use};
+    use regalloc2::OperandPos::{Early, Late};
+    for i in 0..v.insts.len() {
+        let ops = v.inst_operands_of(i);
+        let al = out.inst_allocs(Inst::new(i));
+        for a in 0..ops.len() {
+            for b in a + 1..ops.len() {
+                let (oa, ob) = (ops[a], ops[b]);
+                if !al[a].is_reg() || al[a] != al[b] || oa.vreg() == ob.vreg() {
+                    continue;
+                }
+                let clash = matches!(
+                    (oa.kind(), oa.pos(), ob.kind(), ob.pos()),
+                    (Def, Early, Use, _)
+                        | (Use, _, Def, Early)
+                        | (Def, Late, Use, Late)
+                        | (Use, Late, Def, Late)
+                        | (Def, _, Def, _)
+                );
+                if clash {
+                    return Err(format!("inst {i}: {oa:?} and {ob:?} share {:?}", al[a]));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The function before allocation: blocks, operands, clobbers.
@@ -257,6 +298,8 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             last: Vec::new(),
             lin_block: Vec::new(),
             at_lin: Vec::new(),
+            freq: Vec::new(),
+            cold_start: Pos::MAX,
             inner: Vec::new(),
             outer: Vec::new(),
             words: 0,
@@ -264,6 +307,7 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             pieces: Vec::new(),
             vregs: Vec::new(),
             rep: Vec::new(),
+            deferred: Vec::new(),
             fixed: vec![Vec::new(); PReg::NUM_INDEX],
             reg_idx,
             allocs: Vec::new(),
@@ -289,11 +333,17 @@ impl<'a, I: TargetInst> Ra<'a, I> {
 
     /// The linear order (blocks as numbered: `order.rs` lays out the
     /// allocator's order) and its loops, from the dominators.
-    fn layout(&mut self) -> Result<(), String> {
+    fn layout(&mut self, order: &[u32], hot: usize) -> Result<(), String> {
         let f = self.f;
         let nb = f.num_blocks();
-        self.order = (0..nb).map(Block::new).collect();
-        self.rank = (0..nb as u32).collect();
+        if order.len() != nb {
+            return Err("an order not of every block".into());
+        }
+        self.order = order.iter().map(|&b| Block::new(b as usize)).collect();
+        self.rank = vec![NONE; nb];
+        for (k, &b) in order.iter().enumerate() {
+            self.rank[b as usize] = k as u32;
+        }
         self.first = vec![0; nb];
         self.last = vec![0; nb];
         for &b in &self.order {
@@ -422,6 +472,23 @@ impl<'a, I: TargetInst> Ra<'a, I> {
                 .find(|l| l.1[*h])
                 .map_or(NONE, |l| l.0 as u32);
         }
+        // Static frequencies: eight times per loop level, cold code next to
+        // nothing.
+        self.cold_start = order.get(hot).map_or(Pos::MAX, |&b| self.block_start(b));
+        self.freq = (0..nb)
+            .map(|b| {
+                if self.rank[b] as usize >= hot {
+                    return 1.0 / 1024.0;
+                }
+                let mut depth = 0;
+                let mut h = self.inner[b];
+                while h != NONE {
+                    depth += 1;
+                    h = self.outer[h as usize];
+                }
+                8f32.powi(depth.min(6))
+            })
+            .collect();
         Ok(())
     }
 
@@ -444,6 +511,11 @@ impl<'a, I: TargetInst> Ra<'a, I> {
                 eprintln!("    {:?} {:?} {us:?}", p.loc, p.ivs);
             }
         }
+    }
+
+    /// The frequency of the block holding `p`.
+    fn freq_at(&self, p: Pos) -> f32 {
+        self.freq[self.block_of_pos(p) as usize]
     }
 
     fn is_header(&self, b: u32) -> bool {

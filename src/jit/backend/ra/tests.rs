@@ -113,10 +113,14 @@ struct Gen {
     rng: Rng,
     v: VCode<T>,
     blocks: Vec<B>,
+    /// Blocks made inside a cold arm, which the order puts last.
+    cold: Vec<bool>,
+    in_cold: bool,
 }
 
 impl Gen {
     fn block(&mut self) -> u32 {
+        self.cold.push(self.in_cold);
         self.blocks.push(B::default());
         self.blocks.len() as u32 - 1
     }
@@ -331,10 +335,13 @@ impl Gen {
         self.edge(cur, t, Vec::new());
         let mut at = avail.clone();
         let tl = self.region(t, depth + 1, &mut at);
+        let was = self.in_cold;
+        self.in_cold |= self.rng.chance(25);
         let e = self.block();
         self.edge(cur, e, Vec::new());
         let mut ae = avail.clone();
         let el = self.region(e, depth + 1, &mut ae);
+        self.in_cold = was;
         let j = self.block();
         self.params(j);
         self.jump(tl, j, &mut at);
@@ -425,11 +432,14 @@ impl Gen {
     }
 }
 
-fn generate(seed: u64) -> VCode<T> {
+/// A function, and its blocks in allocation order with how many are hot.
+fn generate(seed: u64) -> (VCode<T>, Vec<u32>, usize) {
     let mut g = Gen {
         rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
         v: VCode::new(),
         blocks: Vec::new(),
+        cold: Vec::new(),
+        in_cold: false,
     };
     let entry = g.block();
     let mut avail = Vec::new();
@@ -451,38 +461,22 @@ fn generate(seed: u64) -> VCode<T> {
     g.blocks[end as usize]
         .insts
         .push((T::Ret, ops, PRegSet::empty()));
-    g.finish()
-}
-
-/// Operands of one instruction that may not share a register: an early
-/// definition with any use, a late definition with a late use, two
-/// definitions.
-fn check_operands(v: &VCode<T>, out: &Output) -> Result<(), String> {
-    use OperandKind::{Def, Use};
-    use OperandPos::{Early, Late};
-    for i in 0..v.insts.len() {
-        let ops = v.inst_operands_of(i);
-        let al = out.inst_allocs(Inst::new(i));
-        for a in 0..ops.len() {
-            for b in a + 1..ops.len() {
-                let (oa, ob) = (ops[a], ops[b]);
-                if !al[a].is_reg() || al[a] != al[b] || oa.vreg() == ob.vreg() {
-                    continue;
-                }
-                let clash = matches!(
-                    (oa.kind(), oa.pos(), ob.kind(), ob.pos()),
-                    (Def, Early, Use, _)
-                        | (Use, _, Def, Early)
-                        | (Def, Late, Use, Late)
-                        | (Use, Late, Def, Late)
-                        | (Def, _, Def, _)
-                );
-                if clash {
-                    return Err(format!("inst {i}: {oa:?} and {ob:?} share {:?}", al[a]));
-                }
-            }
+    // Odd blocks cold too: loop headers and blocks dominating hot ones
+    // laid out after them.
+    for b in 1..g.blocks.len() {
+        if g.rng.chance(10) {
+            g.cold[b] = true;
         }
     }
+    let n = g.blocks.len() as u32;
+    let mut order: Vec<u32> = (0..n).filter(|&b| !g.cold[b as usize]).collect();
+    let hot = order.len();
+    order.extend((0..n).filter(|&b| g.cold[b as usize]));
+    (g.finish(), order, hot)
+}
+
+fn check_operands(v: &VCode<T>, out: &Output) -> Result<(), String> {
+    super::check_operands(v, out)?;
     for (b, blk) in v.blocks.iter().enumerate() {
         if blk.resume
             && out
@@ -510,9 +504,8 @@ fn random_functions_allocate_correctly() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     for seed in first..first + n {
-        let v = generate(seed);
-        let order: Vec<u32> = (0..v.blocks.len() as u32).collect();
-        let out = match run(&v, &env) {
+        let (v, order, hot) = generate(seed);
+        let out = match run(&v, &env, &order, hot) {
             Ok(out) => out,
             Err(e) => panic!("seed {seed}: {e}"),
         };

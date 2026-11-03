@@ -18,14 +18,16 @@ struct Mv {
 /// The order of the moves sharing a gap: stores after the definition
 /// before it, then moves between pieces, across the edge into the block,
 /// stores of its parameters, across the edges out of it (a block of one
-/// instruction has both), and copies into the instruction's fixed
-/// registers.
+/// instruction has both), cold stores of a piece ending at the
+/// instruction's late point (from where the moves before left it), and
+/// copies into the instruction's fixed registers.
 const DEF_STORE: u8 = 0;
 const CONNECT: u8 = 1;
 const EDGE_IN: u8 = 2;
 const PARAM_STORE: u8 = 3;
 const EDGE_OUT: u8 = 4;
-const FIXED_COPY: u8 = 5;
+const LATE_STORE: u8 = 5;
+const FIXED_COPY: u8 = 6;
 
 impl<I: TargetInst> Ra<'_, I> {
     pub(super) fn resolve(&mut self) -> Result<Output, String> {
@@ -53,13 +55,28 @@ impl<I: TargetInst> Ra<'_, I> {
                 self.allocs[u.alloc as usize] = a;
             }
         }
-        // The stores after definitions: a spilled group's slot holds each
-        // member from its definition on.
+        // A group spilled only in cold code (none of its uses wanting the
+        // slot) is stored on its way in there (V8's deferred spilling);
+        // any other spilled group once after each definition, its slot
+        // holding it from there on.
+        self.deferred = (0..self.vregs.len())
+            .map(|g| {
+                let gi = &self.vregs[g];
+                self.rep[g] == g as u32
+                    && gi.slot != NONE
+                    && gi.pieces.iter().all(|&x| {
+                        let p = &self.pieces[x as usize];
+                        p.ivs.is_empty()
+                            || (p.loc != Loc::Stack || p.start() >= self.cold_start)
+                                && p.uses.iter().all(|u| u.need != Need::Stack)
+                    })
+            })
+            .collect();
         let mut moves: Vec<(u32, u8, Mv)> = Vec::new();
         for v in 0..self.vregs.len() as u32 {
             let gr = self.rep[v as usize];
             let g = &self.vregs[gr as usize];
-            if g.slot == NONE || g.pieces.is_empty() {
+            if g.slot == NONE || g.pieces.is_empty() || self.deferred[gr as usize] {
                 continue;
             }
             let (cls, slot) = (
@@ -106,23 +123,29 @@ impl<I: TargetInst> Ra<'_, I> {
                 continue;
             }
             let cls = gi.class;
-            // Between pieces inside a block; a stack piece needs no store.
+            // Between pieces inside a block; a stack piece needs a store only
+            // in cold code, before the instruction it starts at.
+            let deferred = self.deferred[g as usize];
             for w in gi.pieces.windows(2) {
                 let (a, b) = (&self.pieces[w[0] as usize], &self.pieces[w[1] as usize]);
                 let at = b.start();
-                if a.end() != at || b.loc == Loc::Stack || a.loc == b.loc || self.is_def(g, at) {
+                if a.end() != at
+                    || a.loc == b.loc
+                    || self.is_def(g, at)
+                    || b.loc == Loc::Stack && !deferred
+                {
                     continue;
                 }
                 let bb = self.block_of_pos(at);
                 if at == self.block_start(bb) {
                     continue;
                 }
-                if at & 1 != 0 {
+                if at & 1 != 0 && b.loc != Loc::Stack {
                     return Err(format!("v{g} reloaded inside instruction {}", at / 2));
                 }
                 moves.push((
                     at / 2,
-                    CONNECT,
+                    if at & 1 != 0 { LATE_STORE } else { CONNECT },
                     Mv {
                         from: self.alloc_of(w[0]),
                         to: self.alloc_of(w[1]),
@@ -202,7 +225,8 @@ impl<I: TargetInst> Ra<'_, I> {
                             return Err(format!("v{v} not live across b{pi} -> b{si}"));
                         };
                         // The slot has held it since its definition.
-                        if from != to && !to.is_stack() {
+                        let g = self.rep[v as usize] as usize;
+                        if from != to && (!to.is_stack() || self.deferred[g]) {
                             let cls = self.vregs[v as usize].class;
                             moves.push((at, phase, Mv { from, to, cls }));
                         }
@@ -228,7 +252,10 @@ impl<I: TargetInst> Ra<'_, I> {
                     }
                 }
                 if resume && moves.len() != before {
-                    return Err(format!("moves into resume block b{si}"));
+                    return Err(format!(
+                        "moves into resume block b{si}: {:?}",
+                        &moves[before..]
+                    ));
                 }
             }
         }
