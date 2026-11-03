@@ -1,12 +1,10 @@
 //! The words type tests compare with (`BOX`, nil, a range's ends) as
 //! constant operands: made once in the preheader of the innermost loop
-//! around a test where that loop clobbers no register, so it keeps them in
-//! registers, else once for the tests sharing one in code no clobber
-//! interrupts. Not further: without rematerialization the allocator gives
-//! a word live across an outer loop or a clobber a callee-saved register,
-//! spilling what held it, or spills the word itself. A test alone in
-//! reading a word makes it in a scratch register, as do tests in cold
-//! blocks, entry guards and landings.
+//! around a test (the allocator makes a word again past a clobber or where
+//! registers run short), else once for the tests sharing one in code no
+//! clobber interrupts. A test alone in reading a word outside loops makes
+//! it in a scratch register, as do tests in cold blocks, entry guards and
+//! landings.
 
 use crate::jit::FastMap;
 use crate::jit::ir::ops::{ExitTag, Op};
@@ -39,7 +37,7 @@ pub(crate) fn place(f: &mut Func<'_>) {
     }
     loops.sort_by_key(|(_, b)| std::cmp::Reverse(b.len()));
     // The preheader of the innermost loop around each block, where it has
-    // one and calls nothing.
+    // one.
     let mut home: Vec<Option<Block>> = vec![None; f.blocks.len()];
     for (h, body) in &loops {
         let outside: Vec<Block> = (cfg.preds(*h).iter().copied())
@@ -54,12 +52,8 @@ pub(crate) fn place(f: &mut Func<'_>) {
         {
             continue;
         }
-        let calls = body.iter().any(|&b| {
-            let cold = f.blocks[b.idx()].cold;
-            f.insts_of(b).iter().any(|&i| clobbers(f, i, cold))
-        });
         for &b in body {
-            home[b.idx()] = (!calls).then_some(p);
+            home[b.idx()] = Some(p);
         }
     }
     // Elsewhere a word is shared within a segment, code no clobber
