@@ -134,6 +134,89 @@ math1!(
     },
     |i| Math1::Small(i)
 );
+math1!(ff_exp, |x| Math1::Float(x.exp()), |i| Math1::Float(
+    f64::from(i).exp()
+));
+math1!(ff_tan, |x| Math1::Float(x.tan()), |i| Math1::Float(
+    f64::from(i).tan()
+));
+math1!(ff_asin, |x| Math1::Float(x.asin()), |i| Math1::Float(
+    f64::from(i).asin()
+));
+math1!(ff_acos, |x| Math1::Float(x.acos()), |i| Math1::Float(
+    f64::from(i).acos()
+));
+
+/// A float or inline integer argument as a float.
+#[inline(always)]
+fn num_arg(v: &Value<'_>) -> Option<f64> {
+    if v.is_float() {
+        Some(v.read_float())
+    } else {
+        v.get_small().map(f64::from)
+    }
+}
+
+fast_entry! {
+    /// `atan(y [, x])`: `atan2`, as Lua computes even the one-argument form.
+    ff_atan => |call, a, nargs, c, _base, _rt| {
+        let Some(y) = num_arg(&reg![a + 4]) else { miss!() };
+        let x = match nargs {
+            1 => 1.0,
+            2 => match num_arg(&reg![a + 5]) {
+                Some(x) => x,
+                None => miss!(),
+            },
+            _ => miss!(),
+        };
+        reg![a].write_float(y.atan2(x));
+        land1!()
+    }
+}
+
+fast_entry! {
+    /// `log(x [, base])`, bases 2 and 10 by their own functions as in Lua.
+    ff_log => |call, a, nargs, c, _base, _rt| {
+        let Some(x) = num_arg(&reg![a + 4]) else { miss!() };
+        let r = match nargs {
+            1 => x.ln(),
+            2 => match num_arg(&reg![a + 5]) {
+                Some(2.0) => x.log2(),
+                Some(10.0) => x.log10(),
+                Some(b) => x.ln() / b.ln(),
+                None => miss!(),
+            },
+            _ => miss!(),
+        };
+        reg![a].write_float(r);
+        land1!()
+    }
+}
+
+fast_entry! {
+    /// `fmod(x, y)`: C's `%` of two inline integers (a zero divisor raises
+    /// in the builtin), else `fmod` of the numbers.
+    ff_fmod => |call, a, nargs, c, _base, _rt| {
+        if nargs != 2 {
+            miss!()
+        }
+        let (x, y) = (&reg![a + 4], &reg![a + 5]);
+        if let (Some(i), Some(j)) = (x.get_small(), y.get_small()) {
+            // `i32::MIN % -1` overflows; any `% -1` is 0.
+            let r = match j {
+                0 => miss!(),
+                -1 => 0,
+                _ => i % j,
+            };
+            reg![a] = Value::small(r);
+            land1!()
+        }
+        let (Some(x), Some(y)) = (num_arg(x), num_arg(y)) else { miss!() };
+        reg![a].write_float(x % y);
+        land1!()
+    }
+}
+
 math1!(
     ff_ceil,
     |x| {
