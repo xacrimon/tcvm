@@ -37,7 +37,8 @@ pub(crate) struct JitConfig {
     pub(crate) check: bool,
     /// Log each compile's time per stage.
     pub(crate) time: bool,
-    pub(crate) fastalloc: bool,
+    /// Allocate with regalloc2 (`TCVM_JIT_RA=regalloc2`) instead of `ra`.
+    pub(crate) regalloc2: bool,
     pub(crate) only: Option<String>,
     pub(crate) deopt_all: bool,
     /// Inline known small callees (E1); `TCVM_JIT_INLINE=0` turns it off.
@@ -94,7 +95,7 @@ impl JitConfig {
             dump,
             check: flag("TCVM_JIT_CHECK") || cfg!(debug_assertions),
             time: flag("TCVM_JIT_TIME"),
-            fastalloc: flag("TCVM_JIT_FASTALLOC"),
+            regalloc2: var("TCVM_JIT_RA").is_some_and(|v| v == "regalloc2"),
             only: var("TCVM_JIT_ONLY"),
             deopt_all: flag("TCVM_JIT_DEOPT_ALL"),
             inline: var("TCVM_JIT_INLINE").is_none_or(|v| v != "0" && v != "off"),

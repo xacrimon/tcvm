@@ -64,6 +64,28 @@ pub(crate) fn machine_env() -> MachineEnv {
     }
 }
 
+/// The allocator's registers: its classes' allocatable ones, preferred
+/// first; x17 and d31 park a value in a cycle of moves, x16 carries
+/// stack-to-stack moves.
+pub(crate) fn ra_env() -> crate::jit::backend::ra::Env {
+    crate::jit::backend::ra::Env {
+        regs: [
+            INT_PREFERRED
+                .iter()
+                .chain(&INT_OTHER)
+                .map(|&r| preg_int(r))
+                .collect(),
+            FLOAT_PREFERRED
+                .iter()
+                .chain(&FLOAT_OTHER)
+                .map(|&r| preg_float(r))
+                .collect(),
+        ],
+        scratch: [preg_int(17), preg_float(31)],
+        transport: preg_int(16),
+    }
+}
+
 /// Every register the allocator hands out: what a call into another region
 /// may change.
 pub(crate) fn allocatable() -> PRegSet {

@@ -383,26 +383,21 @@ pub(crate) fn compile<'gc>(
     times.lower = t.elapsed().as_micros();
     let t = std::time::Instant::now();
     let env = abi::machine_env();
-    let ra = regalloc2::RegallocOptions {
-        verbose_log: false,
-        validate_ssa: opts.check,
-        algorithm: if config.fastalloc {
-            regalloc2::Algorithm::Fastalloc
-        } else {
-            regalloc2::Algorithm::Ion
-        },
-    };
     let mut rctx = ctx.jit().ra.borrow_mut();
-    let out = regalloc2::run_with_ctx(&lowered.vcode, &env, &ra, &mut rctx)
-        .map_err(|e| CompileError::Backend(format!("regalloc: {e:?}")))?;
-    if opts.check {
-        let mut checker = regalloc2::checker::Checker::new(&lowered.vcode, &env);
-        checker.prepare(out);
-        checker
-            .run()
-            .map_err(|e| CompileError::Backend(format!("regalloc checker: {e:?}")))?;
-    }
-    times.regalloc = t.elapsed().as_micros();
+    let own;
+    let out: &regalloc2::Output = if config.regalloc2 {
+        let ra = regalloc2::RegallocOptions {
+            verbose_log: false,
+            validate_ssa: opts.check,
+            algorithm: regalloc2::Algorithm::Ion,
+        };
+        regalloc2::run_with_ctx(&lowered.vcode, &env, &ra, &mut rctx)
+            .map_err(|e| CompileError::Backend(format!("regalloc: {e:?}")))?
+    } else {
+        own = crate::jit::backend::ra::run(&lowered.vcode, &abi::ra_env())
+            .map_err(|e| CompileError::Backend(format!("regalloc: {e}")))?;
+        &own
+    };
     if config.dump.vcode {
         eprintln!(
             "-- jit vcode {} pc{pc}, {} spill slots\n{}",
@@ -411,6 +406,14 @@ pub(crate) fn compile<'gc>(
             lowered.vcode.print(out, &lowered.emit_order)
         );
     }
+    if opts.check {
+        let mut checker = regalloc2::checker::Checker::new(&lowered.vcode, &env);
+        checker.prepare(out);
+        checker
+            .run()
+            .map_err(|e| CompileError::Backend(format!("regalloc checker: {e:?}")))?;
+    }
+    times.regalloc = t.elapsed().as_micros();
     let t = std::time::Instant::now();
     let jit = ctx.jit();
     let tramp = |h: usize, f: bool| jit.trampoline(h, f);
