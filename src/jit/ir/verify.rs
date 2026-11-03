@@ -158,7 +158,8 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
 }
 
 /// Once the call-boundary pass ran, what is live across a call is a value
-/// its snapshot names or a constant, never a raw pointer (C1).
+/// its snapshot names, a constant, or a table's pointer whose table it
+/// names (C1).
 fn check_r6(f: &Func<'_>, rpo: &[Block], _pos: &[(Block, usize)]) -> Result<(), String> {
     if !f.boundaries {
         return Ok(());
@@ -172,8 +173,10 @@ fn check_r6(f: &Func<'_>, rpo: &[Block], _pos: &[(Block, usize)]) -> Result<(), 
         let kept = crate::jit::opt::calls::kept_across(f, &cfg, b);
         for v in live[b.idx()].iter() {
             let v = Val(v as u32);
-            if !kept.contains(&crate::jit::opt::calls::same_reg(f, v))
-                && !crate::jit::opt::calls::is_const(f, v)
+            use crate::jit::opt::calls::{is_const, rooted, same_reg, table_of};
+            if !kept.contains(&same_reg(f, v))
+                && !is_const(f, v)
+                && !table_of(f, v).is_some_and(|t| rooted(f, &kept, t))
             {
                 return Err(format!(
                     "v{} is live across the call resuming at b{}",

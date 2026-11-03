@@ -2,10 +2,10 @@
 //! so a value live across it stays in the region's frame, and must then be
 //! one the call-site snapshot names: the collector traces those spill slots
 //! while the call runs. A value one of the call's home slots holds is loaded
-//! from it again; pure computations of such values (raw pointers among
-//! them, which the collector does not see) are computed again after the
-//! resume. Constants stay live (the allocator makes them where used). Later
-//! uses get whichever definition reaches them.
+//! from it again; pure computations of such values are computed again after
+//! the resume. Constants stay live (the allocator makes them where used), and
+//! so does a table's pointer, the call naming its table (the collector does
+//! not see raw pointers). Later uses get whichever definition reaches them.
 //! A copy with all its uses in one later block goes there when no call
 //! comes between (`place_copies`).
 
@@ -379,9 +379,25 @@ fn boundaries_round(
             // The copies go after the resume block's `Resume`.
             at: 1,
         };
+        // A table's pointer stays live across the call with its table named
+        // by the call: the collector sees the table, not the pointer.
+        for v in live[b.idx()].iter().collect::<Vec<_>>() {
+            if let Some(t) = table_of(f, Val(v as u32))
+                && !rooted(f, &cx.kept, t)
+                && keep_unnamed(f, &cfg, b, t).is_ok()
+            {
+                cx.kept.push(same_reg(f, t));
+                changed = true;
+            }
+        }
         for v in live[b.idx()].iter().collect::<Vec<_>>() {
             let v = Val(v as u32);
-            if cx.kept.contains(&same_reg(f, v)) || is_const(f, v) {
+            // Constants and rooted pointers stay live: the allocator makes
+            // them again.
+            if cx.kept.contains(&same_reg(f, v))
+                || is_const(f, v)
+                || table_of(f, v).is_some_and(|t| rooted(f, &cx.kept, t))
+            {
                 continue;
             }
             let c = match remat(f, v, &mut cx) {
@@ -636,6 +652,19 @@ pub(crate) fn same_reg(f: &Func<'_>, mut v: Val) -> Val {
     v
 }
 
+/// The table whose pointer `v` is: live across a call when the call names
+/// the table (the rooting rule).
+pub(crate) fn table_of(f: &Func<'_>, v: Val) -> Option<Val> {
+    let d = f.def_inst(v)?;
+    (f.op(d) == Op::Unbox(Rep::Ptr)).then(|| f.args(d)[0])
+}
+
+/// Whether table `t` stays reachable across a call keeping `kept`: named
+/// by it, or a constant (the code holds those).
+pub(crate) fn rooted(f: &Func<'_>, kept: &[Val], t: Val) -> bool {
+    kept.contains(&same_reg(f, t)) || is_const(f, t)
+}
+
 /// Whether `v` is a constant, which needs no spill slot across a call.
 pub(crate) fn is_const(f: &Func<'_>, v: Val) -> bool {
     matches!(
@@ -705,7 +734,7 @@ fn remat(f: &mut Func<'_>, v: Val, cx: &mut After<'_>) -> Option<Val> {
     if let Some(&c) = cx.memo.get(&v) {
         return Some(c);
     }
-    if is_const(f, v) {
+    if is_const(f, v) || table_of(f, v).is_some_and(|t| rooted(f, &cx.kept, t)) {
         return Some(v);
     }
     if cx.kept.contains(&same_reg(f, v)) {
