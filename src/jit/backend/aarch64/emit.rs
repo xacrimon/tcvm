@@ -109,6 +109,19 @@ fn emits_nothing(l: &Lowered, out: &Output, i: usize) -> bool {
     }
 }
 
+/// The operand size of a test of one register against zero for equality,
+/// which `cbz`/`cbnz` branch on without flags; a B1 is a W.
+fn zero_test(test: Test, cond: Cond) -> Option<Sz> {
+    if !matches!(cond, Cond::Eq | Cond::Ne) {
+        return None;
+    }
+    match test {
+        Test::B1 | Test::I32 { imm: Some(0) } => Some(Sz::W),
+        Test::X { imm: Some(0) } => Some(Sz::X),
+        _ => None,
+    }
+}
+
 /// Loop rotation (V8's `ComputeAssemblyOrder`, with any exiting block as the
 /// cut): a hot loop whose last block jumps back to its first is laid out
 /// from the block after one that branches out to the block following the
@@ -303,6 +316,8 @@ struct Em<'a> {
     /// call's paths besides its fast one, so its callee returns into the
     /// resume block.
     ool: Vec<OolPath<'a>>,
+    /// Bit tests branch with `tbz`/`tbnz` (±32 KB), else `tst` and `b.cond`.
+    bit_branches: bool,
 }
 
 /// A function region's fast entry: what `enter` would check of the callee.
@@ -442,6 +457,23 @@ pub(crate) fn emit(
     fast: Option<FastEntry>,
     trace: bool,
 ) -> Result<Emitted, String> {
+    let e = emit_with(l, out, helpers.clone(), fired, fast, trace, true)?;
+    if e.asm.short_branches_reach() {
+        return Ok(e);
+    }
+    // A region past `tbz`'s reach: bit tests as `tst` and `b.cond`.
+    emit_with(l, out, helpers, fired, fast, trace, false)
+}
+
+fn emit_with(
+    l: &Lowered,
+    out: &Output,
+    helpers: Helpers,
+    fired: Option<usize>,
+    fast: Option<FastEntry>,
+    trace: bool,
+    bit_branches: bool,
+) -> Result<Emitted, String> {
     let mut origins: Vec<(u32, u32)> = Vec::new();
     let mut origin = |a: &Asm, o: u32| {
         if trace {
@@ -505,6 +537,7 @@ pub(crate) fn emit(
         landings: Vec::new(),
         level_tail,
         ool: Vec::new(),
+        bit_branches,
     };
     origin(&em.a, Origin::Entry as u32);
     em.a.bind(em.region_word);
@@ -1452,6 +1485,11 @@ impl Em<'_> {
                 self.a.cmp_imm(Sz::W, c, 0);
                 cond
             }
+            Test::Bit(b) => {
+                let x = self.r(i, k);
+                self.a.tst_imm(Sz::W, x, 1 << b);
+                cond
+            }
             Test::Shape(word) => {
                 let t = self.r(i, k);
                 self.a.ldr(X16, t, layout::T_SHAPE as i32);
@@ -1861,12 +1899,23 @@ impl Em<'_> {
             }
             Guard { test, cond, exit } => {
                 let l = self.exit(exit);
-                if test == Test::B1 {
+                if let Test::Bit(b) = test
+                    && self.bit_branches
+                {
+                    // Passes where `cond` holds (`Ne`: the bit set).
+                    let x = self.r(i, 0);
+                    if cond == Cond::Ne {
+                        self.a.tbz(x, b as u32, l);
+                    } else {
+                        self.a.tbnz(x, b as u32, l);
+                    }
+                } else if let Some(sz) = zero_test(test, cond) {
+                    // Passes where `cond` holds: out where it does not.
                     let c = self.r(i, 0);
                     if cond == Cond::Ne {
-                        self.a.cbz(Sz::W, c, l);
+                        self.a.cbz(sz, c, l);
                     } else {
-                        self.a.cbnz(Sz::W, c, l);
+                        self.a.cbnz(sz, c, l);
                     }
                 } else if let Test::Type(set, words) = test
                     && !is_single_test(set)
@@ -2269,6 +2318,35 @@ impl Em<'_> {
                     }
                     if Some(no) != next {
                         self.a.b(no);
+                    }
+                    return Ok(());
+                }
+                if let Test::Bit(b) = test
+                    && self.bit_branches
+                {
+                    let x = self.r(i, 0);
+                    let (set, clear) = if cond == Cond::Ne { (lt, lf) } else { (lf, lt) };
+                    if Some(set) == next {
+                        self.a.tbz(x, b as u32, clear);
+                    } else {
+                        self.a.tbnz(x, b as u32, set);
+                        if Some(clear) != next {
+                            self.a.b(clear);
+                        }
+                    }
+                    return Ok(());
+                }
+                if let Some(sz) = zero_test(test, cond) {
+                    // `cbz` where the operand is zero (`Eq` holding).
+                    let v = self.r(i, 0);
+                    let (on_zero, on_other) = if cond == Cond::Eq { (lt, lf) } else { (lf, lt) };
+                    if Some(on_zero) == next {
+                        self.a.cbnz(sz, v, on_other);
+                    } else {
+                        self.a.cbz(sz, v, on_zero);
+                        if Some(on_other) != next {
+                            self.a.b(on_other);
+                        }
                     }
                     return Ok(());
                 }

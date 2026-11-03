@@ -228,6 +228,16 @@ impl Asm {
         w as usize * 4
     }
 
+    /// Whether every `tbz`/`tbnz` reaches its target (±32 KB).
+    pub(crate) fn short_branches_reach(&self) -> bool {
+        self.fixups.iter().all(|fx| {
+            let target = self.labels[fx.label.0 as usize];
+            !matches!(fx.kind, FixupKind::B14)
+                || target == UNBOUND
+                || (-(1 << 13)..(1 << 13)).contains(&(target as i64 - fx.at as i64))
+        })
+    }
+
     /// Whether the last word is an unconditional `b`: what follows is
     /// reached only by a branch.
     pub(crate) fn after_jump(&self) -> bool {

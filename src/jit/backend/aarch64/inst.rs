@@ -58,6 +58,8 @@ pub(crate) enum Test {
     ShapeIn(u32),
     /// A `B1` is true: `[c]`.
     B1,
+    /// Bit `k` of a w register is set (`Ne`) or clear (`Eq`): `[x]`.
+    Bit(u8),
 }
 
 /// A call's callee, known at compile time.

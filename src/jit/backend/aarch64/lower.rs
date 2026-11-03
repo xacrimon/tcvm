@@ -593,37 +593,80 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
     }
 
-    /// Mark compares used once, by a branch, guard or select of the same
-    /// block, to be computed there.
+    /// Mark compares that only branches, guards and selects use, each
+    /// computing the compare itself: flags feed a branch directly (`cmp`
+    /// and `b.cond` fuse), where a boolean costs a `cset` and a test of it.
     fn find_fusions(&mut self, order: &[Block]) {
+        let f = self.f;
+        let mut tested = vec![0u32; f.vals.len()];
         for &b in order {
-            for &i in self.f.insts_of(b) {
-                let op = self.f.op(i);
-                let cand = match op {
-                    Op::Br | Op::GuardTrue | Op::GuardFalse | Op::Select => Some(self.f.args(i)[0]),
-                    _ => None,
+            for &i in f.insts_of(b) {
+                let op = f.op(i);
+                if !matches!(op, Op::Br | Op::GuardTrue | Op::GuardFalse | Op::Select) {
+                    continue;
+                }
+                let c = f.args(i)[0];
+                let Some(di) = f.def_inst(c) else {
+                    continue;
                 };
-                if let Some(c) = cand
-                    && self.uses[c.idx()] == 1
-                    && let Some(di) = self.f.def_inst(c)
-                    && self.f.insts[di.idx()].block == b
-                    && match self.f.op(di) {
-                        Op::ICmp(_)
-                        | Op::LCmp(_)
-                        | Op::FCmp(_)
-                        | Op::IsFalsy
-                        | Op::SameBits
-                        | Op::ShapeIs(_)
-                        | Op::ShapeIn(_) => true,
-                        // A select takes flags: no test that branches.
-                        Op::IsType(set) => op != Op::Select || is_single_test(set),
-                        _ => false,
-                    }
-                {
-                    self.fused[c.idx()] = true;
+                let fusable = match f.op(di) {
+                    Op::ICmp(_)
+                    | Op::LCmp(_)
+                    | Op::FCmp(_)
+                    | Op::IsFalsy
+                    | Op::SameBits
+                    | Op::ShapeIs(_)
+                    | Op::ShapeIn(_) => true,
+                    // A select takes flags: no test that branches.
+                    Op::IsType(set) => op != Op::Select || is_single_test(set),
+                    _ => false,
+                };
+                let mut n = 0;
+                f.for_each_use(i, |v| n += (v == c) as u32);
+                if fusable && n == 1 {
+                    tested[c.idx()] += 1;
                 }
             }
         }
+        for (v, &n) in tested.iter().enumerate() {
+            if n > 0 && n == self.uses[v] {
+                self.fused[v] = true;
+            }
+        }
+        // A one-bit `and` that only fused tests against zero use: they test
+        // the bit (`tbz`), and it is not computed.
+        let mut bit_tests = vec![0u32; f.vals.len()];
+        for v in 0..f.vals.len() {
+            if !self.fused[v] {
+                continue;
+            }
+            if let Some(Op::ICmp(Cc::Eq | Cc::Ne)) = f.def_op(Val(v as u32)) {
+                let args = f.args(f.def_inst(Val(v as u32)).unwrap());
+                if self.imm12(args[1]) == Some(0) && self.bit_of(args[0]).is_some() {
+                    bit_tests[args[0].idx()] += 1;
+                }
+            }
+        }
+        for (v, &n) in bit_tests.iter().enumerate() {
+            if n > 0 && n == self.uses[v] {
+                self.fused[v] = true;
+            }
+        }
+    }
+
+    /// `v` as `x & (1 << k)`: `x` and `k`.
+    fn bit_of(&self, v: Val) -> Option<(Val, u8)> {
+        let d = self.f.def_inst(v)?;
+        if self.f.op(d) != Op::IAnd {
+            return None;
+        }
+        let args = self.f.args(d);
+        (0..2).find_map(|k| match self.f.def_op(args[k]) {
+            Some(Op::KI32(m)) if m > 0 && (m & (m - 1)) == 0 => {
+                Some((args[1 - k], m.trailing_zeros() as u8))
+            }
+            _ => None,
+        })
     }
 
     /// The test and operands computing B1 `c`.
@@ -631,6 +674,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let i = self.f.def_inst(c).expect("a fused compare");
         let args = self.f.args(i).to_vec();
         match self.f.op(i) {
+            Op::ICmp(cc @ (Cc::Eq | Cc::Ne))
+                if self.imm12(args[1]) == Some(0)
+                    && self.fused[args[0].idx()]
+                    && self.bit_of(args[0]).is_some() =>
+            {
+                let (x, k) = self.bit_of(args[0]).expect("a fused bit");
+                (Test::Bit(k), int_cond(cc), vec![x])
+            }
             Op::ICmp(cc) => {
                 if let Some(k) = self.imm12(args[1]) {
                     (
