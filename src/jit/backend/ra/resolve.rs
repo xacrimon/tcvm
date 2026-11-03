@@ -4,7 +4,7 @@
 
 use regalloc2::{Allocation, Edit, Function, Output, ProgPoint};
 
-use super::{Loc, NONE, Need, Ra};
+use super::{Loc, NONE, Need, Pos, Ra, intersect};
 use crate::jit::backend::vcode::TargetInst;
 
 /// A move of a value of class `cls`.
@@ -31,6 +31,24 @@ const FIXED_COPY: u8 = 6;
 
 impl<I: TargetInst> Ra<'_, I> {
     pub(super) fn resolve(&mut self) -> Result<Output, String> {
+        // A group spilled only in cold code (none of its uses wanting the
+        // slot) is stored on its way in there (V8's deferred spilling);
+        // any other spilled group once after each definition, its slot
+        // holding it from there on.
+        self.deferred = (0..self.vregs.len())
+            .map(|g| {
+                let gi = &self.vregs[g];
+                self.rep[g] == g as u32
+                    && gi.slot != NONE
+                    && gi.pieces.iter().all(|&x| {
+                        let p = &self.pieces[x as usize];
+                        p.ivs.is_empty()
+                            || (p.loc != Loc::Stack || p.start() >= self.cold_start)
+                                && p.uses.iter().all(|u| u.need != Need::Stack)
+                    })
+            })
+            .collect();
+        self.color_slots();
         for x in 0..self.pieces.len() as u32 {
             let p = &self.pieces[x as usize];
             // Merged back into the piece it was split from.
@@ -55,23 +73,6 @@ impl<I: TargetInst> Ra<'_, I> {
                 self.allocs[u.alloc as usize] = a;
             }
         }
-        // A group spilled only in cold code (none of its uses wanting the
-        // slot) is stored on its way in there (V8's deferred spilling);
-        // any other spilled group once after each definition, its slot
-        // holding it from there on.
-        self.deferred = (0..self.vregs.len())
-            .map(|g| {
-                let gi = &self.vregs[g];
-                self.rep[g] == g as u32
-                    && gi.slot != NONE
-                    && gi.pieces.iter().all(|&x| {
-                        let p = &self.pieces[x as usize];
-                        p.ivs.is_empty()
-                            || (p.loc != Loc::Stack || p.start() >= self.cold_start)
-                                && p.uses.iter().all(|u| u.need != Need::Stack)
-                    })
-            })
-            .collect();
         let mut moves: Vec<(u32, u8, Mv)> = Vec::new();
         for v in 0..self.vregs.len() as u32 {
             let gr = self.rep[v as usize];
@@ -190,6 +191,53 @@ impl<I: TargetInst> Ra<'_, I> {
             debug_locations: Vec::new(),
             stats: Default::default(),
         })
+    }
+
+    /// Give spilled groups slots by coloring (JSC's stack coloring): a slot
+    /// is busy over its group's whole range (stores in cold mode may sit at
+    /// a hot predecessor's end); groups take the first slot free over
+    /// theirs, in start order.
+    fn color_slots(&mut self) {
+        let mut busy: Vec<(u32, Vec<(Pos, Pos)>)> = Vec::new();
+        for g in 0..self.vregs.len() {
+            let gi = &self.vregs[g];
+            if self.rep[g] != g as u32 || gi.slot == NONE {
+                continue;
+            }
+            let mut ivs: Vec<(Pos, Pos)> = Vec::new();
+            for &x in &gi.pieces {
+                let p = &self.pieces[x as usize];
+                // Stores land in the gaps around: a point either side.
+                for &(a, b) in &p.ivs {
+                    ivs.push((a.saturating_sub(1), b + 1));
+                }
+            }
+            ivs.sort_unstable_by_key(|iv| iv.0);
+            let mut merged: Vec<(Pos, Pos)> = Vec::with_capacity(ivs.len());
+            for (a, b) in ivs {
+                match merged.last_mut() {
+                    Some(m) if a <= m.1 => m.1 = m.1.max(b),
+                    _ => merged.push((a, b)),
+                }
+            }
+            busy.push((g as u32, merged));
+        }
+        busy.sort_by_key(|(_, iv)| iv.first().map_or(0, |x| x.0));
+        let mut slots: Vec<Vec<(Pos, Pos)>> = Vec::new();
+        for (g, ivs) in busy {
+            let k = match slots.iter().position(|s| intersect(s, &ivs, 0).is_none()) {
+                Some(k) => k,
+                None => {
+                    slots.push(Vec::new());
+                    slots.len() - 1
+                }
+            };
+            let s = &mut slots[k];
+            s.extend_from_slice(&ivs);
+            s.sort_unstable_by_key(|iv| iv.0);
+            self.vregs[g as usize].slot = k as u32;
+        }
+        self.num_slots = slots.len() as u32;
     }
 
     /// Moves on every edge whose ends hold a value in different places: on
