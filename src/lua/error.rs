@@ -16,6 +16,9 @@ pub enum LoadError {
     File(String),
     #[error("{chunk}: chunk is not valid UTF-8")]
     NotUtf8 { chunk: String },
+    /// Longer than `string::MAX_LEN`, which then bounds every string the compiler makes.
+    #[error("{chunk}: chunk too long")]
+    TooLong { chunk: String },
     #[error("internal: {0}")]
     Internal(&'static str),
 }

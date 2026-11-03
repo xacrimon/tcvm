@@ -81,7 +81,7 @@ impl<'gc> Error<'gc> {
     #[cold]
     #[inline(never)]
     pub fn from_str(ctx: Context<'gc>, msg: &str) -> Self {
-        let s = LuaString::new(ctx, msg.as_bytes());
+        let s = LuaString::truncated(ctx, msg.as_bytes());
         Error::new(ctx, Value::string(s)).with_level(1)
     }
 

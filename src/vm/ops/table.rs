@@ -1,7 +1,7 @@
 //! Register-key table access, table construction, length and concatenation.
 
 use crate::env::MetamethodBits;
-use crate::env::string::LuaString;
+use crate::env::string::{LuaString, MAX_LEN};
 use crate::env::table::Table;
 use crate::env::value::Value;
 use crate::vm::abi::handler;
@@ -193,12 +193,17 @@ handler! {
         let b = reg![rhs];
         let s = rt.with_buf(|buf| {
             buf.reserve(num::concat_len(a) + num::concat_len(b));
-            (num::coerce_to_str(buf, a) && num::coerce_to_str(buf, b)).then(|| LuaString::new(rt, buf))
+            (num::coerce_to_str(buf, a) && num::coerce_to_str(buf, b))
+                .then(|| (buf.len() <= MAX_LEN).then(|| LuaString::new(rt, buf)))
         });
-        if let Some(s) = s {
-            reg![dst] = Value::string(s);
-            gc_check!();
-            next!()
+        match s {
+            Some(Some(s)) => {
+                reg![dst] = Value::string(s);
+                gc_check!();
+                next!()
+            }
+            Some(None) => raise!(OpError::StringOverflow),
+            None => {}
         }
         let mm = binop_metamethod(rt, a, b, MetamethodBits::CONCAT);
         if mm.is_nil() {

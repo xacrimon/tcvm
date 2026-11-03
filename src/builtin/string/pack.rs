@@ -373,7 +373,7 @@ pub(super) fn lua_pack<'gc>(
         }
     }
 
-    stack.ret1(Value::string(LuaString::new(ctx, &out)));
+    stack.ret1(Value::string(LuaString::checked(ctx, &out)?));
     Ok(())
 }
 

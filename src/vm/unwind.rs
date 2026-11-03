@@ -22,6 +22,8 @@ pub(crate) enum OpError<'gc> {
     Arith(Value<'gc>, Value<'gc>),
     Bitwise(Value<'gc>, Value<'gc>),
     Concat(Value<'gc>, Value<'gc>),
+    /// A concatenation past `string::MAX_LEN`.
+    StringOverflow,
     Compare(Value<'gc>, Value<'gc>),
     Len(Value<'gc>),
     DivByZero,

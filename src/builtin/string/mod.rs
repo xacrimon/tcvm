@@ -15,6 +15,7 @@ use crate::builtin::util;
 // rejection) match `tonumber`/`math.*` and don't drift.
 use crate::builtin::util::{to_integer, to_number as to_float};
 use crate::env::function::NativeKind;
+use crate::env::string::MAX_LEN;
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
@@ -293,7 +294,7 @@ fn lua_format<'gc>(
     let pending = match res {
         Ok(Some(pending)) => pending,
         Ok(None) => {
-            let s = LuaString::new(ctx, &f.out);
+            let s = LuaString::checked(ctx, &f.out)?;
             give_back(f.out);
             stack.ret1(Value::string(s));
             return NativeOut::RETURN;
@@ -328,10 +329,10 @@ fn lua_format<'gc>(
                 f.run(ctx, fmt, stack)
             })?;
         }
-        cx.enter(|ctx, mut stack| {
-            stack.replace(&[Value::string(LuaString::new(ctx, &f.out))]);
-        });
-        Ok(())
+        cx.try_enter(|ctx, stack| {
+            stack.replace(&[Value::string(LuaString::checked(ctx, &f.out)?)]);
+            Ok(())
+        })
     })
 }
 
@@ -958,7 +959,7 @@ fn gsub_drive<'gc>(
         }
     }
     out.extend_from_slice(&src[pos..]);
-    let result = Value::string(LuaString::new(ctx, &out));
+    let result = Value::string(LuaString::checked(ctx, &out)?);
     stack.replace(&[result, Value::integer(mc, count)]);
     NativeOut::RETURN
 }
@@ -1031,7 +1032,7 @@ fn gsub_string<'gc>(
             }
         }
         out.extend_from_slice(&src[pos..]);
-        Ok((Value::string(LuaString::new(ctx, out)), count))
+        Ok((Value::string(LuaString::checked(ctx, out)?), count))
     })
 }
 
@@ -1167,17 +1168,13 @@ fn lua_rep<'gc>(
     }
     let n = n as usize;
     let body = s.as_bytes();
-    // Bound the result by Lua's `MAX_SIZE` (= `LUA_MAXINTEGER` on 64-bit),
-    // not just by `usize` arithmetic: `(len+sep)*n` can fit `usize` yet still
-    // be an absurd allocation (e.g. `rep("ab", maxinteger)`), so cap at
-    // `i64::MAX` to raise a catchable error instead of aborting on a
-    // `Vec::with_capacity` overflow.
+    // Checked before anything is built, with Lua's message.
     let total = body
         .len()
         .checked_add(sep.len())
         .and_then(|per| per.checked_mul(n))
         .and_then(|t| t.checked_sub(sep.len()))
-        .filter(|&t| t <= i64::MAX as usize);
+        .filter(|&t| t <= MAX_LEN);
     let Some(total) = total else {
         return Err(Error::from_str(ctx, "resulting string too large"));
     };

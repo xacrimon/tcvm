@@ -171,7 +171,7 @@ fn lua_date<'gc>(
             unsafe { libc::strftime(buf.as_mut_ptr().cast(), buf.len(), cc.as_ptr().cast(), &tm) };
         out.extend_from_slice(&buf[..len]);
     }
-    stack.ret1(Value::string(LuaString::new(ctx, &out)));
+    stack.ret1(Value::string(LuaString::checked(ctx, &out)?));
     Ok(())
 }
 

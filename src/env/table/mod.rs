@@ -40,8 +40,7 @@ impl<'gc> Table<'gc> {
     /// an array part in its own cell, and `nrec` inline named slots, as
     /// far as either can grow.
     pub fn with_capacity(ctx: Context<'gc>, nseq: usize, nrec: usize) -> Self {
-        let items = nseq.min(MAX_ASIZE as usize - 1);
-        Self::alloc(ctx.mutation(), ctx.root_shape(nrec), &[], items)
+        Self::alloc(ctx.mutation(), ctx.root_shape(nrec), &[], nseq)
     }
 
     /// A constructor's table, as `NEWTABLE` makes it from `t`.
@@ -51,7 +50,8 @@ impl<'gc> Table<'gc> {
     }
 
     /// A table in `shape` holding `values` in its slots, with nil in keys
-    /// `1..=items` of an array part kept in the table's own cell.
+    /// `1..=items` of an array part kept in the table's own cell, as far as
+    /// `MAX_ASIZE` allows.
     #[inline(always)]
     fn alloc(mc: &Mutation<'gc>, shape: Shape<'gc>, values: &[Value<'gc>], items: usize) -> Self {
         debug_assert_eq!(values.len(), shape.slot_count() as usize);
@@ -59,7 +59,7 @@ impl<'gc> Table<'gc> {
         debug_assert!(shape.mt_cache().is_none() && shape.as_mt().is_none());
         let cap = shape.inline_cap() as usize;
         let (inline, spilled) = values.split_at(values.len().min(cap));
-        let asize = if items == 0 { 0 } else { items + 1 };
+        let asize = if items == 0 { 0 } else { items.min(MAX_ASIZE as usize - 1) + 1 };
         let state = TableState {
             shape,
             spill: match spilled.len() {

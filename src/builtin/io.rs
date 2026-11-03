@@ -767,7 +767,7 @@ fn do_read<'gc>(
                 out.push(Value::nil());
                 break;
             }
-            Ok(ReadOne::Bytes(b)) => Value::string(LuaString::new(ctx, &b)),
+            Ok(ReadOne::Bytes(b)) => Value::string(LuaString::checked(ctx, &b)?),
             Ok(ReadOne::Int(i)) => Value::integer(ctx.mutation(), i),
             Ok(ReadOne::Float(f)) => Value::float(f),
         };

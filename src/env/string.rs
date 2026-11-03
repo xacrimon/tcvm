@@ -6,7 +6,13 @@ use hashbrown::{HashTable, hash_table};
 
 use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::{Collect, Finalization, Gc, Mutation, RefLock, TrailingBytes};
+use crate::env::error::Error;
 use crate::lua::Context;
+
+/// The longest string, LuaJIT's `LJ_MAX_STR`: lengths and positions fit an i32, which compiled
+/// code relies on. Builders whose result can outgrow their inputs raise through
+/// [`LuaString::checked`]; error messages are cut by [`LuaString::truncated`].
+pub const MAX_LEN: usize = 0x7fff_ff00;
 
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
@@ -38,8 +44,23 @@ impl<'gc> LuaString<'gc> {
     /// A string's payload from its box.
     pub(crate) const VALUE_OFFSET: usize = Gc::<'static, StringData>::VALUE_OFFSET;
 
+    /// Panics past [`MAX_LEN`].
     pub fn new(context: Context<'gc>, bytes: &[u8]) -> Self {
         context.interner().intern(context.mutation(), bytes)
+    }
+
+    /// [`new`](Self::new), or the error "string length overflow" past [`MAX_LEN`].
+    pub fn checked(ctx: Context<'gc>, bytes: &[u8]) -> Result<Self, Error<'gc>> {
+        match bytes.len() <= MAX_LEN {
+            true => Ok(Self::new(ctx, bytes)),
+            false => Err(Error::from_str(ctx, "string length overflow")),
+        }
+    }
+
+    /// [`new`](Self::new) of at most [`MAX_LEN`] bytes, for error messages, which have no
+    /// error to raise instead.
+    pub fn truncated(ctx: Context<'gc>, bytes: &[u8]) -> Self {
+        Self::new(ctx, &bytes[..bytes.len().min(MAX_LEN)])
     }
 
     pub fn as_bytes(self) -> &'gc [u8] {
@@ -159,6 +180,7 @@ impl<'gc> Interner<'gc> {
             hasher.finish()
         };
         let len = bytes.len();
+        assert!(len <= MAX_LEN, "string length overflow");
         LuaString(Gc::new_with_bytes(mc, StringData { hash, len }, bytes))
     }
 
@@ -181,6 +203,7 @@ impl<'gc> Interner<'gc> {
             hash_table::Entry::Occupied(o) => *o.get(),
             hash_table::Entry::Vacant(v) => {
                 let len = bytes.len();
+                assert!(len <= MAX_LEN, "string length overflow");
                 let string = LuaString(Gc::new_with_bytes(mc, StringData { hash, len }, bytes));
                 v.insert(string);
                 young.push(string);

@@ -369,7 +369,7 @@ fn push_loaded<'gc>(
 /// A load error as the Lua string `load` returns and `dofile` raises.
 fn load_error_value<'gc>(ctx: Context<'gc>, e: &LoadError) -> Value<'gc> {
     let msg = crate::vm::stack::on_host(ctx, || e.to_string());
-    Value::string(LuaString::new(ctx, msg.as_bytes()))
+    Value::string(LuaString::truncated(ctx, msg.as_bytes()))
 }
 
 /// `getMode` for text-only loading: `B` (fixed buffers) is only for the C API,

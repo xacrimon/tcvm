@@ -104,7 +104,7 @@ fn lua_concat<'gc>(
         if i == last {
             add_field(ctx, out, t.raw_get(Value::integer(ctx.mutation(), i)), i)?;
         }
-        Ok(LuaString::new(ctx, out))
+        LuaString::checked(ctx, out)
     })?;
     stack.ret1(Value::string(s));
     NativeOut::RETURN
@@ -126,8 +126,10 @@ fn concat_meta<'gc>(ctx: Context<'gc>, stack: &mut Stack<'gc, '_>) -> NativeOut 
         if i == last {
             concat_field(&cx, &mut out, i).await?;
         }
-        cx.enter(|ctx, mut stack| stack.ret1(Value::string(LuaString::new(ctx, &out))));
-        Ok(())
+        cx.try_enter(|ctx, stack| {
+            stack.ret1(Value::string(LuaString::checked(ctx, &out)?));
+            Ok(())
+        })
     })
 }
 

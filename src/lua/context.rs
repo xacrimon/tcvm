@@ -10,7 +10,7 @@ use crate::compiler::compile_chunk;
 use crate::dmm::{DynamicRootSet, Mutation};
 use crate::env::function::{Function, UpvalueCell, UpvalueSlot};
 use crate::env::shape::{MetamethodBits, Shape, inline_bucket};
-use crate::env::string::Interner;
+use crate::env::string::{Interner, MAX_LEN};
 use crate::env::thread::ThreadState;
 use crate::env::{LuaString, Symbols, Table, Value};
 use crate::lua::stash::{Fetchable, Stashable};
@@ -346,8 +346,8 @@ impl<'gc> Context<'gc> {
     /// runtime's globals table.
     pub fn load(self, source: &str, name: Option<&str>) -> Result<Function<'gc>, LoadError> {
         // Like Lua's `load`, an unnamed chunk is named by its own text
-        // (rendered as `[string "..."]` in messages).
-        let name = LuaString::new(self, name.unwrap_or(source).as_bytes());
+        // (rendered as `[string "..."]` in messages); one too long fails in `load_text`.
+        let name = LuaString::truncated(self, name.unwrap_or(source).as_bytes());
         self.load_text(source, name, Value::table(self.state.globals))
     }
 
@@ -415,6 +415,10 @@ impl<'gc> Context<'gc> {
         name: LuaString<'gc>,
         env: Value<'gc>,
     ) -> Result<Function<'gc>, LoadError> {
+        if source.len() > MAX_LEN {
+            let chunk = String::from_utf8_lossy(&chunk_id(name.as_bytes())).into_owned();
+            return Err(LoadError::TooLong { chunk });
+        }
         // The parser and compiler recurse with the source's nesting.
         crate::vm::stack::on_host(self, || self.load_text_here(source, name, env))
     }

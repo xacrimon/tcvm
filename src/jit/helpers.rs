@@ -7,7 +7,7 @@ use crate::dmm::Gc;
 use crate::dmm::lock::RefLock;
 use crate::env::MetamethodBits;
 use crate::env::function::{NativeClosure, UpvalueCell};
-use crate::env::string::LuaString;
+use crate::env::string::{LuaString, MAX_LEN};
 use crate::env::table::{Step, Table, TableState};
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
@@ -187,13 +187,15 @@ pub(crate) extern "C" fn jit_len(rt: *const State<'static>, v: u64) -> u64 {
     Value::integer(ctx.mutation(), n as i64).to_raw()
 }
 
-/// `a .. b` of strings and numbers, as `op_concat` builds it.
+/// `a .. b` of strings and numbers, as `op_concat` builds it; fails past `MAX_LEN` too,
+/// for the interpreter to raise.
 pub(crate) extern "C" fn jit_concat(rt: *const State<'static>, a: u64, b: u64) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
     let (a, b) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
     let s = ctx.with_buf(|buf| {
         buf.reserve(num::concat_len(a) + num::concat_len(b));
-        (num::coerce_to_str(buf, a) && num::coerce_to_str(buf, b)).then(|| LuaString::new(ctx, buf))
+        (num::coerce_to_str(buf, a) && num::coerce_to_str(buf, b) && buf.len() <= MAX_LEN)
+            .then(|| LuaString::new(ctx, buf))
     });
     match s {
         Some(s) => Value::string(s).to_raw(),

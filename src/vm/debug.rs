@@ -84,7 +84,7 @@ pub(crate) fn locate<'gc>(ctx: Context<'gc>, ts: &ThreadState<'gc>, err: Error<'
         return err.with_level(0);
     }
     let text = [prefix.as_slice(), msg.as_bytes()].concat();
-    err.with_value(ctx, Value::string(LuaString::new(ctx, &text)))
+    err.with_value(ctx, Value::string(LuaString::truncated(ctx, &text)))
 }
 
 /// [`locate`] for an error raised by a native with no frame of its own (a
@@ -103,7 +103,7 @@ pub(crate) fn locate_unframed<'gc>(
         return err.with_level(0);
     }
     let text = [prefix.as_slice(), msg.as_bytes()].concat();
-    err.with_value(ctx, Value::string(LuaString::new(ctx, &text)))
+    err.with_value(ctx, Value::string(LuaString::truncated(ctx, &text)))
 }
 
 /// An error with `msg` prefixed by the position of frame `level` below the
@@ -116,7 +116,7 @@ pub(crate) fn error_at<'gc>(
 ) -> Error<'gc> {
     let mut text = where_prefix(ts, level);
     text.extend_from_slice(msg.as_bytes());
-    Error::new(ctx, Value::string(LuaString::new(ctx, &text)))
+    Error::new(ctx, Value::string(LuaString::truncated(ctx, &text)))
 }
 
 /// `luaT_objtypename`: a table or userdata whose metatable has a string
@@ -175,6 +175,7 @@ pub(crate) fn op_error_message<'gc>(
             };
             format!("attempt to concatenate a {} value", tn(culprit))
         }
+        OpError::StringOverflow => "string length overflow".to_owned(),
         OpError::Compare(a, b) => {
             let (t1, t2) = (tn(a), tn(b));
             if t1 == t2 {
