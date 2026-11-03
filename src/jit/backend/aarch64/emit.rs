@@ -2593,18 +2593,36 @@ impl Em<'_> {
                             self.a.str(X17, THREAD, layout::THREAD_TOP as i32);
                             self.a.b(done);
                         } else if c <= 4 {
-                            self.a.mov_imm(X17, NIL);
-                            for k in 0..(c - 1) as u64 {
+                            // All `c - 1` there (a callee's count rarely
+                            // varies): copied; else filled out of line.
+                            let n = (c - 1) as u64;
+                            let fill = self.a.new_label();
+                            self.a.cmp_imm(Sz::X, INSN, n);
+                            self.a.b_cond(Cond::Lo, fill);
+                            for k in 0..n {
                                 if k == 0 {
-                                    self.a.mov(X16, Gpr(0));
+                                    self.a.str(Gpr(0), BASE, at);
                                 } else {
                                     self.a.ldr(X16, PC, 8 * k as i32);
+                                    self.a.str(X16, BASE, at + 8 * k as i32);
                                 }
-                                self.a.cmp_imm(Sz::X, INSN, k);
-                                self.a.csel(Sz::X, X16, X16, X17, Cond::Hi);
-                                self.a.str(X16, BASE, at + 8 * k as i32);
                             }
                             self.a.b(done);
+                            self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                                em.a.bind(fill);
+                                em.a.mov_imm(X17, NIL);
+                                for k in 0..n {
+                                    if k == 0 {
+                                        em.a.mov(X16, Gpr(0));
+                                    } else {
+                                        em.a.ldr(X16, PC, 8 * k as i32);
+                                    }
+                                    em.a.cmp_imm(Sz::X, INSN, k);
+                                    em.a.csel(Sz::X, X16, X16, X17, Cond::Hi);
+                                    em.a.str(X16, BASE, at + 8 * k as i32);
+                                }
+                                em.a.b(done);
+                            }));
                         }
                         self.a.bind(helper);
                         // The helper reads the first result from memory too.
