@@ -114,7 +114,8 @@ fn key_of(f: &Func<'_>, i: Inst, mem: &Versions, consts: &mut FastMap<Op, Val>) 
         | Op::GuardFalse
         | Op::GuardMiss
         | Op::ToF64(_)
-        | Op::FToIExact => true,
+        | Op::FToIExact
+        | Op::FToLExact => true,
         _ => {
             e.is_pure() && f.insts[i.idx()].rn == 1
                 || e.reads_memory()

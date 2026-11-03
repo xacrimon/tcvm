@@ -1792,6 +1792,28 @@ impl Em<'_> {
                 self.a.b_cond(Cond::Ne, l);
                 self.a.mov_w(d, X16);
             }
+            FToLExact { exit } => {
+                let (d, n) = (self.r(i, 0), self.fr(i, 1));
+                let l = self.exit(exit);
+                // `fcvtzs` saturates 2^63 to i64::MAX, which converts back to 2^63.
+                self.a.fcvtzs(Sz::X, X16, n);
+                self.a.cmn_imm(Sz::X, X16, 1);
+                self.a.b_cond(Cond::Vs, l);
+                self.a.scvtf(Sz::X, D31, X16);
+                self.a.fcmp(n, D31);
+                self.a.b_cond(Cond::Ne, l);
+                self.a.mov(d, X16);
+            }
+            // `sdiv` gives `MIN / -1 = MIN` without trapping, so `MIN % -1` is 0.
+            Rem { sz, nonzero, exit } => {
+                let (d, n, m) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                if !nonzero {
+                    let l = self.exit(exit);
+                    self.a.cbz(sz, m, l);
+                }
+                self.a.sdiv(sz, X16, n, m);
+                self.a.msub(sz, d, X16, m, n);
+            }
             LToFExact { exit } => {
                 let (d, n) = (self.fr(i, 0), self.r(i, 1));
                 // 10 or more leading bits equal to the sign: |n| <= 2^53.

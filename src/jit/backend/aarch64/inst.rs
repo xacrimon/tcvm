@@ -193,6 +193,17 @@ pub(crate) enum MInst {
     FToIExact {
         exit: u32,
     },
+    /// `[def d, use n (float), snap..]`: the i64 an f64 holds exactly.
+    FToLExact {
+        exit: u32,
+    },
+    /// `[def d, use n, use m, snap..]`: C's `%`, exiting on a zero divisor
+    /// unless `nonzero`.
+    Rem {
+        sz: Sz,
+        nonzero: bool,
+        exit: u32,
+    },
     /// `[def d (float), use n, snap..]`: the f64 of an i64 within ±2^53.
     LToFExact {
         exit: u32,
@@ -417,6 +428,8 @@ impl MInst {
             | ShiftI32 { exit, .. }
             | LToI { exit }
             | FToIExact { exit }
+            | FToLExact { exit }
+            | Rem { exit, .. }
             | LToFExact { exit }
             | ToF64 { exit, .. }
             | Guard { exit, .. }

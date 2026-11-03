@@ -9,7 +9,7 @@ use crate::env::string::LuaString;
 use crate::env::value::Value;
 use crate::instruction::Instruction;
 use crate::jit::build::Builder;
-use crate::jit::build::emit::{arm_end, branch_arm, const_f64, enter_join};
+use crate::jit::build::emit::{all_in, arm_end, branch_arm, const_f64, enter_join};
 use crate::jit::feedback as fb;
 use crate::jit::ir::Block;
 use crate::jit::ir::Val;
@@ -596,16 +596,7 @@ fn emit_math<'gc>(
 ) -> Emitted {
     let insn = b.code(pc);
     let iterators = matches!(intr, Intrinsic::Pairs | Intrinsic::Ipairs);
-    // An exit saw an argument the inline code of a builtin whose result
-    // type follows it does not take.
-    let seen = b.feedback(pc) & fb::KINDS;
-    let follows = matches!(
-        intr,
-        Intrinsic::Abs | Intrinsic::Floor | Intrinsic::Ceil | Intrinsic::FMod
-    );
-    if follows && seen & !(fb::SMALL | fb::BIGINT | fb::FLOAT) != 0 {
-        return Emitted::No;
-    }
+    let bits = b.feedback(pc);
     // A tail call or MULTRET wants all results; the iterators make up to
     // four, the others one.
     let tail = insn.op() == crate::instruction::Op::TAILCALL;
@@ -618,15 +609,6 @@ fn emit_math<'gc>(
         return Emitted::No;
     }
     let x = b.reg(a + 4);
-    if intr == Intrinsic::FMod {
-        // Two integers take C's integer `%`, which stays with the builtin.
-        let ty = b.ty(x);
-        let int = matches!(ty.rep, Rep::I32 | Rep::I64)
-            || (!ty.set.is_empty() && ty.within(TypeSet::INT));
-        if int || seen & fb::INT != 0 {
-            return Emitted::No;
-        }
-    }
     let k = pin(b, f, callee);
     // Where the builtin runs instead.
     let mut slow = None;
@@ -699,76 +681,20 @@ fn emit_math<'gc>(
             }
         }
         Intrinsic::FMod => {
-            let g = b.guard(x, TypeSet::FLOAT);
-            let x = b.as_f64(g);
             let y = b.reg(a + 5);
-            let y = float_arg(b, y);
-            b.ins(Op::Helper(HelperId::Libm(Libm::Fmod)), &[x, y])
-        }
-        Intrinsic::Floor | Intrinsic::Ceil => {
-            let ty = b.ty(x);
-            let int = ty.rep == Rep::I32
-                || ty.rep == Rep::I64
-                || (!ty.set.is_empty() && ty.within(TypeSet::INT));
-            if int {
-                // An integer is its own floor.
-                x
-            } else {
-                let x = number_f64(b, x, seen);
-                let op = if intr == Intrinsic::Floor {
-                    Op::FFloor
-                } else {
-                    Op::FCeil
-                };
-                let y = b.ins(op, &[x]);
-                // Outside i32 the builtin makes a big integer or a float.
-                let i = b.ins_exit(Op::FToIExact, &[y], ExitTag::Slow);
-                b.f.result(i)
+            match fmod(b, a, x, y, bits) {
+                Some(r) => r,
+                None => return Emitted::Done,
             }
         }
-        Intrinsic::Abs => {
-            let ty = b.ty(x);
-            let known = |set| !ty.set.is_empty() && ty.within(set);
-            if ty.rep == Rep::F64 || known(TypeSet::FLOAT) {
-                let x = b.as_f64(x);
-                b.ins(Op::FAbs, &[x])
-            } else if ty.rep == Rep::I32 || known(TypeSet::SMALL) {
-                let x = b.as_i32(x);
-                abs_i32(b, x)
-            } else {
-                // A float, a small integer, a big integer where an exit saw
-                // one; anything else exits, as for `sqrt`.
-                let xv = b.boxed(x);
-                let join = b.new_block();
-                let is_float = b.ins(Op::IsType(TypeSet::FLOAT), &[xv]);
-                let rest = branch_arm(b, is_float);
-                let f = b.ins(Op::Unbox(Rep::F64), &[xv]);
-                let r = b.ins(Op::FAbs, &[f]);
-                arm_end(b, join, a, r);
-                b.switch_to(rest);
-                let is_small = b.ins(Op::IsType(TypeSet::SMALL), &[xv]);
-                let other = branch_arm(b, is_small);
-                let i = b.ins(Op::Unbox(Rep::I32), &[xv]);
-                let r = abs_i32(b, i);
-                arm_end(b, join, a, r);
-                b.switch_to(other);
-                if seen & fb::BIGINT != 0 {
-                    // Wrapping, as Lua's: `abs(math.mininteger)` is itself.
-                    let is_big = b.ins(Op::IsType(TypeSet::BIGINT), &[xv]);
-                    let rest = branch_arm(b, is_big);
-                    let x = b.as_i64(xv);
-                    let zero = b.ins(Op::KI64(0), &[]);
-                    let neg = b.ins(Op::LNeg, &[x]);
-                    let below = b.ins(Op::LCmp(Cc::Lt), &[x, zero]);
-                    let r = b.ins(Op::Select, &[below, neg, x]);
-                    arm_end(b, join, a, r);
-                    b.switch_to(rest);
-                }
-                b.deopt(ExitTag::Type);
-                enter_join(b, join);
-                return Emitted::Done;
-            }
-        }
+        Intrinsic::Floor | Intrinsic::Ceil => match round(b, a, x, bits, intr == Intrinsic::Ceil) {
+            Some(r) => r,
+            None => return Emitted::Done,
+        },
+        Intrinsic::Abs => match abs(b, a, x, bits) {
+            Some(r) => r,
+            None => return Emitted::Done,
+        },
         Intrinsic::Pairs | Intrinsic::Ipairs => unreachable!("returned above"),
         Intrinsic::Select | Intrinsic::Builtin(_) | Intrinsic::Assert | Intrinsic::Error => {
             unreachable!("not math")
@@ -854,38 +780,307 @@ fn done(slow: Option<Block>, k: Val) -> Emitted {
     }
 }
 
-/// `|x|` of an i32; `abs(i32::MIN)` leaves i32 and exits to the builtin.
+/// The kinds a type-following builtin's argument `v` takes arms for: its
+/// representation's, else its type narrowed to what the call's feedback saw
+/// of it (`seen`, the argument's group of bits; empty for a call the
+/// interpreter has not run), which may speculate (the arms' tests exit for
+/// the rest).
+fn arg_kinds(b: &Builder<'_, '_>, v: Val, seen: fb::Bits) -> TypeSet {
+    let t = b.ty(v);
+    let own = match t.rep {
+        Rep::I32 => return TypeSet::SMALL,
+        Rep::I64 => return TypeSet::INT,
+        Rep::F64 => return TypeSet::FLOAT,
+        _ if t.set.is_empty() => TypeSet::ANY,
+        _ => t.set,
+    };
+    let mut saw = TypeSet::empty();
+    for (bit, set) in [
+        (fb::SMALL, TypeSet::SMALL),
+        (fb::BIGINT, TypeSet::BIGINT),
+        (fb::FLOAT, TypeSet::FLOAT),
+        (fb::STR, TypeSet::STR),
+        (fb::TAB, TypeSet::TAB),
+        (fb::OTHER, TypeSet::ANY - TypeSet::NUM - TypeSet::STR - TypeSet::TAB),
+    ] {
+        if seen & bit != 0 {
+            saw |= set;
+        }
+    }
+    match own & saw {
+        k if k.is_empty() => own,
+        k => k,
+    }
+}
+
+/// One arm of [`dispatch`]: the kinds it takes, its result's
+/// representation, and the code making the result of the argument.
+type Arm<'f, 'gc> = (TypeSet, Rep, &'f dyn Fn(&mut Builder<'_, 'gc>, Val) -> Val);
+
+/// `R[a] =` the arm of `x`'s kind: each tested in turn, the last guarded,
+/// exiting with `rest` for any other kind. Their results join as they are
+/// when of one representation, else boxed. Without arms (the call saw only
+/// what the builtin raises on) it exits.
+fn dispatch<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, arms: &[Arm<'_, 'gc>], rest: ExitTag) {
+    let x = b.boxed(x);
+    match arms {
+        [] => {
+            b.deopt(ExitTag::Slow);
+            return;
+        }
+        // No join to go through.
+        &[(set, _, f)] => {
+            let g = b.ins_exit(Op::Guard(set), &[x], rest);
+            let v = b.f.result(g);
+            let r = f(b, v);
+            b.set(a, r);
+            return;
+        }
+        _ => {}
+    }
+    let boxed = arms.iter().any(|arm| arm.1 != arms[0].1 || arm.1 == Rep::Val);
+    let join = b.new_block();
+    for (n, &(set, _, f)) in arms.iter().enumerate() {
+        let other = if n + 1 < arms.len() {
+            let c = b.ins(Op::IsType(set), &[x]);
+            Some(branch_arm(b, c))
+        } else {
+            None
+        };
+        let v = match other {
+            Some(_) => b.ins(Op::Refine(set), &[x]),
+            None => {
+                let g = b.ins_exit(Op::Guard(set), &[x], rest);
+                b.f.result(g)
+            }
+        };
+        let r = f(b, v);
+        let r = if boxed { b.boxed(r) } else { r };
+        arm_end(b, join, a, r);
+        if let Some(o) = other {
+            b.switch_to(o);
+        }
+    }
+    enter_join(b, join);
+}
+
+/// The exit of a dispatch whose arms take `covered`: one that may learn a
+/// number or string kind they miss, or only what the builtin raises on.
+fn rest_tag(covered: TypeSet) -> ExitTag {
+    if covered.contains(TypeSet::NUM | TypeSet::STR) {
+        ExitTag::Slow
+    } else {
+        ExitTag::Type
+    }
+}
+
+/// Whether a type-following builtin's integers are i64 (no small | big
+/// union): the argument may be a big integer, or a result left i32.
+fn wide_ints(kinds: TypeSet, bits: fb::Bits) -> bool {
+    kinds.contains(TypeSet::BIGINT) || bits & (fb::OVERFLOW | fb::FLOAT_RESULT) != 0
+}
+
+/// `abs(x)`: `fabs` of a float or a string's number, an integer's
+/// magnitude in i32 (`i32::MIN` exits to learn the overflow) or, once wide,
+/// in i64, wrapping as Lua's.
+fn abs<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits) -> Option<Val> {
+    let k = arg_kinds(b, x, bits & fb::KINDS);
+    let wide = wide_ints(k, bits);
+    let fabs = |b: &mut Builder<'_, 'gc>, v: Val| {
+        let f = b.ins(Op::Unbox(Rep::F64), &[v]);
+        b.ins(Op::FAbs, &[f])
+    };
+    let sabs = |b: &mut Builder<'_, 'gc>, v: Val| {
+        let f = b.ins_exit(Op::ToF64(TypeSet::STR), &[v], ExitTag::Slow);
+        let f = b.f.result(f);
+        b.ins(Op::FAbs, &[f])
+    };
+    let iabs = |b: &mut Builder<'_, 'gc>, v: Val| {
+        let i = b.as_i32(v);
+        abs_i32(b, i)
+    };
+    let labs = |b: &mut Builder<'_, 'gc>, v: Val| {
+        let i = b.as_i64(v);
+        abs_i64(b, i)
+    };
+    match b.ty(x).rep {
+        Rep::F64 => return Some(b.ins(Op::FAbs, &[x])),
+        Rep::I32 if !wide => return Some(abs_i32(b, x)),
+        Rep::I32 | Rep::I64 => return Some(labs(b, x)),
+        _ => {}
+    }
+    let mut arms: Vec<Arm<'_, 'gc>> = Vec::new();
+    let mut covered = TypeSet::empty();
+    if k.contains(TypeSet::FLOAT) {
+        arms.push((TypeSet::FLOAT, Rep::F64, &fabs));
+        covered |= TypeSet::FLOAT;
+    }
+    if k.intersects(TypeSet::INT) {
+        let (set, rep, f): Arm<'_, 'gc> = if wide {
+            (TypeSet::INT, Rep::I64, &labs)
+        } else {
+            (TypeSet::SMALL, Rep::I32, &iabs)
+        };
+        arms.push((set, rep, f));
+        covered |= set;
+    }
+    if k.contains(TypeSet::STR) {
+        arms.push((TypeSet::STR, Rep::F64, &sabs));
+        covered |= TypeSet::STR;
+    }
+    dispatch(b, a, x, &arms, rest_tag(covered));
+    None
+}
+
+/// `floor(x)` (`ceil`): an integer is its own; a float or a string's
+/// number rounded, then its integer: in i32 (beyond exits to learn the
+/// overflow), once wide in i64 (no integer representation exits to learn
+/// it), and once a float result was seen either, boxed.
+fn round<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits, ceil: bool) -> Option<Val> {
+    let k = arg_kinds(b, x, bits & fb::KINDS);
+    let wide = wide_ints(k, bits);
+    let floats = bits & fb::FLOAT_RESULT != 0;
+    let to_int = move |b: &mut Builder<'_, 'gc>, f: Val| {
+        let r = b.ins(if ceil { Op::FCeil } else { Op::FFloor }, &[f]);
+        if floats {
+            // An integer where it has one, else the float: both boxed.
+            let i = b.ins(Op::FToL, &[r]);
+            let back = b.ins(Op::LToF, &[i]);
+            let same = b.ins(Op::FCmp(Cc::Eq), &[r, back]);
+            let max = b.ins(Op::KI64(i64::MAX), &[]);
+            let sat = b.ins(Op::LCmp(Cc::Ne), &[i, max]);
+            let join = b.new_block();
+            let no = branch_arm(b, same);
+            let no2 = branch_arm(b, sat);
+            let v = b.ins(Op::Box, &[i]);
+            arm_end(b, join, a, v);
+            for o in [no, no2] {
+                b.switch_to(o);
+                let v = b.ins(Op::Box, &[r]);
+                arm_end(b, join, a, v);
+            }
+            enter_join(b, join);
+            b.reg(a)
+        } else if wide {
+            let i = b.ins_exit(Op::FToLExact, &[r], ExitTag::FloatResult);
+            b.f.result(i)
+        } else {
+            let i = b.ins_exit(Op::FToIExact, &[r], ExitTag::Overflow);
+            b.f.result(i)
+        }
+    };
+    let rep = if floats {
+        Rep::Val
+    } else if wide {
+        Rep::I64
+    } else {
+        Rep::I32
+    };
+    match b.ty(x).rep {
+        Rep::I32 | Rep::I64 => return Some(x),
+        Rep::F64 => return Some(to_int(b, x)),
+        _ => {}
+    }
+    let fround = |b: &mut Builder<'_, 'gc>, v: Val| {
+        let f = b.ins(Op::Unbox(Rep::F64), &[v]);
+        to_int(b, f)
+    };
+    let sround = |b: &mut Builder<'_, 'gc>, v: Val| {
+        let f = b.ins_exit(Op::ToF64(TypeSet::STR), &[v], ExitTag::Slow);
+        let f = b.f.result(f);
+        to_int(b, f)
+    };
+    let int = |b: &mut Builder<'_, 'gc>, v: Val| match rep {
+        Rep::I32 => b.as_i32(v),
+        _ => b.as_i64(v),
+    };
+    let mut arms: Vec<Arm<'_, 'gc>> = Vec::new();
+    let mut covered = TypeSet::empty();
+    if k.intersects(TypeSet::INT) {
+        let set = if rep == Rep::I32 { TypeSet::SMALL } else { TypeSet::INT };
+        arms.push((set, rep, &int));
+        covered |= set;
+    }
+    if k.contains(TypeSet::FLOAT) {
+        arms.push((TypeSet::FLOAT, rep, &fround));
+        covered |= TypeSet::FLOAT;
+    }
+    if k.contains(TypeSet::STR) {
+        arms.push((TypeSet::STR, rep, &sround));
+        covered |= TypeSet::STR;
+    }
+    dispatch(b, a, x, &arms, rest_tag(covered));
+    None
+}
+
+/// `fmod(x, y)`: C's `%` when both are integers (i64 once either may be
+/// big; a zero divisor exits for the builtin to raise), else libm's `fmod`
+/// of the numbers. An argument that may not be an integer has the float
+/// path to itself, guarded so; two that may be either take both arms,
+/// joined boxed.
+fn fmod<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, y: Val, bits: fb::Bits) -> Option<Val> {
+    let kx = arg_kinds(b, x, bits & fb::KINDS);
+    let ky = arg_kinds(b, y, bits >> fb::ARGS_SHIFT & fb::KINDS);
+    let wide = (kx | ky).contains(TypeSet::BIGINT);
+    let int = |b: &mut Builder<'_, 'gc>, v: Val| {
+        if wide { b.as_i64(v) } else { b.as_i32(v) }
+    };
+    let irem = |b: &mut Builder<'_, 'gc>, x: Val, y: Val| {
+        let (x, y) = (int(b, x), int(b, y));
+        let op = if wide { Op::LRem } else { Op::IRem };
+        let i = b.ins_exit(op, &[x, y], ExitTag::Slow);
+        b.f.result(i)
+    };
+    let frem = |b: &mut Builder<'_, 'gc>, x: Val, y: Val| {
+        let (x, y) = (float_arg(b, x), float_arg(b, y));
+        b.ins(Op::Helper(HelperId::Libm(Libm::Fmod)), &[x, y])
+    };
+    let (ix, iy) = (kx.intersects(TypeSet::INT), ky.intersects(TypeSet::INT));
+    if !ix || !iy {
+        // Never two integers: the one that is not stays so.
+        let not_int = TypeSet::ANY - TypeSet::INT;
+        let (x, y) = if !ix {
+            (b.guard(x, not_int), y)
+        } else {
+            (x, b.guard(y, not_int))
+        };
+        return Some(frem(b, x, y));
+    }
+    if TypeSet::INT.contains(kx) && TypeSet::INT.contains(ky) {
+        return Some(irem(b, x, y));
+    }
+    let (xv, yv) = (b.boxed(x), b.boxed(y));
+    let join = b.new_block();
+    let maybe: Vec<Val> = [(xv, kx), (yv, ky)]
+        .into_iter()
+        .filter(|&(_, k)| !TypeSet::INT.contains(k))
+        .map(|(v, _)| v)
+        .collect();
+    let floats = all_in(b, TypeSet::INT, &maybe);
+    let r = irem(b, xv, yv);
+    let r = b.boxed(r);
+    arm_end(b, join, a, r);
+    enter_join(b, floats);
+    let r = frem(b, xv, yv);
+    let r = b.boxed(r);
+    arm_end(b, join, a, r);
+    enter_join(b, join);
+    None
+}
+
+/// `|x|` of an i32; `abs(i32::MIN)` leaves i32 and exits to learn it.
 fn abs_i32(b: &mut Builder<'_, '_>, x: Val) -> Val {
-    let i = b.ins_exit(Op::INeg, &[x], ExitTag::Slow);
+    let i = b.ins_exit(Op::INeg, &[x], ExitTag::Overflow);
     let neg = b.f.result(i);
     let zero = b.ki32(0);
     let below = b.ins(Op::ICmp(Cc::Lt), &[x, zero]);
     b.ins(Op::Select, &[below, neg, x])
 }
 
-/// The f64 of a number argument as the builtin converts it (an integer
-/// rounds): typed ones converted, else a small integer or a float, or an
-/// integer where the site's feedback (`seen`) saw big ones and no floats;
-/// anything else exits to the builtin, for good where it saw both.
-fn number_f64(b: &mut Builder<'_, '_>, x: Val, seen: fb::Bits) -> Val {
-    let ty = b.ty(x);
-    let known = |set| !ty.set.is_empty() && ty.within(set);
-    if matches!(ty.rep, Rep::F64 | Rep::I32 | Rep::I64)
-        || known(TypeSet::FLOAT)
-        || known(TypeSet::SMALL)
-    {
-        return b.num_f64(x);
-    }
-    if known(TypeSet::INT) || (seen & fb::BIGINT != 0 && seen & fb::FLOAT == 0) {
-        let i = b.as_i64(x);
-        return b.ins(Op::LToF, &[i]);
-    }
-    let xv = b.boxed(x);
-    let tag = if seen & fb::BIGINT == 0 {
-        ExitTag::Type
-    } else {
-        ExitTag::Slow
-    };
-    let i = b.ins_exit(Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT), &[xv], tag);
-    b.f.result(i)
+/// `|x|` of an i64, wrapping as Lua's: `abs(math.mininteger)` is itself.
+fn abs_i64(b: &mut Builder<'_, '_>, x: Val) -> Val {
+    let zero = b.ins(Op::KI64(0), &[]);
+    let neg = b.ins(Op::LNeg, &[x]);
+    let below = b.ins(Op::LCmp(Cc::Lt), &[x, zero]);
+    b.ins(Op::Select, &[below, neg, x])
 }

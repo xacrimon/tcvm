@@ -697,6 +697,7 @@ fn on_exit<'gc>(
             ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
             ExitTag::Mm => crate::jit::feedback::MM,
             ExitTag::Bounds => crate::jit::feedback::ARR_MISS,
+            ExitTag::FloatResult => crate::jit::feedback::FLOAT_RESULT,
             // A closure of the prototype a guard took one closure of: the
             // next compile guards the prototype.
             ExitTag::Const if callee_of_proto(ctx, closure, base, pc) => 0,

@@ -915,7 +915,7 @@ fn arith_kinds(
 
 /// Continue where every value of `vals` is in `set`; the block where one is
 /// not, unsealed until its predecessors are all there (`enter_join`).
-fn all_in(b: &mut Builder<'_, '_>, set: TypeSet, vals: &[Val]) -> Block {
+pub(super) fn all_in(b: &mut Builder<'_, '_>, set: TypeSet, vals: &[Val]) -> Block {
     let other = b.new_block();
     for &v in vals {
         let c = b.ins(Op::IsType(set), &[v]);

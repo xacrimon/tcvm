@@ -160,6 +160,22 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
+                Op::FToLExact => {
+                    let x = args[0];
+                    if let Some(Op::IToF) = f.def_op(x) {
+                        f.insts[i.idx()].op = Op::IToL;
+                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.args_mut(i)[0] = f.args(f.def_inst(x).unwrap())[0];
+                        changed = true;
+                    } else if let Some(c) = konst_f64(f, x)
+                        && let Some(n) = crate::vm::num::exact_float_to_int(c)
+                    {
+                        f.insts[i.idx()].op = Op::KI64(n);
+                        f.insts[i.idx()].an = 0;
+                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        changed = true;
+                    }
+                }
                 Op::Unbox(rep) => {
                     let x = args[0];
                     if f.ty(x).rep == rep {
@@ -410,6 +426,14 @@ fn fold_arith(f: &mut Func<'_>, i: Inst, op: Op, args: &[Val]) -> bool {
                     r
                 })
             }),
+        IRem => int(0)
+            .zip(int(1))
+            .filter(|&(_, y)| y != 0)
+            .and_then(|(x, y)| small((x as i32).wrapping_rem(y as i32) as i64)),
+        LRem => int(0)
+            .zip(int(1))
+            .filter(|&(_, y)| y != 0)
+            .map(|(x, y)| KI64(x.wrapping_rem(y))),
         LAdd => int(0).zip(int(1)).map(|(x, y)| KI64(x.wrapping_add(y))),
         LSub => int(0).zip(int(1)).map(|(x, y)| KI64(x.wrapping_sub(y))),
         LMul => int(0).zip(int(1)).map(|(x, y)| KI64(x.wrapping_mul(y))),
@@ -712,7 +736,8 @@ fn reduce(f: &mut Func<'_>, b: Block, k: usize, i: Inst, op: Op, args: &[Val]) -
         | (IAnd | LAnd, -1) => return To(x),
         (IAsr, c) if c & 31 == 0 => return To(x),
         (LAsr, c) if c & 63 == 0 => return To(x),
-        (IMul | IMulNo | LMul | IAnd | LAnd, 0) | (IModFloor | LModFloor, 1 | -1) => {
+        (IMul | IMulNo | LMul | IAnd | LAnd, 0)
+        | (IModFloor | LModFloor | IRem | LRem, 1 | -1) => {
             (int_k(op, 0), &[])
         }
         (LShl | LShr, c) if !(-63..=63).contains(&c) => (int_k(op, 0), &[]),

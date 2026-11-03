@@ -291,15 +291,15 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
         Helper(h) => h.sig().args,
         GuardTrue | GuardFalse | Br => &[B1],
         IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | IAnd | IOr | IXor | IShl | IShr
-        | IDivFloor | IModFloor | IAsr | IUMulShr(_) | ICmp(_) => &[I32, I32],
+        | IDivFloor | IModFloor | IRem | IAsr | IUMulShr(_) | ICmp(_) => &[I32, I32],
         INeg | INot | IToF | IToL => &[I32],
         LAdd | LSub | LMul | LUDiv | LAnd | LOr | LXor | LShl | LShr | LDivFloor | LModFloor
-        | LAsr | LCmp(_) => &[I64, I64],
+        | LRem | LAsr | LCmp(_) => &[I64, I64],
         LNeg | LNot | LToF | LToI | LToFExact => &[I64],
         StrLt | StrLe => &[Ptr, Ptr],
         UpvalValueOf(_) => &[Ptr],
         FAdd | FSub | FMul | FDiv | FIDiv | FCmp(_) => &[F64, F64],
-        FNeg | FAbs | FSqrt | FFloor | FCeil | FToIExact | FToL => &[F64],
+        FNeg | FAbs | FSqrt | FFloor | FCeil | FToIExact | FToLExact | FToL => &[F64],
         Box => {
             if f.ty(args[0]).rep == Val {
                 return Err(format!("i{} boxes a val", i.0));
