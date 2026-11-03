@@ -2,17 +2,20 @@
 //! across edges, into fixed registers, and the stores after definitions,
 //! each gap's moves sequenced as one parallel move.
 
-use regalloc2::{Allocation, Edit, Function, Output, ProgPoint};
+use regalloc2::{Allocation, Function, ProgPoint, RegClass, VReg};
 
-use super::{Loc, NONE, Need, Pos, Ra, intersect};
+use super::{Edit, Loc, NONE, Need, Output, Pos, Ra, intersect};
 use crate::jit::backend::vcode::TargetInst;
 
-/// A move of a value of class `cls`.
+/// A move of a value of class `cls`, or with `remat` its computation
+/// again from `from` (`Allocation::none()` for a constant).
 #[derive(Clone, Copy, Debug)]
 struct Mv {
     from: Allocation,
     to: Allocation,
     cls: u8,
+    vreg: u32,
+    remat: bool,
 }
 
 /// The order of the moves sharing a gap: stores after the definition
@@ -31,6 +34,7 @@ const FIXED_COPY: u8 = 6;
 
 impl<I: TargetInst> Ra<'_, I> {
     pub(super) fn resolve(&mut self) -> Result<Output, String> {
+        self.slot_derived();
         // A group spilled only in cold code (none of its uses wanting the
         // slot) is stored on its way in there (V8's deferred spilling);
         // any other spilled group once after each definition, its slot
@@ -99,6 +103,8 @@ impl<I: TargetInst> Ra<'_, I> {
                         from,
                         to: slot,
                         cls,
+                        vreg: v,
+                        remat: false,
                     },
                 ));
             } else if vi.param_of != NONE && !vi.args_in_group {
@@ -113,6 +119,8 @@ impl<I: TargetInst> Ra<'_, I> {
                             from,
                             to: slot,
                             cls,
+                            vreg: v,
+                            remat: false,
                         },
                     ));
                 }
@@ -133,6 +141,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 if a.end() != at
                     || a.loc == b.loc
                     || self.is_def(g, at)
+                    || b.loc == Loc::Remat
                     || b.loc == Loc::Stack && !deferred
                 {
                     continue;
@@ -147,11 +156,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 moves.push((
                     at / 2,
                     if at & 1 != 0 { LATE_STORE } else { CONNECT },
-                    Mv {
-                        from: self.alloc_of(w[0]),
-                        to: self.alloc_of(w[1]),
-                        cls,
-                    },
+                    self.mv(g, at - 1, self.alloc_of(w[1]), cls),
                 ));
             }
             // Into fixed registers, from wherever the value is when the
@@ -160,10 +165,9 @@ impl<I: TargetInst> Ra<'_, I> {
                 for u in &self.pieces[x as usize].uses {
                     if let Need::Fixed(r) = u.need {
                         let n = u.pos / 2;
-                        let from = self.alloc_at(g, 2 * n).expect("live at its use");
-                        let to = Allocation::reg(r);
-                        if from != to {
-                            moves.push((n, FIXED_COPY, Mv { from, to, cls }));
+                        let m = self.mv(g, 2 * n, Allocation::reg(r), cls);
+                        if m.remat || m.from != m.to {
+                            moves.push((n, FIXED_COPY, m));
                         }
                     }
                 }
@@ -188,9 +192,41 @@ impl<I: TargetInst> Ra<'_, I> {
             edits,
             allocs: std::mem::take(&mut self.allocs),
             inst_alloc_offsets: std::mem::take(&mut self.alloc_base),
-            debug_locations: Vec::new(),
-            stats: Default::default(),
         })
+    }
+
+    /// A value computed from one on the stack costs a load and the
+    /// computation where reloading it costs the load alone: one spilled
+    /// where its source is on the stack gets a slot, stored after its
+    /// definition, when that is in a register.
+    fn slot_derived(&mut self) {
+        for v in 0..self.vregs.len() {
+            let crate::jit::backend::vcode::Remat::AndImm { src, .. } = self.f.remat[v] else {
+                continue;
+            };
+            let vi = &self.vregs[v];
+            if !vi.remat || vi.pieces.is_empty() {
+                continue;
+            }
+            let def_in_reg = self.alloc_at(v as u32, vi.def).is_some_and(|a| a.is_reg());
+            let src_on_stack = vi.pieces.iter().any(|&x| {
+                let p = &self.pieces[x as usize];
+                p.loc == Loc::Remat
+                    && p.ivs
+                        .iter()
+                        .any(|&(a, _)| self.alloc_at(src, a).is_some_and(|l| l.is_stack()))
+            });
+            if def_in_reg && src_on_stack {
+                let ps = self.vregs[v].pieces.clone();
+                for x in ps {
+                    if self.pieces[x as usize].loc == Loc::Remat {
+                        self.pieces[x as usize].loc = Loc::Stack;
+                    }
+                }
+                self.vregs[v].remat = false;
+                self.slot_of(v as u32);
+            }
+        }
     }
 
     /// Give spilled groups slots by coloring (JSC's stack coloring): a slot
@@ -240,6 +276,27 @@ impl<I: TargetInst> Ra<'_, I> {
         self.num_slots = slots.len() as u32;
     }
 
+    /// The move of `v` to `to` from where it is at `at`: computed again when
+    /// it is there (a constant from nothing, a derived value from its
+    /// source's location at `at`).
+    fn mv(&self, v: u32, at: Pos, to: Allocation, cls: u8) -> Mv {
+        let from = self.alloc_at(v, at).expect("live where it moves");
+        let (from, remat) = match (from.is_none(), self.f.remat[v as usize]) {
+            (true, crate::jit::backend::vcode::Remat::AndImm { src, .. }) => {
+                (self.alloc_at(src, at).expect("the source live"), true)
+            }
+            (true, _) => (from, true),
+            (false, _) => (from, false),
+        };
+        Mv {
+            from,
+            to,
+            cls,
+            vreg: v,
+            remat,
+        }
+    }
+
     /// Moves on every edge whose ends hold a value in different places: on
     /// the successor's side when it has one predecessor (not a resume block,
     /// which a return enters past its moves), else on the predecessor's.
@@ -272,11 +329,12 @@ impl<I: TargetInst> Ra<'_, I> {
                         let (Some(from), Some(to)) = (from, to) else {
                             return Err(format!("v{v} not live across b{pi} -> b{si}"));
                         };
-                        // The slot has held it since its definition.
+                        // The slot has held it since its definition; a
+                        // constant is computed again where it is needed.
                         let g = self.rep[v as usize] as usize;
-                        if from != to && (!to.is_stack() || self.deferred[g]) {
+                        if from != to && !to.is_none() && (!to.is_stack() || self.deferred[g]) {
                             let cls = self.vregs[v as usize].class;
-                            moves.push((at, phase, Mv { from, to, cls }));
+                            moves.push((at, phase, self.mv(v, pe, to, cls)));
                         }
                     }
                 }
@@ -296,7 +354,7 @@ impl<I: TargetInst> Ra<'_, I> {
                         .ok_or_else(|| format!("argument v{} not live at b{pi}'s end", a.vreg()))?;
                     if from != to {
                         let cls = self.vregs[q as usize].class;
-                        moves.push((at, phase, Mv { from, to, cls }));
+                        moves.push((at, phase, self.mv(a.vreg() as u32, pe, to, cls)));
                     }
                 }
                 if resume && moves.len() != before {
@@ -314,10 +372,29 @@ impl<I: TargetInst> Ra<'_, I> {
     /// still reads its target; a cycle parks one value in the scratch
     /// register; stack-to-stack goes through the transport register.
     fn sequence(&self, mut ms: Vec<Mv>, mut emit: impl FnMut(Edit)) -> Result<(), String> {
-        ms.retain(|m| m.from != m.to);
+        ms.retain(|m| m.remat || m.from != m.to);
         let transport = Allocation::reg(self.env.transport);
         let mut put = |m: Mv| {
-            if m.from.is_stack() && m.to.is_stack() {
+            if m.remat {
+                let class = if m.cls == 0 {
+                    RegClass::Int
+                } else {
+                    RegClass::Float
+                };
+                let vreg = VReg::new(m.vreg as usize, class);
+                let to = if m.to.is_stack() { transport } else { m.to };
+                emit(Edit::Remat {
+                    to,
+                    vreg,
+                    src: m.from,
+                });
+                if m.to.is_stack() {
+                    emit(Edit::Move {
+                        from: transport,
+                        to: m.to,
+                    });
+                }
+            } else if m.from.is_stack() && m.to.is_stack() {
                 emit(Edit::Move {
                     from: m.from,
                     to: transport,
@@ -350,6 +427,8 @@ impl<I: TargetInst> Ra<'_, I> {
                 from: t,
                 to: scratch,
                 cls: reader.cls,
+                vreg: reader.vreg,
+                remat: false,
             });
             for m in &mut ms {
                 if m.from == t {

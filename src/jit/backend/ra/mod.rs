@@ -11,14 +11,97 @@
 //! needs a gap.
 
 mod build;
+pub(crate) mod checker;
 mod resolve;
 mod scan;
 #[cfg(test)]
 mod tests;
 
-use regalloc2::{Allocation, Block, Function, Inst, Output, PReg, RegClass};
+use regalloc2::{Allocation, Block, Function, Inst, PReg, ProgPoint, RegClass, VReg};
 
 use crate::jit::backend::vcode::{TargetInst, VCode};
+
+/// What goes between two instructions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Edit {
+    Move {
+        from: Allocation,
+        to: Allocation,
+    },
+    /// Compute `vreg` again into `to`, as `VCode::remat` says, from `src`
+    /// where it is computed from a value (none for a constant).
+    Remat {
+        to: Allocation,
+        vreg: VReg,
+        src: Allocation,
+    },
+}
+
+/// The allocation: each operand's location, and the edits between
+/// instructions, sorted by program point.
+#[derive(Debug)]
+pub(crate) struct Output {
+    pub(crate) num_spillslots: usize,
+    pub(crate) edits: Vec<(ProgPoint, Edit)>,
+    pub(crate) allocs: Vec<Allocation>,
+    pub(crate) inst_alloc_offsets: Vec<u32>,
+}
+
+pub(crate) enum InstOrEdit<'a> {
+    Inst(Inst),
+    Edit(&'a Edit),
+}
+
+impl Output {
+    pub(crate) fn inst_allocs(&self, inst: Inst) -> &[Allocation] {
+        let start = self.inst_alloc_offsets[inst.index()] as usize;
+        let end = (self.inst_alloc_offsets.get(inst.index() + 1))
+            .map_or(self.allocs.len(), |&e| e as usize);
+        &self.allocs[start..end]
+    }
+
+    /// A block's instructions with the edits before each.
+    pub(crate) fn block_insts_and_edits<'a, F: Function>(
+        &'a self,
+        f: &F,
+        block: Block,
+    ) -> impl Iterator<Item = InstOrEdit<'a>> + 'a {
+        let range = f.block_insns(block);
+        let first = ProgPoint::before(range.first());
+        let mut k = self.edits.partition_point(|e| e.0 < first);
+        let mut insts = range.iter().peekable();
+        std::iter::from_fn(move || {
+            let &next = insts.peek()?;
+            if let Some((p, e)) = self.edits.get(k)
+                && *p <= ProgPoint::before(next)
+            {
+                k += 1;
+                return Some(InstOrEdit::Edit(e));
+            }
+            insts.next().map(InstOrEdit::Inst)
+        })
+    }
+
+    /// regalloc2's allocation in these terms.
+    pub(crate) fn from_regalloc2(o: &regalloc2::Output) -> Output {
+        Output {
+            num_spillslots: o.num_spillslots,
+            edits: (o.edits.iter())
+                .map(|(p, regalloc2::Edit::Move { from, to })| {
+                    (
+                        *p,
+                        Edit::Move {
+                            from: *from,
+                            to: *to,
+                        },
+                    )
+                })
+                .collect(),
+            allocs: o.allocs.clone(),
+            inst_alloc_offsets: o.inst_alloc_offsets.clone(),
+        }
+    }
+}
 
 type Pos = u32;
 const NONE: u32 = u32::MAX;
@@ -49,6 +132,15 @@ enum Loc {
     None,
     Reg(PReg),
     Stack,
+    /// Computed again where needed (a constant): no slot, no store.
+    Remat,
+}
+
+impl Loc {
+    /// Out of a register: on the stack or to be computed again.
+    fn spilled(self) -> bool {
+        matches!(self, Loc::Stack | Loc::Remat)
+    }
 }
 
 /// What a use position asks of the location.
@@ -148,6 +240,8 @@ struct VInfo {
     /// A group's members' definition points, sorted: a piece may start at
     /// one without a move.
     defs: Vec<Pos>,
+    /// A constant, computed again instead of spilled.
+    remat: bool,
 }
 
 struct Ra<'a, I: TargetInst> {
@@ -252,6 +346,22 @@ pub(crate) fn check_operands<I: TargetInst>(v: &VCode<I>, out: &Output) -> Resul
         }
     }
     Ok(())
+}
+
+/// For the checker: per vreg, whether it may be computed again, and the
+/// value it is computed from.
+pub(crate) fn remat_table<I: TargetInst>(f: &VCode<I>) -> (Vec<bool>, Vec<Option<VReg>>) {
+    use crate::jit::backend::vcode::Remat;
+    let remat = f.remat.iter().map(|&r| r != Remat::None).collect();
+    let src = (f.remat.iter())
+        .map(|&r| match r {
+            Remat::AndImm { src, .. } => {
+                Some(VReg::new(src as usize, f.vreg_classes[src as usize]))
+            }
+            _ => None,
+        })
+        .collect();
+    (remat, src)
 }
 
 /// The function before allocation: blocks, operands, clobbers.
@@ -658,6 +768,7 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         let p = &self.pieces[x as usize];
         match p.loc {
             Loc::Reg(r) => Allocation::reg(r),
+            Loc::Remat => Allocation::none(),
             Loc::Stack => Allocation::stack(regalloc2::SpillSlot::new(
                 self.vregs[p.vreg as usize].slot as usize,
             )),

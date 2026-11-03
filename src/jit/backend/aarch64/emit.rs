@@ -2,7 +2,7 @@
 //! allocator's moves, every instruction's sequence, the exit stubs and the
 //! region's exit trampoline in the cold section.
 
-use regalloc2::{Allocation, Edit, Output, PReg, RegClass};
+use regalloc2::{Allocation, PReg, RegClass};
 
 use crate::env::function::NativeClosure;
 use crate::env::table::SlotLoc;
@@ -20,7 +20,8 @@ use crate::jit::backend::aarch64::asm::{
 };
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
 use crate::jit::backend::aarch64::lower::{LExit, Lowered, Src};
-use crate::jit::backend::vcode::VCode;
+use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
+use crate::jit::backend::vcode::{Remat, VCode};
 use crate::jit::ir::ops::Ctx;
 use crate::jit::ir::types::TypeSet;
 use crate::jit::layout;
@@ -105,10 +106,10 @@ fn thread_jumps(
         }
         let insts: Option<Vec<usize>> = out
             .block_insts_and_edits(&l.vcode, regalloc2::Block::new(b))
-            .filter(|ie| !matches!(ie, regalloc2::InstOrEdit::Inst(i) if matches!(l.vcode.insts[i.index()], MInst::Elided)))
+            .filter(|ie| !matches!(ie, InstOrEdit::Inst(i) if matches!(l.vcode.insts[i.index()], MInst::Elided)))
             .map(|ie| match ie {
-                regalloc2::InstOrEdit::Inst(i) => Some(i.index()),
-                regalloc2::InstOrEdit::Edit(_) => None,
+                InstOrEdit::Inst(i) => Some(i.index()),
+                InstOrEdit::Edit(_) => None,
             })
             .collect();
         insts.filter(|v| v.len() == n)
@@ -512,16 +513,19 @@ pub(crate) fn emit(
             match ie {
                 // A fast callee's `ret` lands at the `Resume`, past anything
                 // before it.
-                regalloc2::InstOrEdit::Edit(_) if blk.resume && k == 0 => {
+                InstOrEdit::Edit(_) if blk.resume && k == 0 => {
                     return Err("a move before a call's resume".into());
                 }
-                regalloc2::InstOrEdit::Edit(Edit::Move { from, to }) => {
+                InstOrEdit::Edit(e) => {
                     if let Some((r, _)) = em.pending_based.take() {
                         em.a.bind(em.resume_based[r]);
                     }
-                    em.mov(*from, *to)
+                    match *e {
+                        Edit::Move { from, to } => em.mov(from, to),
+                        Edit::Remat { to, vreg, src } => em.remat(to, vreg.vreg(), src),
+                    }
                 }
-                regalloc2::InstOrEdit::Inst(i) => {
+                InstOrEdit::Inst(i) => {
                     let next = laid.get(at + 1).map(|&x| em.labels[x]);
                     em.inst(i.index(), b, next)?;
                 }
@@ -768,6 +772,37 @@ impl Em<'_> {
                 _ => self.a.ldr_d(fpr(t), FP, spill_off(s.index())),
             },
             _ => panic!("stack-to-stack move"),
+        }
+    }
+
+    fn fimm(&mut self, d: Fpr, bits: u64) {
+        if bits == 0 {
+            self.a.fmov_from_gpr(d, ZR);
+        } else if let Some(imm8) = Asm::fmov_imm8(f64::from_bits(bits)) {
+            self.a.fmov_imm(d, imm8);
+        } else {
+            self.a.ldr_lit_f(d, bits);
+        }
+    }
+
+    /// A value computed again into `to` (`VCode::remat`).
+    fn remat(&mut self, to: Allocation, vreg: usize, src: Allocation) {
+        let r = to.as_reg().expect("a register to compute into");
+        match self.v.remat[vreg] {
+            Remat::Int(v) => self.a.mov_imm(gpr(r), v),
+            Remat::Float(bits) => self.fimm(fpr(r), bits),
+            Remat::AndImm { imm, .. } => {
+                let s = match (src.as_reg(), src.as_stack()) {
+                    (Some(s), _) => gpr(s),
+                    (None, Some(slot)) => {
+                        self.a.ldr(gpr(r), FP, spill_off(slot.index()));
+                        gpr(r)
+                    }
+                    _ => panic!("v{vreg} computed again from nowhere"),
+                };
+                self.a.and_imm(Sz::X, gpr(r), s, imm);
+            }
+            Remat::None => panic!("v{vreg} is not rematerializable"),
         }
     }
 
@@ -1369,19 +1404,15 @@ impl Em<'_> {
         match inst {
             Prologue => self.open_frame(),
             Params | Elided => {}
+            // A value the allocator computes again where used.
+            MovImm(_) | FImm(_) | AluImm(..) if self.allocs(i)[0].is_none() => {}
             MovImm(v) => {
                 let d = self.r(i, 0);
                 self.a.mov_imm(d, v);
             }
             FImm(bits) => {
                 let d = self.fr(i, 0);
-                if bits == 0 {
-                    self.a.fmov_from_gpr(d, ZR);
-                } else if let Some(imm8) = Asm::fmov_imm8(f64::from_bits(bits)) {
-                    self.a.fmov_imm(d, imm8);
-                } else {
-                    self.a.ldr_lit_f(d, bits);
-                }
+                self.fimm(d, bits);
             }
             LoadSlot(r) => {
                 let d = self.r(i, 0);

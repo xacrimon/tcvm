@@ -38,7 +38,25 @@ pub(crate) struct VCode<I> {
     rpool: Vec<VReg>,
     args: Vec<(u32, u32)>,
     pub(crate) vreg_classes: Vec<RegClass>,
+    /// Per vreg: how to compute it again instead of reloading it.
+    pub(crate) remat: Vec<Remat>,
     pub(crate) entry: RBlock,
+}
+
+/// A value the allocator may compute again where it is needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Remat {
+    None,
+    /// An integer constant.
+    Int(u64),
+    /// A float constant, by its bits.
+    Float(u64),
+    /// `src & imm` (a table's pointer from its value), from wherever `src`
+    /// is; only where `src` is live.
+    AndImm {
+        src: u32,
+        imm: u64,
+    },
 }
 
 fn run<T: Copy>(pool: &mut Vec<T>, xs: impl IntoIterator<Item = T>) -> (u32, u32) {
@@ -59,6 +77,7 @@ impl<I: TargetInst> VCode<I> {
             rpool: Vec::new(),
             args: Vec::new(),
             vreg_classes: Vec::new(),
+            remat: Vec::new(),
             entry: RBlock::new(0),
         }
     }
@@ -66,6 +85,7 @@ impl<I: TargetInst> VCode<I> {
     pub(crate) fn new_vreg(&mut self, class: RegClass) -> VReg {
         let v = VReg::new(self.vreg_classes.len(), class);
         self.vreg_classes.push(class);
+        self.remat.push(Remat::None);
         v
     }
 
@@ -153,10 +173,12 @@ impl<I: TargetInst + std::fmt::Debug> VCode<I> {
     /// The allocated code, blocks in `order` (`TCVM_JIT_DUMP=vcode`): each
     /// instruction's defs and uses with their locations, and the allocator's
     /// moves between them.
-    pub(crate) fn print(&self, out: &regalloc2::Output, order: &[u32]) -> String {
+    pub(crate) fn print(&self, out: &crate::jit::backend::ra::Output, order: &[u32]) -> String {
         use std::fmt::Write;
 
-        use regalloc2::{Allocation, AllocationKind, Edit, InstOrEdit};
+        use regalloc2::{Allocation, AllocationKind};
+
+        use crate::jit::backend::ra::{Edit, InstOrEdit};
         let loc = |a: Allocation| match a.kind() {
             AllocationKind::Reg => {
                 let r = a.as_reg().unwrap();
@@ -215,6 +237,15 @@ impl<I: TargetInst + std::fmt::Debug> VCode<I> {
                     }
                     InstOrEdit::Edit(Edit::Move { from, to }) => {
                         let _ = writeln!(s, "        move {} <- {}", loc(*to), loc(*from));
+                    }
+                    InstOrEdit::Edit(Edit::Remat { to, vreg, src }) => {
+                        let _ = writeln!(
+                            s,
+                            "        remat {} <- v{} {}",
+                            loc(*to),
+                            vreg.vreg(),
+                            loc(*src)
+                        );
                     }
                 }
             }

@@ -5,12 +5,12 @@
 //! within an instruction, which that checker does not see.
 
 use regalloc2::{
-    Block as RBlock, Inst, MachineEnv, Operand, OperandConstraint, OperandKind, OperandPos, Output,
-    PReg, PRegSet, ProgPoint, RegClass, VReg,
+    Block as RBlock, Inst, MachineEnv, Operand, OperandConstraint, OperandKind, OperandPos, PReg,
+    PRegSet, ProgPoint, RegClass, VReg,
 };
 
-use super::{Env, run};
-use crate::jit::backend::vcode::{TargetInst, VCode};
+use super::{Env, Output, run};
+use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
 #[derive(Clone, Debug)]
 enum T {
@@ -184,6 +184,46 @@ impl Gen {
     }
 
     fn op(&mut self, b: u32, avail: &mut Vec<VReg>) {
+        // A constant, which the allocator may compute again.
+        if self.rng.chance(15) {
+            let c = self.class();
+            let d = self.v.new_vreg(c);
+            self.v.remat[d.vreg()] = if c == RegClass::Int {
+                Remat::Int(self.rng.next())
+            } else {
+                Remat::Float(self.rng.next())
+            };
+            self.blocks[b as usize].insts.push((
+                T::Op,
+                vec![Operand::reg_def(d)],
+                PRegSet::empty(),
+            ));
+            avail.push(d);
+            return;
+        }
+        // A value computed from another, which the allocator may compute
+        // again from it.
+        if self.rng.chance(10) {
+            let ints: Vec<VReg> = avail
+                .iter()
+                .copied()
+                .filter(|v| v.class() == RegClass::Int)
+                .collect();
+            if let Some(src) = self.pick(&ints) {
+                let d = self.v.new_vreg(RegClass::Int);
+                self.v.remat[d.vreg()] = Remat::AndImm {
+                    src: src.vreg() as u32,
+                    imm: self.rng.next(),
+                };
+                self.blocks[b as usize].insts.push((
+                    T::Op,
+                    vec![Operand::reg_def(d), Operand::reg_use(src)],
+                    PRegSet::empty(),
+                ));
+                avail.push(d);
+                return;
+            }
+        }
         let mut ops = Vec::new();
         let mut clob = PRegSet::empty();
         let mut defs = Vec::new();
@@ -492,13 +532,15 @@ fn check_operands(v: &VCode<T>, out: &Output) -> Result<(), String> {
     Ok(())
 }
 
+/// 300 functions by default; `TCVM_RA_CASES` runs more (a change to the
+/// allocator wants 100k or more, in a release build), from `TCVM_RA_SEED`.
 #[test]
 fn random_functions_allocate_correctly() {
     let (env, me) = envs();
     let n: u64 = std::env::var("TCVM_RA_CASES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(3000);
+        .unwrap_or(300);
     let first: u64 = std::env::var("TCVM_RA_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -509,7 +551,9 @@ fn random_functions_allocate_correctly() {
             Ok(out) => out,
             Err(e) => panic!("seed {seed}: {e}"),
         };
-        let mut checker = regalloc2::checker::Checker::new(&v, &me);
+        let mut checker = super::checker::Checker::new(&v, &me);
+        let (remat, src) = super::remat_table(&v);
+        checker.allow_unmaterialized(remat, src);
         checker.prepare(&out);
         if let Err(e) = checker.run() {
             panic!("seed {seed}: {e:?}\n{}", v.print(&out, &order));

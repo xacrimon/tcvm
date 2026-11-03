@@ -534,7 +534,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 return (begin, pos);
             }
             if let Some(live) = self.piece_at(v, ls)
-                && self.pieces[live as usize].loc != Loc::Stack
+                && !self.pieces[live as usize].loc.spilled()
             {
                 let ps = &self.vregs[v as usize].pieces;
                 let from = ps.iter().position(|&y| y == live).expect("a piece");
@@ -562,7 +562,7 @@ impl<I: TargetInst> Ra<'_, I> {
             return;
         }
         let v = self.pieces[begin as usize].vreg;
-        if self.pieces[begin as usize].loc != Loc::Stack && !self.pieces[begin as usize].fixed {
+        if !self.pieces[begin as usize].loc.spilled() && !self.pieces[begin as usize].fixed {
             self.spill_after(begin, pos);
         }
         let ps = self.vregs[v as usize].pieces.clone();
@@ -571,7 +571,7 @@ impl<I: TargetInst> Ra<'_, I> {
             if y == end {
                 break;
             }
-            if self.pieces[y as usize].loc != Loc::Stack && !self.pieces[y as usize].fixed {
+            if !self.pieces[y as usize].loc.spilled() && !self.pieces[y as usize].fixed {
                 self.spill(y);
             }
         }
@@ -583,9 +583,13 @@ impl<I: TargetInst> Ra<'_, I> {
             "spilling v{} over a register use",
             self.pieces[x as usize].vreg
         );
-        self.pieces[x as usize].loc = Loc::Stack;
         let v = self.pieces[x as usize].vreg;
-        self.slot_of(v);
+        if self.vregs[v as usize].remat {
+            self.pieces[x as usize].loc = Loc::Remat;
+        } else {
+            self.pieces[x as usize].loc = Loc::Stack;
+            self.slot_of(v);
+        }
         self.active.retain(|&a| a != x);
         self.inactive.retain(|&a| a != x);
     }
@@ -665,7 +669,8 @@ impl<I: TargetInst> Ra<'_, I> {
                 return Ok(());
             }
         };
-        if self.pieces[third as usize].start() & 1 != 0 {
+        let t = self.pieces[third as usize].start();
+        if t & 1 != 0 && !self.is_def(g, t) {
             // No gap to reload in before `end`: a piece not yet reached goes
             // back unallocated instead.
             if s2 >= until {

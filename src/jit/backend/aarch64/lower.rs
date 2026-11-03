@@ -10,7 +10,7 @@ use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, p
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Shift, Sz, logical_imm};
 use crate::jit::backend::aarch64::emit::is_single_test;
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
-use crate::jit::backend::vcode::VCode;
+use crate::jit::backend::vcode::{Remat, VCode};
 use crate::jit::ir::ops::{Cc, ExitTag, NO_PROTO, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, ExitKind, Func, Inst, NO_SNAP, Val};
@@ -420,6 +420,19 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
         }
         v
+    }
+
+    /// A constant: defined where the IR puts it, computed again by the
+    /// allocator wherever that is cheaper than keeping it.
+    fn constant(&mut self, r: Val, k: Remat) {
+        let d = self.def(r);
+        self.v.remat[d.vreg().vreg()] = k;
+        let inst = match k {
+            Remat::Int(v) => MInst::MovImm(v),
+            Remat::Float(b) => MInst::FImm(b),
+            Remat::None | Remat::AndImm { .. } => unreachable!(),
+        };
+        self.push(inst, &[d], PRegSet::empty());
     }
 
     fn push(&mut self, inst: MInst, ops: &[Operand], clob: PRegSet) -> usize {
@@ -879,30 +892,12 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             return Ok(());
         }
         match op {
-            Op::KVal(b) => {
-                let d = self.def(res.unwrap());
-                self.push(MInst::MovImm(b), &[d], none);
-            }
-            Op::KObj(p) => {
-                let d = self.def(res.unwrap());
-                self.push(MInst::MovImm(f.pool[p as usize].to_raw()), &[d], none);
-            }
-            Op::KI32(n) => {
-                let d = self.def(res.unwrap());
-                self.push(MInst::MovImm(n as u32 as u64), &[d], none);
-            }
-            Op::KI64(n) => {
-                let d = self.def(res.unwrap());
-                self.push(MInst::MovImm(n as u64), &[d], none);
-            }
-            Op::KB1(c) => {
-                let d = self.def(res.unwrap());
-                self.push(MInst::MovImm(c as u64), &[d], none);
-            }
-            Op::KF64(b) => {
-                let d = self.def(res.unwrap());
-                self.push(MInst::FImm(b), &[d], none);
-            }
+            Op::KVal(b) => self.constant(res.unwrap(), Remat::Int(b)),
+            Op::KObj(p) => self.constant(res.unwrap(), Remat::Int(f.pool[p as usize].to_raw())),
+            Op::KI32(n) => self.constant(res.unwrap(), Remat::Int(n as u32 as u64)),
+            Op::KI64(n) => self.constant(res.unwrap(), Remat::Int(n as u64)),
+            Op::KB1(c) => self.constant(res.unwrap(), Remat::Int(c as u64)),
+            Op::KF64(b) => self.constant(res.unwrap(), Remat::Float(b)),
             Op::Load(r) => {
                 let d = self.def(res.unwrap());
                 self.push(MInst::LoadSlot(r), &[d], none);
@@ -923,6 +918,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::FrameFn => {
                 let d = self.def(res.unwrap());
                 let t = self.v.new_vreg(RegClass::Int);
+                self.v.remat[t.vreg()] = Remat::Int(crate::env::value::FUNCTION_BITS);
                 self.push(
                     MInst::MovImm(crate::env::value::FUNCTION_BITS),
                     &[Operand::reg_def(t)],
@@ -987,6 +983,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     }
                     Rep::Ptr => {
                         let (d, u) = (self.def(r), self.use_(x));
+                        self.v.remat[d.vreg().vreg()] = Remat::AndImm {
+                            src: u.vreg().vreg() as u32,
+                            imm: crate::env::value::PAYLOAD_MASK,
+                        };
                         self.push(
                             MInst::AluImm(AluOp::And, Sz::X, crate::env::value::PAYLOAD_MASK),
                             &[d, u],

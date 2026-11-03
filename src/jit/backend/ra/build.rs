@@ -26,8 +26,23 @@ impl<I: TargetInst> Ra<'_, I> {
                 param_of: NONE,
                 args_in_group: false,
                 defs: Vec::new(),
+                remat: f.remat[v] != crate::jit::backend::vcode::Remat::None,
             })
             .collect();
+        // A constant some use takes from wherever it is (a snapshot, a
+        // call's slots) is spilled as any value: such a use has no register.
+        for i in 0..f.num_insts() {
+            for op in f.inst_operands(Inst::new(i)) {
+                if op.kind() == OperandKind::Use
+                    && matches!(
+                        op.constraint(),
+                        OperandConstraint::Stack | OperandConstraint::Any
+                    )
+                {
+                    self.vregs[op.vreg().vreg()].remat = false;
+                }
+            }
+        }
         let mut ivs: Vec<Vec<(Pos, Pos)>> = vec![Vec::new(); nv];
         let mut uses: Vec<Vec<Use>> = vec![Vec::new(); nv];
         let mut fixed_def = vec![None; nv];
@@ -90,6 +105,23 @@ impl<I: TargetInst> Ra<'_, I> {
                             fixed_def[v] = Some(r);
                             self.allocs[alloc as usize] = Allocation::reg(r);
                             self.fixed[r.index()].push((pos, 2 * l + 2, v as u32));
+                        }
+                        // A constant needs a register only where it is used;
+                        // a value derived from another is made where it is
+                        // defined, and only computed again where a reload
+                        // would be.
+                        OperandConstraint::Reg | OperandConstraint::Any
+                            if self.vregs[v].remat
+                                && !matches!(
+                                    f.remat[v],
+                                    crate::jit::backend::vcode::Remat::AndImm { .. }
+                                ) =>
+                        {
+                            uses[v].push(Use {
+                                pos,
+                                alloc,
+                                need: Need::Any,
+                            });
                         }
                         OperandConstraint::Reg | OperandConstraint::Any => {
                             uses[v].push(Use {
@@ -181,6 +213,29 @@ impl<I: TargetInst> Ra<'_, I> {
                 coalesce(iv)
             })
             .collect();
+        // A value computed again from another only where that one is live
+        // (always holding it at the gap before a reload), not from a value
+        // itself computed again.
+        for v in 0..nv {
+            if let crate::jit::backend::vcode::Remat::AndImm { src, .. } = f.remat[v]
+                && self.vregs[v].remat
+            {
+                let src = src as usize;
+                let within = |&(a, b): &(Pos, Pos)| {
+                    let k = merged[src].partition_point(|iv| iv.1 < b);
+                    k < merged[src].len() && merged[src][k].0 <= a
+                };
+                if self.vregs[src].remat || !merged[v].iter().all(within) {
+                    self.vregs[v].remat = false;
+                    let def = self.vregs[v].def;
+                    for u in &mut uses[v] {
+                        if u.pos == def {
+                            u.need = Need::Reg;
+                        }
+                    }
+                }
+            }
+        }
         // Groups: a block parameter shares one allocation unit with each
         // argument passed to it whose range stays clear of the group's
         // (V8's `BundleBuilder`, allocated as one range as regalloc2 does), so
@@ -209,6 +264,8 @@ impl<I: TargetInst> Ra<'_, I> {
                     }
                     let (gq, ga) = (gq as usize, ga as usize);
                     if self.vregs[gq].class != self.vregs[ga].class
+                        || self.vregs[gq].remat
+                        || self.vregs[ga].remat
                         || merged[gq].is_empty()
                         || merged[ga].is_empty()
                         || super::intersect(&merged[gq], &merged[ga], 0).is_some()
