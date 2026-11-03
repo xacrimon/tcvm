@@ -2120,6 +2120,22 @@ impl Em<'_> {
                 self.a
                     .ldr(d, s, crate::env::string::LuaString::LEN_OFFSET as i32);
             }
+            StrByteAt { exit } => {
+                use crate::env::string::LuaString;
+                let (d, s, p) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                let l = self.exit(exit);
+                // k = p, or len + p + 1 for a negative p; in range when
+                // k - 1 is below len, unsigned.
+                self.a.ldr(X16, s, LuaString::LEN_OFFSET as i32);
+                self.a.add(Sz::X, X17, X16, p);
+                self.a.cmp_imm(Sz::X, p, 0);
+                self.a.csinc(Sz::X, X17, p, X17, Cond::Ge);
+                self.a.sub_imm(Sz::X, X17, X17, 1);
+                self.a.cmp(Sz::X, X17, X16);
+                self.a.b_cond(Cond::Hs, l);
+                self.a.add(Sz::X, X17, s, X17);
+                self.a.ldrb(d, X17, LuaString::DATA_OFFSET as i32);
+            }
             TabMmBits => {
                 let (d, t) = (self.r(i, 0), self.r(i, 1));
                 let (none, done) = (self.a.new_label(), self.a.new_label());

@@ -1609,6 +1609,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let ops = vec![self.def(res.unwrap()), self.use_(args[0])];
                 self.push_exit(i, |exit| MInst::FToLExact { exit }, ops, none);
             }
+            Op::StrByteAt => {
+                let ops = vec![
+                    self.def(res.unwrap()),
+                    self.use_(args[0]),
+                    self.use_(args[1]),
+                ];
+                self.push_exit(i, |exit| MInst::StrByteAt { exit }, ops, none);
+            }
             Op::IRem | Op::LRem => {
                 let sz = if op == Op::IRem { Sz::W } else { Sz::X };
                 let nonzero = self.konst_int(args[1]).is_some_and(|k| k != 0);

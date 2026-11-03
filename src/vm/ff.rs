@@ -85,7 +85,7 @@ enum Math1 {
     Float(f64),
     Small(i32),
     /// Not the common shape: leave the call to the full builtin, whose
-    /// result these feedback bits describe (`OVERFLOW`, `FLOAT_RESULT`).
+    /// result these feedback bits describe (`OVERFLOW`, `OTHER_RESULT`).
     Miss(Bits),
 }
 
@@ -134,7 +134,7 @@ fn rounded(r: f64) -> Math1 {
     } else if (i64::MIN as f64..-(i64::MIN as f64)).contains(&r) {
         Math1::Miss(fb::OVERFLOW)
     } else {
-        Math1::Miss(fb::FLOAT_RESULT)
+        Math1::Miss(fb::OTHER_RESULT)
     }
 }
 

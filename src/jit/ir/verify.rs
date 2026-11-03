@@ -297,6 +297,7 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
         | LRem | LAsr | LCmp(_) => &[I64, I64],
         LNeg | LNot | LToF | LToI | LToFExact => &[I64],
         StrLt | StrLe => &[Ptr, Ptr],
+        StrByteAt => &[Ptr, I64],
         UpvalValueOf(_) => &[Ptr],
         FAdd | FSub | FMul | FDiv | FIDiv | FCmp(_) => &[F64, F64],
         FNeg | FAbs | FSqrt | FFloor | FCeil | FToIExact | FToLExact | FToL => &[F64],

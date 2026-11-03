@@ -61,7 +61,6 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::RawLen => jit_rawlen as *const () as usize,
         HelperId::ToString => jit_tostring as *const () as usize,
         HelperId::ToNumber => jit_tonumber as *const () as usize,
-        HelperId::StrLen => jit_strlen as *const () as usize,
         HelperId::StrSub => jit_strsub as *const () as usize,
         HelperId::StrByte => jit_strbyte as *const () as usize,
         HelperId::TInsert => jit_tinsert as *const () as usize,
@@ -1048,21 +1047,18 @@ pub(crate) extern "C" fn jit_tonumber(rt: *const State<'static>, v: u64) -> u64 
         .to_raw()
 }
 
-/// `string.sub(s, i [, j])` with small-integer positions (`j` nil: -1).
-pub(crate) extern "C" fn jit_strsub(rt: *const State<'static>, s: u64, i: u64, j: u64) -> u64 {
+/// The string whose payload is `p`.
+fn payload_string<'gc>(p: u64) -> LuaString<'gc> {
+    // SAFETY: compiled code passes a live string's payload.
+    LuaString::from_inner(unsafe { Gc::from_ptr(p as usize as *const crate::env::string::StringData) })
+}
+
+/// `string.sub(s, i, j)`, `j` -1 when absent.
+pub(crate) extern "C" fn jit_strsub(rt: *const State<'static>, s: u64, i: i64, j: i64) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
-    let (s, i, j) = unsafe { (Value::from_raw(s), Value::from_raw(i), Value::from_raw(j)) };
-    let (Some(s), Some(i)) = (s.get_string(), i.get_small()) else {
-        return HELPER_FAIL_VAL;
-    };
-    let j = match j.get_small() {
-        Some(j) => i64::from(j),
-        None if j.is_nil() => -1,
-        None => return HELPER_FAIL_VAL,
-    };
-    let bytes = s.as_bytes();
+    let bytes = payload_string(s).as_bytes();
     let len = bytes.len();
-    let start = crate::builtin::posrelat(i64::from(i), len).max(1);
+    let start = crate::builtin::posrelat(i, len).max(1);
     let end = crate::builtin::posrelat(j, len).min(len as i64);
     let r = if start <= end {
         &bytes[(start - 1) as usize..end as usize]
@@ -1072,31 +1068,12 @@ pub(crate) extern "C" fn jit_strsub(rt: *const State<'static>, s: u64, i: u64, j
     Value::string(LuaString::new(ctx, r)).to_raw()
 }
 
-/// `string.byte(s [, i])`'s one result: the byte, or nil out of range.
-pub(crate) extern "C" fn jit_strbyte(s: u64, i: u64) -> u64 {
-    let (s, i) = unsafe { (Value::from_raw(s), Value::from_raw(i)) };
-    let Some(s) = s.get_string() else {
-        return HELPER_FAIL_VAL;
-    };
-    let i = match i.get_small() {
-        Some(i) => i64::from(i),
-        None if i.is_nil() => 1,
-        None => return HELPER_FAIL_VAL,
-    };
-    let bytes = s.as_bytes();
+/// `string.byte(s, i)`'s one result: the byte, or nil out of range.
+pub(crate) extern "C" fn jit_strbyte(s: u64, i: i64) -> u64 {
+    let bytes = payload_string(s).as_bytes();
     let k = crate::builtin::posrelat(i, bytes.len());
     match (k >= 1).then(|| bytes.get(k as usize - 1)).flatten() {
         Some(&b) => Value::small(b as i32).to_raw(),
         None => Value::nil().to_raw(),
-    }
-}
-
-/// `string.len(s)` of a string.
-pub(crate) extern "C" fn jit_strlen(rt: *const State<'static>, v: u64) -> u64 {
-    let ctx = unsafe { Context::from_state(rt) };
-    let v = unsafe { Value::from_raw(v) };
-    match v.get_string() {
-        Some(s) => Value::integer(ctx.mutation(), s.len() as i64).to_raw(),
-        None => HELPER_FAIL_VAL,
     }
 }

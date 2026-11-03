@@ -275,6 +275,11 @@ pub(crate) enum MInst {
     TabMmBits,
     /// `[def d, use s]`: a string's length.
     StrLenOf,
+    /// `[def d, use s, use i, snap..]`: the byte of string `s` at Lua
+    /// position `i`, exiting out of range.
+    StrByteAt {
+        exit: u32,
+    },
     /// `[def d, use c]`: the value of an upvalue cell.
     LoadCell,
     /// `[use c, use v]`: store into an upvalue cell.
@@ -430,6 +435,7 @@ impl MInst {
             | FToIExact { exit }
             | FToLExact { exit }
             | Rem { exit, .. }
+            | StrByteAt { exit }
             | LToFExact { exit }
             | ToF64 { exit, .. }
             | Guard { exit, .. }

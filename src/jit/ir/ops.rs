@@ -186,7 +186,8 @@ pub(crate) enum HelperId {
     RawLen,
     ToString,
     ToNumber,
-    StrLen,
+    /// `string.sub(s, i, j)` and `string.byte(s, i)`'s one result, the
+    /// string its payload (`Ptr`), the positions `I64`.
     StrSub,
     StrByte,
     /// `table.insert(t, v)` and `table.remove(t)` on a table whose
@@ -399,7 +400,7 @@ impl HelperId {
                 Some(Val),
                 table_store,
             ),
-            HelperId::Type | HelperId::ToNumber | HelperId::StrLen => {
+            HelperId::Type | HelperId::ToNumber => {
                 (RT, None, &[Val], Some(Val), e(ALLOC, NONE, NONE))
             }
             HelperId::RawLen => (
@@ -427,8 +428,8 @@ impl HelperId {
             ),
             HelperId::RawSet => (RT, None, &[Val, Val, Val], Some(Val), table_store),
             HelperId::RawEqual => (&[][..], None, &[Val, Val], Some(I32), pure),
-            HelperId::StrSub => (RT, None, &[Val, Val, Val], Some(Val), e(ALLOC, NONE, NONE)),
-            HelperId::StrByte => (&[][..], None, &[Val, Val], Some(Val), pure),
+            HelperId::StrSub => (RT, None, &[Ptr, I64, I64], Some(Val), e(ALLOC, NONE, NONE)),
+            HelperId::StrByte => (&[][..], None, &[Ptr, I64], Some(Val), pure),
             HelperId::TInsert => (RT, None, &[Val, Val], Some(Val), table_store),
             HelperId::TRemove => (RT, None, &[Val], Some(Val), table_store),
             HelperId::Min | HelperId::Max => (&[][..], None, &[Val, Val], Some(Val), pure),
@@ -477,9 +478,10 @@ pub(crate) enum ExitTag {
     Entry,
     /// A `LazyExit`: a dependency broke.
     Lazy,
-    /// A `floor` or `ceil` result had no integer representation, where the
-    /// call's feedback never saw one: the exit records `FLOAT_RESULT`.
-    FloatResult,
+    /// A builtin's result was of a kind its inline code does not make, where
+    /// the call's feedback never saw one (`floor` without an integer,
+    /// `string.byte` out of range): the exit records `OTHER_RESULT`.
+    OtherResult,
 }
 
 impl ExitTag {
@@ -493,7 +495,7 @@ impl ExitTag {
                 | ExitTag::Mm
                 | ExitTag::Bounds
                 | ExitTag::Const
-                | ExitTag::FloatResult
+                | ExitTag::OtherResult
         )
     }
 }
@@ -717,8 +719,13 @@ pub(crate) enum Op {
     ClassMm(u8),
     /// The live metamethod bits (`I32`) of the table's class, 0 without one.
     TabMmBits,
-    /// A string's length (`I64`), the operand its value's payload (`Ptr`).
+    /// A string's length (`I32`: strings are capped below 2^31), the operand
+    /// its value's payload (`Ptr`).
     StrLenOf,
+    /// `string.byte(s, i)`'s byte (`I32`) of the string whose payload is
+    /// the first operand, at Lua position `i` (`I64`, negative from the end);
+    /// exits out of range.
+    StrByteAt,
     /// Whether string `a` orders before (`StrLe`: not after) `b`, by bytes;
     /// the operands their payloads.
     StrLt,
@@ -941,7 +948,8 @@ impl Op {
             Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
             Guard(_) | GuardTrue | GuardFalse | GuardMiss | GuardSame | GuardProto(_) | IAdd
             | ISub | IMul | INeg | IShl | IShr | IDivFloor | IModFloor | IRem | LDivFloor
-            | LModFloor | LRem | LToI | LToFExact | FToIExact | FToLExact | ToF64(_) => {
+            | LModFloor | LRem | LToI | LToFExact | FToIExact | FToLExact | ToF64(_)
+            | StrByteAt => {
                 Effects::flags(DEOPT)
             }
             GuardNoFlag(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
@@ -1087,7 +1095,8 @@ impl Op {
             | FToIExact => Ty::I32,
             IToF | LToF | LToFExact | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor
             | FCeil | FIDiv | ToF64(_) => Ty::F64,
-            IToL | FToL | FToLExact | StrLenOf | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr
+            StrLenOf | StrByteAt => Ty::I32,
+            IToL | FToL | FToLExact | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr
             | LXor | LNot | LShl | LShr | LDivFloor | LModFloor | LRem | LAsr => Ty::I64,
             Helper(HelperId::ArithCoerce(ArithKind::Div | ArithKind::Pow)) => {
                 Ty::val(TypeSet::FLOAT)
@@ -1098,7 +1107,11 @@ impl Op {
             Helper(HelperId::ArithCoerce(_) | HelperId::BNot | HelperId::Len) => {
                 Ty::val(TypeSet::INT)
             }
-            Helper(HelperId::Concat | HelperId::Type) => Ty::val(TypeSet::STR),
+            Helper(
+                HelperId::Concat | HelperId::Type | HelperId::ToString | HelperId::StrSub,
+            ) => Ty::val(TypeSet::STR),
+            Helper(HelperId::RawLen) => Ty::val(TypeSet::INT),
+            Helper(HelperId::StrByte) => Ty::val(TypeSet::SMALL | TypeSet::NIL),
             Helper(HelperId::Closure { .. } | HelperId::ClosureOf { .. }) => Ty::val(TypeSet::FUN),
             Helper(HelperId::NewTable | HelperId::VarargTable(_)) => Ty::val(TypeSet::TAB),
             Helper(h) => Ty::of_rep(h.sig().ret.unwrap_or(Rep::Val)),

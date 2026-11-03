@@ -31,8 +31,9 @@ pub(crate) const CONST_MISS: Bits = MM;
 pub(crate) const KIND_EXIT: Bits = 256;
 /// At a call, the kinds of the arguments after the first, shifted by this.
 pub(crate) const ARGS_SHIFT: u32 = 9;
-/// At a call of `floor` or `ceil`: a result had no integer representation.
-pub(crate) const FLOAT_RESULT: Bits = 1 << 15;
+/// At a call, a result the inline code does not make: `floor` or `ceil`
+/// without an integer representation, `string.byte` out of range.
+pub(crate) const OTHER_RESULT: Bits = 1 << 15;
 
 pub(crate) const INT: Bits = SMALL | BIGINT;
 pub(crate) const KINDS: Bits = SMALL | BIGINT | FLOAT | STR | TAB | OTHER;

@@ -38,6 +38,8 @@ enum Intrinsic {
     Pairs,
     Ipairs,
     Select,
+    /// `string.len(s)`.
+    StrLen,
     /// A builtin computed by its helper.
     Builtin(HelperId),
 }
@@ -62,7 +64,7 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         (base::lua_select, Intrinsic::Select),
         (
             crate::builtin::string::lua_len,
-            Intrinsic::Builtin(HelperId::StrLen),
+            Intrinsic::StrLen,
         ),
         (
             crate::builtin::string::lua_byte,
@@ -311,6 +313,9 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
         Intrinsic::Builtin(h @ (HelperId::Min | HelperId::Max)) if nb != 0 => {
             return min_max(b, pc, h, a, nb - 1, c, f, callee);
         }
+        Intrinsic::StrLen | Intrinsic::Builtin(HelperId::StrSub | HelperId::StrByte) if nb != 0 => {
+            return string(b, pc, intr, a, nb - 1, c, f, callee);
+        }
         Intrinsic::Builtin(h) if nb != 0 => return builtin(b, h, a, nb - 1, c, f, callee),
         _ if nb == 0 => return Emitted::No,
         _ => {}
@@ -367,8 +372,6 @@ fn builtin<'gc>(
     let (arity, optional) = match h {
         HelperId::SetMetatable | HelperId::RawGet | HelperId::RawEqual => (2, 0),
         HelperId::RawSet => (3, 0),
-        HelperId::StrSub => (3, 1),
-        HelperId::StrByte => (2, 1),
         HelperId::TInsert | HelperId::Min | HelperId::Max => (2, 0),
         _ => (1, 0),
     };
@@ -393,6 +396,14 @@ fn builtin<'gc>(
     {
         if c == 2 {
             b.set(a, r);
+        }
+        return Emitted::Done;
+    }
+    if h == HelperId::RawLen && TypeSet::STR.contains(b.ty(args[0]).set) && !b.ty(args[0]).set.is_empty() {
+        if c == 2 {
+            let p = b.ins(Op::Unbox(Rep::Ptr), &[args[0]]);
+            let n = b.ins(Op::StrLenOf, &[p]);
+            b.set(a, n);
         }
         return Emitted::Done;
     }
@@ -559,6 +570,109 @@ fn min_max<'gc>(
         b.set(a, r);
     }
     Emitted::Done
+}
+
+/// `string.len(s)`, `string.sub(s, i [, j])` and `string.byte(s [, i])`'s
+/// one result, of a string `s` (a number converts in the builtin, so a call
+/// that saw one calls it): the length inline, `byte` inline until a position
+/// out of range is seen, `sub` (and `byte` then) by a helper given the
+/// payload and i64 positions (`position`; one that may be a string calls
+/// the builtin).
+#[allow(clippy::too_many_arguments)]
+fn string<'gc>(
+    b: &mut Builder<'_, 'gc>,
+    pc: u32,
+    intr: Intrinsic,
+    a: u8,
+    nargs: u8,
+    c: u8,
+    f: Function<'gc>,
+    callee: Val,
+) -> Emitted {
+    let (min, max) = match intr {
+        Intrinsic::StrLen => (1, 1),
+        Intrinsic::Builtin(HelperId::StrSub) => (2, 3),
+        _ => (1, 2),
+    };
+    if !(min..=max).contains(&nargs) || c == 0 || c > 2 {
+        return Emitted::No;
+    }
+    let bits = b.feedback(pc);
+    // Nothing records these calls' kinds but exits: until one does, the
+    // string is a string and the positions integers, guarded.
+    let kinds = |b: &Builder<'_, 'gc>, v: Val, seen: fb::Bits, guess: TypeSet| {
+        let k = arg_kinds(b, v, seen);
+        if seen == 0 && k.contains(guess) { guess } else { k }
+    };
+    let s = b.reg(a + 4);
+    if kinds(b, s, bits & fb::KINDS, TypeSet::STR) != TypeSet::STR {
+        return Emitted::No;
+    }
+    let rest = bits >> fb::ARGS_SHIFT & fb::KINDS;
+    let mut pos = Vec::new();
+    for k in 1..nargs {
+        let v = b.reg(a + 4 + k);
+        let kv = kinds(b, v, rest, TypeSet::INT);
+        if kv.contains(TypeSet::STR) {
+            return Emitted::No;
+        }
+        pos.push((v, kv));
+    }
+    pin(b, f, callee);
+    let s = b.guard(s, TypeSet::STR);
+    let p = b.ins(Op::Unbox(Rep::Ptr), &[s]);
+    let mut pos: Vec<Val> = pos.into_iter().map(|(v, k)| position(b, v, k)).collect();
+    let r = match intr {
+        Intrinsic::StrLen => b.ins(Op::StrLenOf, &[p]),
+        Intrinsic::Builtin(HelperId::StrSub) => {
+            if pos.len() == 1 {
+                pos.push(b.ins(Op::KI64(-1), &[]));
+            }
+            b.ins(Op::Helper(HelperId::StrSub), &[p, pos[0], pos[1]])
+        }
+        _ => {
+            let i = pos.first().copied().unwrap_or_else(|| b.ins(Op::KI64(1), &[]));
+            if bits & fb::OTHER_RESULT == 0 {
+                let r = b.ins_exit(Op::StrByteAt, &[p, i], ExitTag::OtherResult);
+                b.f.result(r)
+            } else {
+                b.ins(Op::Helper(HelperId::StrByte), &[p, i])
+            }
+        }
+    };
+    if c == 2 {
+        b.set(a, r);
+    }
+    Emitted::Done
+}
+
+/// A string position of kinds `k` as the i64 the builtin takes
+/// (`luaL_checkinteger`): an integer, or a float with an integer value
+/// (otherwise the builtin raises, to which the conversion exits). One that
+/// may be either converts through a float, exact where it matters: past
+/// ±2^31 only its sign counts.
+fn position(b: &mut Builder<'_, '_>, v: Val, k: TypeSet) -> Val {
+    let exact = |b: &mut Builder<'_, '_>, f: Val| {
+        let i = b.ins_exit(Op::FToLExact, &[f], ExitTag::Slow);
+        b.f.result(i)
+    };
+    match b.ty(v).rep {
+        Rep::I32 => return b.ins(Op::IToL, &[v]),
+        Rep::I64 => return v,
+        Rep::F64 => return exact(b, v),
+        _ => {}
+    }
+    if TypeSet::INT.contains(k) {
+        b.as_i64(v)
+    } else if TypeSet::FLOAT.contains(k) {
+        let f = b.as_f64(v);
+        exact(b, f)
+    } else {
+        let v = b.boxed(v);
+        let f = b.ins_exit(Op::ToF64(TypeSet::NUM), &[v], ExitTag::Slow);
+        let f = b.f.result(f);
+        exact(b, f)
+    }
 }
 
 /// `math.max(x, y)` (or `min`) of two small integers or two floats: the
@@ -799,7 +913,11 @@ fn emit_math<'gc>(
             None => return Emitted::Done,
         },
         Intrinsic::Pairs | Intrinsic::Ipairs => unreachable!("returned above"),
-        Intrinsic::Select | Intrinsic::Builtin(_) | Intrinsic::Assert | Intrinsic::Error => {
+        Intrinsic::Select
+        | Intrinsic::StrLen
+        | Intrinsic::Builtin(_)
+        | Intrinsic::Assert
+        | Intrinsic::Error => {
             unreachable!("not math")
         }
     };
@@ -980,7 +1098,7 @@ fn rest_tag(covered: TypeSet) -> ExitTag {
 /// Whether a type-following builtin's integers are i64 (no small | big
 /// union): the argument may be a big integer, or a result left i32.
 fn wide_ints(kinds: TypeSet, bits: fb::Bits) -> bool {
-    kinds.contains(TypeSet::BIGINT) || bits & (fb::OVERFLOW | fb::FLOAT_RESULT) != 0
+    kinds.contains(TypeSet::BIGINT) || bits & (fb::OVERFLOW | fb::OTHER_RESULT) != 0
 }
 
 /// `abs(x)`: `fabs` of a float or a string's number, an integer's
@@ -1042,7 +1160,7 @@ fn abs<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits) -> Option<V
 fn round<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits, ceil: bool) -> Option<Val> {
     let k = arg_kinds(b, x, bits & fb::KINDS);
     let wide = wide_ints(k, bits);
-    let floats = bits & fb::FLOAT_RESULT != 0;
+    let floats = bits & fb::OTHER_RESULT != 0;
     let to_int = move |b: &mut Builder<'_, 'gc>, f: Val| {
         let r = b.ins(if ceil { Op::FCeil } else { Op::FFloor }, &[f]);
         if floats {
@@ -1065,7 +1183,7 @@ fn round<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, bits: fb::Bits, ceil: boo
             enter_join(b, join);
             b.reg(a)
         } else if wide {
-            let i = b.ins_exit(Op::FToLExact, &[r], ExitTag::FloatResult);
+            let i = b.ins_exit(Op::FToLExact, &[r], ExitTag::OtherResult);
             b.f.result(i)
         } else {
             let i = b.ins_exit(Op::FToIExact, &[r], ExitTag::Overflow);
