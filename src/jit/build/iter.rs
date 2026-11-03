@@ -163,10 +163,14 @@ fn past_array(b: &mut Builder<'_, '_>, join: Block, vars: u8, count: u8, t: Val,
     let failed = b.ins(Op::SameBits, &[w, fail]);
     let s = b.snap_before();
     b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Slow);
+    // A branch, not a select: the end comes once, and the key then waits
+    // on nothing (a `csel` would wait for the helper's result).
     let end = b.ins(Op::IsType(TypeSet::NIL), &[w]);
+    let more = branch_arm(b, end);
     let nil = b.konst(Value::nil());
-    let key = b.ins(Op::Select, &[end, nil, kv]);
-    step_to(b, join, vars, count, key, w);
+    step_to(b, join, vars, count, nil, w);
+    b.switch_to(more);
+    step_to(b, join, vars, count, kv, w);
 }
 
 /// The loop variables `(k, v, nil...)`, then the join.
