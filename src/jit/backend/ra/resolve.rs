@@ -330,6 +330,40 @@ impl<I: TargetInst> Ra<'_, I> {
             let si = s.index();
             let resume = f.blocks[si].resume;
             let ss = self.block_start(si as u32);
+            // A constant no predecessor has where the join wants it: made
+            // once at the join's start, not on every edge.
+            let mut once: Vec<u32> = Vec::new();
+            if preds.len() > 1 && !resume {
+                for (k, &w) in self.live_in(si).iter().enumerate() {
+                    let mut w = w;
+                    while w != 0 {
+                        let v = (k * 64 + w.trailing_zeros() as usize) as u32;
+                        w &= w - 1;
+                        use crate::jit::backend::vcode::Remat;
+                        if !matches!(self.f.remat[v as usize], Remat::Int(_) | Remat::Float(_)) {
+                            continue;
+                        }
+                        let Some(to) = self.alloc_at(v, ss).filter(|a| a.is_reg()) else {
+                            continue;
+                        };
+                        let held = preds
+                            .iter()
+                            .any(|p| self.alloc_at(v, 2 * self.last[p.index()] + 1) == Some(to));
+                        if !held {
+                            let cls = self.vregs[v as usize].class;
+                            let m = Mv {
+                                from: Allocation::none(),
+                                to,
+                                cls,
+                                vreg: v,
+                                remat: true,
+                            };
+                            moves.push((self.first[si], EDGE_IN, m));
+                            once.push(v);
+                        }
+                    }
+                }
+            }
             for &p in preds {
                 let pi = p.index();
                 let pe = 2 * self.last[pi] + 1;
@@ -355,7 +389,11 @@ impl<I: TargetInst> Ra<'_, I> {
                         // The slot has held it since its definition; a
                         // constant is computed again where it is needed.
                         let g = self.rep[v as usize] as usize;
-                        if from != to && !to.is_none() && (!to.is_stack() || self.deferred[g]) {
+                        if from != to
+                            && !to.is_none()
+                            && (!to.is_stack() || self.deferred[g])
+                            && !once.contains(&v)
+                        {
                             let cls = self.vregs[v as usize].class;
                             moves.push((at, phase, self.mv(v, pe, to, cls)));
                         }

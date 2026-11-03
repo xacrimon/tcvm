@@ -4,7 +4,7 @@
 
 use std::cmp::Reverse;
 
-use regalloc2::PReg;
+use regalloc2::{Block, Function, PReg};
 
 use super::{Loc, NONE, Piece, Pos, Ra, intersect, needs_reg, reg_beneficial};
 use crate::jit::backend::vcode::TargetInst;
@@ -172,14 +172,29 @@ impl<I: TargetInst> Ra<'_, I> {
     }
 
     fn process(&mut self, c: u32) -> Result<(), String> {
-        // A constant wanted in no register here is made where it is.
-        if self.vregs[self.pieces[c as usize].vreg as usize].remat
-            && self.pieces[c as usize]
-                .next_use(0, reg_beneficial)
-                .is_none()
-        {
-            self.spill(c);
-            return Ok(());
+        // A value computed again is made where a register first serves it
+        // (V8 spills a range with a spill operand until then): holding it
+        // before costs a materialization on each path into the stretch
+        // that lacks it.
+        if self.vregs[self.pieces[c as usize].vreg as usize].remat {
+            let s = self.pieces[c as usize].start();
+            match self.pieces[c as usize].next_use(s, reg_beneficial) {
+                None => {
+                    self.spill(c);
+                    return Ok(());
+                }
+                // Already made in a loop's preheader for a use in the loop,
+                // and kept around it.
+                Some(u) if u.pos > s + 1 && !self.hoisted_to(c, u.pos) => {
+                    return self.spill_between(c, s, u.pos);
+                }
+                Some(_) => {}
+            }
+            // Nor held into a join a path enters without it.
+            if let Some(j) = self.entered_without(c) {
+                let t = self.split_at(c, j).expect("a split inside the piece");
+                self.queue(t);
+            }
         }
         let cls = self.class_of(c);
         let n = self.env.regs[cls].len();
@@ -308,6 +323,62 @@ impl<I: TargetInst> Ra<'_, I> {
             self.active.push(c);
         }
         Ok(())
+    }
+
+    /// Whether piece `c` starts a loop header whose loop holds position `p`
+    /// and a register is free for `c` throughout the loop's hot blocks.
+    /// Else, made there, it would be made again on every back edge.
+    fn hoisted_to(&self, c: u32, p: Pos) -> bool {
+        let s = self.pieces[c as usize].start();
+        let h = self.block_of_pos(s);
+        if !self.is_header(h) || self.block_start(h) != s || !self.in_loop(self.block_of_pos(p), h)
+        {
+            return false;
+        }
+        let end = (0..self.first.len() as u32)
+            .filter(|&b| self.in_loop(b, h) && self.block_start(b) < self.cold_start)
+            .map(|b| self.block_end(b))
+            .max()
+            .unwrap_or(s);
+        self.env.regs[self.class_of(c)]
+            .iter()
+            .any(|&r| self.fixed_conflict(r, c).is_none_or(|x| x >= end))
+    }
+
+    fn in_loop(&self, b: u32, h: u32) -> bool {
+        let mut x = self.inner[b as usize];
+        while x != NONE {
+            if x == h {
+                return true;
+            }
+            x = self.outer[x as usize];
+        }
+        false
+    }
+
+    /// The first block inside piece `c` that a hot edge from outside it
+    /// enters, back edges aside.
+    fn entered_without(&self, c: u32) -> Option<Pos> {
+        let (s, e) = {
+            let p = &self.pieces[c as usize];
+            (p.start(), p.end())
+        };
+        let mut i = s / 2 + 1;
+        while 2 * i < e {
+            let j = self.lin_block[i as usize];
+            if self.first[j as usize] == i {
+                let outside = self.f.block_preds(Block::new(j as usize)).iter().any(|p| {
+                    let p = p.index() as u32;
+                    let end = self.block_end(p) - 1;
+                    end < self.cold_start && !(s..e).contains(&end) && !self.in_loop(p, j)
+                });
+                if outside {
+                    return Some(2 * i);
+                }
+            }
+            i += 1;
+        }
+        None
     }
 
     /// Per register of `c`'s class: where its holders next want it
