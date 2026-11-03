@@ -978,16 +978,25 @@ impl Operand {
         match self {
             Operand::Int(n) => Some(n as f64),
             Operand::Float(x) => Some(x),
-            Operand::Reg(v) => match b.f.def_op(v)? {
-                Op::KI32(n) => Some(n as f64),
-                Op::KF64(bits) => Some(f64::from_bits(bits)),
-                Op::KVal(bits) => {
-                    let k: Value<'_> = unsafe { std::mem::transmute::<u64, Value<'static>>(bits) };
-                    k.get_small().map(f64::from).or(k.get_float())
-                }
-                _ => None,
-            },
+            Operand::Reg(v) => const_f64(b, v),
         }
+    }
+}
+
+/// The number `v` is, when a constant.
+pub(super) fn const_f64(b: &Builder<'_, '_>, v: Val) -> Option<f64> {
+    match b.f.def_op(v)? {
+        Op::KI32(n) => Some(n as f64),
+        Op::KF64(bits) => Some(f64::from_bits(bits)),
+        Op::IToF => match b.f.def_op(b.f.args(b.f.def_inst(v).unwrap())[0])? {
+            Op::KI32(n) => Some(n as f64),
+            _ => None,
+        },
+        Op::KVal(bits) => {
+            let k: Value<'_> = unsafe { std::mem::transmute::<u64, Value<'static>>(bits) };
+            k.get_small().map(f64::from).or(k.get_float())
+        }
+        _ => None,
     }
 }
 
@@ -2357,17 +2366,6 @@ fn const_i64(b: &Builder<'_, '_>, v: Val) -> Option<i64> {
         Some(Op::KI64(n)) => Some(n),
         Some(Op::KI32(n)) => Some(n as i64),
         Some(Op::IToL) => const_i64(b, b.f.args(b.f.def_inst(v).unwrap())[0]),
-        _ => None,
-    }
-}
-
-fn const_f64(b: &Builder<'_, '_>, v: Val) -> Option<f64> {
-    match b.f.def_op(v) {
-        Some(Op::KF64(bits)) => Some(f64::from_bits(bits)),
-        Some(Op::IToF) => match b.f.def_op(b.f.args(b.f.def_inst(v).unwrap())[0]) {
-            Some(Op::KI32(n)) => Some(n as f64),
-            _ => None,
-        },
         _ => None,
     }
 }

@@ -9,7 +9,7 @@ use crate::env::string::LuaString;
 use crate::env::value::Value;
 use crate::instruction::Instruction;
 use crate::jit::build::Builder;
-use crate::jit::build::emit::{arm_end, branch_arm, enter_join};
+use crate::jit::build::emit::{arm_end, branch_arm, const_f64, enter_join};
 use crate::jit::feedback as fb;
 use crate::jit::ir::Block;
 use crate::jit::ir::Val;
@@ -22,8 +22,14 @@ use crate::vm::native::ContFn;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Intrinsic {
     Sqrt,
-    Sin,
-    Cos,
+    /// A one-argument libm function.
+    Unary(Libm),
+    /// `atan(y [, x])`: `atan2`.
+    Atan,
+    /// `log(x [, base])`.
+    Log,
+    /// `fmod(x, y)` with a float `x`.
+    FMod,
     Floor,
     Ceil,
     Abs,
@@ -90,10 +96,17 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         _ => {}
     }
     let entry = nc.entry as usize;
-    let table: [(Handler, Intrinsic); 11] = [
+    let table: [(Handler, Intrinsic); 18] = [
         (ff::ff_sqrt, Intrinsic::Sqrt),
-        (ff::ff_sin, Intrinsic::Sin),
-        (ff::ff_cos, Intrinsic::Cos),
+        (ff::ff_sin, Intrinsic::Unary(Libm::Sin)),
+        (ff::ff_cos, Intrinsic::Unary(Libm::Cos)),
+        (ff::ff_tan, Intrinsic::Unary(Libm::Tan)),
+        (ff::ff_asin, Intrinsic::Unary(Libm::Asin)),
+        (ff::ff_acos, Intrinsic::Unary(Libm::Acos)),
+        (ff::ff_exp, Intrinsic::Unary(Libm::Exp)),
+        (ff::ff_atan, Intrinsic::Atan),
+        (ff::ff_log, Intrinsic::Log),
+        (ff::ff_fmod, Intrinsic::FMod),
         (ff::ff_floor, Intrinsic::Floor),
         (ff::ff_ceil, Intrinsic::Ceil),
         (ff::ff_abs, Intrinsic::Abs),
@@ -591,11 +604,35 @@ fn emit_math<'gc>(
     // A tail call or MULTRET wants all results; the iterators make up to
     // four, the others one.
     let tail = insn.op() == crate::instruction::Op::TAILCALL;
-    if c == 0 || (c > 2 && !iterators) || (iterators && (tail || c > 5)) || nargs != 1 {
+    let arity = match intr {
+        Intrinsic::Atan | Intrinsic::Log => nargs == 1 || nargs == 2,
+        Intrinsic::FMod => nargs == 2,
+        _ => nargs == 1,
+    };
+    if c == 0 || (c > 2 && !iterators) || (iterators && (tail || c > 5)) || !arity {
         return Emitted::No;
     }
-    let k = pin(b, f, callee);
     let x = b.reg(a + 4);
+    // `log`'s base, taken as the constant it is; a varying one calls.
+    let base = if intr == Intrinsic::Log && nargs == 2 {
+        let v = b.reg(a + 5);
+        let Some(k) = const_f64(b, v) else {
+            return Emitted::No;
+        };
+        Some(k)
+    } else {
+        None
+    };
+    if intr == Intrinsic::FMod {
+        // Two integers take C's integer `%`, which stays with the builtin.
+        let ty = b.ty(x);
+        let int = matches!(ty.rep, Rep::I32 | Rep::I64)
+            || (!ty.set.is_empty() && ty.within(TypeSet::INT));
+        if int || seen & fb::INT != 0 {
+            return Emitted::No;
+        }
+    }
+    let k = pin(b, f, callee);
     // Where the builtin runs instead.
     let mut slow = None;
     if iterators {
@@ -625,13 +662,43 @@ fn emit_math<'gc>(
         return done(slow, k);
     }
     let r = match intr {
-        Intrinsic::Sqrt | Intrinsic::Sin | Intrinsic::Cos => {
+        Intrinsic::Sqrt => {
             let x = number_f64(b, x, seen);
-            match intr {
-                Intrinsic::Sqrt => b.ins(Op::FSqrt, &[x]),
-                Intrinsic::Sin => b.ins(Op::Helper(HelperId::Libm(Libm::Sin)), &[x]),
-                _ => b.ins(Op::Helper(HelperId::Libm(Libm::Cos)), &[x]),
+            b.ins(Op::FSqrt, &[x])
+        }
+        Intrinsic::Unary(l) => {
+            let x = number_f64(b, x, seen);
+            b.ins(Op::Helper(HelperId::Libm(l)), &[x])
+        }
+        Intrinsic::Atan => {
+            let y = number_f64(b, x, seen);
+            let x = if nargs == 2 {
+                second_f64(b, pc, a)
+            } else {
+                b.kf64(1.0)
+            };
+            b.ins(Op::Helper(HelperId::Libm(Libm::Atan2)), &[y, x])
+        }
+        Intrinsic::Log => {
+            let x = number_f64(b, x, seen);
+            let libm = |b: &mut Builder<'_, '_>, l| b.ins(Op::Helper(HelperId::Libm(l)), &[x]);
+            match base {
+                None => libm(b, Libm::Log),
+                Some(2.0) => libm(b, Libm::Log2),
+                Some(10.0) => libm(b, Libm::Log10),
+                // `log(base)` by the same libm the builtin calls.
+                Some(k) => {
+                    let ln = libm(b, Libm::Log);
+                    let d = b.kf64(k.ln());
+                    b.ins(Op::FDiv, &[ln, d])
+                }
             }
+        }
+        Intrinsic::FMod => {
+            let g = b.guard(x, TypeSet::FLOAT);
+            let x = b.as_f64(g);
+            let y = second_f64(b, pc, a);
+            b.ins(Op::Helper(HelperId::Libm(Libm::Fmod)), &[x, y])
         }
         Intrinsic::Floor | Intrinsic::Ceil => {
             let ty = b.ty(x);
@@ -706,6 +773,20 @@ fn emit_math<'gc>(
         b.set(a, r);
     }
     done(slow, k)
+}
+
+/// The second argument of the math CALL at `pc` as a float. Its kind is not
+/// the site's feedback (the first argument's): once the site exited on
+/// kinds, it leaves other numbers to the builtin without counting as a
+/// kind exit again.
+fn second_f64(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
+    let y = b.reg(a + 5);
+    let seen = if b.kind_exited(pc) {
+        fb::BIGINT | fb::FLOAT
+    } else {
+        0
+    };
+    number_f64(b, y, seen)
 }
 
 /// Go on where `cond` is `holds`, the returned block taking the other way.

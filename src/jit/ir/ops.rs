@@ -67,12 +67,21 @@ impl Cc {
 pub(crate) enum Libm {
     Sin,
     Cos,
+    Tan,
+    Asin,
+    Acos,
+    Exp,
+    Log,
+    Log2,
+    Log10,
     Pow,
+    Atan2,
+    Fmod,
 }
 
 impl Libm {
     pub(crate) fn binary(self) -> bool {
-        matches!(self, Libm::Pow)
+        matches!(self, Libm::Pow | Libm::Atan2 | Libm::Fmod)
     }
 }
 

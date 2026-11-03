@@ -88,15 +88,34 @@ pub(crate) extern "C" fn jit_fmod(a: f64, b: f64) -> f64 {
 unsafe extern "C" {
     safe fn sin(x: f64) -> f64;
     safe fn cos(x: f64) -> f64;
+    safe fn tan(x: f64) -> f64;
+    safe fn asin(x: f64) -> f64;
+    safe fn acos(x: f64) -> f64;
+    safe fn exp(x: f64) -> f64;
+    safe fn log(x: f64) -> f64;
+    safe fn log2(x: f64) -> f64;
+    safe fn log10(x: f64) -> f64;
     safe fn pow(x: f64, y: f64) -> f64;
+    safe fn atan2(y: f64, x: f64) -> f64;
+    safe fn fmod(x: f64, y: f64) -> f64;
 }
 
 fn libm_address(f: Libm) -> usize {
-    match f {
-        Libm::Sin => sin as *const () as usize,
-        Libm::Cos => cos as *const () as usize,
-        Libm::Pow => pow as *const () as usize,
-    }
+    let p: *const () = match f {
+        Libm::Sin => sin as _,
+        Libm::Cos => cos as _,
+        Libm::Tan => tan as _,
+        Libm::Asin => asin as _,
+        Libm::Acos => acos as _,
+        Libm::Exp => exp as _,
+        Libm::Log => log as _,
+        Libm::Log2 => log2 as _,
+        Libm::Log10 => log10 as _,
+        Libm::Pow => pow as _,
+        Libm::Atan2 => atan2 as _,
+        Libm::Fmod => fmod as _,
+    };
+    p as usize
 }
 
 /// `arith_slow`'s numeric cases; everything it would raise or hand to a
