@@ -197,6 +197,13 @@ pub(crate) enum MInst {
     FToLExact {
         exit: u32,
     },
+    /// `[def d, use v, temp t (float), snap..]`: `ToPos` of a `Value` of
+    /// `kinds`, a small integer inline and the others out of line (a string
+    /// through `jit_str_to_i64`'s trampoline).
+    ToPos {
+        exit: u32,
+        kinds: TypeSet,
+    },
     /// `[def d, use n, use m, snap..]`: C's `%`, exiting on a zero divisor
     /// unless `nonzero`.
     Rem {
@@ -447,6 +454,7 @@ impl MInst {
             | FToLExact { exit }
             | Rem { exit, .. }
             | StrByteAt { exit }
+            | ToPos { exit, .. }
             | LToFExact { exit }
             | ToF64 { exit, .. }
             | Guard { exit, .. }

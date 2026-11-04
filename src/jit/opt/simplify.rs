@@ -155,6 +155,44 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
+                // Only kinds in `set` convert: the others must still exit.
+                Op::ToPos(set) => {
+                    let x = args[0];
+                    if let Some(Op::Box) = f.def_op(x)
+                        && set.contains(TypeSet::SMALL)
+                        && f.ty(f.args(f.def_inst(x).unwrap())[0]).rep == Rep::I32
+                    {
+                        map[res(f).idx()] = f.args(f.def_inst(x).unwrap())[0];
+                        remove(i);
+                        changed = true;
+                        continue;
+                    }
+                    if let Some(k) = konst_val(f, x)
+                        && let Some(n) = k.get_integer()
+                        && set.contains(if k.get_small().is_some() {
+                            TypeSet::SMALL
+                        } else {
+                            TypeSet::BIGINT
+                        })
+                    {
+                        let n = n.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                        f.insts[i.idx()].op = Op::KI32(n);
+                        f.insts[i.idx()].an = 0;
+                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        changed = true;
+                        continue;
+                    }
+                    let t = f.ty(x);
+                    if t.rep == Rep::Val
+                        && !t.set.is_empty()
+                        && t.within(TypeSet::SMALL)
+                        && set.contains(TypeSet::SMALL)
+                    {
+                        f.insts[i.idx()].op = Op::Unbox(Rep::I32);
+                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        changed = true;
+                    }
+                }
                 Op::FToIExact => {
                     let x = args[0];
                     if let Some(Op::IToF) = f.def_op(x) {

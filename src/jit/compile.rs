@@ -442,6 +442,10 @@ pub(crate) fn compile<'gc>(
                 crate::jit::helpers::jit_str_to_f64 as *const () as usize,
                 false,
             ),
+            MInst::ToPos { kinds, .. } if kinds.contains(crate::jit::ir::types::TypeSet::STR) => (
+                crate::jit::helpers::jit_str_to_i64 as *const () as usize,
+                false,
+            ),
             _ => continue,
         };
         if !trampolines.iter().any(|&(x, _)| x == a) {

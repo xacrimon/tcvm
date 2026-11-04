@@ -286,7 +286,7 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
     let args = f.args(i);
     let want: &[Rep] = match op {
         Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | GuardProto(_) => &[Val],
-        ToF64(set) => {
+        ToF64(set) | ToPos(set) => {
             use crate::jit::ir::types::TypeSet;
             if set.is_empty() || !(TypeSet::NUM | TypeSet::STR).contains(set) {
                 return Err(format!("i{} converts {set:?}", i.0));
@@ -304,7 +304,7 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
         | LRem | LAsr | LCmp(_) => &[I64, I64],
         LNeg | LNot | LToF | LToI | LToFExact => &[I64],
         StrLt | StrLe => &[Ptr, Ptr],
-        StrByteAt => &[Ptr, I64],
+        StrByteAt => &[Ptr, I32],
         IFCmp(_) => &[I64, F64],
         NumCmp(_) => &[Val, Val],
         UpvalValueOf(_) => &[Ptr],

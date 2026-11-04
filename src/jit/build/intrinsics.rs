@@ -625,11 +625,11 @@ fn str_fold(b: &mut Builder<'_, '_>, max: bool, args: &[Val]) -> Val {
 }
 
 /// `string.len(s)`, `string.sub(s, i [, j])` and `string.byte(s [, i])`'s
-/// one result, of a string `s` (a number converts in the builtin, so a call
-/// that saw one calls it): the length inline, `byte` inline until a position
-/// out of range is seen, `sub` (and `byte` then) by a helper given the
-/// payload and i64 positions (`position`; one that may be a string calls
-/// the builtin).
+/// one result, by the arguments' types: a string `s` inline, a number (which
+/// converts) the builtin in a cold arm once one was seen; positions as `ToPos`
+/// clamps them, an optional one that is nil its default. The length
+/// inline; `byte` inline until a position out of range is seen, then by its
+/// helper, as `sub` always is (it makes a string).
 #[allow(clippy::too_many_arguments)]
 fn string<'gc>(
     b: &mut Builder<'_, 'gc>,
@@ -641,57 +641,59 @@ fn string<'gc>(
     f: Function<'gc>,
     callee: Val,
 ) -> Emitted {
+    let sub = intr == Intrinsic::Builtin(HelperId::StrSub);
     let (min, max) = match intr {
         Intrinsic::StrLen => (1, 1),
-        Intrinsic::Builtin(HelperId::StrSub) => (2, 3),
+        _ if sub => (2, 3),
         _ => (1, 2),
     };
     if !(min..=max).contains(&nargs) || c == 0 || c > 2 {
         return Emitted::No;
     }
-    let bits = b.feedback(pc);
-    // Nothing records these calls' kinds but exits: until one does, the
-    // string is a string and the positions integers, guarded.
-    let kinds = |b: &Builder<'_, 'gc>, v: Val, seen: fb::Bits, guess: TypeSet| {
-        let k = arg_kinds(b, v, seen);
-        if seen == 0 && k.contains(guess) {
-            guess
-        } else {
-            k
-        }
-    };
+    let k = pin(b, f, callee);
     let s = b.reg(a + 4);
-    if kinds(b, s, bits & fb::KINDS, TypeSet::STR) != TypeSet::STR {
-        return Emitted::No;
-    }
-    let rest = bits >> fb::ARGS_SHIFT & fb::KINDS;
-    let mut pos = Vec::new();
-    for k in 1..nargs {
-        let v = b.reg(a + 4 + k);
-        let kv = kinds(b, v, rest, TypeSet::INT);
-        if kv.contains(TypeSet::STR) {
-            return Emitted::No;
-        }
-        pos.push((v, kv));
-    }
-    pin(b, f, callee);
-    let s = b.guard(s, TypeSet::STR);
+    let t = b.ty(s);
+    // A string, guarded (`Arg`: a number is learned, anything else raises),
+    // which types it for the rest of the region; once a number was seen, a
+    // test with the builtin, which converts it, in a cold arm.
+    let numbers = b.feedback(pc) & (fb::SMALL | fb::BIGINT | fb::FLOAT) != 0;
+    let (s, slow) = if t.rep == Rep::Val && !t.set.is_empty() && t.within(TypeSet::STR) {
+        (s, None)
+    } else if !numbers {
+        let sv = b.boxed(s);
+        (arg_guard(b, sv, TypeSet::STR, ExitTag::Arg), None)
+    } else {
+        let sv = b.boxed(s);
+        let is = b.ins(Op::IsType(TypeSet::STR), &[sv]);
+        let (slow, ok) = (b.new_sealed_succ(), b.new_sealed_succ());
+        b.br(is, ok, slow);
+        b.switch_to(ok);
+        (b.ins(Op::Refine(TypeSet::STR), &[sv]), Some(slow))
+    };
     let p = b.ins(Op::Unbox(Rep::Ptr), &[s]);
-    let mut pos: Vec<Val> = pos.into_iter().map(|(v, k)| position(b, v, k)).collect();
+    // `sub`'s `j` defaults to -1, `byte`'s `i` to 1; `sub`'s `i` is required.
+    let default = |k: u8| match (sub, k) {
+        (true, 2) => Some(-1),
+        (false, 1) => Some(1),
+        _ => None,
+    };
+    let mut pos: Vec<Val> = (1..nargs)
+        .map(|k| {
+            let v = b.reg(a + 4 + k);
+            position(b, v, default(k))
+        })
+        .collect();
     let r = match intr {
         Intrinsic::StrLen => b.ins(Op::StrLenOf, &[p]),
-        Intrinsic::Builtin(HelperId::StrSub) => {
+        _ if sub => {
             if pos.len() == 1 {
-                pos.push(b.ins(Op::KI64(-1), &[]));
+                pos.push(b.ki32(-1));
             }
             b.ins(Op::Helper(HelperId::StrSub), &[p, pos[0], pos[1]])
         }
         _ => {
-            let i = pos
-                .first()
-                .copied()
-                .unwrap_or_else(|| b.ins(Op::KI64(1), &[]));
-            if bits & fb::OTHER_RESULT == 0 {
+            let i = pos.first().copied().unwrap_or_else(|| b.ki32(1));
+            if b.feedback(pc) & fb::OTHER_RESULT == 0 {
                 let r = b.ins_exit(Op::StrByteAt, &[p, i], ExitTag::OtherResult);
                 b.f.result(r)
             } else {
@@ -702,36 +704,47 @@ fn string<'gc>(
     if c == 2 {
         b.set(a, r);
     }
-    Emitted::Done
+    match slow {
+        Some(slow) => Emitted::Fallback(slow, k),
+        None => Emitted::Done,
+    }
 }
 
-/// A string position of kinds `k` as the i64 the builtin takes
-/// (`luaL_checkinteger`): an integer, or a float with an integer value
-/// (otherwise the builtin raises, to which the conversion exits). One that
-/// may be either converts through a float, exact where it matters: past
-/// ±2^31 only its sign counts.
-fn position(b: &mut Builder<'_, '_>, v: Val, k: TypeSet) -> Val {
-    let exact = |b: &mut Builder<'_, '_>, f: Val| {
-        let i = b.ins_exit(Op::FToLExact, &[f], ExitTag::Slow);
-        b.f.result(i)
-    };
-    match b.ty(v).rep {
-        Rep::I32 => return b.ins(Op::IToL, &[v]),
-        Rep::I64 => return v,
-        Rep::F64 => return exact(b, v),
+/// A string position as `ToPos` takes it: by its representation, else every
+/// kind the builtin converts (exiting only where it raises); an optional one
+/// that may be nil its `default` first.
+fn position(b: &mut Builder<'_, '_>, v: Val, default: Option<i32>) -> Val {
+    let t = b.ty(v);
+    match t.rep {
+        Rep::I32 => return v,
+        // Clamped as `ToPos` does; the conversion then holds.
+        Rep::I64 => {
+            let (hi, lo) = (
+                b.ins(Op::KI64(i32::MAX as i64), &[]),
+                b.ins(Op::KI64(i32::MIN as i64), &[]),
+            );
+            let above = b.ins(Op::LCmp(Cc::Gt), &[v, hi]);
+            let x = b.ins(Op::Select, &[above, hi, v]);
+            let below = b.ins(Op::LCmp(Cc::Lt), &[x, lo]);
+            let x = b.ins(Op::Select, &[below, lo, x]);
+            let i = b.ins_exit(Op::LToI, &[x], ExitTag::Slow);
+            return b.f.result(i);
+        }
+        // A small integer is its own (its box's low word).
+        Rep::Val if !t.set.is_empty() && t.within(TypeSet::SMALL) => return b.as_i32(v),
         _ => {}
     }
-    if TypeSet::INT.contains(k) {
-        b.as_i64(v)
-    } else if TypeSet::FLOAT.contains(k) {
-        let f = b.as_f64(v);
-        exact(b, f)
-    } else {
-        let v = b.boxed(v);
-        let f = b.ins_exit(Op::ToF64(TypeSet::NUM), &[v], ExitTag::Slow);
-        let f = b.f.result(f);
-        exact(b, f)
+    let mut v = b.boxed(v);
+    if let Some(d) = default
+        && (t.set.is_empty() || t.set.contains(TypeSet::NIL))
+    {
+        let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
+        let k = b.konst(Value::small(d));
+        v = b.ins(Op::Select, &[nil, k, v]);
     }
+    let set = TypeSet::NUM | TypeSet::STR;
+    let i = b.ins_exit(Op::ToPos(set), &[v], ExitTag::Slow);
+    b.f.result(i)
 }
 
 /// What `type` answers for values of `set`, when they share it.

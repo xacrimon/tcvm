@@ -114,6 +114,7 @@ fn key_of(f: &Func<'_>, i: Inst, mem: &Versions, consts: &mut FastMap<Op, Val>) 
         | Op::GuardFalse
         | Op::GuardMiss
         | Op::ToF64(_)
+        | Op::ToPos(_)
         | Op::FToIExact
         | Op::FToLExact
         | Op::StrByteAt => true,

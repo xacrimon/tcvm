@@ -2120,6 +2120,88 @@ impl Em<'_> {
                 self.a
                     .ldr(d, s, crate::env::string::LuaString::LEN_OFFSET as i32);
             }
+            // A small integer inline, the other kinds out of line, clamped.
+            ToPos { exit, kinds } => {
+                let (d, v, t) = (self.r(i, 0), self.r(i, 1), self.fr(i, 2));
+                let (other, done) = (self.a.new_label(), self.a.new_label());
+                if kinds.contains(TypeSet::SMALL) {
+                    self.a.lsr_imm(Sz::X, X16, v, 32);
+                    self.a.cmn_imm(Sz::W, X16, 1);
+                    self.a.b_cond(Cond::Ne, other);
+                    self.a.mov_w(d, v);
+                } else {
+                    self.a.b(other);
+                }
+                self.a.bind(done);
+                let l = self.exit(exit);
+                let tramp = kinds.contains(TypeSet::STR).then(|| {
+                    let t = crate::jit::helpers::jit_str_to_i64 as *const () as usize;
+                    let t = self.helpers.trampolines.iter().find(|(h, _)| *h == t);
+                    t.expect("jit_str_to_i64's trampoline").1
+                });
+                self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                    em.a.bind(other);
+                    // Each arm leaves the i64 in x16 for the clamp.
+                    let clamp = em.a.new_label();
+                    // The tag, sign-extended: a big integer's is -6, a string's -5.
+                    if kinds.contains(TypeSet::BIGINT) {
+                        let next = em.a.new_label();
+                        em.a.asr_imm(Sz::X, X16, v, 48);
+                        em.a.cmn_imm(Sz::X, X16, 6);
+                        em.a.b_cond(Cond::Ne, next);
+                        em.a.and_imm(Sz::X, X16, v, PTR_MASK);
+                        em.a.ldr(X16, X16, 0);
+                        em.a.b(clamp);
+                        em.a.bind(next);
+                    }
+                    // `fcvtzs` saturates out of range to MAX, which no f64 is, or to
+                    // a MIN that does not convert back (-2^63 itself does).
+                    if kinds.contains(TypeSet::FLOAT) {
+                        let next = em.a.new_label();
+                        em.a.mov_imm(X16, BOX);
+                        em.a.cmp(Sz::X, v, X16);
+                        em.a.b_cond(Cond::Hs, next);
+                        em.a.fmov_from_gpr(t, v);
+                        em.a.fcvtzs(Sz::X, X16, t);
+                        em.a.cmn_imm(Sz::X, X16, 1);
+                        em.a.b_cond(Cond::Vs, l);
+                        em.a.scvtf(Sz::X, D31, X16);
+                        em.a.fcmp(D31, t);
+                        em.a.b_cond(Cond::Ne, l);
+                        em.a.b(clamp);
+                        em.a.bind(next);
+                    }
+                    if let Some(tramp) = tramp {
+                        em.a.asr_imm(Sz::X, X16, v, 48);
+                        em.a.cmn_imm(Sz::X, X16, 5);
+                        em.a.b_cond(Cond::Ne, l);
+                        // The trampoline keeps every register but x0, its result
+                        // (converted or not); the integer goes to a slot above it.
+                        em.a.sub_imm(Sz::X, SP, SP, 32);
+                        em.a.stp(Gpr(0), Gpr(1), SP, 0);
+                        em.a.mov(Gpr(0), v);
+                        em.a.add_imm(Sz::X, Gpr(1), SP, 16);
+                        em.a.bl_far(tramp);
+                        em.a.mov(X17, Gpr(0));
+                        em.a.ldr(X16, SP, 16);
+                        em.a.ldp(Gpr(0), Gpr(1), SP, 0);
+                        em.a.add_imm(Sz::X, SP, SP, 32);
+                        em.a.cbz(Sz::X, X17, l);
+                    } else {
+                        em.a.b(l);
+                    }
+                    // x16 to i32, saturating: past it, the sign's extreme.
+                    em.a.bind(clamp);
+                    let fits = em.a.new_label();
+                    em.a.cmp_ext(X16, X16, Extend::Sxtw);
+                    em.a.b_cond(Cond::Eq, fits);
+                    em.a.asr_imm(Sz::X, X17, X16, 63);
+                    em.a.eor_imm(Sz::W, X16, X17, 0x7fff_ffff);
+                    em.a.bind(fits);
+                    em.a.mov_w(d, X16);
+                    em.a.b(done);
+                }));
+            }
             IFCmp { cc } => {
                 let (d, i, f, t) = (self.r(i, 0), self.r(i, 1), self.fr(i, 2), self.fr(i, 3));
                 let (slow, done) = (self.a.new_label(), self.a.new_label());
@@ -2195,13 +2277,13 @@ impl Em<'_> {
                 let (d, s, p) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
                 let l = self.exit(exit);
                 // k = p, or len + p + 1 for a negative p; in range when
-                // k - 1 is below len, unsigned.
+                // k - 1 is below len, unsigned (both below 2^31: i32 suffices).
                 self.a.ldr(X16, s, LuaString::LEN_OFFSET as i32);
-                self.a.add(Sz::X, X17, X16, p);
-                self.a.cmp_imm(Sz::X, p, 0);
-                self.a.csinc(Sz::X, X17, p, X17, Cond::Ge);
-                self.a.sub_imm(Sz::X, X17, X17, 1);
-                self.a.cmp(Sz::X, X17, X16);
+                self.a.add(Sz::W, X17, X16, p);
+                self.a.cmp_imm(Sz::W, p, 0);
+                self.a.csinc(Sz::W, X17, p, X17, Cond::Ge);
+                self.a.sub_imm(Sz::W, X17, X17, 1);
+                self.a.cmp(Sz::W, X17, X16);
                 self.a.b_cond(Cond::Hs, l);
                 self.a.add(Sz::X, X17, s, X17);
                 self.a.ldrb(d, X17, LuaString::DATA_OFFSET as i32);

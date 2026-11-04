@@ -1617,6 +1617,16 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 ];
                 self.push_exit(i, |exit| MInst::StrByteAt { exit }, ops, none);
             }
+            Op::ToPos(set) => {
+                let t = f.ty(args[0]).set;
+                let kinds = if t.is_empty() { set } else { set & t };
+                let ops = vec![
+                    self.def(res.unwrap()),
+                    self.use_(args[0]),
+                    Operand::reg_temp(self.v.new_vreg(RegClass::Float)),
+                ];
+                self.push_exit(i, |exit| MInst::ToPos { exit, kinds }, ops, none);
+            }
             Op::IFCmp(cc) => {
                 let ops = [
                     self.def(res.unwrap()),

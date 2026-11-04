@@ -187,7 +187,7 @@ pub(crate) enum HelperId {
     ToString,
     ToNumber,
     /// `string.sub(s, i, j)` and `string.byte(s, i)`'s one result, the
-    /// string its payload (`Ptr`), the positions `I64`.
+    /// string its payload (`Ptr`), the positions `I32` (`ToPos`).
     StrSub,
     StrByte,
     /// `table.insert(t, v)` and `table.remove(t)` on a table whose
@@ -424,8 +424,8 @@ impl HelperId {
             ),
             HelperId::RawSet => (RT, None, &[Val, Val, Val], Some(Val), table_store),
             HelperId::RawEqual => (&[][..], None, &[Val, Val], Some(I32), pure),
-            HelperId::StrSub => (RT, None, &[Ptr, I64, I64], Some(Val), e(ALLOC, NONE, NONE)),
-            HelperId::StrByte => (&[][..], None, &[Ptr, I64], Some(Val), pure),
+            HelperId::StrSub => (RT, None, &[Ptr, I32, I32], Some(Val), e(ALLOC, NONE, NONE)),
+            HelperId::StrByte => (&[][..], None, &[Ptr, I32], Some(Val), pure),
             HelperId::TInsert => (RT, None, &[Val, Val], Some(Val), table_store),
             HelperId::TRemove => (RT, None, &[Val], Some(Val), table_store),
         };
@@ -652,6 +652,12 @@ pub(crate) enum Op {
     /// rules) in out-of-line arms; exits otherwise. Arithmetic never passes
     /// `STR`: string arithmetic is the string metamethods'.
     ToF64(TypeSet),
+    /// A string position: the integer `luaL_checkinteger` takes a `Val` of
+    /// the kinds in the set for, clamped to i32, which changes no position's
+    /// meaning as strings are shorter than 2^31. A small integer inline; a
+    /// big one, a float with an i64 value and a string that converts to one
+    /// (`jit_str_to_i64`) out of line; exits otherwise.
+    ToPos(TypeSet),
     /// The i64 of an f64 rounded toward zero, saturating; NaN gives 0.
     FToL,
 
@@ -729,7 +735,7 @@ pub(crate) enum Op {
     /// its value's payload (`Ptr`).
     StrLenOf,
     /// `string.byte(s, i)`'s byte (`I32`) of the string whose payload is
-    /// the first operand, at Lua position `i` (`I64`, negative from the end);
+    /// the first operand, at Lua position `i` (`I32`, negative from the end);
     /// exits out of range.
     StrByteAt,
     /// `i cc f` of an i64 and an f64 (`Eq`, `Lt`, `Le`, `Gt`, `Ge`), exact as
@@ -963,7 +969,7 @@ impl Op {
             Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
             Guard(_) | GuardTrue | GuardFalse | GuardMiss | GuardSame | GuardProto(_) | IAdd
             | ISub | IMul | INeg | IShl | IShr | IDivFloor | IModFloor | IRem | LDivFloor
-            | LModFloor | LRem | LToI | LToFExact | FToIExact | FToLExact | ToF64(_)
+            | LModFloor | LRem | LToI | LToFExact | FToIExact | FToLExact | ToF64(_) | ToPos(_)
             | StrByteAt => Effects::flags(DEOPT),
             GuardNoFlag(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) | GuardShapeIn(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
@@ -1109,7 +1115,7 @@ impl Op {
             | FToIExact => Ty::I32,
             IToF | LToF | LToFExact | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor
             | FCeil | FIDiv | ToF64(_) => Ty::F64,
-            StrLenOf | StrByteAt => Ty::I32,
+            StrLenOf | StrByteAt | ToPos(_) => Ty::I32,
             IToL | FToL | FToLExact | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor
             | LNot | LShl | LShr | LDivFloor | LModFloor | LRem | LAsr => Ty::I64,
             Helper(HelperId::ArithCoerce(ArithKind::Div | ArithKind::Pow)) => {

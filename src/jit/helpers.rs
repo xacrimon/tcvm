@@ -184,6 +184,24 @@ pub(crate) extern "C" fn jit_len(rt: *const State<'static>, v: u64) -> u64 {
     Value::integer(ctx.mutation(), n as i64).to_raw()
 }
 
+/// The integer string `v` converts to as `luaL_checkinteger` takes it ("3",
+/// "3.0"; not "3.5"), stored at `out`; 0 when it has none. Called through a
+/// trampoline (`ToPos`).
+pub(crate) extern "C" fn jit_str_to_i64(v: u64, out: *mut i64) -> u64 {
+    let v = unsafe { Value::from_raw(v) };
+    let n = v
+        .get_string()
+        .and_then(|s| crate::builtin::util::str_to_number(s.as_bytes()))
+        .and_then(|n| n.to_integer());
+    match n {
+        Some(n) => {
+            unsafe { out.write(n) };
+            1
+        }
+        None => 0,
+    }
+}
+
 /// The f64 of string `v` as Lua converts a numeric argument (`tonumber`'s
 /// rules), as bits; `HELPER_FAIL_VAL` (a NaN, which no conversion makes)
 /// when it is no number. Called through a trampoline (`ToF64`).
@@ -1014,12 +1032,12 @@ fn payload_string<'gc>(p: u64) -> LuaString<'gc> {
 }
 
 /// `string.sub(s, i, j)`, `j` -1 when absent.
-pub(crate) extern "C" fn jit_strsub(rt: *const State<'static>, s: u64, i: i64, j: i64) -> u64 {
+pub(crate) extern "C" fn jit_strsub(rt: *const State<'static>, s: u64, i: i32, j: i32) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
     let bytes = payload_string(s).as_bytes();
     let len = bytes.len();
-    let start = crate::builtin::posrelat(i, len).max(1);
-    let end = crate::builtin::posrelat(j, len).min(len as i64);
+    let start = crate::builtin::posrelat(i.into(), len).max(1);
+    let end = crate::builtin::posrelat(j.into(), len).min(len as i64);
     let r = if start <= end {
         &bytes[(start - 1) as usize..end as usize]
     } else {
@@ -1029,9 +1047,9 @@ pub(crate) extern "C" fn jit_strsub(rt: *const State<'static>, s: u64, i: i64, j
 }
 
 /// `string.byte(s, i)`'s one result: the byte, or nil out of range.
-pub(crate) extern "C" fn jit_strbyte(s: u64, i: i64) -> u64 {
+pub(crate) extern "C" fn jit_strbyte(s: u64, i: i32) -> u64 {
     let bytes = payload_string(s).as_bytes();
-    let k = crate::builtin::posrelat(i, bytes.len());
+    let k = crate::builtin::posrelat(i.into(), bytes.len());
     match (k >= 1).then(|| bytes.get(k as usize - 1)).flatten() {
         Some(&b) => Value::small(b as i32).to_raw(),
         None => Value::nil().to_raw(),
