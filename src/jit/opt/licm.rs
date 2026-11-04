@@ -123,7 +123,11 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
                 // refinement holds only where the test before it passed.
                 Op::Load(_) | Op::GcCheck | Op::Refine(_) => false,
                 // Its exit tells raising arguments by the call's registers.
-                Op::Guard(_) if f.insts[i.idx()].tag == ExitTag::Arg => false,
+                Op::Guard(_) | Op::ToF64(_)
+                    if matches!(f.insts[i.idx()].tag, ExitTag::Arg | ExitTag::ArgCmp) =>
+                {
+                    false
+                }
                 // A big integer's unbox loads through its box: hoisted past the
                 // test that found an integer, it would read through a float's bits.
                 Op::Unbox(Rep::I64)

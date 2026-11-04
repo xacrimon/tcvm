@@ -689,8 +689,11 @@ fn on_exit<'gc>(
     pc: u32,
 ) {
     use crate::jit::ir::ops::ExitTag;
-    // The interpreter raises on such an argument: the code is as it should be.
-    if e.tag == ExitTag::Arg && kind == ExitKind::Before && call_arg_raises(closure, base, pc) {
+    // The interpreter raises on such arguments: the code is as it should be.
+    if matches!(e.tag, ExitTag::Arg | ExitTag::ArgCmp)
+        && kind == ExitKind::Before
+        && call_arg_raises(closure, base, pc, e.tag == ExitTag::ArgCmp)
+    {
         return;
     }
     // A `Before` exit's operands are in their home slots; the other kinds
@@ -716,7 +719,7 @@ fn on_exit<'gc>(
             _ => 0,
         };
         let extra = extra
-            | if matches!(e.tag, ExitTag::Type | ExitTag::Arg) {
+            | if matches!(e.tag, ExitTag::Type | ExitTag::Arg | ExitTag::ArgCmp) {
                 crate::jit::feedback::KIND_EXIT
             } else {
                 0
@@ -876,9 +879,10 @@ fn record_shape<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, base: *mut Value<'g
         .backward_barrier(Gc::erase(closure.proto), None);
 }
 
-/// Whether the instruction at `pc` is a call with an argument that is no
-/// number and no string, which a builtin's `ExitTag::Arg` guard raises on.
-fn call_arg_raises<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32) -> bool {
+/// Whether the instruction at `pc` is a call whose arguments a builtin's
+/// `ExitTag::Arg` guard raises on: one that is no number and no string, or
+/// (`cmp`: `min`, `max`, which compare them) strings mixed with numbers.
+fn call_arg_raises<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, cmp: bool) -> bool {
     let mut i = unsafe { *closure.code.add(pc as usize) };
     if i.is_jit_word() {
         i = original_of(closure, i);
@@ -893,11 +897,22 @@ fn call_arg_raises<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32) -> 
             | Op::CALLS_R1
             | Op::TAILCALL
     );
-    // SAFETY: the arguments are registers of the frame's window.
-    call && (4..i.b().saturating_add(3)).any(|r| {
+    if !call {
+        return false;
+    }
+    let (mut num, mut str) = (false, false);
+    for r in 4..i.b().saturating_add(3) {
+        // SAFETY: the arguments are registers of the frame's window.
         let v = unsafe { *base.add((i.a() + r) as usize) };
-        !(v.is_float() || v.get_integer().is_some() || v.get_string().is_some())
-    })
+        if v.is_float() || v.get_integer().is_some() {
+            num = true;
+        } else if v.get_string().is_some() {
+            str = true;
+        } else {
+            return true;
+        }
+    }
+    cmp && num && str
 }
 
 /// Record the kinds of the operands of the site at `pc`, from the frame just

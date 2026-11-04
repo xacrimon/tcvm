@@ -65,8 +65,6 @@ pub(crate) fn address(h: HelperId) -> usize {
         HelperId::StrByte => jit_strbyte as *const () as usize,
         HelperId::TInsert => jit_tinsert as *const () as usize,
         HelperId::TRemove => jit_tremove as *const () as usize,
-        HelperId::Min => jit_min as *const () as usize,
-        HelperId::Max => jit_max as *const () as usize,
     }
 }
 
@@ -967,46 +965,6 @@ pub(crate) extern "C" fn jit_tremove(rt: *const State<'static>, t: u64) -> u64 {
     let v = t.raw_get(k);
     t.raw_set(ctx, k, Value::nil());
     v.to_raw()
-}
-
-/// `x < y` for two numbers, compared exactly.
-fn num_lt(x: Value<'_>, y: Value<'_>) -> Option<bool> {
-    Some(match (x.get_integer(), y.get_integer()) {
-        (Some(a), Some(b)) => a < b,
-        (Some(a), None) => num::lt_int_float(a, y.get_float()?),
-        (None, Some(b)) => num::lt_float_int(x.get_float()?, b),
-        (None, None) => x.get_float()? < y.get_float()?,
-    })
-}
-
-/// `math.min(a, b)`: `b` when it is below `a`.
-pub(crate) extern "C" fn jit_min(a: u64, b: u64) -> u64 {
-    let (x, y) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
-    match num_lt(y, x) {
-        Some(lt) => {
-            if lt {
-                b
-            } else {
-                a
-            }
-        }
-        None => HELPER_FAIL_VAL,
-    }
-}
-
-/// `math.max(a, b)`: `b` when `a` is below it.
-pub(crate) extern "C" fn jit_max(a: u64, b: u64) -> u64 {
-    let (x, y) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
-    match num_lt(x, y) {
-        Some(lt) => {
-            if lt {
-                b
-            } else {
-                a
-            }
-        }
-        None => HELPER_FAIL_VAL,
-    }
 }
 
 pub(crate) extern "C" fn jit_rawlen(rt: *const State<'static>, v: u64) -> u64 {

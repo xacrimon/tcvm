@@ -195,10 +195,6 @@ pub(crate) enum HelperId {
     /// `HELPER_FAIL_VAL`; `insert` gives nil.
     TInsert,
     TRemove,
-    /// `math.min(a, b)` and `math.max(a, b)` of two numbers, the one the
-    /// builtin picks, else `HELPER_FAIL_VAL`.
-    Min,
-    Max,
     /// `(Val, Val, Val) ->`: `recv[key] = v` through `__newindex` tables,
     /// `raw_set_keyed` when `keyed` (`t[k] = v`), or `HELPER_FAIL_VAL`.
     NewIndex {
@@ -432,7 +428,6 @@ impl HelperId {
             HelperId::StrByte => (&[][..], None, &[Ptr, I64], Some(Val), pure),
             HelperId::TInsert => (RT, None, &[Val, Val], Some(Val), table_store),
             HelperId::TRemove => (RT, None, &[Val], Some(Val), table_store),
-            HelperId::Min | HelperId::Max => (&[][..], None, &[Val, Val], Some(Val), pure),
         };
         Sig {
             ctx,
@@ -484,6 +479,9 @@ pub(crate) enum ExitTag {
     /// kind is a `Type` exit. One exit for both, which compiled code cannot
     /// tell apart at a guard that covers some numbers.
     Arg,
+    /// `Arg` for `min`/`max`, which compare their arguments: strings mixed with
+    /// numbers raise too.
+    ArgCmp,
     /// A builtin's result was of a kind its inline code does not make, where
     /// the call's feedback never saw one (`floor` without an integer,
     /// `string.byte` out of range): the exit records `OTHER_RESULT`.
@@ -503,6 +501,7 @@ impl ExitTag {
                 | ExitTag::Const
                 | ExitTag::OtherResult
                 | ExitTag::Arg
+                | ExitTag::ArgCmp
         )
     }
 }

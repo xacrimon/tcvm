@@ -40,6 +40,8 @@ enum Intrinsic {
     Select,
     /// `string.len(s)`.
     StrLen,
+    /// `min(...)`, `max(...)` (true).
+    MinMax(bool),
     /// A builtin computed by its helper.
     Builtin(HelperId),
 }
@@ -67,14 +69,8 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
             crate::builtin::string::lua_byte,
             Intrinsic::Builtin(HelperId::StrByte),
         ),
-        (
-            crate::builtin::math::lua_min,
-            Intrinsic::Builtin(HelperId::Min),
-        ),
-        (
-            crate::builtin::math::lua_max,
-            Intrinsic::Builtin(HelperId::Max),
-        ),
+        (crate::builtin::math::lua_min, Intrinsic::MinMax(false)),
+        (crate::builtin::math::lua_max, Intrinsic::MinMax(true)),
     ];
     match nc.function {
         NativeKind::Plain(p) => {
@@ -307,9 +303,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
             b.deopt(ExitTag::Slow);
             return Emitted::Done;
         }
-        Intrinsic::Builtin(h @ (HelperId::Min | HelperId::Max)) if nb != 0 => {
-            return min_max(b, pc, h, a, nb - 1, c, f, callee);
-        }
+        Intrinsic::MinMax(max) if nb != 0 => return min_max(b, pc, max, a, nb - 1, c, f, callee),
         Intrinsic::StrLen | Intrinsic::Builtin(HelperId::StrSub | HelperId::StrByte) if nb != 0 => {
             return string(b, pc, intr, a, nb - 1, c, f, callee);
         }
@@ -369,7 +363,7 @@ fn builtin<'gc>(
     let (arity, optional) = match h {
         HelperId::SetMetatable | HelperId::RawGet | HelperId::RawEqual => (2, 0),
         HelperId::RawSet => (3, 0),
-        HelperId::TInsert | HelperId::Min | HelperId::Max => (2, 0),
+        HelperId::TInsert => (2, 0),
         _ => (1, 0),
     };
     if nargs > arity || nargs + optional < arity || c == 0 || c > 2 {
@@ -388,14 +382,6 @@ fn builtin<'gc>(
             }
         })
         .collect();
-    if matches!(h, HelperId::Min | HelperId::Max)
-        && let Some(r) = min_max_inline(b, h == HelperId::Max, args[0], args[1])
-    {
-        if c == 2 {
-            b.set(a, r);
-        }
-        return Emitted::Done;
-    }
     if h == HelperId::RawLen
         && TypeSet::STR.contains(b.ty(args[0]).set)
         && !b.ty(args[0]).set.is_empty()
@@ -475,16 +461,17 @@ fn moved_shape(b: &mut Builder<'_, '_>, args: &[Val]) -> Option<u32> {
 /// `min(...)`/`max(...)` of `nargs` arguments by the kinds of them all,
 /// folded as the builtin's loop picks: the next argument when below the pick
 /// (`max`: the pick below it), so the first of equals stays and a NaN follows
-/// `<`. Integers compare as i32 or, with a big one, i64; floats as floats;
-/// small integers with floats as floats (exact for i32), picking the
-/// original values; strings by their bytes. Big integers with floats take
-/// the exact helper (two arguments; more call the builtin), as do kinds
-/// `<` raises on or runs a metamethod for.
+/// `<`. Numbers in the narrowest representation that holds every kind seen
+/// (i32, i64, f64; small integers with floats as floats, picking the original
+/// values; big integers with floats by `NumCmp`), strings by their bytes; a
+/// site that saw both tests which a call has. Guards exit as `ArgCmp`: an
+/// argument that is no number and no string, or strings with numbers,
+/// raise. Only a variable count calls the builtin.
 #[allow(clippy::too_many_arguments)]
 fn min_max<'gc>(
     b: &mut Builder<'_, 'gc>,
     pc: u32,
-    h: HelperId,
+    max: bool,
     a: u8,
     nargs: u8,
     c: u8,
@@ -494,7 +481,6 @@ fn min_max<'gc>(
     if nargs == 0 || c == 0 || c > 2 {
         return Emitted::No;
     }
-    let max = h == HelperId::Max;
     let bits = b.feedback(pc);
     let args: Vec<Val> = (0..nargs).map(|i| b.reg(a + 4 + i)).collect();
     let all = args
@@ -504,34 +490,72 @@ fn min_max<'gc>(
             let group = if i == 0 { bits } else { bits >> fb::ARGS_SHIFT };
             s | arg_kinds(b, v, group & fb::KINDS)
         });
-    let within = |set: TypeSet| set.contains(all);
-    if nargs > 1 && !within(TypeSet::SMALL | TypeSet::FLOAT) && !within(TypeSet::INT) {
-        if !within(TypeSet::STR) {
-            return if nargs == 2 && within(TypeSet::NUM) {
-                builtin(b, h, a, nargs, c, f, callee)
-            } else {
-                Emitted::No
-            };
-        }
-    }
     pin(b, f, callee);
+    if nargs == 1 {
+        if c == 2 {
+            b.set(a, args[0]);
+        }
+        return Emitted::Done;
+    }
+    let (nums, strs) = (all & TypeSet::NUM, all.contains(TypeSet::STR));
+    match (!nums.is_empty(), strs) {
+        (true, false) => {
+            let r = num_fold(b, max, &args, nums);
+            if c == 2 {
+                b.set(a, r);
+            }
+        }
+        (false, true) => {
+            let r = str_fold(b, max, &args);
+            if c == 2 {
+                b.set(a, r);
+            }
+        }
+        (true, true) => {
+            let vals: Vec<Val> = args.iter().map(|&v| b.boxed(v)).collect();
+            let join = b.new_block();
+            let not_nums = all_in(b, TypeSet::NUM, &vals);
+            let r = num_fold(b, max, &vals, nums);
+            let r = b.boxed(r);
+            arm_end(b, join, a, r);
+            enter_join(b, not_nums);
+            let r = str_fold(b, max, &vals);
+            arm_end(b, join, a, r);
+            enter_join(b, join);
+        }
+        // Every kind seen raises.
+        (false, false) => b.deopt(ExitTag::ArgCmp),
+    }
+    Emitted::Done
+}
+
+/// [`min_max`]'s fold of numbers of kinds `nums`, each argument guarded to
+/// them.
+fn num_fold(b: &mut Builder<'_, '_>, max: bool, args: &[Val], nums: TypeSet) -> Val {
     // The pick so far and the next argument, `x < y` deciding.
-    let below = |b: &mut Builder<'_, 'gc>, op: Op, pick: Val, v: Val| {
+    let below = |b: &mut Builder<'_, '_>, op: Op, pick: Val, v: Val| {
         if max {
             b.ins(op, &[pick, v])
         } else {
             b.ins(op, &[v, pick])
         }
     };
-    let r = if nargs == 1 {
-        args[0]
-    } else if within(TypeSet::SMALL) || within(TypeSet::INT) || within(TypeSet::FLOAT) {
-        let (conv, op): (fn(&mut Builder<'_, 'gc>, Val) -> Val, Op) = if within(TypeSet::SMALL) {
-            (|b, v| b.as_i32(v), Op::ICmp(Cc::Lt))
-        } else if within(TypeSet::INT) {
-            (|b, v| b.as_i64(v), Op::LCmp(Cc::Lt))
-        } else {
-            (|b, v| b.as_f64(v), Op::FCmp(Cc::Lt))
+    let one = [TypeSet::SMALL, TypeSet::INT, TypeSet::FLOAT]
+        .into_iter()
+        .find(|k| k.contains(nums));
+    if let Some(k) = one {
+        let op = match k {
+            TypeSet::SMALL => Op::ICmp(Cc::Lt),
+            TypeSet::INT => Op::LCmp(Cc::Lt),
+            _ => Op::FCmp(Cc::Lt),
+        };
+        let conv = |b: &mut Builder<'_, '_>, v: Val| {
+            let v = arg_guard(b, v, k, ExitTag::ArgCmp);
+            match k {
+                TypeSet::SMALL => b.as_i32(v),
+                TypeSet::INT => b.as_i64(v),
+                _ => b.as_f64(v),
+            }
         };
         let mut pick = conv(b, args[0]);
         for &v in &args[1..] {
@@ -539,9 +563,11 @@ fn min_max<'gc>(
             let lt = below(b, op, pick, v);
             pick = b.ins(Op::Select, &[lt, v, pick]);
         }
-        pick
-    } else if within(TypeSet::SMALL | TypeSet::FLOAT) {
-        let num = |b: &mut Builder<'_, 'gc>, v: Val| {
+        return pick;
+    }
+    if (TypeSet::SMALL | TypeSet::FLOAT).contains(nums) {
+        // As floats, exact for small integers; the pick is the original.
+        let num = |b: &mut Builder<'_, '_>, v: Val| {
             let t = b.ty(v);
             // One kind converts directly; small | float takes `ToF64`'s two arms.
             if t.rep != Rep::Val
@@ -550,11 +576,8 @@ fn min_max<'gc>(
                 return (b.num_f64(v), b.boxed(v));
             }
             let bv = b.boxed(v);
-            let i = b.ins_exit(
-                Op::ToF64(TypeSet::SMALL | TypeSet::FLOAT),
-                &[bv],
-                ExitTag::Type,
-            );
+            let set = TypeSet::SMALL | TypeSet::FLOAT;
+            let i = b.ins_exit(Op::ToF64(set), &[bv], ExitTag::ArgCmp);
             (b.f.result(i), bv)
         };
         let (mut at, mut pick) = num(b, args[0]);
@@ -564,26 +587,41 @@ fn min_max<'gc>(
             at = b.ins(Op::Select, &[lt, x, at]);
             pick = b.ins(Op::Select, &[lt, v, pick]);
         }
-        pick
-    } else {
-        let str = |b: &mut Builder<'_, 'gc>, v: Val| {
-            let v = b.boxed(v);
-            let g = b.guard(v, TypeSet::STR);
-            (b.ins(Op::Unbox(Rep::Ptr), &[g]), g)
-        };
-        let (mut at, mut pick) = str(b, args[0]);
-        for &v in &args[1..] {
-            let (p, v) = str(b, v);
-            let lt = below(b, Op::StrLt, at, p);
-            at = b.ins(Op::Select, &[lt, p, at]);
-            pick = b.ins(Op::Select, &[lt, v, pick]);
-        }
-        pick
-    };
-    if c == 2 {
-        b.set(a, r);
+        return pick;
     }
-    Emitted::Done
+    // Big integers with floats: compared exactly, boxed.
+    let num = |b: &mut Builder<'_, '_>, v: Val| {
+        let v = b.boxed(v);
+        arg_guard(b, v, TypeSet::NUM, ExitTag::ArgCmp)
+    };
+    let mut pick = num(b, args[0]);
+    for &v in &args[1..] {
+        let v = num(b, v);
+        let lt = below(b, Op::NumCmp(Cc::Lt), pick, v);
+        pick = b.ins(Op::Select, &[lt, v, pick]);
+    }
+    pick
+}
+
+/// [`min_max`]'s fold of strings, by their bytes.
+fn str_fold(b: &mut Builder<'_, '_>, max: bool, args: &[Val]) -> Val {
+    let str = |b: &mut Builder<'_, '_>, v: Val| {
+        let v = b.boxed(v);
+        let g = arg_guard(b, v, TypeSet::STR, ExitTag::ArgCmp);
+        (b.ins(Op::Unbox(Rep::Ptr), &[g]), g)
+    };
+    let (mut at, mut pick) = str(b, args[0]);
+    for &v in &args[1..] {
+        let (p, v) = str(b, v);
+        let lt = if max {
+            b.ins(Op::StrLt, &[at, p])
+        } else {
+            b.ins(Op::StrLt, &[p, at])
+        };
+        at = b.ins(Op::Select, &[lt, p, at]);
+        pick = b.ins(Op::Select, &[lt, v, pick]);
+    }
+    pick
 }
 
 /// `string.len(s)`, `string.sub(s, i [, j])` and `string.byte(s [, i])`'s
@@ -694,28 +732,6 @@ fn position(b: &mut Builder<'_, '_>, v: Val, k: TypeSet) -> Val {
         let f = b.f.result(f);
         exact(b, f)
     }
-}
-
-/// `math.max(x, y)` (or `min`) of two small integers or two floats: the
-/// builtin's pick by `<`, which keeps `x` for a NaN.
-fn min_max_inline(b: &mut Builder<'_, '_>, max: bool, x: Val, y: Val) -> Option<Val> {
-    let (tx, ty) = (b.ty(x), b.ty(y));
-    let is = |t: crate::jit::ir::types::Ty, rep, set| {
-        t.rep == rep || (!t.set.is_empty() && t.within(set))
-    };
-    let (x, y, cmp) = if is(tx, Rep::I32, TypeSet::SMALL) && is(ty, Rep::I32, TypeSet::SMALL) {
-        (b.as_i32(x), b.as_i32(y), Op::ICmp(Cc::Lt))
-    } else if is(tx, Rep::F64, TypeSet::FLOAT) && is(ty, Rep::F64, TypeSet::FLOAT) {
-        (b.as_f64(x), b.as_f64(y), Op::FCmp(Cc::Lt))
-    } else {
-        return None;
-    };
-    let lt = if max {
-        b.ins(cmp, &[x, y])
-    } else {
-        b.ins(cmp, &[y, x])
-    };
-    Some(b.ins(Op::Select, &[lt, y, x]))
 }
 
 /// What `type` answers for values of `set`, when they share it.
@@ -936,6 +952,7 @@ fn emit_math<'gc>(
         Intrinsic::Pairs | Intrinsic::Ipairs => unreachable!("returned above"),
         Intrinsic::Select
         | Intrinsic::StrLen
+        | Intrinsic::MinMax(_)
         | Intrinsic::Builtin(_)
         | Intrinsic::Assert
         | Intrinsic::Error => {
@@ -1257,7 +1274,8 @@ fn fmod<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, y: Val, bits: fb::Bits) ->
     let ky = arg_kinds(b, y, bits >> fb::ARGS_SHIFT & fb::KINDS);
     let wide = (kx | ky).contains(TypeSet::BIGINT);
     let int = |b: &mut Builder<'_, 'gc>, v: Val| {
-        let v = arg_guard(b, v, if wide { TypeSet::INT } else { TypeSet::SMALL });
+        let set = if wide { TypeSet::INT } else { TypeSet::SMALL };
+        let v = arg_guard(b, v, set, ExitTag::Arg);
         if wide { b.as_i64(v) } else { b.as_i32(v) }
     };
     let irem = |b: &mut Builder<'_, 'gc>, x: Val, y: Val| {
@@ -1275,9 +1293,9 @@ fn fmod<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, y: Val, bits: fb::Bits) ->
         // Never two integers: the one that is not stays so.
         let not_int = TypeSet::ANY - TypeSet::INT;
         let (x, y) = if !ix {
-            (arg_guard(b, x, not_int), y)
+            (arg_guard(b, x, not_int, ExitTag::Arg), y)
         } else {
-            (x, arg_guard(b, y, not_int))
+            (x, arg_guard(b, y, not_int, ExitTag::Arg))
         };
         return Some(frem(b, x, y));
     }
@@ -1303,13 +1321,13 @@ fn fmod<'gc>(b: &mut Builder<'_, 'gc>, a: u8, x: Val, y: Val, bits: fb::Bits) ->
     None
 }
 
-/// `v` guarded to `set` as a builtin's argument (`ExitTag::Arg`).
-fn arg_guard(b: &mut Builder<'_, '_>, v: Val, set: TypeSet) -> Val {
+/// `v` guarded to `set` as a builtin's argument (`tag`: `Arg`, `ArgCmp`).
+fn arg_guard(b: &mut Builder<'_, '_>, v: Val, set: TypeSet, tag: ExitTag) -> Val {
     let t = b.ty(v);
     if t.rep != Rep::Val || (!t.set.is_empty() && t.within(set)) {
         return v;
     }
-    let g = b.ins_exit(Op::Guard(set), &[v], ExitTag::Arg);
+    let g = b.ins_exit(Op::Guard(set), &[v], tag);
     b.f.result(g)
 }
 
