@@ -285,7 +285,14 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
     let op = f.op(i);
     let args = f.args(i);
     let want: &[Rep] = match op {
-        Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | GuardProto(_) | ToF64(_) => &[Val],
+        Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | GuardProto(_) => &[Val],
+        ToF64(set) => {
+            use crate::jit::ir::types::TypeSet;
+            if set.is_empty() || !(TypeSet::NUM | TypeSet::STR).contains(set) {
+                return Err(format!("i{} converts {set:?}", i.0));
+            }
+            &[Val]
+        }
         SameBits | GuardSame => &[Val, Val],
         GuardMiss => &[Val, B1],
         Helper(h) => h.sig().args,

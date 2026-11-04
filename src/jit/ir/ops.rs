@@ -650,8 +650,8 @@ pub(crate) enum Op {
     FToLExact,
     /// The f64 of a `Val` of the kinds in the set, as Lua converts them: a
     /// float inline, small and big integers and strings (`tonumber`'s
-    /// rules) in out-of-line arms; exits otherwise. Arithmetic does not
-    /// convert strings.
+    /// rules) in out-of-line arms; exits otherwise. Arithmetic never passes
+    /// `STR`: string arithmetic is the string metamethods'.
     ToF64(TypeSet),
     /// The i64 of an f64 rounded toward zero, saturating; NaN gives 0.
     FToL,

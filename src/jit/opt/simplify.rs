@@ -89,25 +89,26 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         changed = true;
                     }
                 }
+                // Only kinds in `set` convert: the others must still exit.
                 Op::ToF64(set) => {
                     let x = args[0];
                     if let Some(Op::Box) = f.def_op(x) {
                         let y = f.args(f.def_inst(x).unwrap())[0];
                         match f.ty(y).rep {
-                            Rep::F64 => {
+                            Rep::F64 if set.contains(TypeSet::FLOAT) => {
                                 map[res(f).idx()] = y;
                                 remove(i);
                                 changed = true;
                                 continue;
                             }
-                            Rep::I32 => {
+                            Rep::I32 if set.contains(TypeSet::SMALL) => {
                                 f.insts[i.idx()].op = Op::IToF;
                                 f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
                                 f.args_mut(i)[0] = y;
                                 changed = true;
                                 continue;
                             }
-                            Rep::I64 if set.contains(TypeSet::BIGINT) => {
+                            Rep::I64 if set.contains(TypeSet::INT) => {
                                 f.insts[i.idx()].op = Op::LToF;
                                 f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
                                 f.args_mut(i)[0] = y;
@@ -118,10 +119,14 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         }
                     }
                     if let Some(k) = konst_val(f, x)
-                        && let Some(n) = k.get_small().map(f64::from).or(k.get_float()).or(k
-                            .get_integer()
-                            .filter(|_| set.contains(TypeSet::BIGINT))
-                            .map(|n| n as f64))
+                        && let Some(n) = if let Some(n) = k.get_small() {
+                            set.contains(TypeSet::SMALL).then_some(f64::from(n))
+                        } else if let Some(x) = k.get_float() {
+                            set.contains(TypeSet::FLOAT).then_some(x)
+                        } else {
+                            let n = k.get_integer().filter(|_| set.contains(TypeSet::BIGINT));
+                            n.map(|n| n as f64)
+                        }
                     {
                         f.insts[i.idx()].op = Op::KF64(n.to_bits());
                         f.insts[i.idx()].an = 0;
@@ -130,11 +135,16 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         continue;
                     }
                     let t = f.ty(x);
-                    if t.within(TypeSet::FLOAT) && !t.set.is_empty() {
+                    if t.within(TypeSet::FLOAT) && !t.set.is_empty() && set.contains(TypeSet::FLOAT)
+                    {
                         f.insts[i.idx()].op = Op::Unbox(Rep::F64);
                         f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
                         changed = true;
-                    } else if t.rep == Rep::Val && t.within(TypeSet::SMALL) && !t.set.is_empty() {
+                    } else if t.rep == Rep::Val
+                        && t.within(TypeSet::SMALL)
+                        && !t.set.is_empty()
+                        && set.contains(TypeSet::SMALL)
+                    {
                         // The block's last instruction waits for the next round.
                         let u = f.make_inst(Op::Unbox(Rep::I32), &[x], None, ExitTag::Type);
                         f.insert(b, k, u);
