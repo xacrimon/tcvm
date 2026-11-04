@@ -10,6 +10,7 @@
 //! interpreter's result would leave i32 anyway.
 
 use crate::jit::ir::ops::{ExitTag, Flags, Mem, Op};
+use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Func, Inst, Val};
 use crate::jit::opt::calls::rematerializable;
 use crate::jit::opt::natural_loops;
@@ -123,6 +124,14 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
                 Op::Load(_) | Op::GcCheck | Op::Refine(_) => false,
                 // Its exit tells raising arguments by the call's registers.
                 Op::Guard(_) if f.insts[i.idx()].tag == ExitTag::Arg => false,
+                // A big integer's unbox loads through its box: hoisted past the
+                // test that found an integer, it would read through a float's bits.
+                Op::Unbox(Rep::I64)
+                    if !f.ty(f.args(i)[0]).within(TypeSet::INT)
+                        || f.ty(f.args(i)[0]).set.is_empty() =>
+                {
+                    false
+                }
                 _ if e.is_pure() => true,
                 _ if !e.movable() || e.writes() || e.has(Flags::MAY_ALLOC) => false,
                 // A test of values alone needs no earlier guard; a read of
