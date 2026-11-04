@@ -1638,17 +1638,11 @@ fn bits_cmp_kind(bits: fb::Bits) -> Option<CmpKind> {
     }
 }
 
-/// The f64 of a number of kind `k`, exact for the compare: an i64 outside
-/// ±2^53 exits.
+/// The f64 of a number of kind `k` for a compare, exact: small integers and
+/// floats only (an i64 compares as such, or by `IFCmp` with a float).
 fn cmp_f64(b: &mut Builder<'_, '_>, v: Val, k: NumKind) -> Val {
-    match k {
-        NumKind::I64 => {
-            let x = b.as_i64(v);
-            let i = b.ins_exit(Op::LToFExact, &[x], ExitTag::Type);
-            b.f.result(i)
-        }
-        k => Operand::Reg(v).f64(b, k),
-    }
+    debug_assert!(!matches!(k, NumKind::I64 | NumKind::Wide));
+    Operand::Reg(v).f64(b, k)
 }
 
 /// `x cc y` of numbers of these kinds.
@@ -1667,6 +1661,16 @@ fn cmp_num(
         (I32 | I64, I32 | I64) => {
             let (x, y) = (b.as_i64(x), b.as_i64(y));
             b.ins(Op::LCmp(cc), &[x, y])
+        }
+        // A float (or a small integer, which converts exactly) with an i64:
+        // exact at any size.
+        (I64, F64 | Num) => {
+            let (i, f) = (b.as_i64(x), cmp_f64(b, y, ky));
+            b.ins(Op::IFCmp(cc), &[i, f])
+        }
+        (F64 | Num, I64) => {
+            let (i, f) = (b.as_i64(y), cmp_f64(b, x, kx));
+            b.ins(Op::IFCmp(cc.swap()), &[i, f])
         }
         _ => {
             let (x, y) = (cmp_f64(b, x, kx), cmp_f64(b, y, ky));
@@ -1761,6 +1765,27 @@ fn emit_cmp_reg(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
     branch(b, c, sense, succs);
 }
 
+/// `x cc y` where one is an i64 and the other a value of any kind: an
+/// integer or a float other compares with the i64 unboxed, as boxing a big
+/// one allocates; continues where it is neither.
+fn i64_arms(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, yes: Block, no: Block) {
+    let (i, v, cc) = match (b.ty(x).rep, b.ty(y).rep) {
+        (Rep::I64, Rep::Val) => (x, y, cc),
+        (Rep::Val, Rep::I64) => (y, x, cc.swap()),
+        _ => return,
+    };
+    let other = all_in(b, TypeSet::INT, &[v]);
+    let n = b.ins(Op::Unbox(Rep::I64), &[v]);
+    let c = b.ins(Op::LCmp(cc), &[i, n]);
+    b.br(c, yes, no);
+    enter_join(b, other);
+    let other = all_in(b, TypeSet::FLOAT, &[v]);
+    let f = b.ins(Op::Unbox(Rep::F64), &[v]);
+    let c = b.ins(Op::IFCmp(cc), &[i, f]);
+    b.br(c, yes, no);
+    enter_join(b, other);
+}
+
 /// The targets of a compare's branch: where it goes when equal (or less)
 /// and when not.
 fn targets(sense: bool, succs: &[Block]) -> (Block, Block) {
@@ -1778,6 +1803,7 @@ fn targets(sense: bool, succs: &[Block]) -> (Block, Block) {
 /// two userdata, which the site's feedback must have seen run to call.
 fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Block]) {
     let (yes, no) = targets(sense, succs);
+    i64_arms(b, Cc::Eq, x, y, yes, no);
     let (x, y) = (b.boxed(x), b.boxed(y));
     let bits = b.feedback(b.pc);
     let big = bits & fb::BIGINT != 0;
@@ -1858,9 +1884,7 @@ fn big_float_eq(b: &mut Builder<'_, '_>, big: bool, v: Val, f: Val, yes: Block, 
     }
     let not_big = all_in(b, TypeSet::BIGINT, &[v]);
     let i = b.ins(Op::Unbox(Rep::I64), &[v]);
-    let g = b.ins_exit(Op::LToFExact, &[i], ExitTag::Slow);
-    let g = b.f.result(g);
-    let c = b.ins(Op::FCmp(Cc::Eq), &[g, f]);
+    let c = b.ins(Op::IFCmp(Cc::Eq), &[i, f]);
     b.br(c, yes, no);
     enter_join(b, not_big);
     b.jump(no);
@@ -1884,6 +1908,7 @@ fn eq_mm_arm(b: &mut Builder<'_, '_>, x: Val, y: Val, yes: Block, no: Block, suc
 /// run; anything else raises in the interpreter.
 fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, succs: &[Block]) {
     let (yes, no) = targets(sense, succs);
+    i64_arms(b, cc, x, y, yes, no);
     let (x, y) = (b.boxed(x), b.boxed(y));
     let bits = b.feedback(b.pc);
     let le = cc == Cc::Le;
@@ -1905,9 +1930,14 @@ fn generic_cmp(b: &mut Builder<'_, '_>, cc: Cc, x: Val, y: Val, sense: bool, suc
         let c = cmp_num(b, cc, (x, NumKind::I64), (y, NumKind::I64));
         b.br(c, yes, no);
         enter_join(b, other);
+        // An integer, a big one among them, with a float.
+        let other = all_in(b, TypeSet::NUM, &[x, y]);
+        let c = b.ins(Op::NumCmp(cc), &[x, y]);
+        b.br(c, yes, no);
+        enter_join(b, other);
     }
     if !calls_mm(b) {
-        // Mixed big integers and floats, or what raises.
+        // What raises.
         b.deopt(ExitTag::Slow);
         return;
     }

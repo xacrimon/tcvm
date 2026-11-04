@@ -142,7 +142,7 @@ fn srep(rep: Rep) -> SRep {
     }
 }
 
-fn int_cond(cc: Cc) -> Cond {
+pub(super) fn int_cond(cc: Cc) -> Cond {
     match cc {
         Cc::Eq => Cond::Eq,
         Cc::Ne => Cond::Ne,
@@ -156,7 +156,7 @@ fn int_cond(cc: Cc) -> Cond {
 }
 
 /// After `fcmp`: false when unordered, except `ne`.
-fn float_cond(cc: Cc) -> Cond {
+pub(super) fn float_cond(cc: Cc) -> Cond {
     match cc {
         Cc::Eq => Cond::Eq,
         Cc::Ne => Cond::Ne,
@@ -1616,6 +1616,33 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     self.use_(args[1]),
                 ];
                 self.push_exit(i, |exit| MInst::StrByteAt { exit }, ops, none);
+            }
+            Op::IFCmp(cc) => {
+                let ops = [
+                    self.def(res.unwrap()),
+                    self.use_(args[0]),
+                    self.use_(args[1]),
+                    Operand::reg_temp(self.v.new_vreg(RegClass::Float)),
+                ];
+                self.push(MInst::IFCmp { cc }, &ops, none);
+            }
+            Op::NumCmp(cc) => {
+                // Arms for the kinds the operands' types allow (numbers).
+                let kinds = |v: Val| match f.ty(v).set & TypeSet::NUM {
+                    k if k.is_empty() => TypeSet::NUM,
+                    k => k,
+                };
+                let (kx, ky) = (kinds(args[0]), kinds(args[1]));
+                let ops = [
+                    self.def(res.unwrap()),
+                    self.use_(args[0]),
+                    self.use_(args[1]),
+                    Operand::reg_temp(self.v.new_vreg(RegClass::Float)),
+                    Operand::reg_temp(self.v.new_vreg(RegClass::Float)),
+                    Operand::reg_temp(self.v.new_vreg(RegClass::Int)),
+                    Operand::reg_temp(self.v.new_vreg(RegClass::Int)),
+                ];
+                self.push(MInst::NumCmp { cc, kx, ky }, &ops, none);
             }
             Op::IRem | Op::LRem => {
                 let sz = if op == Op::IRem { Sz::W } else { Sz::X };

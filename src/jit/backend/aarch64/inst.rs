@@ -5,7 +5,7 @@
 
 use crate::jit::backend::aarch64::asm::{Cond, Shift, Sz};
 use crate::jit::backend::vcode::TargetInst;
-use crate::jit::ir::ops::HelperId;
+use crate::jit::ir::ops::{Cc, HelperId};
 use crate::jit::ir::types::TypeSet;
 
 /// The exit of an entry guard: the region's entry-fail stub (6.4).
@@ -273,6 +273,17 @@ pub(crate) enum MInst {
     ClassMm(u8),
     /// `[def d, use t]`: the class bits of the table, 0 without a class.
     TabMmBits,
+    /// `[def d, use i, use f, temp t (float)]`: `IFCmp`.
+    IFCmp {
+        cc: Cc,
+    },
+    /// `[def d, use x, use y, temp fx, temp fy (float), temp ix, temp iy]`:
+    /// `NumCmp` of operands whose kinds are `kx`, `ky` (numbers).
+    NumCmp {
+        cc: Cc,
+        kx: TypeSet,
+        ky: TypeSet,
+    },
     /// `[def d, use s]`: a string's length.
     StrLenOf,
     /// `[def d, use s, use i, snap..]`: the byte of string `s` at Lua

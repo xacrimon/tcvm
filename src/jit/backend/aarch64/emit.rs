@@ -19,10 +19,10 @@ use crate::jit::backend::aarch64::asm::{
     Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
 };
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
-use crate::jit::backend::aarch64::lower::{LExit, Lowered, Src};
+use crate::jit::backend::aarch64::lower::{LExit, Lowered, Src, float_cond, int_cond};
 use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
 use crate::jit::backend::vcode::{Remat, VCode};
-use crate::jit::ir::ops::Ctx;
+use crate::jit::ir::ops::{Cc, Ctx};
 use crate::jit::ir::types::TypeSet;
 use crate::jit::layout;
 use crate::jit::layout::FUNCTION_TAG;
@@ -2120,6 +2120,76 @@ impl Em<'_> {
                 self.a
                     .ldr(d, s, crate::env::string::LuaString::LEN_OFFSET as i32);
             }
+            IFCmp { cc } => {
+                let (d, i, f, t) = (self.r(i, 0), self.r(i, 1), self.fr(i, 2), self.fr(i, 3));
+                let (slow, done) = (self.a.new_label(), self.a.new_label());
+                self.if_fast(d, i, f, t, cc, slow);
+                self.a.bind(done);
+                self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                    em.a.bind(slow);
+                    em.if_big(d, i, f, t, cc, done);
+                    em.a.b(done);
+                }));
+            }
+            NumCmp { cc, kx, ky } => {
+                let (d, x, y) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                let (fx, fy, ix, iy) = (self.fr(i, 3), self.fr(i, 4), self.r(i, 5), self.r(i, 6));
+                let float = |k: TypeSet| k.contains(TypeSet::FLOAT);
+                let int = |k: TypeSet| k.intersects(TypeSet::INT);
+                let (x_int, xf_y_int, done) =
+                    (self.a.new_label(), self.a.new_label(), self.a.new_label());
+                // Two floats inline; `x` an integer, or `y` one, out of line.
+                if !float(kx) {
+                    self.a.b(x_int);
+                } else {
+                    if int(kx) {
+                        self.is_float_or(x, x_int);
+                    }
+                    if !float(ky) {
+                        self.a.b(xf_y_int);
+                    } else {
+                        if int(ky) {
+                            self.is_float_or(y, xf_y_int);
+                        }
+                        self.a.fmov_from_gpr(fx, x);
+                        self.a.fmov_from_gpr(fy, y);
+                        self.a.fcmp(fx, fy);
+                        self.a.cset(Sz::W, d, float_cond(cc));
+                    }
+                }
+                self.a.bind(done);
+                self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                    if int(kx) {
+                        em.a.bind(x_int);
+                        em.unbox_int(ix, x);
+                        let xi_yf = em.a.new_label();
+                        if !int(ky) {
+                            em.a.b(xi_yf);
+                        } else {
+                            if float(ky) {
+                                em.is_float_or_not(y, xi_yf);
+                            }
+                            em.unbox_int(iy, y);
+                            em.a.cmp(Sz::X, ix, iy);
+                            em.a.cset(Sz::W, d, int_cond(cc));
+                            em.a.b(done);
+                        }
+                        em.a.bind(xi_yf);
+                        if float(ky) {
+                            em.a.fmov_from_gpr(fy, y);
+                            em.if_both(d, ix, fy, fx, cc);
+                        }
+                        em.a.b(done);
+                    }
+                    if float(kx) && int(ky) {
+                        em.a.bind(xf_y_int);
+                        em.unbox_int(iy, y);
+                        em.a.fmov_from_gpr(fx, x);
+                        em.if_both(d, iy, fx, fy, cc.swap());
+                        em.a.b(done);
+                    }
+                }));
+            }
             StrByteAt { exit } => {
                 use crate::env::string::LuaString;
                 let (d, s, p) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
@@ -2846,6 +2916,100 @@ impl Em<'_> {
     }
 
     /// Floor division or modulo of `n` by `m`.
+    /// `IFCmp`'s inline part: `d = i cc f` as floats while `|i| <= 2^53`
+    /// converts exactly (`i + 2^53` below 2^54, unsigned; 2^53 itself goes
+    /// to `slow`, which is exact too), else on to `slow`.
+    fn if_fast(&mut self, d: Gpr, i: Gpr, f: Fpr, t: Fpr, cc: Cc, slow: Label) {
+        self.a.movz(Sz::X, X16, 0x20, 3);
+        self.a.add(Sz::X, X16, i, X16);
+        self.a.lsr_imm(Sz::X, X16, X16, 54);
+        self.a.cbnz(Sz::X, X16, slow);
+        self.a.scvtf(Sz::X, t, i);
+        self.a.fcmp(t, f);
+        self.a.cset(Sz::W, d, float_cond(cc));
+    }
+
+    /// `IFCmp` past ±2^53, as Lua's `LTintfloat` and kin: a float whose
+    /// floor or ceiling is an i64 compares by it (`i < ceil f`, `i <= floor
+    /// f`, `floor f < i` for `Gt`, `ceil f <= i` for `Ge`, `i == floor f`,
+    /// exact as a non-integral float is below 2^53 in magnitude); a NaN is
+    /// false; any other float is above or below every integer by its sign.
+    fn if_big(&mut self, d: Gpr, i: Gpr, f: Fpr, t: Fpr, cc: Cc, done: Label) {
+        let (no, huge) = (self.a.new_label(), self.a.new_label());
+        self.a.fcmp(f, f);
+        self.a.b_cond(Cond::Vs, no);
+        match cc {
+            Cc::Lt | Cc::Ge => self.a.frintp(t, f),
+            _ => self.a.frintm(t, f),
+        }
+        // Out of i64 when `fcvtzs` saturates: to MAX, which no f64 is, or to
+        // a MIN that does not convert back (-2^63 itself does).
+        self.a.fcvtzs(Sz::X, X16, t);
+        self.a.cmn_imm(Sz::X, X16, 1);
+        self.a.b_cond(Cond::Vs, huge);
+        self.a.scvtf(Sz::X, D31, X16);
+        self.a.fcmp(D31, t);
+        self.a.b_cond(Cond::Ne, huge);
+        self.a.cmp(Sz::X, i, X16);
+        self.a.cset(Sz::W, d, int_cond(cc));
+        self.a.b(done);
+        self.a.bind(huge);
+        match cc {
+            Cc::Lt | Cc::Le => {
+                self.a.fcmp_zero(f);
+                self.a.cset(Sz::W, d, Cond::Gt);
+                self.a.b(done);
+            }
+            Cc::Gt | Cc::Ge => {
+                self.a.fcmp_zero(f);
+                self.a.cset(Sz::W, d, Cond::Mi);
+                self.a.b(done);
+            }
+            Cc::Eq => {}
+            _ => unreachable!("an int-float compare is ordered"),
+        }
+        self.a.bind(no);
+        self.a.movz(Sz::W, d, 0, 0);
+    }
+
+    /// `if_fast` and `if_big` in place, for code already out of line.
+    fn if_both(&mut self, d: Gpr, i: Gpr, f: Fpr, t: Fpr, cc: Cc) {
+        let (slow, done) = (self.a.new_label(), self.a.new_label());
+        self.if_fast(d, i, f, t, cc, slow);
+        self.a.b(done);
+        self.a.bind(slow);
+        self.if_big(d, i, f, t, cc, done);
+        self.a.bind(done);
+    }
+
+    /// Branch to `other` unless number `v` is a float.
+    fn is_float_or(&mut self, v: Gpr, other: Label) {
+        self.a.mov_imm(X16, BOX);
+        self.a.cmp(Sz::X, v, X16);
+        self.a.b_cond(Cond::Hs, other);
+    }
+
+    /// Branch to `float` if number `v` is a float.
+    fn is_float_or_not(&mut self, v: Gpr, float: Label) {
+        self.a.mov_imm(X16, BOX);
+        self.a.cmp(Sz::X, v, X16);
+        self.a.b_cond(Cond::Lo, float);
+    }
+
+    /// `d` = the i64 of integer `v`, small or boxed.
+    fn unbox_int(&mut self, d: Gpr, v: Gpr) {
+        let (big, done) = (self.a.new_label(), self.a.new_label());
+        self.a.lsr_imm(Sz::X, X16, v, 32);
+        self.a.cmn_imm(Sz::W, X16, 1);
+        self.a.b_cond(Cond::Ne, big);
+        self.a.sxtw(d, v);
+        self.a.b(done);
+        self.a.bind(big);
+        self.a.and_imm(Sz::X, X16, v, PTR_MASK);
+        self.a.ldr(d, X16, 0);
+        self.a.bind(done);
+    }
+
     fn divmod(&mut self, i: usize, div: bool, sz: Sz, nonzero: bool, minus1: bool, exit: u32) {
         let (d, n, m) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
         let l = self.exit(exit);

@@ -733,6 +733,15 @@ pub(crate) enum Op {
     /// the first operand, at Lua position `i` (`I64`, negative from the end);
     /// exits out of range.
     StrByteAt,
+    /// `i cc f` of an i64 and an f64 (`Eq`, `Lt`, `Le`, `Gt`, `Ge`), exact as
+    /// Lua compares them (`LTintfloat` and kin; equal when the float is that
+    /// integer): as floats while `|i| <= 2^53` converts exactly, else by the
+    /// float's floor or ceiling as an integer, out of line.
+    IFCmp(Cc),
+    /// `x cc y` (`Eq`, `Lt`, `Le`) of two numbers of any kinds, exact as
+    /// Lua's `LTnum`, `LEnum` and equality: two floats inline, integers and
+    /// mixes out of line (a mix as `IFCmp`).
+    NumCmp(Cc),
     /// Whether string `a` orders before (`StrLe`: not after) `b`, by bytes;
     /// the operands their payloads.
     StrLt,
@@ -1089,7 +1098,8 @@ impl Op {
                 },
                 refine: args[0].refine,
             },
-            IsType(_) | IsFalsy | SameBits | ICmp(_) | LCmp(_) | FCmp(_) | StrLt | StrLe => Ty::B1,
+            IsType(_) | IsFalsy | SameBits | ICmp(_) | LCmp(_) | FCmp(_) | IFCmp(_) | NumCmp(_)
+            | StrLt | StrLe => Ty::B1,
             Select => args[1].join(args[2]),
             Guard(set) | Refine(set) => Ty {
                 set: args[0].set & set,
