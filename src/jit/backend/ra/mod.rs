@@ -328,25 +328,37 @@ struct VInfo {
 
 /// The allocator, kept by the JIT runtime: the state of the function in
 /// hand and each phase's working buffers.
-pub(crate) struct Ctx {
+pub(crate) struct Ctx(std::mem::ManuallyDrop<Parts>);
+
+struct Parts {
     ra: Ra,
     live: Live,
     build: build::Build,
     resolve: resolve::Resolve,
 }
 
+impl Drop for Ctx {
+    /// Freeing the many buffers is a lot of code: once, here, not in every
+    /// crate that drops a state.
+    #[inline(never)]
+    fn drop(&mut self) {
+        // SAFETY: dropped once, here.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.0) }
+    }
+}
+
 impl Ctx {
     pub(crate) fn new(env: Env) -> Self {
-        Ctx {
+        Ctx(std::mem::ManuallyDrop::new(Parts {
             ra: Ra::new(env),
             live: Live::default(),
             build: build::Build::default(),
             resolve: resolve::Resolve::default(),
-        }
+        }))
     }
 
     pub(crate) fn env(&self) -> &Env {
-        &self.ra.env
+        &self.0.ra.env
     }
 
     /// Allocate `f`'s registers, its blocks taken in `order`: the first
@@ -357,12 +369,12 @@ impl Ctx {
         order: &[u32],
         hot: usize,
     ) -> Result<Output, String> {
-        let Ctx {
+        let Parts {
             ra,
             live,
             build,
             resolve,
-        } = self;
+        } = &mut *self.0;
         ra.clear();
         live.clear();
         build.clear();
