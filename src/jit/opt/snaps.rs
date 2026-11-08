@@ -1,171 +1,342 @@
 //! Snapshot re-pruning (`jit-design.md` 9.8): an exit need not restore a
-//! register whose slot still holds the value its snapshot names, a load of
-//! that slot no path from the load to the exit writes. A value only exits
-//! used then dies at its last other use instead of living to the last exit.
+//! register whose slot holds the value its snapshot names, so a value only
+//! exits use dies at its last other use. The slots' contents are followed
+//! through the region: a load tells what a slot holds, a store sets it, and
+//! a call clears what it keeps neither in its homes (`Func::call_homes`)
+//! nor in a slot its snapshot names with that very value, which joins its
+//! homes (the collector traces the slot in place while the call runs,
+//! `ThreadState::trace`).
 
 use crate::jit::FastMap;
+use crate::jit::build::cfg::RegSet;
 use crate::jit::ir::ops::{Mem, Op};
-use crate::jit::ir::{Block, CfgInfo, Func, Inst, NO_SNAP, Val};
+use crate::jit::ir::{Block, CfgInfo, Func, Inst, KEPT, List, NO_SNAP, SnapData, Val};
 
-/// Blocks as a bit set.
-type Blocks = Vec<u64>;
+/// A slot's contents when nothing is known.
+const UNKNOWN: Val = Val(u32::MAX);
+const NONE: u16 = u16::MAX;
 
-fn has(s: &Blocks, b: Block) -> bool {
-    s[b.idx() / 64] >> (b.idx() % 64) & 1 != 0
+/// `v` without its boxing, guards and refinements: the slot value it is.
+fn canon(f: &Func<'_>, mut v: Val) -> Val {
+    while let Some(i) = f.def_inst(v)
+        && matches!(
+            f.op(i),
+            Op::Box | Op::Unbox(_) | Op::Guard(_) | Op::Refine(_)
+        )
+    {
+        v = f.args(i)[0];
+    }
+    v
 }
 
-/// The slots one instruction writes: `Some(r)` for one, `None` for any.
-fn writes(op: Op) -> Option<Option<u8>> {
-    match op {
-        Op::Store(r) => Some(Some(r)),
-        op if op.effects().writes.contains(Mem::SLOT) => Some(None),
-        _ => None,
+/// What an instruction does to the slots followed: sets one (a load tells,
+/// a store puts), is a call, writes the captured ones (a cell store) or
+/// any, or exits with a snapshot, read before the instruction acts.
+#[derive(Clone, Copy)]
+enum Ev {
+    Set(u16, Val),
+    Call(Inst),
+    Cells,
+    All,
+    Exit(Inst),
+}
+
+/// The contents of the slots snapshots name and the region loads or
+/// stores, through it.
+struct Slots<'a, 'gc> {
+    f: &'a Func<'gc>,
+    cfg: &'a CfgInfo,
+    /// The slots followed, and each slot's index among them.
+    regs: Vec<u8>,
+    idx: [u16; 256],
+    /// Each block's events, a range of `evs`.
+    evs: Vec<Ev>,
+    range: Vec<(u32, u32)>,
+    /// Registers a call's snapshot names with the slot's own value that it
+    /// does not keep after all: another call of the snapshot does not.
+    forbid: FastMap<u32, RegSet>,
+    /// Each block's contents at its end, once reached.
+    out: Vec<Val>,
+    reached: Vec<bool>,
+}
+
+impl<'a, 'gc> Slots<'a, 'gc> {
+    fn new(f: &'a Func<'gc>, cfg: &'a CfgInfo) -> Option<Self> {
+        let (mut named, mut touched) = (RegSet::EMPTY, RegSet::EMPTY);
+        for &b in &cfg.rpo {
+            for &i in f.insts_of(b) {
+                match f.op(i) {
+                    Op::Load(r) | Op::Store(r) => touched.insert(r as usize),
+                    _ => {}
+                }
+                for &(r, _) in f.snap_entries(i) {
+                    if r != KEPT {
+                        named.insert(r as usize);
+                    }
+                }
+            }
+        }
+        for (n, t) in named.0.iter_mut().zip(&touched.0) {
+            *n &= t;
+        }
+        let regs: Vec<u8> = named.iter().map(|r| r as u8).collect();
+        if regs.is_empty() {
+            return None;
+        }
+        let mut idx = [NONE; 256];
+        for (k, &r) in regs.iter().enumerate() {
+            idx[r as usize] = k as u16;
+        }
+        let cells = regs.iter().any(|&r| f.captured.contains(r as usize));
+        let (mut evs, mut range) = (Vec::new(), vec![(0, 0); f.blocks.len()]);
+        for &b in &cfg.rpo {
+            let start = evs.len() as u32;
+            for &i in f.insts_of(b) {
+                let op = f.op(i);
+                match op {
+                    Op::Call { .. } | Op::CallMm { .. } => evs.push(Ev::Call(i)),
+                    _ if f.insts[i.idx()].snap != NO_SNAP => evs.push(Ev::Exit(i)),
+                    _ => {}
+                }
+                match op {
+                    Op::Load(r) if idx[r as usize] != NONE => {
+                        evs.push(Ev::Set(idx[r as usize], f.result(i)));
+                    }
+                    Op::Store(r) if idx[r as usize] != NONE => {
+                        evs.push(Ev::Set(idx[r as usize], canon(f, f.args(i)[0])));
+                    }
+                    Op::Load(_) | Op::Store(_) | Op::Call { .. } | Op::CallMm { .. } => {}
+                    // A cell is a slot of the frame only when a closure captured it.
+                    Op::CellStore if cells => evs.push(Ev::Cells),
+                    op if op.effects().writes.contains(Mem::SLOT) => evs.push(Ev::All),
+                    _ => {}
+                }
+            }
+            range[b.idx()] = (start, evs.len() as u32);
+        }
+        Some(Slots {
+            f,
+            cfg,
+            out: vec![UNKNOWN; f.blocks.len() * regs.len()],
+            reached: vec![false; f.blocks.len()],
+            regs,
+            idx,
+            evs,
+            range,
+            forbid: FastMap::default(),
+        })
+    }
+
+    fn events(&self, b: Block) -> &[Ev] {
+        let (lo, hi) = self.range[b.idx()];
+        &self.evs[lo as usize..hi as usize]
+    }
+
+    /// The index of slot `r` among those followed, or `NONE`.
+    #[inline]
+    fn at(&self, r: u8) -> u16 {
+        self.idx[r as usize]
+    }
+
+    /// The contents at `b`'s start, from the predecessors reached so far.
+    fn meet(&self, b: Block, st: &mut [Val]) {
+        let n = self.regs.len();
+        let mut any = false;
+        for &p in self.cfg.preds(b) {
+            if b == self.f.entry || !self.reached[p.idx()] {
+                continue;
+            }
+            let o = &self.out[p.idx() * n..][..n];
+            if !std::mem::replace(&mut any, true) {
+                st.copy_from_slice(o);
+            } else {
+                for (x, &y) in st.iter_mut().zip(o) {
+                    if *x != y {
+                        *x = UNKNOWN;
+                    }
+                }
+            }
+        }
+        if !any {
+            st.fill(UNKNOWN);
+        }
+    }
+
+    /// `st` after `ev`; at a call, the registers it newly keeps in place go
+    /// to `kept`.
+    fn step(&self, st: &mut [Val], ev: Ev, mut kept: Option<&mut RegSet>) {
+        let f = self.f;
+        match ev {
+            Ev::Set(k, v) => st[k as usize] = v,
+            Ev::Call(i) => {
+                let (Op::Call { a: hdr, .. } | Op::CallMm { hdr, .. }) = f.op(i) else {
+                    unreachable!()
+                };
+                let s = f.insts[i.idx()].snap;
+                let homes = f.call_homes.get(&s);
+                let forbid = self.forbid.get(&s);
+                for (x, &r) in st.iter_mut().zip(&self.regs) {
+                    let r = r as usize;
+                    if r >= hdr as usize || f.captured.contains(r) {
+                        *x = UNKNOWN;
+                    } else if !homes.is_some_and(|h| h.contains(r)) {
+                        let holds = !forbid.is_some_and(|h| h.contains(r))
+                            && (f.entries(s).iter())
+                                .any(|&(er, v)| er as usize == r && canon(f, v) == *x);
+                        match kept.as_deref_mut() {
+                            Some(kept) if holds => kept.insert(r),
+                            _ if holds => {}
+                            _ => *x = UNKNOWN,
+                        }
+                    }
+                }
+            }
+            Ev::Cells => {
+                for (x, &r) in st.iter_mut().zip(&self.regs) {
+                    if f.captured.contains(r as usize) {
+                        *x = UNKNOWN;
+                    }
+                }
+            }
+            Ev::All => st.fill(UNKNOWN),
+            Ev::Exit(_) => {}
+        }
+    }
+
+    /// The contents at every block's end: a fixpoint, each slot's contents
+    /// only ever becoming unknown.
+    fn flow(&mut self) {
+        let n = self.regs.len();
+        let mut st = vec![UNKNOWN; n];
+        self.reached.fill(false);
+        loop {
+            let mut changed = false;
+            for &b in &self.cfg.rpo {
+                self.meet(b, &mut st);
+                for &ev in self.events(b) {
+                    self.step(&mut st, ev, None);
+                }
+                let o = &mut self.out[b.idx() * n..][..n];
+                if !self.reached[b.idx()] || o != &st[..] {
+                    o.copy_from_slice(&st);
+                    self.reached[b.idx()] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+
+    /// What each call keeps in place; a snapshot several calls share keeps
+    /// what all of them do, the rest forbidden. Whether anything was.
+    fn settle(&mut self) -> bool {
+        let n = self.regs.len();
+        let mut st = vec![UNKNOWN; n];
+        let mut by_snap: FastMap<u32, (RegSet, RegSet)> = FastMap::default();
+        for &b in &self.cfg.rpo {
+            self.meet(b, &mut st);
+            for &ev in self.events(b) {
+                let mut kept = RegSet::EMPTY;
+                self.step(&mut st, ev, Some(&mut kept));
+                if let Ev::Call(i) = ev {
+                    let s = self.f.insts[i.idx()].snap;
+                    let e = by_snap.entry(s).or_insert((kept, kept));
+                    for w in 0..4 {
+                        e.0.0[w] &= kept.0[w];
+                        e.1.0[w] |= kept.0[w];
+                    }
+                }
+            }
+        }
+        let mut more = false;
+        for (s, (all, mut any)) in by_snap {
+            any.minus(&all);
+            if any != RegSet::EMPTY {
+                self.forbid.entry(s).or_default().union(&any);
+                more = true;
+            }
+        }
+        more
     }
 }
 
 pub(crate) fn prune_snapshots(f: &mut Func<'_>) {
     let cfg = f.cfg();
-    let nb = f.blocks.len();
-    let words = nb.div_ceil(64);
-    // The slots each block writes, and whether it may write any.
-    let mut wrote = vec![[0u64; 4]; nb];
-    let mut any = vec![false; nb];
-    for &b in &cfg.rpo {
-        for &i in f.insts_of(b) {
-            match writes(f.op(i)) {
-                Some(Some(r)) => wrote[b.idx()][r as usize / 64] |= 1 << (r % 64),
-                Some(None) => any[b.idx()] = true,
-                None => {}
-            }
+    let Some(mut slots) = Slots::new(f, &cfg) else {
+        return;
+    };
+    loop {
+        slots.flow();
+        if !slots.settle() {
+            break;
         }
     }
-    let block_writes =
-        |b: Block, r: u8| any[b.idx()] || wrote[b.idx()][r as usize / 64] >> (r % 64) & 1 != 0;
-    // From a load's block, the blocks a path reaches without entering it
-    // again (which would load again), and those reaching an exit's block.
-    let mut fwd: FastMap<Block, Blocks> = FastMap::default();
-    let mut bwd: FastMap<(Block, Block), Blocks> = FastMap::default();
-    let mut done: FastMap<(u32, Vec<bool>), u32> = FastMap::default();
-    for bi in 0..nb {
-        let b = Block(bi as u32);
-        if f.blocks[bi].dead {
-            continue;
-        }
-        for k in 0..f.insts_of(b).len() {
-            let e = f.insts_of(b)[k];
-            let s = f.insts[e.idx()].snap;
-            // A call-site snapshot names what the frame keeps in spill slots
-            // for the collector, whatever its home slot holds.
-            if s == NO_SNAP || matches!(f.op(e), Op::Call { .. } | Op::CallMm { .. }) {
-                continue;
-            }
-            let entries = f.entries(s).to_vec();
-            let keep: Vec<bool> = entries
-                .iter()
-                .map(|&(r, v)| {
-                    let Some((l, lr)) = root_load(f, v) else {
-                        return true;
-                    };
-                    if lr != r {
-                        return true;
-                    }
-                    let lb = f.insts[l.idx()].block;
-                    let fw = fwd
-                        .entry(lb)
-                        .or_insert_with(|| reach(f, &cfg, lb, words, true, lb));
-                    let bw = bwd
-                        .entry((b, lb))
-                        .or_insert_with(|| reach(f, &cfg, b, words, false, lb));
-                    written(f, l, e, r, &block_writes, fw, bw)
-                })
-                .collect();
-            if keep.iter().all(|&x| x) {
-                continue;
-            }
-            let ns = *done.entry((s, keep.clone())).or_insert_with(|| {
-                let d = f.snaps[s as usize];
-                let from = f.snap_pool.len();
-                for (&x, &(r, v)) in keep.iter().zip(&entries) {
-                    if x {
-                        f.snap_pool.push((r, v));
+    // Each exit's entries whose slot holds the value, and what each call
+    // keeps in place.
+    let mut pruned: Vec<(Inst, u32, u32)> = Vec::new();
+    let mut bits: Vec<bool> = Vec::new();
+    let mut homes: Vec<(u32, RegSet)> = Vec::new();
+    let mut st = vec![UNKNOWN; slots.regs.len()];
+    for &b in &cfg.rpo {
+        slots.meet(b, &mut st);
+        for &ev in slots.events(b) {
+            let mut kept = RegSet::EMPTY;
+            match ev {
+                Ev::Exit(i) => {
+                    let from = bits.len();
+                    bits.extend((f.snap_entries(i).iter()).map(|&(r, v)| {
+                        let k = slots.at(r);
+                        k != NONE && st[k as usize] == canon(f, v)
+                    }));
+                    if bits[from..].contains(&true) {
+                        pruned.push((i, from as u32, bits.len() as u32));
+                    } else {
+                        bits.truncate(from);
                     }
                 }
-                f.finish_snap(d.frame, d.pc, d.kind, from).0
-            });
-            f.insts[e.idx()].snap = ns;
+                Ev::Call(i) => {
+                    slots.step(&mut st, ev, Some(&mut kept));
+                    if kept != RegSet::EMPTY {
+                        homes.push((f.insts[i.idx()].snap, kept));
+                    }
+                }
+                ev => slots.step(&mut st, ev, None),
+            }
         }
     }
-}
-
-/// The load a snapshot value is, through boxing and refinement.
-fn root_load(f: &Func<'_>, mut v: Val) -> Option<(Inst, u8)> {
-    loop {
-        let i = f.def_inst(v)?;
-        match f.op(i) {
-            Op::Box | Op::Unbox(_) | Op::Guard(_) | Op::Refine(_) => v = f.args(i)[0],
-            Op::Load(r) => return Some((i, r)),
-            _ => return None,
-        }
+    for (s, kept) in homes {
+        f.call_homes.entry(s).or_default().union(&kept);
     }
-}
-
-/// The blocks reachable from `b`'s successors (`forward`) or reaching its
-/// predecessors, without passing through `avoid`.
-fn reach(
-    f: &Func<'_>,
-    cfg: &CfgInfo,
-    b: Block,
-    words: usize,
-    forward: bool,
-    avoid: Block,
-) -> Blocks {
-    let mut set = vec![0u64; words];
-    let mut work: Vec<Block> = if forward {
-        f.succs(b).collect()
-    } else {
-        cfg.preds(b).to_vec()
-    };
-    while let Some(x) = work.pop() {
-        if x == avoid || has(&set, x) {
-            continue;
-        }
-        set[x.idx() / 64] |= 1 << (x.idx() % 64);
-        if forward {
-            work.extend(f.succs(x));
-        } else {
-            work.extend_from_slice(cfg.preds(x));
-        }
+    // The same snapshot less the same entries is made once.
+    let mut done: FastMap<(u32, Vec<bool>), u32> = FastMap::default();
+    let mut key = (0, Vec::new());
+    for (i, from, to) in pruned {
+        let s = f.insts[i.idx()].snap;
+        key.0 = s;
+        key.1.clear();
+        key.1.extend_from_slice(&bits[from as usize..to as usize]);
+        let ns = match done.get(&key) {
+            Some(&ns) => ns,
+            None => {
+                let d = f.snaps[s as usize];
+                let start = f.snap_pool.len() as u32;
+                for (k, &gone) in key.1.iter().enumerate() {
+                    if !gone {
+                        let e = f.snap_pool[d.entries.start as usize + k];
+                        f.snap_pool.push(e);
+                    }
+                }
+                let len = f.snap_pool.len() as u32 - start;
+                f.snaps.push(SnapData {
+                    entries: List { start, len },
+                    ..d
+                });
+                done.insert(key.clone(), f.snaps.len() as u32 - 1);
+                f.snaps.len() as u32 - 1
+            }
+        };
+        f.insts[i.idx()].snap = ns;
     }
-    set
-}
-
-/// Whether some path from load `l` to exit `e` may write slot `r`.
-fn written(
-    f: &Func<'_>,
-    l: Inst,
-    e: Inst,
-    r: u8,
-    block_writes: &impl Fn(Block, u8) -> bool,
-    fwd: &Blocks,
-    bwd: &Blocks,
-) -> bool {
-    let (lb, eb) = (f.insts[l.idx()].block, f.insts[e.idx()].block);
-    let hits = |insts: &[Inst]| {
-        insts
-            .iter()
-            .any(|&i| writes(f.op(i)).is_some_and(|w| w.is_none_or(|x| x == r)))
-    };
-    let li = f.insts_of(lb).iter().position(|&i| i == l).unwrap();
-    let ei = f.insts_of(eb).iter().position(|&i| i == e).unwrap();
-    if lb == eb {
-        // `l` dominates `e`; a path leaving the block loads again.
-        return hits(&f.insts_of(lb)[li + 1..ei]);
-    }
-    if hits(&f.insts_of(lb)[li + 1..]) || hits(&f.insts_of(eb)[..ei]) {
-        return true;
-    }
-    (0..f.blocks.len()).any(|x| {
-        let x = Block(x as u32);
-        has(fwd, x) && has(bwd, x) && x != eb && block_writes(x, r)
-    }) || (has(fwd, eb) && has(bwd, eb) && block_writes(eb, r))
 }
