@@ -2,7 +2,9 @@
 //! arguments, snapshot entries), terminators, edge arity, snapshots on every
 //! exiting instruction, and R6 (nothing but constants lives across a call).
 
-use crate::jit::ir::{Block, CfgInfo, Func, Inst, NO_SNAP, Val, ValDef};
+use crate::jit::ir::{Block, CfgInfo, Func};
+#[cfg(feature = "tcvm-dev")]
+use crate::jit::ir::{Inst, NO_SNAP, Val, ValDef};
 
 /// Dominators by the Cooper-Harvey-Kennedy iteration over an RPO.
 pub(crate) fn dominators(f: &Func<'_>, cfg: &CfgInfo) -> Vec<Option<Block>> {
@@ -60,6 +62,7 @@ pub(crate) fn dominates(idom: &[Option<Block>], a: Block, mut b: Block) -> bool 
     }
 }
 
+#[cfg(feature = "tcvm-dev")]
 pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
     let cfg = f.cfg();
     let rpo = &cfg.rpo;
@@ -160,6 +163,7 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
 /// Once the call-boundary pass ran, what is live across a call is a value
 /// its snapshot names, a constant, or a table's pointer whose table it
 /// names (C1).
+#[cfg(feature = "tcvm-dev")]
 fn check_r6(f: &Func<'_>, rpo: &[Block], _pos: &[(Block, usize)]) -> Result<(), String> {
     if !f.boundaries {
         return Ok(());
@@ -279,6 +283,7 @@ pub(crate) fn live_in(f: &Func<'_>, rpo: &[Block]) -> Vec<ValSet> {
 }
 
 /// Each operation's operands are the representations it takes.
+#[cfg(feature = "tcvm-dev")]
 fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
     use crate::jit::ir::ops::Op::*;
     use crate::jit::ir::types::Rep::{self, *};

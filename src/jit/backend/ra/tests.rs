@@ -635,7 +635,8 @@ fn check_operands(v: &VCode<T>, out: &Output) -> Result<(), String> {
 }
 
 /// 300 functions by default; `TCVM_RA_CASES` runs more (a change to the
-/// allocator wants 100k or more, in a release build), from `TCVM_RA_SEED`.
+/// allocator wants 100k or more, in a release build), from `TCVM_RA_SEED`;
+/// `TCVM_RA_RECORD=dir` records each (`corpus`).
 #[test]
 fn random_functions_allocate_correctly() {
     let env = env();
@@ -647,12 +648,17 @@ fn random_functions_allocate_correctly() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let record = std::env::var("TCVM_RA_RECORD").ok();
     for seed in first..first + n {
         let (v, order, hot) = generate(seed);
         let out = match run(&v, &env, &order, hot) {
             Ok(out) => out,
             Err(e) => panic!("seed {seed}: {e}"),
         };
+        if let Some(dir) = &record {
+            let rec = super::corpus::write(&v, &env, &order, hot, &out);
+            std::fs::write(format!("{dir}/seed-{seed:07}.ra"), rec).expect("writing a record");
+        }
         let mut checker = super::checker::Checker::new(&v);
         let (remat, src) = super::remat_table(&v);
         checker.allow_unmaterialized(remat, src);
@@ -664,4 +670,69 @@ fn random_functions_allocate_correctly() {
             panic!("seed {seed}: {e}\n{}", v.print(&out, &order));
         }
     }
+}
+
+/// Every allocation recorded in `TCVM_RA_CORPUS` (`corpus`) comes out the
+/// same and passes the checker; then all of them are allocated
+/// `TCVM_RA_ROUNDS` times (default 0), timed. In a release build:
+/// `TCVM_RA_CORPUS=dir cargo test --release --lib recorded -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn recorded_allocations_stay_the_same() {
+    let dir = std::env::var("TCVM_RA_CORPUS").expect("TCVM_RA_CORPUS");
+    let rounds: u32 = std::env::var("TCVM_RA_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut paths: Vec<_> = (std::fs::read_dir(&dir).expect("the corpus directory"))
+        .map(|e| e.expect("an entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ra"))
+        .collect();
+    paths.sort();
+    let cases: Vec<_> = (paths.iter())
+        .map(|p| {
+            let d = std::fs::read(p).expect("a record");
+            let mk = |b: bool| if b { T::Br } else { T::Op };
+            super::corpus::read(&d, mk).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+        })
+        .collect();
+    let mut differ = 0;
+    for (p, c) in paths.iter().zip(&cases) {
+        let out =
+            run(&c.f, &c.env, &c.order, c.hot).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let same = out.num_spillslots == c.out.num_spillslots
+            && out.edits == c.out.edits
+            && out.allocs == c.out.allocs
+            && out.inst_alloc_offsets == c.out.inst_alloc_offsets;
+        if !same {
+            differ += 1;
+            if differ <= 5 {
+                eprintln!("{}: allocation differs", p.display());
+            }
+        }
+        let mut checker = super::checker::Checker::new(&c.f);
+        let (remat, src) = super::remat_table(&c.f);
+        checker.allow_unmaterialized(remat, src);
+        checker.prepare(&out);
+        if let Err(e) = checker.run() {
+            panic!("{}: {e:?}", p.display());
+        }
+    }
+    let insts: usize = cases.iter().map(|c| c.f.num_insts()).sum();
+    if rounds > 0 {
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            for c in &cases {
+                std::hint::black_box(run(&c.f, &c.env, &c.order, c.hot).expect("allocated once"));
+            }
+        }
+        let ns = t.elapsed().as_nanos() as f64 / rounds as f64;
+        eprintln!(
+            "{} allocations, {insts} instructions: {:.3} ms a round, {:.1} ns an instruction",
+            cases.len(),
+            ns / 1e6,
+            ns / insts as f64
+        );
+    }
+    assert_eq!(differ, 0, "{differ} of {} allocations differ", cases.len());
 }

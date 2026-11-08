@@ -473,6 +473,7 @@ impl MInst {
 }
 
 impl TargetInst for MInst {
+    #[cfg(feature = "tcvm-dev")]
     fn is_branch(&self) -> bool {
         matches!(
             self,

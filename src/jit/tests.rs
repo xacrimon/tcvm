@@ -47,7 +47,7 @@ pub(crate) fn ir_of(src: &str, name: &str, pc: u32) -> String {
             &opts,
             std::ptr::null(),
             &[],
-            &mut Default::default(),
+            &mut crate::jit::compile::Times::new(),
         ) {
             Ok((func, _)) => func.print(),
             Err(e) => panic!("{e:?}"),
@@ -480,7 +480,7 @@ fn hoisted_inlined_bounds_miss_at_the_callee() {
             .collect();
         // Compiled at once (`TCVM_JIT_HOT_*`), no feedback makes the check.
         let config = &ctx.jit().config;
-        assert!(config.hot_call <= 1 || config.hot_loop <= 1 || !hoisted.is_empty());
+        assert!(config.dev.hot_call <= 1 || config.dev.hot_loop <= 1 || !hoisted.is_empty());
         assert!(hoisted.iter().all(|&p| crate::dmm::Gc::ptr_eq(p, at.proto)));
     });
 }

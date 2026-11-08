@@ -12,11 +12,16 @@ TCVM is a Lua 5.5 implementation in Rust: parser, compiler, direct-threaded inte
 ## Build and test
 ```sh
 cargo build --release --workspace   # plain `cargo build` does not rebuild cli/, so tcvm-cli goes stale
-cargo test --workspace
+cargo build --release --workspace --features tcvm/tcvm-dev   # with the development knobs below
+cargo test --workspace               # tests always have `tcvm-dev`
 INSTA_UPDATE=always cargo test       # accept new snapshots, then check them against `lua`
-cargo clippy --workspace
+cargo clippy --workspace --all-targets --features tcvm/tcvm-dev
 cargo fmt
 ```
+The `tcvm-dev` feature holds everything that exists for development only: the IR verifier and
+allocation checker, dumps, timing, the test modes and every `TCVM_*` knob but `TCVM_JIT=off`, plus
+the `Lua` test hooks (`set_jit_inline`, `stop_gc_stress`, `jit_internal_errors`). A plain release
+build has none of it; the tools under `tools/` and `.claude/docs/tools` need the dev build.
 Workspace: `tcvm` (root), `derive/` (`#[derive(Collect)]`), `cli/` (`tcvm-cli`). Toolchain is pinned nightly (`rust-toolchain.toml`), edition 2024; nightly features are listed in `src/lib.rs`.
 
 Tests: `tests/suite/*.rs` (runtime), `test-files/*.lua` (snapshots), `src/compiler/snapshots`, `cli/tests`. Fix a behavior bug together with a regression test. Never reach the tested path through a limitation that planned work removes; force it explicitly (e.g. `Lua::set_jit_inline(false)`).
@@ -32,8 +37,8 @@ Tests: `tests/suite/*.rs` (runtime), `test-files/*.lua` (snapshots), `src/compil
 
 Use rust-analyzer for anything the module docs don't answer; don't rely on this file for details.
 
-## JIT knobs (env)
-`TCVM_JIT=off`, `TCVM_JIT_HOT_CALL=N`/`TCVM_JIT_HOT_LOOP=N` (1 = compile at first count), `TCVM_JIT_DEOPT_ALL=1`, `TCVM_JIT_INLINE=0`, `TCVM_JIT_DUMP=ir,opt,vcode,asm`, `TCVM_JIT_LOG=1`, `TCVM_JIT_CHECK=1`, `TCVM_JIT_ONLY=…`, `TCVM_GC_STRESS`. The Bash tool runs zsh: `env $m` with several variables in `$m` sets only the first, so use `env ${=m}`.
+## JIT knobs (env, `tcvm-dev` builds)
+`TCVM_JIT=off` (every build), `TCVM_JIT_HOT_CALL=N`/`TCVM_JIT_HOT_LOOP=N` (1 = compile at first count), `TCVM_JIT_DEOPT_ALL=1`, `TCVM_JIT_INLINE=0`, `TCVM_JIT_DUMP=ir,opt,vcode,asm`, `TCVM_JIT_LOG=1`, `TCVM_JIT_CHECK=1`, `TCVM_JIT_TIME=1`, `TCVM_JIT_ONLY=…`, `TCVM_JIT_FAR=1`, `TCVM_JIT_RA_CAPTURE=dir`, `TCVM_GC_STRESS=N`. The Bash tool runs zsh: `env $m` with several variables in `$m` sets only the first, so use `env ${=m}`.
 
 ## Working style
 - Planning or brainstorming: ask clarifying questions one at a time; don't create tasks, spawn subagents, or write plan files until explicitly approved.

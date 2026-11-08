@@ -6,6 +6,7 @@ use crate::env::value::Value;
 use crate::jit::build::cfg::{Cfg, CfgError};
 use crate::jit::build::{BuildError, Builder, remove_trivial_params, value_set};
 use crate::jit::ir::types::TypeSet;
+#[cfg(feature = "tcvm-dev")]
 use crate::jit::ir::verify::verify;
 use crate::jit::ir::{DepOn, Func};
 use crate::jit::opt;
@@ -28,6 +29,7 @@ pub(crate) enum CompileError {
 
 impl CompileError {
     /// A failure of the compiler rather than a refusal of the code.
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) fn internal(&self) -> bool {
         matches!(self, CompileError::Verify(_) | CompileError::Backend(_))
     }
@@ -73,23 +75,69 @@ impl From<BuildError> for CompileError {
 }
 
 pub(crate) struct Options {
+    /// Verify the IR after each pass group and check the allocation.
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) check: bool,
+    /// Every exit leaves (the test mode).
     pub(crate) deopt_all: bool,
 }
 
-/// Microseconds spent per stage of one compile.
-#[derive(Default, Debug)]
-pub(crate) struct Times {
-    pub(crate) build: u128,
-    pub(crate) passes: u128,
-    pub(crate) lower: u128,
-    pub(crate) regalloc: u128,
-    pub(crate) emit: u128,
-    /// Each pass's share of `passes`, summed over its runs (F1).
-    pub(crate) pass: Vec<(&'static str, u128)>,
+impl Options {
+    fn of(config: &crate::jit::state::JitConfig) -> Options {
+        #[cfg(feature = "tcvm-dev")]
+        return Options {
+            check: config.dev.check,
+            deopt_all: config.dev.deopt_all,
+        };
+        #[cfg(not(feature = "tcvm-dev"))]
+        {
+            let _ = config;
+            Options { deopt_all: false }
+        }
+    }
 }
 
+/// A compile's stages, in order.
+#[cfg(feature = "tcvm-dev")]
+#[derive(Clone, Copy)]
+enum Stage {
+    Build,
+    Passes,
+    Lower,
+    Regalloc,
+    Emit,
+}
+
+/// Microseconds spent per stage and pass of one compile (`TCVM_JIT_TIME`);
+/// nothing without `tcvm-dev`.
+#[cfg(feature = "tcvm-dev")]
+pub(crate) struct Times {
+    last: std::time::Instant,
+    stages: [u128; 5],
+    /// Each pass's share of `Passes`, summed over its runs (F1).
+    pass: Vec<(&'static str, u128)>,
+}
+
+#[cfg(not(feature = "tcvm-dev"))]
+pub(crate) struct Times;
+
+#[cfg(feature = "tcvm-dev")]
 impl Times {
+    pub(crate) fn new() -> Times {
+        Times {
+            last: std::time::Instant::now(),
+            stages: [0; 5],
+            pass: Vec::new(),
+        }
+    }
+
+    /// Stage `s` ends here.
+    fn mark(&mut self, s: Stage) {
+        let now = std::time::Instant::now();
+        self.stages[s as usize] = (now - self.last).as_micros();
+        self.last = now;
+    }
+
     /// Run `f` as the pass `name`, adding its time.
     fn timed<T>(&mut self, name: &'static str, f: impl FnOnce() -> T) -> T {
         let t = std::time::Instant::now();
@@ -100,6 +148,29 @@ impl Times {
             None => self.pass.push((name, us)),
         }
         r
+    }
+}
+
+#[cfg(not(feature = "tcvm-dev"))]
+impl Times {
+    pub(crate) fn new() -> Times {
+        Times
+    }
+
+    #[inline(always)]
+    fn timed<T>(&mut self, _: &'static str, f: impl FnOnce() -> T) -> T {
+        f()
+    }
+}
+
+/// The IR for an error message, with `tcvm-dev`.
+fn ir_text(f: &Func<'_>) -> String {
+    #[cfg(feature = "tcvm-dev")]
+    return f.print();
+    #[cfg(not(feature = "tcvm-dev"))]
+    {
+        let _ = f;
+        String::new()
     }
 }
 
@@ -114,7 +185,6 @@ pub(crate) fn build_ir<'gc>(
     seen: &[(u8, TypeSet)],
     times: &mut Times,
 ) -> Result<(Func<'gc>, Cfg), CompileError> {
-    let start = std::time::Instant::now();
     let mut code: Vec<_> = closure
         .proto
         .code
@@ -141,15 +211,18 @@ pub(crate) fn build_ir<'gc>(
         closure.proto.ir_size.set(f.built() as u32);
     }
     let check = |f: &Func<'gc>, stage: &str| -> Result<(), CompileError> {
+        #[cfg(feature = "tcvm-dev")]
         if opts.check {
             verify(f)
                 .map_err(|e| CompileError::Verify(format!("after {stage}: {e}\n{}", f.print())))?;
         }
+        #[cfg(not(feature = "tcvm-dev"))]
+        let _ = (f, stage);
         Ok(())
     };
     check(&f, "build")?;
-    let built = std::time::Instant::now();
-    times.build = (built - start).as_micros();
+    #[cfg(feature = "tcvm-dev")]
+    times.mark(Stage::Build);
     let mut kinds = EntryKinds {
         frame: Vec::new(),
         seen: seen.to_vec(),
@@ -188,13 +261,14 @@ pub(crate) fn build_ir<'gc>(
     }
     times.timed("test words", || opt::words::place(&mut f));
     if let Err(e) = times.timed("calls", || opt::calls::call_boundaries(&mut f)) {
-        return Err(CompileError::Verify(format!("{e}\n{}", f.print())));
+        return Err(CompileError::Verify(format!("{e}\n{}", ir_text(&f))));
     }
     times.timed("verify", || check(&f, "call boundaries"))?;
     times.timed("snapshots", || opt::snaps::prune_snapshots(&mut f));
     times.timed("dce", || opt::dce(&mut f));
     times.timed("verify", || check(&f, "snapshot pruning"))?;
-    times.passes = built.elapsed().as_micros();
+    #[cfg(feature = "tcvm-dev")]
+    times.mark(Stage::Passes);
     if !opt::completes(&f) {
         return Err(CompileError::Useless);
     }
@@ -351,12 +425,9 @@ pub(crate) fn compile<'gc>(
     use crate::jit::backend::aarch64::{abi, emit, lower};
     use crate::jit::region::{ExitInfo, Region, encode_snap};
     let config = &ctx.jit().config;
-    let opts = Options {
-        check: config.check,
-        deopt_all: config.deopt_all,
-    };
+    let opts = Options::of(config);
     note_upvalues_offset(closure);
-    let mut times = Times::default();
+    let mut times = Times::new();
     let (mut f, cfg) = build_ir(ctx, closure, pc, &opts, frame, seen, &mut times)?;
     let mut nest = Vec::new();
     if f.meta.loop_entry {
@@ -367,29 +438,47 @@ pub(crate) fn compile<'gc>(
         }
     }
     opt::split_critical_edges(&mut f);
+    #[cfg(feature = "tcvm-dev")]
     if opts.check {
         verify(&f)
             .map_err(|e| CompileError::Verify(format!("after splitting: {e}\n{}", f.print())))?;
     }
-    if config.dump.ir || config.dump.opt {
+    #[cfg(feature = "tcvm-dev")]
+    if config.dev.dump.ir || config.dev.dump.opt {
         eprintln!("-- jit ir {} pc{pc}\n{}", chunk_name(closure), f.print());
     }
-    let t = std::time::Instant::now();
     // A function region of a prototype without varargs is what a compiled
     // caller's `blr` can enter (5.4).
     let enterable = pc == 0 && !f.meta.loop_entry && !closure.proto.is_vararg;
     let own = enterable.then(|| closure.proto.ptr.as_ptr() as u64);
     let lowered = lower::lower(&f, closure.code as usize, own).map_err(CompileError::Backend)?;
-    times.lower = t.elapsed().as_micros();
-    let t = std::time::Instant::now();
+    #[cfg(feature = "tcvm-dev")]
+    times.mark(Stage::Lower);
+    let env = abi::ra_env();
     let out = &crate::jit::backend::ra::run(
         &lowered.vcode,
-        &abi::ra_env(),
+        &env,
         &lowered.emit_order,
         lowered.hot_blocks,
     )
     .map_err(|e| CompileError::Backend(format!("regalloc: {e}")))?;
-    if config.dump.vcode {
+    #[cfg(feature = "tcvm-dev")]
+    if let Some(dir) = &config.dev.ra_capture {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = format!("{dir}/{}-{n:05}.ra", std::process::id());
+        let rec = crate::jit::backend::ra::corpus::write(
+            &lowered.vcode,
+            &env,
+            &lowered.emit_order,
+            lowered.hot_blocks,
+            out,
+        );
+        std::fs::write(&path, rec)
+            .map_err(|e| CompileError::Backend(format!("writing {path}: {e}")))?;
+    }
+    #[cfg(feature = "tcvm-dev")]
+    if config.dev.dump.vcode {
         eprintln!(
             "-- jit vcode {} pc{pc}, {} spill slots\n{}",
             chunk_name(closure),
@@ -397,6 +486,7 @@ pub(crate) fn compile<'gc>(
             lowered.vcode.print(out, &lowered.emit_order)
         );
     }
+    #[cfg(feature = "tcvm-dev")]
     if opts.check {
         let mut checker = crate::jit::backend::ra::checker::Checker::new(&lowered.vcode);
         let (remat, src) = crate::jit::backend::ra::remat_table(&lowered.vcode);
@@ -408,8 +498,8 @@ pub(crate) fn compile<'gc>(
         crate::jit::backend::ra::check_operands(&lowered.vcode, out)
             .map_err(|e| CompileError::Backend(format!("regalloc checker: {e}")))?;
     }
-    times.regalloc = t.elapsed().as_micros();
-    let t = std::time::Instant::now();
+    #[cfg(feature = "tcvm-dev")]
+    times.mark(Stage::Regalloc);
     let jit = ctx.jit();
     let tramp = |h: usize, f: bool| jit.trampoline(h, f);
     let mut trampolines: Vec<(usize, usize)> = Vec::new();
@@ -474,28 +564,34 @@ pub(crate) fn compile<'gc>(
             .collect(),
     };
     // Allocated now, moved into the region after: the code embeds its address.
-    let fired: Box<[std::cell::Cell<u32>]> = if config.deopt_all {
+    let fired: Box<[std::cell::Cell<u32>]> = if opts.deopt_all {
         (0..lowered.exits.len())
             .map(|_| std::cell::Cell::new(0))
             .collect()
     } else {
         Box::new([])
     };
-    let fired_at = config.deopt_all.then_some(fired.as_ptr() as usize);
+    let fired_at = opts.deopt_all.then_some(fired.as_ptr() as usize);
     let fast = enterable.then_some(emit::FastEntry {
         max_stack: closure.proto.max_stack_size,
         num_params: closure.proto.num_params,
         proto: closure.proto.ptr.as_ptr() as u64,
     });
-    let mut em = emit::emit(&lowered, out, helpers, fired_at, fast, config.dump.asm)
-        .map_err(CompileError::Backend)?;
+    #[cfg(feature = "tcvm-dev")]
+    let trace = config.dev.dump.asm;
+    #[cfg(not(feature = "tcvm-dev"))]
+    let trace = false;
+    let mut em =
+        emit::emit(&lowered, out, helpers, fired_at, fast, trace).map_err(CompileError::Backend)?;
     let size = em.asm.offset() + em.asm.pool_bytes() + 16;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc.reserve(size)?;
     let region_word = em.asm.label_offset(em.region_word);
     let start = block.rx();
     let entry = start.wrapping_add(em.asm.label_offset(em.entry));
+    #[cfg(feature = "tcvm-dev")]
     let cold_at = em.asm.label_offset(em.cold);
+    #[cfg(feature = "tcvm-dev")]
     let hot_at: Vec<(u32, usize)> = (em.hot.iter())
         .map(|&(b, l)| (b, em.asm.label_offset(l)))
         .collect();
@@ -547,7 +643,8 @@ pub(crate) fn compile<'gc>(
         .map_err(|e| CompileError::Backend(format!("assembler: {e:?}")))?;
     block.write(&words);
     block.describe_frame(em.frame_size);
-    if config.dump.asm {
+    #[cfg(feature = "tcvm-dev")]
+    if config.dev.dump.asm {
         eprintln!(
             "-- jit asm {} pc{pc} at {start:p}, {} bytes, entry +{:#x}, cold +{cold_at:#x}",
             chunk_name(closure),
@@ -576,21 +673,19 @@ pub(crate) fn compile<'gc>(
             .collect();
         dump_words(start as usize, &words, &tags);
     }
-    times.emit = t.elapsed().as_micros();
-    if config.time {
+    #[cfg(feature = "tcvm-dev")]
+    times.mark(Stage::Emit);
+    #[cfg(feature = "tcvm-dev")]
+    if config.dev.time {
+        let [build, passes, lower, regalloc, emit] = times.stages;
         eprintln!(
-            "jit time {} pc{pc}: {} IR insts, build {}us, passes {}us, lower {}us, regalloc {}us, emit {}us; passes: {}",
+            "jit time {} pc{pc}: {} IR insts, build {build}us, passes {passes}us, lower {lower}us, regalloc {regalloc}us, emit {emit}us; passes: {}",
             chunk_name(closure),
             f.blocks
                 .iter()
                 .filter(|b| !b.dead)
                 .map(|b| b.insts.len())
                 .sum::<usize>(),
-            times.build,
-            times.passes,
-            times.lower,
-            times.regalloc,
-            times.emit,
             times
                 .pass
                 .iter()
@@ -772,6 +867,7 @@ pub(crate) fn chunk_name(closure: LuaFn<'_>) -> String {
 
 /// With each line tagged `@origin` after a `;` (`tags`: word index, origin,
 /// sorted).
+#[cfg(feature = "tcvm-dev")]
 fn dump_words(base: usize, words: &[u32], tags: &[(u32, String)]) {
     let tag = |line: &str| -> Option<&str> {
         let off = line.trim_start().split(':').next()?;

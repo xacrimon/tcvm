@@ -2,12 +2,15 @@
 //! target's `Inst` type in blocks with parameters, each with its operands in
 //! a flat pool.
 
+#[cfg(feature = "tcvm-dev")]
+use crate::jit::backend::reg::OperandKind;
 use crate::jit::backend::reg::{
-    Block as RBlock, Inst as RInst, InstRange, Operand, OperandKind, PRegSet, RegClass, VReg,
+    Block as RBlock, Inst as RInst, InstRange, Operand, PRegSet, RegClass, VReg,
 };
 
 /// What a target's instruction type tells the allocator.
 pub(crate) trait TargetInst: Clone {
+    #[cfg(feature = "tcvm-dev")]
     fn is_branch(&self) -> bool;
 }
 
@@ -153,6 +156,7 @@ impl<I: TargetInst + std::fmt::Debug> VCode<I> {
     /// The allocated code, blocks in `order` (`TCVM_JIT_DUMP=vcode`): each
     /// instruction's defs and uses with their locations, and the allocator's
     /// moves between them.
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) fn print(&self, out: &crate::jit::backend::ra::Output, order: &[u32]) -> String {
         use std::fmt::Write;
 
@@ -269,6 +273,7 @@ impl<I: TargetInst> VCode<I> {
         &self.rpool[s as usize..e as usize]
     }
 
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) fn is_branch(&self, insn: RInst) -> bool {
         self.insts[insn.index()].is_branch()
     }

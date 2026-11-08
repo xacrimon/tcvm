@@ -257,7 +257,7 @@ fn inline_site(
     site: Site<'_>,
     callee: Val,
 ) -> Option<Option<Val>> {
-    if !b.ctx.jit().config.inline {
+    if !b.ctx.jit().config.inline() {
         return None;
     }
     // A metamethod's header is past the frame's registers (`a`), and one

@@ -14,7 +14,10 @@
 //! a piece is a window of its group's runs, so splitting copies nothing.
 
 mod build;
+#[cfg(feature = "tcvm-dev")]
 pub(crate) mod checker;
+#[cfg(feature = "tcvm-dev")]
+pub(crate) mod corpus;
 mod resolve;
 mod scan;
 #[cfg(test)]
@@ -400,6 +403,7 @@ pub(crate) fn run<I: TargetInst>(
 /// Operands of one instruction that may not share a register: an early
 /// definition with any use, a late definition with a late use, two
 /// definitions.
+#[cfg(feature = "tcvm-dev")]
 pub(crate) fn check_operands<I: TargetInst>(v: &VCode<I>, out: &Output) -> Result<(), String> {
     use crate::jit::backend::reg::OperandKind::{Def, Use};
     use crate::jit::backend::reg::OperandPos::{Early, Late};
@@ -431,6 +435,7 @@ pub(crate) fn check_operands<I: TargetInst>(v: &VCode<I>, out: &Output) -> Resul
 
 /// For the checker: per vreg, whether it may be computed again, and the
 /// value it is computed from.
+#[cfg(feature = "tcvm-dev")]
 pub(crate) fn remat_table<I: TargetInst>(f: &VCode<I>) -> (Vec<bool>, Vec<Option<VReg>>) {
     use crate::jit::backend::vcode::Remat;
     let remat = f.remat.iter().map(|&r| r != Remat::None).collect();

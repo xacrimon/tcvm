@@ -22,6 +22,10 @@ repository.workspace = true
 [features]
 default = ["lib-all", "jit"]
 jit = []
+# Development only: the IR verifier and allocation checker, dumps, timing,
+# the test modes and every `TCVM_*` knob but `TCVM_JIT=off` (CLAUDE.md).
+# On for the crate's own tests through the dev-dependency below.
+tcvm-dev = []
 lib-all = [
     "lib-coroutine", "lib-debug", "lib-io",
     "lib-math", "lib-os", "lib-package",
@@ -55,5 +59,6 @@ getrandom = "0.4.2"
 libc = "0.2.186"
 
 [dev-dependencies]
+tcvm = { path = ".", features = ["tcvm-dev"] }
 paste = "1.0.15"
 insta = "1.47.2"

@@ -110,6 +110,7 @@ pub struct Lua {
     /// `TCVM_GC_STRESS=N`: collect at every `enter`'s end, which the
     /// collector checks reach every N bytes allocated; a full collection
     /// every eighth time.
+    #[cfg(feature = "tcvm-dev")]
     stress: Option<(usize, std::cell::Cell<u32>)>,
 }
 
@@ -148,17 +149,21 @@ impl Lua {
                 stacks: crate::vm::stack::StackPool::new(),
             }
         });
-        let stress = std::env::var("TCVM_GC_STRESS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .map(|n| (n, std::cell::Cell::new(0)));
-        Lua { arena, stress }
+        Lua {
+            arena,
+            #[cfg(feature = "tcvm-dev")]
+            stress: std::env::var("TCVM_GC_STRESS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .map(|n| (n, std::cell::Cell::new(0))),
+        }
     }
 
     /// Collect once memory in use is past the heap limit, then re-arm the
     /// interpreter's check.
     fn collect_debt(&mut self) {
+        #[cfg(feature = "tcvm-dev")]
         if let Some((n, count)) = &self.stress {
             let (n, k) = (*n, count.get().wrapping_add(1));
             count.set(k);
@@ -217,24 +222,25 @@ impl Lua {
     }
 
     /// Drop `TCVM_GC_STRESS`'s extra collections, for a test that counts
-    /// what one collection frees. A hook for tests.
-    #[doc(hidden)]
+    /// what one collection frees.
+    #[cfg(feature = "tcvm-dev")]
     pub fn stop_gc_stress(&mut self) {
         self.stress = None;
     }
 
     /// How many compiles failed on a verifier or backend error rather than
-    /// refusing the code. A hook for tests.
-    #[doc(hidden)]
+    /// refusing the code.
+    #[cfg(feature = "tcvm-dev")]
     pub fn jit_internal_errors(&mut self) -> u32 {
         self.arena.mutate(|_, root| root.jit.internal_errors.get())
     }
 
     /// Turn inlining (E1) on or off for regions compiled from now on: tests
     /// of the call protocol keep their calls real whatever the inliner takes.
+    #[cfg(feature = "tcvm-dev")]
     pub fn set_jit_inline(&mut self, on: bool) {
         self.arena
-            .mutate_root(|_, root| root.jit.config.inline = on);
+            .mutate_root(|_, root| root.jit.config.dev.inline = on);
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.

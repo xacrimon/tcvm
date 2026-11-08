@@ -47,6 +47,7 @@ impl Cc {
         }
     }
 
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Cc::Eq => "eq",
@@ -223,12 +224,14 @@ pub(crate) enum Ctx {
 pub(crate) struct Sig {
     pub(crate) ctx: &'static [Ctx],
     pub(crate) imm: Option<u64>,
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) args: &'static [Rep],
     pub(crate) ret: Option<Rep>,
     pub(crate) effects: Effects,
 }
 
 impl HelperId {
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) fn name(self) -> String {
         match self {
             HelperId::FMod => "fmod".into(),
@@ -429,9 +432,12 @@ impl HelperId {
             HelperId::TInsert => (RT, None, &[Val, Val], Some(Val), table_store),
             HelperId::TRemove => (RT, None, &[Val], Some(Val), table_store),
         };
+        #[cfg(not(feature = "tcvm-dev"))]
+        let _ = args;
         Sig {
             ctx,
             imm,
+            #[cfg(feature = "tcvm-dev")]
             args,
             ret,
             effects,
@@ -1139,6 +1145,7 @@ impl Op {
         }
     }
 
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) fn name(self) -> String {
         use Op::*;
         match self {

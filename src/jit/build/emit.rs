@@ -2131,7 +2131,7 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
 /// call for any other value; the arms join after. Not with results up to
 /// `top`, which the arms would leave differently.
 fn poly_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> bool {
-    if insn.c() == 0 || !b.ctx.jit().config.inline {
+    if insn.c() == 0 || !b.ctx.jit().config.inline() {
         return false;
     }
     let Some(targets) = joined_functions(b, b.root_of(callee)) else {

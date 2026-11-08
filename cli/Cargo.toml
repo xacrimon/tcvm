@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+tcvm-dev = ["tcvm/tcvm-dev"]
+
 [dependencies]
 tcvm = { path = ".." }
 clap = { version = "4.6.1", features = ["derive"] }
+
+[dev-dependencies]
+tcvm = { path = "..", features = ["tcvm-dev"] }

@@ -4,6 +4,7 @@
 //! edge arguments, snapshot entries) is a run of a flat pool (8.1).
 
 pub(crate) mod ops;
+#[cfg(feature = "tcvm-dev")]
 pub(crate) mod print;
 pub(crate) mod types;
 pub(crate) mod verify;

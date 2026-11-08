@@ -368,9 +368,12 @@ fn original_of(closure: LuaFn<'_>, word: Instruction) -> Instruction {
 }
 
 fn log(ctx: Context<'_>, msg: impl FnOnce() -> String) {
-    if ctx.jit().config.log {
+    #[cfg(feature = "tcvm-dev")]
+    if ctx.jit().config.dev.log {
         eprintln!("jit: {}", msg());
     }
+    #[cfg(not(feature = "tcvm-dev"))]
+    let _ = (ctx, msg);
 }
 
 /// Compile the entry at `at` and install it; its entry address.
@@ -381,8 +384,8 @@ fn try_compile<'gc>(
     word: Instruction,
     frame: *const Value<'gc>,
 ) -> Option<*const u8> {
-    let config = &ctx.jit().config;
-    if let Some(only) = &config.only
+    #[cfg(feature = "tcvm-dev")]
+    if let Some(only) = &ctx.jit().config.dev.only
         && !crate::jit::compile::chunk_name(closure).contains(only.as_str())
     {
         return None;
@@ -416,6 +419,7 @@ fn try_compile<'gc>(
                     crate::jit::compile::chunk_name(closure)
                 )
             });
+            #[cfg(feature = "tcvm-dev")]
             if e.internal() {
                 let n = &ctx.jit().internal_errors;
                 n.set(n.get() + 1);
@@ -1138,6 +1142,7 @@ fn recompile<'gc>(
                     crate::jit::compile::chunk_name(closure)
                 )
             });
+            #[cfg(feature = "tcvm-dev")]
             if e.internal() {
                 let n = &jit.internal_errors;
                 n.set(n.get() + 1);

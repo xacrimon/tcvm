@@ -54,10 +54,13 @@ pub(crate) struct Emitted {
     /// Where each hot block starts, in layout order, and where the hot ones
     /// end: deopt blocks, cold arms and stubs after (the asm dump's
     /// `blocks` and `cold`).
+    #[cfg_attr(not(feature = "tcvm-dev"), allow(dead_code))]
     pub(crate) hot: Vec<(u32, Label)>,
+    #[cfg_attr(not(feature = "tcvm-dev"), allow(dead_code))]
     pub(crate) cold: Label,
     /// With `trace`: where each instruction's words start (word index) and
     /// what it is, a VCode instruction's index or one of `Origin`'s.
+    #[cfg_attr(not(feature = "tcvm-dev"), allow(dead_code))]
     pub(crate) origins: Vec<(u32, u32)>,
 }
 

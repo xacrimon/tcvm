@@ -166,7 +166,10 @@ fn range() -> MutexGuard<'static, Option<Range>> {
 
 impl Range {
     fn new() -> io::Result<Range> {
+        #[cfg(feature = "tcvm-dev")]
         let far = std::env::var_os("TCVM_JIT_FAR").is_some_and(|v| v != "0");
+        #[cfg(not(feature = "tcvm-dev"))]
+        let far = false;
         let near = (!far)
             .then(|| {
                 NEAR_SIZES.iter().find_map(|&size| {

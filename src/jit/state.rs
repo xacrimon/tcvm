@@ -26,10 +26,24 @@ pub(crate) const EXIT_REGS: usize = 320;
 /// Image word of the first spill slot.
 pub(crate) const IMAGE_SPILLS: usize = 64;
 
-/// Settings read from the environment when a `Lua` is created.
+/// Settings read from the environment when a `Lua` is created: `TCVM_JIT=off`,
+/// and with `tcvm-dev` the development knobs.
 #[derive(Clone, Debug)]
 pub(crate) struct JitConfig {
     pub(crate) enabled: bool,
+    #[cfg(feature = "tcvm-dev")]
+    pub(crate) dev: Dev,
+}
+
+/// Invocations of a function (a power of two: `FUNC` tests the count's low
+/// bits) and iterations of a loop before compiling.
+pub(crate) const HOT_CALL: u16 = 256;
+pub(crate) const HOT_LOOP: u16 = 200;
+
+/// The development knobs (CLAUDE.md).
+#[cfg(feature = "tcvm-dev")]
+#[derive(Clone, Debug)]
+pub(crate) struct Dev {
     pub(crate) hot_call: u16,
     pub(crate) hot_loop: u16,
     pub(crate) log: bool,
@@ -41,8 +55,11 @@ pub(crate) struct JitConfig {
     pub(crate) deopt_all: bool,
     /// Inline known small callees (E1); `TCVM_JIT_INLINE=0` turns it off.
     pub(crate) inline: bool,
+    /// Record each compile's allocation in this directory (`ra::corpus`).
+    pub(crate) ra_capture: Option<String>,
 }
 
+#[cfg(feature = "tcvm-dev")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DumpFlags {
     pub(crate) ir: bool,
@@ -54,11 +71,48 @@ pub(crate) struct DumpFlags {
 impl JitConfig {
     pub(crate) fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok();
-        let num = |name: &str| {
+        JitConfig {
+            enabled: var("TCVM_JIT").is_none_or(|v| v != "off" && v != "0")
+                && cfg!(target_arch = "aarch64"),
+            #[cfg(feature = "tcvm-dev")]
+            dev: Dev::from_env(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn hot_call(&self) -> u16 {
+        #[cfg(feature = "tcvm-dev")]
+        return self.dev.hot_call;
+        #[cfg(not(feature = "tcvm-dev"))]
+        HOT_CALL
+    }
+
+    #[inline]
+    pub(crate) fn hot_loop(&self) -> u16 {
+        #[cfg(feature = "tcvm-dev")]
+        return self.dev.hot_loop;
+        #[cfg(not(feature = "tcvm-dev"))]
+        HOT_LOOP
+    }
+
+    #[inline]
+    pub(crate) fn inline(&self) -> bool {
+        #[cfg(feature = "tcvm-dev")]
+        return self.dev.inline;
+        #[cfg(not(feature = "tcvm-dev"))]
+        true
+    }
+}
+
+#[cfg(feature = "tcvm-dev")]
+impl Dev {
+    fn from_env() -> Self {
+        let var = |name: &str| std::env::var(name).ok();
+        let num = |name: &str, default: u16| {
             var(name)
                 .and_then(|v| v.parse::<u16>().ok())
                 .map(|n| n.max(1))
-                .unwrap_or(200)
+                .unwrap_or(default)
         };
         let flag = |name: &str| var(name).is_some_and(|v| v != "0" && !v.is_empty());
         let mut dump = DumpFlags::default();
@@ -81,14 +135,11 @@ impl JitConfig {
                 }
             }
         }
-        JitConfig {
-            enabled: var("TCVM_JIT").is_none_or(|v| v != "off" && v != "0")
-                && cfg!(target_arch = "aarch64"),
-            // A power of two: `FUNC` tests the invocation count's low bits.
-            hot_call: num("TCVM_JIT_HOT_CALL")
+        Dev {
+            hot_call: num("TCVM_JIT_HOT_CALL", HOT_CALL)
                 .checked_next_power_of_two()
                 .unwrap_or(1 << 15),
-            hot_loop: num("TCVM_JIT_HOT_LOOP"),
+            hot_loop: num("TCVM_JIT_HOT_LOOP", HOT_LOOP),
             log: flag("TCVM_JIT_LOG"),
             dump,
             check: flag("TCVM_JIT_CHECK") || cfg!(debug_assertions),
@@ -96,6 +147,7 @@ impl JitConfig {
             only: var("TCVM_JIT_ONLY"),
             deopt_all: flag("TCVM_JIT_DEOPT_ALL"),
             inline: var("TCVM_JIT_INLINE").is_none_or(|v| v != "0" && v != "off"),
+            ra_capture: var("TCVM_JIT_RA_CAPTURE"),
         }
     }
 }
@@ -135,6 +187,7 @@ pub(crate) struct JitRuntime {
     pub(crate) jump_target: Cell<usize>,
     /// Compiles that failed on a verifier or backend error, not a refusal
     /// (`Lua::jit_internal_errors`).
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) internal_errors: Cell<u32>,
 }
 
@@ -147,13 +200,13 @@ struct EntryTable {
 impl JitRuntime {
     pub(crate) fn new() -> Self {
         let config = JitConfig::from_env();
-        let start = config.hot_call.min(config.hot_loop);
+        let start = config.hot_call().min(config.hot_loop());
         let exit_regs_buf: Box<[Cell<u64>; EXIT_REGS]> =
             Box::new(std::array::from_fn(|_| Cell::new(0)));
         let exit_regs = exit_regs_buf.as_ptr() as *mut u64;
         let rt = JitRuntime {
             hot: std::array::from_fn(|_| Cell::new(start)),
-            call_mask: Cell::new(config.hot_call as u64 - 1),
+            call_mask: Cell::new(config.hot_call() as u64 - 1),
             entries: Cell::new(std::ptr::null()),
             table: RefCell::new(EntryTable::default()),
             exit_regs,
@@ -170,6 +223,7 @@ impl JitRuntime {
             level_ret: 0,
             level_land: crate::vm::stack::level_land(),
             jump_target: Cell::new(0),
+            #[cfg(feature = "tcvm-dev")]
             internal_errors: Cell::new(0),
         };
         rt.grow_table(16);
@@ -260,9 +314,9 @@ impl JitRuntime {
     /// The counter's restart value for a site of `word`'s kind.
     pub(crate) fn hot_start(&self, word: Instruction) -> u16 {
         if word.op() == crate::instruction::Op::FUNC {
-            self.config.hot_call
+            self.config.hot_call()
         } else {
-            self.config.hot_loop
+            self.config.hot_loop()
         }
     }
 }
