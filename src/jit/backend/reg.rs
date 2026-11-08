@@ -860,8 +860,10 @@ impl Operand {
     /// are used to track dataflow.
     #[inline(always)]
     pub fn vreg(self) -> VReg {
-        let vreg_idx = ((self.bits >> Self::VREG_SHIFT) & Self::VREG_MASK) as usize;
-        VReg::new(vreg_idx, self.class())
+        // The class field is a `VReg`'s low two bits, as it is here.
+        let vreg_idx = (self.bits >> Self::VREG_SHIFT) & Self::VREG_MASK;
+        let class_field = (self.bits >> Self::CLASS_SHIFT) & Self::CLASS_MASK;
+        VReg::from_bits((vreg_idx << 2 | class_field) as u32)
     }
 
     /// Get the register class used by this operand.
@@ -1052,7 +1054,7 @@ impl Allocation {
     /// Is the allocation "none"?
     #[inline(always)]
     pub fn is_none(self) -> bool {
-        self.kind() == AllocationKind::None
+        self.bits >> 29 == AllocationKind::None as u32
     }
 
     /// Is the allocation not "none"?
@@ -1064,13 +1066,13 @@ impl Allocation {
     /// Is the allocation a register?
     #[inline(always)]
     pub fn is_reg(self) -> bool {
-        self.kind() == AllocationKind::Reg
+        self.bits >> 29 == AllocationKind::Reg as u32
     }
 
     /// Is the allocation on the stack (a spillslot)?
     #[inline(always)]
     pub fn is_stack(self) -> bool {
-        self.kind() == AllocationKind::Stack
+        self.bits >> 29 == AllocationKind::Stack as u32
     }
 
     /// Get the index of the spillslot or register. If register, this

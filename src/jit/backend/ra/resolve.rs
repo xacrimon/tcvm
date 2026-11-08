@@ -379,6 +379,7 @@ impl<I: TargetInst> Ra<'_, I> {
     /// the successor's side when it has one predecessor (not a resume block,
     /// which a return enters past its moves), else on the predecessor's.
     /// Only values of split groups can be in two places.
+    #[inline(never)]
     fn edge_moves(&self, split: &[u64], moves: &mut Vec<(u32, u8, Mv)>) -> Result<(), String> {
         let f = self.f;
         let mut once: Vec<u32> = Vec::new();

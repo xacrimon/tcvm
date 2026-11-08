@@ -232,6 +232,17 @@ impl<'a> Ivs<'a> {
     fn covers(&self, p: Pos) -> bool {
         self.start <= p && p < self.end && self.raw[self.after(p)].0 <= p
     }
+
+    /// The first point of `lo..hi` covered.
+    fn first_in(&self, lo: Pos, hi: Pos) -> Option<Pos> {
+        let k = self.after(lo);
+        if lo >= hi || k == self.len() {
+            return None;
+        }
+        let (a, b) = self.get(k);
+        let p = a.max(lo);
+        (p < b.min(hi)).then_some(p)
+    }
 }
 
 /// The uses `next_use` looks for: needing a register, served by one,
@@ -333,6 +344,8 @@ struct Ra<'a, I: TargetInst> {
     hot_end: Vec<Pos>,
     words: usize,
     live_in: Vec<u64>,
+    /// The values some use takes from wherever they are (`Any`, `Stack`).
+    anyuse: Vec<u64>,
     /// Intervals and uses, a run per group (`Piece`).
     ivs: Vec<(Pos, Pos)>,
     uses: Vec<Use>,
@@ -357,17 +370,17 @@ struct Ra<'a, I: TargetInst> {
     /// Per group: stored where it goes from a register to the stack, not
     /// after its definitions.
     deferred: Vec<bool>,
-    /// Points fixed operands reserve allocatable registers over, `(from,
-    /// to, owner)` by `from`, `env.regs[c][k]`'s at `fixres[fixoff[r]..
-    /// fixoff[r + 1]]` for `r = c * MAX_REGS + k`; the owner vreg may sit
-    /// there (a fixed operand of its own).
-    fixres: Vec<(Pos, Pos, u32)>,
-    fixoff: Vec<u32>,
-    /// Per class, the registers (as `env.regs` bits) with any.
+    /// Points fixed operands reserve allocatable registers over, per class
+    /// by `from`: `(from, to, owner, k)` for `env.regs[c][k]`; the owner
+    /// vreg may sit there (a fixed operand of its own).
+    fixres: [Vec<(Pos, Pos, u32, u8)>; 2],
+    /// Per class, the registers (as `env.regs` bits) with any, and the ones
+    /// any clobber names.
     fixregs: [u32; 2],
-    /// Where `fixed_conflicts` left off in each register's reservations and
-    /// in `clobs`: it asks at the scan's position, which only grows.
-    fixcur: Vec<std::cell::Cell<u32>>,
+    clobregs: [u32; 2],
+    /// Where `fixed_conflicts` left off in each class's reservations and in
+    /// `clobs`: it asks at the scan's position, which only grows.
+    fixcur: [std::cell::Cell<u32>; 2],
     clobcur: std::cell::Cell<u32>,
     /// Late points of clobbering instructions, by point, with the
     /// registers they take per class as bits of `env.regs` indices.
@@ -483,6 +496,7 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             hot_end: Vec::new(),
             words: 0,
             live_in: Vec::new(),
+            anyuse: Vec::new(),
             ivs: Vec::new(),
             uses: Vec::new(),
             snaps: Vec::new(),
@@ -496,10 +510,10 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             vregs: Vec::new(),
             rep: Vec::new(),
             deferred: Vec::new(),
-            fixres: Vec::new(),
-            fixoff: Vec::new(),
+            fixres: [Vec::new(), Vec::new()],
             fixregs: [0; 2],
-            fixcur: Vec::new(),
+            clobregs: [0; 2],
+            fixcur: [std::cell::Cell::new(0), std::cell::Cell::new(0)],
             clobcur: std::cell::Cell::new(0),
             clobs: Vec::new(),
             reg_idx,
@@ -613,13 +627,14 @@ impl<'a, I: TargetInst> Ra<'a, I> {
 
     /// Live-in sets by a backward dataflow fixpoint.
     fn liveness(&mut self) -> Result<(), String> {
-        use crate::jit::backend::reg::OperandKind;
+        use crate::jit::backend::reg::{OperandConstraint, OperandKind};
         let f = self.f;
         let nb = f.num_blocks();
         let w = f.num_vregs().div_ceil(64);
         self.words = w;
         let mut gen_ = vec![0u64; nb * w];
         let mut kill = vec![0u64; nb * w];
+        let mut anyuse = vec![0u64; w];
         let set = |s: &mut [u64], v: usize| s[v / 64] |= 1 << (v % 64);
         let has = |s: &[u64], v: usize| s[v / 64] >> (v % 64) & 1 != 0;
         for b in 0..nb {
@@ -630,8 +645,17 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             for i in f.block_insns(Block::new(b)).iter() {
                 let ops = f.inst_operands(i);
                 for op in ops {
-                    if op.kind() == OperandKind::Use && !has(k, op.vreg().vreg()) {
-                        set(g, op.vreg().vreg());
+                    if op.kind() == OperandKind::Use {
+                        let v = op.vreg().vreg();
+                        if !has(k, v) {
+                            set(g, v);
+                        }
+                        if matches!(
+                            op.constraint(),
+                            OperandConstraint::Any | OperandConstraint::Stack
+                        ) {
+                            set(&mut anyuse, v);
+                        }
                     }
                 }
                 for op in ops {
@@ -690,6 +714,7 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             return Err("a value is used before any definition".into());
         }
         self.live_in = live_in;
+        self.anyuse = anyuse;
         Ok(())
     }
 
@@ -782,6 +807,7 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         Some(self.alloc_of(x))
     }
 
+    #[inline]
     fn alloc_of(&self, x: u32) -> Allocation {
         let p = &self.pieces[x as usize];
         match p.loc {

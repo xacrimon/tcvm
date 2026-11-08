@@ -4,7 +4,7 @@
 
 use std::cmp::Reverse;
 
-use super::{Held, Ivs, Loc, MAX_REGS, NONE, Piece, Pos, Ra, Want, intersect};
+use super::{Held, Loc, MAX_REGS, NONE, Piece, Pos, Ra, Want, intersect};
 use crate::jit::backend::reg::PReg;
 use crate::jit::backend::vcode::TargetInst;
 
@@ -73,6 +73,7 @@ impl<I: TargetInst> Ra<'_, I> {
     /// Retire pieces that end by `pos`; move the rest between active (they
     /// cover `pos`) and inactive (a hole there). Only entries whose
     /// `until` has come look at their piece.
+    #[inline(never)]
     fn advance(&mut self, pos: Pos) {
         if pos < self.next_change {
             return;
@@ -82,50 +83,53 @@ impl<I: TargetInst> Ra<'_, I> {
         back.clear();
         let mut next = Pos::MAX;
         // Listed pieces start by `pos`: the interval ending after it covers
-        // it unless it starts later.
-        self.active.retain_mut(|h| {
-            if h.until > pos {
-                next = next.min(h.until);
-                return true;
-            }
-            let p = &pieces[h.x as usize];
-            if p.end <= pos {
-                return false;
-            }
-            let iv = p.ivs(ivs);
-            let (s, e) = iv.get(iv.after(pos));
-            if s > pos {
-                h.until = s;
-                next = next.min(s);
-                back.push(*h);
-                return false;
-            }
-            h.until = e;
-            next = next.min(e);
-            true
-        });
-        let active = &mut self.active;
-        self.inactive.retain_mut(|h| {
-            if h.until > pos {
-                next = next.min(h.until);
-                return true;
-            }
-            let p = &pieces[h.x as usize];
-            if p.end <= pos {
-                return false;
-            }
-            let iv = p.ivs(ivs);
-            let (s, e) = iv.get(iv.after(pos));
-            if s <= pos {
+        // it unless it starts later. Kept entries stay in order.
+        let mut keep = 0;
+        for k in 0..self.active.len() {
+            let mut h = self.active[k];
+            if h.until <= pos {
+                let p = &pieces[h.x as usize];
+                if p.end <= pos {
+                    continue;
+                }
+                let iv = p.ivs(ivs);
+                let (s, e) = iv.get(iv.after(pos));
+                if s > pos {
+                    h.until = s;
+                    next = next.min(s);
+                    back.push(h);
+                    continue;
+                }
                 h.until = e;
-                next = next.min(e);
-                active.push(*h);
-                return false;
             }
-            h.until = s;
-            next = next.min(s);
-            true
-        });
+            next = next.min(h.until);
+            self.active[keep] = h;
+            keep += 1;
+        }
+        self.active.truncate(keep);
+        let mut keep = 0;
+        for k in 0..self.inactive.len() {
+            let mut h = self.inactive[k];
+            if h.until <= pos {
+                let p = &pieces[h.x as usize];
+                if p.end <= pos {
+                    continue;
+                }
+                let iv = p.ivs(ivs);
+                let (s, e) = iv.get(iv.after(pos));
+                if s <= pos {
+                    h.until = e;
+                    next = next.min(e);
+                    self.active.push(h);
+                    continue;
+                }
+                h.until = s;
+            }
+            next = next.min(h.until);
+            self.inactive[keep] = h;
+            keep += 1;
+        }
+        self.inactive.truncate(keep);
         self.inactive.extend_from_slice(&back);
         self.scratch = back;
         self.next_change = next;
@@ -159,17 +163,12 @@ impl<I: TargetInst> Ra<'_, I> {
     /// not its own takes (a clobber, another value's fixed operand).
     fn fixed_conflicts(&self, c: u32) -> Regs {
         let cls = self.class_of(c);
-        let n = self.env.regs[cls].len();
         let p = &self.pieces[c as usize];
         let (s, e, iv) = (p.start, p.end, p.ivs(&self.ivs));
         let mut out = [Pos::MAX; MAX_REGS];
         // A clobber takes every register it names at once: the first one
         // `c` covers settles them.
-        let mut open = if n == 0 {
-            0
-        } else {
-            u32::MAX >> (MAX_REGS - n)
-        };
+        let mut open = self.clobregs[cls];
         let mut j = 0;
         let from = cursor(&self.clobcur, &self.clobs, |x| x.0 < s);
         for &(q, m) in &self.clobs[from..] {
@@ -188,49 +187,56 @@ impl<I: TargetInst> Ra<'_, I> {
                 }
             }
         }
-        let mut regs = self.fixregs[cls];
-        while regs != 0 {
-            let k = regs.trailing_zeros() as usize;
-            regs &= regs - 1;
-            let best = &mut out[k];
-            let r = cls * MAX_REGS + k;
-            let list = &self.fixres[self.fixoff[r] as usize..self.fixoff[r + 1] as usize];
-            // Reservations span at most two points.
-            let from = cursor(&self.fixcur[r], list, |x| x.0 + 2 <= s);
-            for &(a, b, o) in &list[from..] {
-                if a >= e || a >= *best {
-                    break;
-                }
-                if o != p.g
-                    && let Some(x) = intersect(Ivs::plain(&[(a, b)]), iv, s)
-                {
-                    *best = (*best).min(x);
-                }
+        // Reservations by point (each spans at most two): one at or past a
+        // register's best settles nothing more for it.
+        let mut pending = self.fixregs[cls];
+        let list = &self.fixres[cls];
+        let from = cursor(&self.fixcur[cls], list, |x| x.0 + 2 <= s);
+        for &(a, b, o, k) in &list[from..] {
+            if pending == 0 || a >= e {
+                break;
+            }
+            let k = k as usize;
+            if a >= out[k] {
+                pending &= !(1 << k);
+            } else if o != p.g
+                && let Some(x) = iv.first_in(a.max(s), b)
+            {
+                out[k] = out[k].min(x);
             }
         }
         out
     }
 
+    #[inline(never)]
     fn avail(&self, c: u32) -> Avail {
         let cls = self.class_of(c);
         let n = self.env.regs[cls].len();
-        let (s, iv) = (self.start(c), self.ivs_of(c));
+        let iv = self.ivs_of(c);
         let mut free = [Pos::MAX; MAX_REGS];
         let mut inact = [Pos::MAX; MAX_REGS];
+        // `% MAX_REGS` only spares the bounds checks.
         for h in &self.active {
             if h.cls as usize == cls {
-                free[h.k as usize] = 0;
+                free[h.k as usize % MAX_REGS] = 0;
             }
         }
         let e = self.end(c);
         for h in &self.inactive {
-            let k = h.k as usize;
+            let k = h.k as usize % MAX_REGS;
             // Not before its next interval: past `c` or the best so far
             // settles nothing.
             if h.cls as usize != cls || h.until >= e.min(inact[k]) {
                 continue;
             }
-            if let Some(x) = intersect(self.ivs_of(h.x), iv, s) {
+            // They meet where the holder's next interval starts when `c`
+            // covers it; the holder has nothing before there.
+            let x = if iv.covers(h.until) {
+                Some(h.until)
+            } else {
+                intersect(self.ivs_of(h.x), iv, h.until)
+            };
+            if let Some(x) = x {
                 inact[k] = inact[k].min(x);
             }
         }

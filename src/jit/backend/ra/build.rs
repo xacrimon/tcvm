@@ -1,11 +1,9 @@
 //! Live ranges: each group's intervals and use positions, the points fixed
 //! operands reserve registers over, and the clobbers.
 
-use super::{
-    Ivs, Loc, MAX_REGS, NONE, Need, Piece, Pos, Ra, Use, VInfo, Want, class_index, intersect,
-};
+use super::{Ivs, Loc, NONE, Need, Piece, Pos, Ra, Use, VInfo, Want, class_index, intersect};
 use crate::jit::backend::reg::{
-    Allocation, Block, Inst, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
+    Allocation, Block, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
 };
 use crate::jit::backend::vcode::{Remat, TargetInst};
 
@@ -13,12 +11,9 @@ impl<I: TargetInst> Ra<'_, I> {
     pub(super) fn build(&mut self) -> Result<(), String> {
         let f = self.f;
         let nv = f.num_vregs();
-        let mut n = 0u32;
-        self.alloc_base = Vec::with_capacity(f.num_insts());
-        for i in 0..f.num_insts() {
-            self.alloc_base.push(n);
-            n += f.inst_operands(Inst::new(i)).len() as u32;
-        }
+        // Instructions' operands lie in order (`VCode::push`).
+        self.alloc_base = f.ops.iter().map(|o| o.0).collect();
+        let n = f.operands.len() as u32;
         self.allocs = vec![Allocation::none(); n as usize];
         self.vregs = (0..nv)
             .map(|v| VInfo {
@@ -36,14 +31,11 @@ impl<I: TargetInst> Ra<'_, I> {
             .collect();
         // A constant some use takes from wherever it is (a snapshot, a
         // call's slots) is spilled as any value: such a use has no register.
-        for op in &f.operands {
-            if op.kind() == OperandKind::Use
-                && matches!(
-                    op.constraint(),
-                    OperandConstraint::Stack | OperandConstraint::Any
-                )
-            {
-                self.vregs[op.vreg().vreg()].remat = false;
+        for (k, &w) in self.anyuse.iter().enumerate() {
+            let mut w = w;
+            while w != 0 {
+                self.vregs[k * 64 + w.trailing_zeros() as usize].remat = false;
+                w &= w - 1;
             }
         }
         let w = self.walk(n)?;
@@ -56,6 +48,7 @@ impl<I: TargetInst> Ra<'_, I> {
     }
 
     /// The backward walk: interval, use and reservation records.
+    #[inline(never)]
     fn walk(&mut self, n: u32) -> Result<Walk, String> {
         let f = self.f;
         let nv = f.num_vregs();
@@ -495,33 +488,24 @@ impl<I: TargetInst> Ra<'_, I> {
         self.next_of.truncate(self.uses.len());
     }
 
-    /// Fixed operands' reservations by register, and each clobbering
+    /// Fixed operands' reservations per class by point, and each clobbering
     /// instruction's registers, in point order.
     fn reservations(&mut self, fixtmp: &[(u32, Pos, Pos, u32)]) {
-        // By allocatable register, as `class * MAX_REGS + index`: only those
-        // are asked about.
-        let slot = |r: u32| {
-            let k = self.reg_idx[r as usize];
-            (k != NONE).then(|| {
-                class_index(PReg::from_index(r as usize).class()) as u32 * MAX_REGS as u32 + k
-            })
-        };
+        // By class and point; only allocatable registers are asked about.
         let mut keys: Vec<u64> = (fixtmp.iter().enumerate())
-            .filter_map(|(k, e)| Some((slot(e.0)? as u64) << 56 | (e.1 as u64) << 24 | k as u64))
+            .filter(|(_, e)| self.reg_idx[e.0 as usize] != NONE)
+            .map(|(k, e)| {
+                let c = class_index(PReg::from_index(e.0 as usize).class()) as u64;
+                c << 56 | (e.1 as u64) << 24 | k as u64
+            })
             .collect();
         assert!(fixtmp.len() < 1 << 24, "too many fixed operands");
         keys.sort_unstable();
-        self.fixoff = runs(2 * MAX_REGS, keys.iter().map(|&k| (k >> 56) as u32));
-        self.fixcur = (0..2 * MAX_REGS).map(|_| std::cell::Cell::new(0)).collect();
-        self.fixres = (keys.iter())
-            .map(|&k| {
-                let (_, a, b, o) = fixtmp[(k & 0xff_ffff) as usize];
-                (a, b, o)
-            })
-            .collect();
-        for &k in &keys {
-            let slot = (k >> 56) as usize;
-            self.fixregs[slot / MAX_REGS] |= 1 << (slot % MAX_REGS);
+        for &key in &keys {
+            let (r, a, b, o) = fixtmp[(key & 0xff_ffff) as usize];
+            let (c, k) = ((key >> 56) as usize, self.reg_idx[r as usize]);
+            self.fixregs[c] |= 1 << k;
+            self.fixres[c].push((a, b, o, k as u8));
         }
         // Calls clobber one of a few sets: each translated once.
         let mut seen: Vec<(PRegSet, [u32; 2])> = Vec::new();
@@ -546,6 +530,8 @@ impl<I: TargetInst> Ra<'_, I> {
             };
             if m != [0, 0] {
                 self.clobs.push((2 * l as u32 + 1, m));
+                self.clobregs[0] |= m[0];
+                self.clobregs[1] |= m[1];
             }
         }
     }
