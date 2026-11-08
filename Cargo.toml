@@ -19,6 +19,27 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["lib-all", "jit"]
+jit = []
+lib-all = [
+    "lib-coroutine", "lib-debug", "lib-io",
+    "lib-math", "lib-os", "lib-package",
+    "lib-string", "lib-table", "lib-utf8"
+]
+lib-coroutine = []
+lib-debug = []
+lib-io = []
+lib-math = []
+lib-os = []
+lib-package = []
+lib-string = []
+lib-table = []
+lib-utf8 = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tcvm_generic_group)"] }
+
 [dependencies]
 tcvm-derive = { path = "derive", version = "0.1.0" }
 hashbrown = { version = "0.17.1", default-features = false, features = ["nightly"] }
@@ -33,9 +54,6 @@ rand_core = "0.10.1"
 getrandom = "0.4.2"
 libc = "0.2.186"
 regalloc2 = { version = "0.15.2", features = ["checker"] }
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tcvm_generic_group)"] }
 
 [dev-dependencies]
 paste = "1.0.15"
