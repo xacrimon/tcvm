@@ -245,6 +245,9 @@ pub(crate) fn build_ir<'gc>(
         times.timed("verify", || check(&f, "peel"))?;
     }
     optimize(&mut f, times);
+    if times.timed("jumps", || opt::jumps::thread(&mut f)) {
+        times.timed("verify", || check(&f, "jumps"))?;
+    }
     // Edge arguments (the boxes `narrow` makes for them among them) sink
     // to their edges.
     times.timed("split edges", || opt::split_critical_edges(&mut f));

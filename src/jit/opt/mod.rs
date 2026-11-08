@@ -5,6 +5,7 @@ pub(crate) mod branch;
 pub(crate) mod calls;
 pub(crate) mod gvn;
 pub(crate) mod infer;
+pub(crate) mod jumps;
 pub(crate) mod licm;
 pub(crate) mod miss;
 pub(crate) mod peel;
