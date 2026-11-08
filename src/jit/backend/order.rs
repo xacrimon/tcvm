@@ -25,6 +25,11 @@ pub(crate) struct Layout {
     /// Each loop as the first and last index of its blocks in `order` (its
     /// header first), innermost loops first.
     pub(crate) loops: Vec<(u32, u32)>,
+    /// Per block of `order`: the header of the innermost loop holding it
+    /// (itself for a header), and for a header the enclosing loop's; as
+    /// indices into `order`, `u32::MAX` for none.
+    pub(crate) loop_of: Vec<u32>,
+    pub(crate) loop_parent: Vec<u32>,
 }
 
 pub(crate) fn layout(f: &Func<'_>) -> Layout {
@@ -113,11 +118,16 @@ pub(crate) fn layout(f: &Func<'_>) -> Layout {
             (at[h.idx()], last)
         })
         .collect();
+    let index = |h: Option<Block>| h.map_or(u32::MAX, |h| at[h.idx()]);
+    let loop_of = order.iter().map(|b| index(loop_header[b.idx()])).collect();
+    let loop_parent = order.iter().map(|b| index(loop_parent[b.idx()])).collect();
     Layout {
         order,
         emit,
         hot,
         loops,
+        loop_of,
+        loop_parent,
     }
 }
 

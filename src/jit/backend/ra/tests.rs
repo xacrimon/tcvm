@@ -494,7 +494,127 @@ fn generate(seed: u64) -> (VCode<T>, Vec<u32>, usize) {
     let mut order: Vec<u32> = (0..n).filter(|&b| !g.cold[b as usize]).collect();
     let hot = order.len();
     order.extend((0..n).filter(|&b| g.cold[b as usize]));
-    (g.finish(), order, hot)
+    let mut v = g.finish();
+    (v.loop_of, v.loop_parent) = loops(&v);
+    (v, order, hot)
+}
+
+/// What `order.rs` gives lowering: each block's innermost natural loop
+/// (its header) and each header's enclosing loop, from the dominators.
+fn loops(f: &VCode<T>) -> (Vec<u32>, Vec<u32>) {
+    const NONE: u32 = u32::MAX;
+    let nb = f.num_blocks();
+    let entry = f.entry_block().index();
+    let mut post = Vec::with_capacity(nb);
+    let mut seen = vec![false; nb];
+    let mut stack = vec![(entry, 0usize)];
+    seen[entry] = true;
+    while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+        let succs = f.block_succs(RBlock::new(b));
+        if *k < succs.len() {
+            let s = succs[*k].index();
+            *k += 1;
+            if !std::mem::replace(&mut seen[s], true) {
+                stack.push((s, 0));
+            }
+        } else {
+            post.push(b);
+            stack.pop();
+        }
+    }
+    let mut po = vec![NONE; nb];
+    for (k, &b) in post.iter().enumerate() {
+        po[b] = k as u32;
+    }
+    let mut idom = vec![NONE; nb];
+    idom[entry] = entry as u32;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in post.iter().rev() {
+            if b == entry {
+                continue;
+            }
+            let mut new = NONE;
+            for p in f.block_preds(RBlock::new(b)) {
+                let p = p.index();
+                if idom[p] == NONE {
+                    continue;
+                }
+                new = if new == NONE {
+                    p as u32
+                } else {
+                    let (mut x, mut y) = (new as usize, p);
+                    while x != y {
+                        while po[x] < po[y] {
+                            x = idom[x] as usize;
+                        }
+                        while po[y] < po[x] {
+                            y = idom[y] as usize;
+                        }
+                    }
+                    x as u32
+                };
+            }
+            if new != idom[b] {
+                idom[b] = new;
+                changed = true;
+            }
+        }
+    }
+    let dominates = |a: usize, mut b: usize| loop {
+        if a == b {
+            return true;
+        }
+        if b == entry || idom[b] == NONE {
+            return false;
+        }
+        b = idom[b] as usize;
+    };
+    let mut loops: Vec<(usize, Vec<bool>)> = Vec::new();
+    for (b, &d) in idom.iter().enumerate() {
+        if d == NONE {
+            continue;
+        }
+        for s in f.block_succs(RBlock::new(b)) {
+            let h = s.index();
+            if !dominates(h, b) {
+                continue;
+            }
+            let k = match loops.iter().position(|l| l.0 == h) {
+                Some(k) => k,
+                None => {
+                    let mut body = vec![false; nb];
+                    body[h] = true;
+                    loops.push((h, body));
+                    loops.len() - 1
+                }
+            };
+            let body = &mut loops[k].1;
+            let mut work = vec![b];
+            while let Some(x) = work.pop() {
+                if !std::mem::replace(&mut body[x], true) {
+                    work.extend(f.block_preds(RBlock::new(x)).iter().map(|p| p.index()));
+                }
+            }
+        }
+    }
+    loops.sort_by_key(|l| l.1.iter().filter(|&&x| x).count());
+    let mut inner = vec![NONE; nb];
+    let mut outer = vec![NONE; nb];
+    for (h, body) in &loops {
+        for (x, &inside) in body.iter().enumerate() {
+            if inside && inner[x] == NONE {
+                inner[x] = *h as u32;
+            }
+        }
+    }
+    for (k, (h, _)) in loops.iter().enumerate() {
+        outer[*h] = (loops[k + 1..].iter())
+            .find(|l| l.1[*h])
+            .map_or(NONE, |l| l.0 as u32);
+    }
+    (inner, outer)
 }
 
 fn check_operands(v: &VCode<T>, out: &Output) -> Result<(), String> {

@@ -39,6 +39,10 @@ pub(crate) struct VCode<I> {
     /// Per vreg: how to compute it again instead of reloading it.
     pub(crate) remat: Vec<Remat>,
     pub(crate) entry: RBlock,
+    /// Per block: the header of the innermost loop holding it (itself for a
+    /// header), and for a header the enclosing loop's; `u32::MAX` for none.
+    pub(crate) loop_of: Vec<u32>,
+    pub(crate) loop_parent: Vec<u32>,
 }
 
 /// A value the allocator may compute again where it is needed.
@@ -77,6 +81,8 @@ impl<I: TargetInst> VCode<I> {
             vreg_classes: Vec::new(),
             remat: Vec::new(),
             entry: RBlock::new(0),
+            loop_of: Vec::new(),
+            loop_parent: Vec::new(),
         }
     }
 

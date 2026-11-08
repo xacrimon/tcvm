@@ -9,6 +9,9 @@
 //! points. A spilled value is stored once, after its definition, so a
 //! register piece may end at any point without a store; only a reload
 //! needs a gap.
+//!
+//! Storage: a group's intervals and uses are runs of two flat arrays, and
+//! a piece is a window of its group's runs, so splitting copies nothing.
 
 mod build;
 pub(crate) mod checker;
@@ -85,6 +88,9 @@ impl Output {
 type Pos = u32;
 const NONE: u32 = u32::MAX;
 
+/// Registers per class the allocator can track (as bits of a `u32`).
+const MAX_REGS: usize = 32;
+
 /// The registers the allocator hands out and the ones its moves borrow.
 pub(crate) struct Env {
     /// Allocatable registers per class (int, float), preferred first.
@@ -105,7 +111,7 @@ fn class_index(c: RegClass) -> usize {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Loc {
     #[default]
     None,
@@ -123,7 +129,7 @@ impl Loc {
 }
 
 /// What a use position asks of the location.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Need {
     /// A register: a register use or a definition.
     Reg,
@@ -135,7 +141,7 @@ enum Need {
     Fixed(PReg),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 struct Use {
     pos: Pos,
     /// The operand's index in `Output::allocs`.
@@ -143,57 +149,114 @@ struct Use {
     need: Need,
 }
 
-/// One piece of a value's live range, with one location.
-#[derive(Debug, Default)]
+/// One piece of a group's live range, with one location: the group's
+/// intervals `lo..hi` cut to `start..end` (only the first and the last
+/// can be), and its uses `ulo..uhi`.
+#[derive(Clone, Copy)]
 struct Piece {
-    vreg: u32,
-    /// Sorted, disjoint, not adjacent.
-    ivs: Vec<(Pos, Pos)>,
-    uses: Vec<Use>,
+    g: u32,
+    class: u8,
+    start: Pos,
+    end: Pos,
+    lo: u32,
+    hi: u32,
+    ulo: u32,
+    uhi: u32,
+    /// The group's pieces by start.
+    prev: u32,
+    next: u32,
     loc: Loc,
     /// A fixed definition's point in its register: never moved or spilled.
     fixed: bool,
 }
 
 impl Piece {
-    fn start(&self) -> Pos {
-        self.ivs[0].0
+    /// Merged back into the piece before it.
+    fn dead(&self) -> bool {
+        self.lo == self.hi
     }
 
-    fn end(&self) -> Pos {
-        self.ivs[self.ivs.len() - 1].1
+    fn ivs<'a>(&self, ivs: &'a [(Pos, Pos)]) -> Ivs<'a> {
+        Ivs {
+            raw: &ivs[self.lo as usize..self.hi as usize],
+            start: self.start,
+            end: self.end,
+        }
+    }
+
+    fn uses<'a>(&self, uses: &'a [Use]) -> &'a [Use] {
+        &uses[self.ulo as usize..self.uhi as usize]
+    }
+}
+
+/// Sorted, disjoint, not adjacent intervals, cut to `start..end`.
+#[derive(Clone, Copy)]
+struct Ivs<'a> {
+    raw: &'a [(Pos, Pos)],
+    start: Pos,
+    end: Pos,
+}
+
+impl<'a> Ivs<'a> {
+    fn plain(raw: &'a [(Pos, Pos)]) -> Self {
+        Ivs {
+            raw,
+            start: 0,
+            end: Pos::MAX,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.raw.len()
+    }
+
+    fn get(&self, k: usize) -> (Pos, Pos) {
+        let (a, b) = self.raw[k];
+        (a.max(self.start), b.min(self.end))
+    }
+
+    /// The first interval ending after `p`.
+    fn after(&self, p: Pos) -> usize {
+        if p >= self.end {
+            return self.raw.len();
+        }
+        self.raw.partition_point(|iv| iv.1 <= p)
     }
 
     fn covers(&self, p: Pos) -> bool {
-        let k = self.ivs.partition_point(|iv| iv.1 <= p);
-        k < self.ivs.len() && self.ivs[k].0 <= p
-    }
-
-    /// The first use at or after `from` that `want` accepts.
-    fn next_use(&self, from: Pos, want: impl Fn(Need) -> bool) -> Option<Use> {
-        let k = self.uses.partition_point(|u| u.pos < from);
-        self.uses[k..].iter().find(|u| want(u.need)).copied()
+        self.start <= p && p < self.end && self.raw[self.after(p)].0 <= p
     }
 }
 
-fn needs_reg(n: Need) -> bool {
-    n == Need::Reg
+/// The uses `next_use` looks for: needing a register, served by one,
+/// wanting a fixed one.
+#[derive(Clone, Copy)]
+enum Want {
+    Reg = 0,
+    Beneficial = 1,
+    Fixed = 2,
 }
 
-fn reg_beneficial(n: Need) -> bool {
-    matches!(n, Need::Reg | Need::Fixed(_))
+impl Want {
+    fn of(n: Need) -> [bool; 3] {
+        [
+            n == Need::Reg,
+            matches!(n, Need::Reg | Need::Fixed(_)),
+            matches!(n, Need::Fixed(_)),
+        ]
+    }
 }
 
 /// The first point at or after `from` both interval lists cover.
-fn intersect(a: &[(Pos, Pos)], b: &[(Pos, Pos)], from: Pos) -> Option<Pos> {
-    let mut i = a.partition_point(|iv| iv.1 <= from);
-    let mut j = b.partition_point(|iv| iv.1 <= from);
+fn intersect(a: Ivs, b: Ivs, from: Pos) -> Option<Pos> {
+    let (mut i, mut j) = (a.after(from), b.after(from));
     while i < a.len() && j < b.len() {
-        let lo = a[i].0.max(b[j].0).max(from);
-        if lo < a[i].1.min(b[j].1) {
+        let (x, y) = (a.get(i), b.get(j));
+        let lo = x.0.max(y.0).max(from);
+        if lo < x.1.min(y.1) {
             return Some(lo);
         }
-        if a[i].1 <= b[j].1 {
+        if x.1 <= y.1 {
             i += 1;
         } else {
             j += 1;
@@ -202,25 +265,41 @@ fn intersect(a: &[(Pos, Pos)], b: &[(Pos, Pos)], from: Pos) -> Option<Pos> {
     None
 }
 
-#[derive(Debug)]
+/// A piece in `active` or `inactive` with its register (`env.regs[cls][k]`)
+/// and where it next changes sides: the end of the interval it is in, or
+/// the start of its next. A listed piece is not split or merged.
+#[derive(Clone, Copy)]
+struct Held {
+    x: u32,
+    until: Pos,
+    cls: u8,
+    k: u8,
+}
+
+/// A group of values sharing one allocation (`build`), by its
+/// representative; the fields after `class` are the group's.
 struct VInfo {
     class: u8,
-    /// Its pieces, by start.
-    pieces: Vec<u32>,
-    /// Its spill slot, once spilled anywhere or used from the stack.
-    slot: u32,
+    /// A constant, computed again instead of spilled.
+    remat: bool,
+    /// A parameter every argument of which is in its group: their stores
+    /// after their definitions already filled the slot.
+    args_in_group: bool,
     /// The point it is defined at, `NONE` for a block parameter.
     def: Pos,
     /// The block whose parameter it is, else `NONE`.
     param_of: u32,
-    /// A parameter every argument of which is in its group: their stores
-    /// after their definitions already filled the slot.
-    args_in_group: bool,
-    /// A group's members' definition points, sorted: a piece may start at
-    /// one without a move.
-    defs: Vec<Pos>,
-    /// A constant, computed again instead of spilled.
-    remat: bool,
+    /// Its first piece, `NONE` for none.
+    head: u32,
+    /// Its spill slot, once spilled anywhere or used from the stack.
+    slot: u32,
+    /// Its members' definition points, sorted (a run of `Ra::defs`): a
+    /// piece may start at one without a move.
+    defs: (u32, u32),
+    /// Its members, ascending (a run of `Ra::members`).
+    members: (u32, u32),
+    /// Its pieces by start, after the scan (a run of `Ra::flat`).
+    flat: (u32, u32),
 }
 
 struct Ra<'a, I: TargetInst> {
@@ -241,11 +320,25 @@ struct Ra<'a, I: TargetInst> {
     cold_start: Pos,
     /// Header of the innermost loop holding each block (itself for a
     /// header), else `NONE`; the enclosing loop's header of each header.
-    inner: Vec<u32>,
-    outer: Vec<u32>,
+    inner: &'a [u32],
+    outer: &'a [u32],
+    /// Per loop header: the end of the last hot block of its loop, 0 for
+    /// none.
+    hot_end: Vec<Pos>,
     words: usize,
     live_in: Vec<u64>,
+    /// Intervals and uses, a run per group (`Piece`).
+    ivs: Vec<(Pos, Pos)>,
+    uses: Vec<Use>,
+    /// Per use: the index of the first use from it on (in its group) that
+    /// needs a register, that a register serves, that is fixed (`Want`);
+    /// past the group's last otherwise.
+    next_of: Vec<[u32; 3]>,
+    defs: Vec<Pos>,
+    members: Vec<u32>,
     pieces: Vec<Piece>,
+    flat: Vec<u32>,
+    flat_start: Vec<Pos>,
     /// Per value; a group's pieces and slot are its representative's.
     vregs: Vec<VInfo>,
     /// Each value's group (`build`): itself, or the parameter it joined.
@@ -253,47 +346,55 @@ struct Ra<'a, I: TargetInst> {
     /// Per group: stored where it goes from a register to the stack, not
     /// after its definitions.
     deferred: Vec<bool>,
-    /// Per `PReg::index()`: points it is reserved over, `(from, to, owner)`
-    /// sorted by `from`; the owner vreg may sit there (a fixed operand of
-    /// its own), `NONE` owns a clobber.
-    fixed: Vec<Vec<(Pos, Pos, u32)>>,
+    /// Points fixed operands reserve allocatable registers over, `(from,
+    /// to, owner)` by `from`, `env.regs[c][k]`'s at `fixres[fixoff[r]..
+    /// fixoff[r + 1]]` for `r = c * MAX_REGS + k`; the owner vreg may sit
+    /// there (a fixed operand of its own).
+    fixres: Vec<(Pos, Pos, u32)>,
+    fixoff: Vec<u32>,
+    /// Per class, the registers (as `env.regs` bits) with any.
+    fixregs: [u32; 2],
+    /// Where `fixed_conflicts` left off in each register's reservations and
+    /// in `clobs`: it asks at the scan's position, which only grows.
+    fixcur: Vec<std::cell::Cell<u32>>,
+    clobcur: std::cell::Cell<u32>,
+    /// Late points of clobbering instructions, by point, with the
+    /// registers they take per class as bits of `env.regs` indices.
+    clobs: Vec<(Pos, [u32; 2])>,
     /// Per `PReg::index()`: its place in `env.regs` of its class, or `NONE`.
     reg_idx: Vec<u32>,
     allocs: Vec<Allocation>,
     alloc_base: Vec<u32>,
     num_slots: u32,
-    unhandled: std::collections::BinaryHeap<std::cmp::Reverse<(Pos, u32)>>,
+    /// Pieces to allocate by start: those `build` made, sorted, and a heap
+    /// of the ones queued since.
+    initial: Vec<u64>,
+    next_initial: usize,
+    unhandled: std::collections::BinaryHeap<std::cmp::Reverse<u64>>,
     /// Pieces holding their register at the scan's position, and those in
     /// a hole there.
-    active: Vec<u32>,
-    inactive: Vec<u32>,
+    active: Vec<Held>,
+    inactive: Vec<Held>,
+    /// No piece of `active` or `inactive` changes sides or retires before
+    /// this point (V8's `next_active_ranges_change_` and inactive's).
+    next_change: Pos,
+    scratch: Vec<Held>,
 }
 
-/// Allocate `f`'s registers.
 /// Allocate `f`'s registers, its blocks taken in `order`: the first `hot`
 /// of them hot, the rest (exits, cold arms) after them all.
-pub(crate) fn run<I: TargetInst + std::fmt::Debug>(
+pub(crate) fn run<I: TargetInst>(
     f: &VCode<I>,
     env: &Env,
     order: &[u32],
     hot: usize,
 ) -> Result<Output, String> {
     let mut ra = Ra::new(f, env);
-    let r = (|| {
-        ra.layout(order, hot)?;
-        ra.liveness()?;
-        ra.build()?;
-        ra.scan()?;
-        #[cfg(test)]
-        if std::env::var_os("TCVM_RA_PIECES").is_some() {
-            ra.dump_pieces();
-        }
-        ra.resolve()
-    })();
-    if r.is_err() && std::env::var_os("TCVM_RA_DEBUG").is_some() {
-        eprintln!("{}", dump(f));
-    }
-    r
+    ra.layout(order, hot)?;
+    ra.liveness()?;
+    ra.build()?;
+    ra.scan()?;
+    ra.resolve()
 }
 
 /// Operands of one instruction that may not share a register: an early
@@ -344,37 +445,11 @@ pub(crate) fn remat_table<I: TargetInst>(f: &VCode<I>) -> (Vec<bool>, Vec<Option
     (remat, src)
 }
 
-/// The function before allocation: blocks, operands, clobbers.
-fn dump<I: TargetInst + std::fmt::Debug>(f: &VCode<I>) -> String {
-    use std::fmt::Write;
-    let mut s = String::new();
-    for b in 0..f.num_blocks() {
-        let rb = Block::new(b);
-        let _ = writeln!(
-            s,
-            "b{b}{:?} <- {:?} -> {:?}",
-            f.block_params(rb),
-            f.block_preds(rb),
-            f.block_succs(rb)
-        );
-        for i in f.block_insns(rb).iter() {
-            let _ = writeln!(
-                s,
-                "  {:>4} {:?} {:?} clob {:?}",
-                i.index(),
-                f.insts[i.index()],
-                f.inst_operands(i),
-                f.inst_clobbers(i)
-            );
-        }
-    }
-    s
-}
-
 impl<'a, I: TargetInst> Ra<'a, I> {
     fn new(f: &'a VCode<I>, env: &'a Env) -> Self {
         let mut reg_idx = vec![NONE; PReg::NUM_INDEX];
         for regs in &env.regs {
+            assert!(regs.len() <= MAX_REGS, "more registers than a mask holds");
             for (k, r) in regs.iter().enumerate() {
                 reg_idx[r.index()] = k as u32;
             }
@@ -390,22 +465,39 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             at_lin: Vec::new(),
             freq: Vec::new(),
             cold_start: Pos::MAX,
-            inner: Vec::new(),
-            outer: Vec::new(),
+            inner: &[],
+            outer: &[],
+            hot_end: Vec::new(),
             words: 0,
             live_in: Vec::new(),
+            ivs: Vec::new(),
+            uses: Vec::new(),
+            next_of: Vec::new(),
+            defs: Vec::new(),
+            members: Vec::new(),
             pieces: Vec::new(),
+            flat: Vec::new(),
+            flat_start: Vec::new(),
             vregs: Vec::new(),
             rep: Vec::new(),
             deferred: Vec::new(),
-            fixed: vec![Vec::new(); PReg::NUM_INDEX],
+            fixres: Vec::new(),
+            fixoff: Vec::new(),
+            fixregs: [0; 2],
+            fixcur: Vec::new(),
+            clobcur: std::cell::Cell::new(0),
+            clobs: Vec::new(),
             reg_idx,
             allocs: Vec::new(),
             alloc_base: Vec::new(),
             num_slots: 0,
+            initial: Vec::new(),
+            next_initial: 0,
             unhandled: std::collections::BinaryHeap::new(),
             active: Vec::new(),
             inactive: Vec::new(),
+            next_change: 0,
+            scratch: Vec::new(),
         }
     }
 
@@ -422,13 +514,19 @@ impl<'a, I: TargetInst> Ra<'a, I> {
     }
 
     /// The linear order (blocks as numbered: `order.rs` lays out the
-    /// allocator's order) and its loops, from the dominators.
+    /// allocator's order), its loops (`VCode::loop_of`), and the static
+    /// frequencies.
     fn layout(&mut self, order: &[u32], hot: usize) -> Result<(), String> {
         let f = self.f;
         let nb = f.num_blocks();
         if order.len() != nb {
             return Err("an order not of every block".into());
         }
+        if f.loop_of.len() != nb || f.loop_parent.len() != nb {
+            return Err("no loop nesting".into());
+        }
+        self.inner = &f.loop_of;
+        self.outer = &f.loop_parent;
         self.order = order.iter().map(|&b| Block::new(b as usize)).collect();
         self.rank = vec![NONE; nb];
         for (k, &b) in order.iter().enumerate() {
@@ -436,6 +534,8 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         }
         self.first = vec![0; nb];
         self.last = vec![0; nb];
+        self.at_lin.reserve(f.num_insts());
+        self.lin_block.reserve(f.num_insts());
         for &b in &self.order {
             let r = f.block_insns(b);
             if r.len() == 0 {
@@ -447,120 +547,6 @@ impl<'a, I: TargetInst> Ra<'a, I> {
                 self.lin_block.push(b.index() as u32);
             }
             self.last[b.index()] = self.at_lin.len() as u32 - 1;
-        }
-        // Dominators (Cooper, Harvey, Kennedy) over reverse postorder.
-        let mut post = Vec::with_capacity(nb);
-        let mut seen = vec![false; nb];
-        let mut stack = vec![(f.entry_block().index(), 0usize)];
-        seen[f.entry_block().index()] = true;
-        while let Some(&mut (b, ref mut k)) = stack.last_mut() {
-            let succs = f.block_succs(Block::new(b));
-            if *k < succs.len() {
-                let s = succs[*k].index();
-                *k += 1;
-                if !std::mem::replace(&mut seen[s], true) {
-                    stack.push((s, 0));
-                }
-            } else {
-                post.push(b);
-                stack.pop();
-            }
-        }
-        let mut po = vec![NONE; nb];
-        for (k, &b) in post.iter().enumerate() {
-            po[b] = k as u32;
-        }
-        let mut idom = vec![NONE; nb];
-        let entry = f.entry_block().index();
-        idom[entry] = entry as u32;
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &b in post.iter().rev() {
-                if b == entry {
-                    continue;
-                }
-                let mut new = NONE;
-                for p in f.block_preds(Block::new(b)) {
-                    let p = p.index();
-                    if idom[p] == NONE {
-                        continue;
-                    }
-                    new = if new == NONE {
-                        p as u32
-                    } else {
-                        let (mut x, mut y) = (new as usize, p);
-                        while x != y {
-                            while po[x] < po[y] {
-                                x = idom[x] as usize;
-                            }
-                            while po[y] < po[x] {
-                                y = idom[y] as usize;
-                            }
-                        }
-                        x as u32
-                    };
-                }
-                if new != idom[b] {
-                    idom[b] = new;
-                    changed = true;
-                }
-            }
-        }
-        let dominates = |a: usize, mut b: usize| loop {
-            if a == b {
-                return true;
-            }
-            if b == entry || idom[b] == NONE {
-                return false;
-            }
-            b = idom[b] as usize;
-        };
-        // Natural loops, one per header; smallest first gives each block its
-        // innermost loop on the first write.
-        let mut loops: Vec<(usize, Vec<bool>)> = Vec::new();
-        for (b, &d) in idom.iter().enumerate() {
-            if d == NONE {
-                continue;
-            }
-            for s in f.block_succs(Block::new(b)) {
-                let h = s.index();
-                if !dominates(h, b) {
-                    continue;
-                }
-                let k = match loops.iter().position(|l| l.0 == h) {
-                    Some(k) => k,
-                    None => {
-                        let mut body = vec![false; nb];
-                        body[h] = true;
-                        loops.push((h, body));
-                        loops.len() - 1
-                    }
-                };
-                let body = &mut loops[k].1;
-                let mut work = vec![b];
-                while let Some(x) = work.pop() {
-                    if !std::mem::replace(&mut body[x], true) {
-                        work.extend(f.block_preds(Block::new(x)).iter().map(|p| p.index()));
-                    }
-                }
-            }
-        }
-        loops.sort_by_key(|l| l.1.iter().filter(|&&x| x).count());
-        self.inner = vec![NONE; nb];
-        self.outer = vec![NONE; nb];
-        for (h, body) in &loops {
-            for (x, &inside) in body.iter().enumerate() {
-                if inside && self.inner[x] == NONE {
-                    self.inner[x] = *h as u32;
-                }
-            }
-        }
-        for (k, (h, _)) in loops.iter().enumerate() {
-            self.outer[*h] = loops[k + 1..]
-                .iter()
-                .find(|l| l.1[*h])
-                .map_or(NONE, |l| l.0 as u32);
         }
         // Static frequencies: eight times per loop level, cold code next to
         // nothing.
@@ -579,28 +565,16 @@ impl<'a, I: TargetInst> Ra<'a, I> {
                 8f32.powi(depth.min(6))
             })
             .collect();
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn dump_pieces(&self) {
-        for (g, gi) in self.vregs.iter().enumerate() {
-            if gi.pieces.is_empty() {
-                continue;
-            }
-            let members: Vec<usize> = (0..self.rep.len())
-                .filter(|&v| self.rep[v] == g as u32)
-                .collect();
-            eprintln!(
-                "g{g} {members:?} slot {} defs {:?}",
-                gi.slot as i64, gi.defs
-            );
-            for &x in &gi.pieces {
-                let p = &self.pieces[x as usize];
-                let us: Vec<_> = p.uses.iter().map(|u| (u.pos, u.need)).collect();
-                eprintln!("    {:?} {:?} {us:?}", p.loc, p.ivs);
+        self.hot_end = vec![0; nb];
+        for &b in &order[..hot.min(nb)] {
+            let end = self.block_end(b);
+            let mut h = self.inner[b as usize];
+            while h != NONE {
+                self.hot_end[h as usize] = self.hot_end[h as usize].max(end);
+                h = self.outer[h as usize];
             }
         }
+        Ok(())
     }
 
     /// The frequency of the block holding `p`.
@@ -624,6 +598,7 @@ impl<'a, I: TargetInst> Ra<'a, I> {
 
     /// Live-in sets by a backward dataflow fixpoint.
     fn liveness(&mut self) -> Result<(), String> {
+        use crate::jit::backend::reg::OperandKind;
         let f = self.f;
         let nb = f.num_blocks();
         let w = f.num_vregs().div_ceil(64);
@@ -637,17 +612,15 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             for p in f.block_params(Block::new(b)) {
                 set(k, p.vreg());
             }
-            let insns = f.block_insns(Block::new(b));
-            for i in insns.iter() {
-                for op in f.inst_operands(i) {
-                    if op.kind() == crate::jit::backend::reg::OperandKind::Use
-                        && !has(k, op.vreg().vreg())
-                    {
+            for i in f.block_insns(Block::new(b)).iter() {
+                let ops = f.inst_operands(i);
+                for op in ops {
+                    if op.kind() == OperandKind::Use && !has(k, op.vreg().vreg()) {
                         set(g, op.vreg().vreg());
                     }
                 }
-                for op in f.inst_operands(i) {
-                    if op.kind() == crate::jit::backend::reg::OperandKind::Def {
+                for op in ops {
+                    if op.kind() == OperandKind::Def {
                         set(k, op.vreg().vreg());
                     }
                 }
@@ -660,27 +633,39 @@ impl<'a, I: TargetInst> Ra<'a, I> {
                 }
             }
         }
+        // A worklist from the last block: a block is done again only when
+        // a successor's set grew.
         let mut live_in = vec![0u64; nb * w];
         let mut out = vec![0u64; w];
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &b in self.order.iter().rev() {
-                let b = b.index();
-                out.fill(0);
-                for s in f.block_succs(Block::new(b)) {
-                    for (o, x) in out
-                        .iter_mut()
-                        .zip(&live_in[s.index() * w..(s.index() + 1) * w])
-                    {
-                        *o |= x;
+        let mut queued = vec![true; nb];
+        let mut work: std::collections::VecDeque<u32> =
+            self.order.iter().rev().map(|b| b.index() as u32).collect();
+        while let Some(b) = work.pop_front() {
+            let b = b as usize;
+            queued[b] = false;
+            let succs = f.block_succs(Block::new(b));
+            match succs.split_first() {
+                None => out.fill(0),
+                Some((s, rest)) => {
+                    out.copy_from_slice(&live_in[s.index() * w..(s.index() + 1) * w]);
+                    for s in rest {
+                        let si = s.index();
+                        for (o, x) in out.iter_mut().zip(&live_in[si * w..(si + 1) * w]) {
+                            *o |= x;
+                        }
                     }
                 }
-                for k in 0..w {
-                    let n = gen_[b * w + k] | (out[k] & !kill[b * w + k]);
-                    if n != live_in[b * w + k] {
-                        live_in[b * w + k] = n;
-                        changed = true;
+            }
+            let mut changed = false;
+            for k in 0..w {
+                let n = gen_[b * w + k] | (out[k] & !kill[b * w + k]);
+                changed |= n != live_in[b * w + k];
+                live_in[b * w + k] = n;
+            }
+            if changed {
+                for p in f.block_preds(Block::new(b)) {
+                    if !std::mem::replace(&mut queued[p.index()], true) {
+                        work.push_back(p.index() as u32);
                     }
                 }
             }
@@ -697,17 +682,6 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         &self.live_in[b * self.words..(b + 1) * self.words]
     }
 
-    /// The live-out set of `b`.
-    fn live_out(&self, b: usize) -> Vec<u64> {
-        let mut out = vec![0u64; self.words];
-        for s in self.f.block_succs(Block::new(b)) {
-            for (o, x) in out.iter_mut().zip(self.live_in(s.index())) {
-                *o |= x;
-            }
-        }
-        out
-    }
-
     fn slot_of(&mut self, v: u32) -> u32 {
         let vi = &mut self.vregs[v as usize];
         if vi.slot == NONE {
@@ -717,20 +691,68 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         vi.slot
     }
 
-    /// The piece of `v` covering `p`.
-    fn piece_at(&self, v: u32, p: Pos) -> Option<u32> {
-        let ps = &self.vregs[v as usize].pieces;
-        let k = ps.partition_point(|&x| self.pieces[x as usize].start() <= p);
-        if k == 0 {
+    fn ivs_of(&self, x: u32) -> Ivs<'_> {
+        self.pieces[x as usize].ivs(&self.ivs)
+    }
+
+    fn uses_of(&self, x: u32) -> &[Use] {
+        self.pieces[x as usize].uses(&self.uses)
+    }
+
+    fn start(&self, x: u32) -> Pos {
+        self.pieces[x as usize].start
+    }
+
+    fn end(&self, x: u32) -> Pos {
+        self.pieces[x as usize].end
+    }
+
+    /// The first use of `x` at or after `from` that `want` names.
+    fn next_use(&self, x: u32, from: Pos, want: Want) -> Option<Use> {
+        let p = &self.pieces[x as usize];
+        let k = p.ulo + p.uses(&self.uses).partition_point(|u| u.pos < from) as u32;
+        self.want_from(k, p.uhi, want)
+            .map(|j| self.uses[j as usize])
+    }
+
+    /// The first use index from `k` below `hi` that `want` names.
+    fn want_from(&self, k: u32, hi: u32, want: Want) -> Option<u32> {
+        if k >= hi {
             return None;
         }
-        let x = ps[k - 1];
-        self.pieces[x as usize].covers(p).then_some(x)
+        let j = self.next_of[k as usize][want as usize];
+        (j < hi).then_some(j)
+    }
+
+    /// The piece of group `g` covering `p`: from the index `resolve` makes,
+    /// or along the list before it.
+    fn piece_at(&self, g: u32, p: Pos) -> Option<u32> {
+        let vi = &self.vregs[g as usize];
+        let x = if vi.flat.1 > vi.flat.0 {
+            let ps = &self.flat[vi.flat.0 as usize..vi.flat.1 as usize];
+            let k = ps.partition_point(|&x| self.start(x) <= p);
+            if k == 0 {
+                return None;
+            }
+            ps[k - 1]
+        } else {
+            let (mut x, mut at) = (vi.head, NONE);
+            while x != NONE && self.start(x) <= p {
+                at = x;
+                x = self.pieces[x as usize].next;
+            }
+            if at == NONE {
+                return None;
+            }
+            at
+        };
+        self.ivs_of(x).covers(p).then_some(x)
     }
 
     /// Whether a member of group `g` is defined at `p`.
     fn is_def(&self, g: u32, p: Pos) -> bool {
-        self.vregs[g as usize].defs.binary_search(&p).is_ok()
+        let (a, b) = self.vregs[g as usize].defs;
+        self.defs[a as usize..b as usize].binary_search(&p).is_ok()
     }
 
     /// Whether a piece of `g` spilled from `s` can be back in a register
@@ -751,9 +773,9 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             Loc::Reg(r) => Allocation::reg(r),
             Loc::Remat => Allocation::none(),
             Loc::Stack => Allocation::stack(crate::jit::backend::reg::SpillSlot::new(
-                self.vregs[p.vreg as usize].slot as usize,
+                self.vregs[p.g as usize].slot as usize,
             )),
-            Loc::None => panic!("piece {x} of v{} unallocated", p.vreg),
+            Loc::None => panic!("piece {x} of v{} unallocated", p.g),
         }
     }
 }

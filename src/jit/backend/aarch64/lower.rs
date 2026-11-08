@@ -179,6 +179,8 @@ pub(crate) fn lower<'gc>(
         emit: emit_order,
         hot: hot_blocks,
         loops,
+        loop_of,
+        loop_parent,
     } = crate::jit::backend::order::layout(f);
     let order = &order;
     let mut block_of = vec![u32::MAX; f.blocks.len()];
@@ -298,6 +300,8 @@ pub(crate) fn lower<'gc>(
         );
     }
     lw.v.entry = RBlock::new(0);
+    lw.v.loop_of = loop_of;
+    lw.v.loop_parent = loop_parent;
     Ok(Lowered {
         vcode: lw.v,
         exits: lw.exits,

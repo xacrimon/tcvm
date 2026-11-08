@@ -2,9 +2,10 @@
 //! across edges, into fixed registers, and the stores after definitions,
 //! each gap's moves sequenced as one parallel move.
 
-use super::{Edit, Loc, NONE, Need, Output, Pos, Ra, intersect};
-use crate::jit::backend::reg::{Allocation, ProgPoint, RegClass, VReg};
-use crate::jit::backend::vcode::TargetInst;
+use super::build::{merge_tail, push_coalesced};
+use super::{Edit, Ivs, Loc, NONE, Need, Output, Pos, Ra, Want, intersect};
+use crate::jit::backend::reg::{Allocation, ProgPoint, RegClass, SpillSlot, VReg};
+use crate::jit::backend::vcode::{Remat, TargetInst};
 
 /// A move of a value of class `cls`, or with `remat` its computation
 /// again from `from` (`Allocation::none()` for a constant).
@@ -33,6 +34,7 @@ const FIXED_COPY: u8 = 6;
 
 impl<I: TargetInst> Ra<'_, I> {
     pub(super) fn resolve(&mut self) -> Result<Output, String> {
+        let split = self.index_pieces();
         self.slot_derived();
         // A group is stored where it goes from a register to the stack when
         // that runs no more often than storing after its definitions (V8's
@@ -44,24 +46,22 @@ impl<I: TargetInst> Ra<'_, I> {
             .collect();
         self.color_slots();
         for x in 0..self.pieces.len() as u32 {
-            let p = &self.pieces[x as usize];
-            // Merged back into the piece it was split from.
-            if p.ivs.is_empty() {
+            let p = self.pieces[x as usize];
+            if p.dead() {
                 continue;
             }
             if p.loc == Loc::None {
-                return Err(format!("v{} left unallocated", p.vreg));
+                return Err(format!("v{} left unallocated", p.g));
             }
-            for u in &p.uses {
+            for k in p.ulo..p.uhi {
+                let u = self.uses[k as usize];
                 let a = match u.need {
                     Need::Reg => match p.loc {
                         Loc::Reg(r) => Allocation::reg(r),
-                        _ => return Err(format!("v{} needs a register at {}", p.vreg, u.pos)),
+                        _ => return Err(format!("v{} needs a register at {}", p.g, u.pos)),
                     },
                     Need::Any => self.alloc_of(x),
-                    Need::Stack => Allocation::stack(crate::jit::backend::reg::SpillSlot::new(
-                        self.vregs[p.vreg as usize].slot as usize,
-                    )),
+                    Need::Stack => self.slot(p.g),
                     Need::Fixed(r) => Allocation::reg(r),
                 };
                 self.allocs[u.alloc as usize] = a;
@@ -71,13 +71,10 @@ impl<I: TargetInst> Ra<'_, I> {
         for v in 0..self.vregs.len() as u32 {
             let gr = self.rep[v as usize];
             let g = &self.vregs[gr as usize];
-            if g.slot == NONE || g.pieces.is_empty() || self.deferred[gr as usize] {
+            if g.slot == NONE || g.head == NONE || self.deferred[gr as usize] {
                 continue;
             }
-            let (cls, slot) = (
-                g.class,
-                Allocation::stack(crate::jit::backend::reg::SpillSlot::new(g.slot as usize)),
-            );
+            let (cls, slot) = (g.class, self.slot(gr));
             let vi = &self.vregs[v as usize];
             if vi.def != NONE {
                 let l = vi.def / 2;
@@ -86,49 +83,30 @@ impl<I: TargetInst> Ra<'_, I> {
                 }
                 let from = self.alloc_at(v, vi.def).expect("the definition's piece");
                 debug_assert!(from.is_reg());
-                moves.push((
-                    l + 1,
-                    DEF_STORE,
-                    Mv {
-                        from,
-                        to: slot,
-                        cls,
-                        vreg: v,
-                        remat: false,
-                    },
-                ));
+                moves.push((l + 1, DEF_STORE, mv(from, slot, cls, v, false)));
             } else if vi.param_of != NONE && !vi.args_in_group {
                 let b = vi.param_of;
                 if let Some(from) = self.alloc_at(v, self.block_start(b))
                     && from.is_reg()
                 {
-                    moves.push((
-                        self.first[b as usize],
-                        PARAM_STORE,
-                        Mv {
-                            from,
-                            to: slot,
-                            cls,
-                            vreg: v,
-                            remat: false,
-                        },
-                    ));
+                    let at = self.first[b as usize];
+                    moves.push((at, PARAM_STORE, mv(from, slot, cls, v, false)));
                 }
             }
         }
         for g in 0..self.vregs.len() as u32 {
             let gi = &self.vregs[g as usize];
-            if self.rep[g as usize] != g || gi.pieces.is_empty() {
+            if self.rep[g as usize] != g || gi.head == NONE {
                 continue;
             }
-            let cls = gi.class;
+            let (cls, deferred) = (gi.class, self.deferred[g as usize]);
+            let ps = &self.flat[gi.flat.0 as usize..gi.flat.1 as usize];
             // Between pieces inside a block; a stack piece needs a store only
             // in cold code, before the instruction it starts at.
-            let deferred = self.deferred[g as usize];
-            for w in gi.pieces.windows(2) {
+            for w in ps.windows(2) {
                 let (a, b) = (&self.pieces[w[0] as usize], &self.pieces[w[1] as usize]);
-                let at = b.start();
-                if a.end() != at
+                let at = b.start;
+                if a.end != at
                     || a.loc == b.loc
                     || self.is_def(g, at)
                     || b.loc == Loc::Remat
@@ -136,46 +114,55 @@ impl<I: TargetInst> Ra<'_, I> {
                 {
                     continue;
                 }
-                let bb = self.block_of_pos(at);
-                if at == self.block_start(bb) {
+                if at == self.block_start(self.block_of_pos(at)) {
                     continue;
                 }
                 if at & 1 != 0 && b.loc != Loc::Stack {
                     return Err(format!("v{g} reloaded inside instruction {}", at / 2));
                 }
-                moves.push((
-                    at / 2,
-                    if at & 1 != 0 { LATE_STORE } else { CONNECT },
-                    self.mv(g, at - 1, self.alloc_of(w[1]), cls),
-                ));
+                let phase = if at & 1 != 0 { LATE_STORE } else { CONNECT };
+                moves.push((at / 2, phase, self.mv(g, at - 1, self.alloc_of(w[1]), cls)));
             }
             // Into fixed registers, from wherever the value is when the
             // instruction starts.
-            for &x in &gi.pieces {
-                for u in &self.pieces[x as usize].uses {
-                    if let Need::Fixed(r) = u.need {
-                        let n = u.pos / 2;
-                        let m = self.mv(g, 2 * n, Allocation::reg(r), cls);
-                        if m.remat || m.from != m.to {
-                            moves.push((n, FIXED_COPY, m));
-                        }
+            for &x in ps {
+                let p = &self.pieces[x as usize];
+                let mut k = p.ulo;
+                while let Some(j) = self.want_from(k, p.uhi, Want::Fixed) {
+                    let u = self.uses[j as usize];
+                    let Need::Fixed(r) = u.need else {
+                        unreachable!("a fixed use")
+                    };
+                    let n = u.pos / 2;
+                    let m = self.mv(g, 2 * n, Allocation::reg(r), cls);
+                    if m.remat || m.from != m.to {
+                        moves.push((n, FIXED_COPY, m));
                     }
+                    k = j + 1;
                 }
             }
         }
-        self.edge_moves(&mut moves)?;
-        moves.sort_by_key(|&(l, phase, _)| (self.at_lin[l as usize].index(), phase));
-        let mut edits: Vec<(ProgPoint, Edit)> = Vec::new();
+        self.edge_moves(&split, &mut moves)?;
+        // By instruction and phase, in the order pushed.
+        let mut keys: Vec<u64> = (moves.iter().enumerate())
+            .map(|(k, &(l, phase, _))| {
+                ((self.at_lin[l as usize].index() as u64) << 3 | phase as u64) << 32 | k as u64
+            })
+            .collect();
+        keys.sort_unstable();
+        let moves: Vec<_> = keys.iter().map(|&k| moves[k as u32 as usize]).collect();
+        let mut edits: Vec<(ProgPoint, Edit)> = Vec::with_capacity(moves.len());
+        let mut group = Vec::new();
         let mut k = 0;
         while k < moves.len() {
             let (l, phase) = (moves[k].0, moves[k].1);
-            let mut group = Vec::new();
+            group.clear();
             while k < moves.len() && moves[k].0 == l && moves[k].1 == phase {
                 group.push(moves[k].2);
                 k += 1;
             }
             let at = ProgPoint::before(self.at_lin[l as usize]);
-            self.sequence(group, |e| edits.push((at, e)))?;
+            self.sequence(&mut group, |e| edits.push((at, e)))?;
         }
         Ok(Output {
             num_spillslots: self.num_slots as usize,
@@ -185,29 +172,59 @@ impl<I: TargetInst> Ra<'_, I> {
         })
     }
 
+    /// Each group's pieces by start as a run of `flat`, for lookups; the
+    /// values whose group's pieces are not all in one place, as a set over
+    /// vregs (only those can be in two places at an edge's ends).
+    fn index_pieces(&mut self) -> Vec<u64> {
+        let mut split = vec![0u64; self.words];
+        for g in 0..self.vregs.len() {
+            let s = self.flat.len() as u32;
+            let mut x = self.vregs[g].head;
+            while x != NONE {
+                self.flat.push(x);
+                self.flat_start.push(self.start(x));
+                x = self.pieces[x as usize].next;
+            }
+            let e = self.flat.len() as u32;
+            self.vregs[g].flat = (s, e);
+            let ps = &self.flat[s as usize..e as usize];
+            let loc = |x: &u32| self.pieces[*x as usize].loc;
+            if ps.iter().any(|x| loc(x) != loc(&ps[0])) {
+                let (a, b) = self.vregs[g].members;
+                for &m in &self.members[a as usize..b as usize] {
+                    split[m as usize / 64] |= 1 << (m % 64);
+                }
+            }
+        }
+        split
+    }
+
+    fn slot(&self, g: u32) -> Allocation {
+        Allocation::stack(SpillSlot::new(self.vregs[g as usize].slot as usize))
+    }
+
+    fn pieces_of(&self, g: u32) -> &[u32] {
+        let (a, b) = self.vregs[g as usize].flat;
+        &self.flat[a as usize..b as usize]
+    }
+
     fn stores_at_transitions(&self, g: usize) -> bool {
         let gi = &self.vregs[g];
         if self.rep[g] != g as u32 || gi.slot == NONE {
             return false;
         }
         let mut at_transitions = 0f32;
-        for &x in &gi.pieces {
+        for &x in self.pieces_of(g as u32) {
             let p = &self.pieces[x as usize];
-            if p.ivs.is_empty() {
-                continue;
-            }
             if p.loc == Loc::Stack {
-                at_transitions += self.freq_at(p.start());
-            } else if p.uses.iter().any(|u| u.need == Need::Stack) {
+                at_transitions += self.freq_at(p.start);
+            } else if self.uses_of(x).iter().any(|u| u.need == Need::Stack) {
                 return false;
             }
         }
         let mut at_defs = 0f32;
-        for v in 0..self.vregs.len() {
-            if self.rep[v] != g as u32 {
-                continue;
-            }
-            let vi = &self.vregs[v];
+        for &v in &self.members[gi.members.0 as usize..gi.members.1 as usize] {
+            let vi = &self.vregs[v as usize];
             if vi.def != NONE {
                 at_defs += self.freq_at(vi.def);
             } else if vi.param_of != NONE && !vi.args_in_group {
@@ -223,26 +240,28 @@ impl<I: TargetInst> Ra<'_, I> {
     /// definition, when that is in a register.
     fn slot_derived(&mut self) {
         for v in 0..self.vregs.len() {
-            let crate::jit::backend::vcode::Remat::AndImm { src, .. } = self.f.remat[v] else {
+            let Remat::AndImm { src, .. } = self.f.remat[v] else {
                 continue;
             };
             let vi = &self.vregs[v];
-            if !vi.remat || vi.pieces.is_empty() {
+            if !vi.remat || vi.head == NONE {
                 continue;
             }
             let def_in_reg = self.alloc_at(v as u32, vi.def).is_some_and(|a| a.is_reg());
-            let src_on_stack = vi.pieces.iter().any(|&x| {
-                let p = &self.pieces[x as usize];
-                p.loc == Loc::Remat
-                    && p.ivs
-                        .iter()
-                        .any(|&(a, _)| self.alloc_at(src, a).is_some_and(|l| l.is_stack()))
+            let src_on_stack = self.pieces_of(v as u32).iter().any(|&x| {
+                let iv = self.ivs_of(x);
+                self.pieces[x as usize].loc == Loc::Remat
+                    && (0..iv.len()).any(|k| {
+                        self.alloc_at(src, iv.get(k).0)
+                            .is_some_and(|l| l.is_stack())
+                    })
             });
             if def_in_reg && src_on_stack {
-                let ps = self.vregs[v].pieces.clone();
-                for x in ps {
-                    if self.pieces[x as usize].loc == Loc::Remat {
-                        self.pieces[x as usize].loc = Loc::Stack;
+                let (a, b) = self.vregs[v].flat;
+                for k in a..b {
+                    let x = self.flat[k as usize] as usize;
+                    if self.pieces[x].loc == Loc::Remat {
+                        self.pieces[x].loc = Loc::Stack;
                     }
                 }
                 self.vregs[v].remat = false;
@@ -256,43 +275,53 @@ impl<I: TargetInst> Ra<'_, I> {
     /// a hot predecessor's end); groups take the first slot free over
     /// theirs, in start order.
     fn color_slots(&mut self) {
-        let mut busy: Vec<(u32, Vec<(Pos, Pos)>)> = Vec::new();
+        let mut busy: Vec<(u32, u32, u32)> = Vec::new();
+        let mut all: Vec<(Pos, Pos)> = Vec::new();
+        let mut ivs: Vec<(Pos, Pos)> = Vec::new();
         for g in 0..self.vregs.len() {
-            let gi = &self.vregs[g];
-            if self.rep[g] != g as u32 || gi.slot == NONE {
+            if self.rep[g] != g as u32 || self.vregs[g].slot == NONE {
                 continue;
             }
-            let mut ivs: Vec<(Pos, Pos)> = Vec::new();
-            for &x in &gi.pieces {
-                let p = &self.pieces[x as usize];
+            ivs.clear();
+            for &x in self.pieces_of(g as u32) {
                 // Stores land in the gaps around: a point either side.
-                for &(a, b) in &p.ivs {
-                    ivs.push((a.saturating_sub(1), b + 1));
-                }
+                let iv = self.ivs_of(x);
+                ivs.extend(
+                    (0..iv.len())
+                        .map(|k| iv.get(k))
+                        .map(|(a, b)| (a.saturating_sub(1), b + 1)),
+                );
             }
-            ivs.sort_unstable_by_key(|iv| iv.0);
-            let mut merged: Vec<(Pos, Pos)> = Vec::with_capacity(ivs.len());
-            for (a, b) in ivs {
-                match merged.last_mut() {
-                    Some(m) if a <= m.1 => m.1 = m.1.max(b),
-                    _ => merged.push((a, b)),
-                }
+            // Pieces by start: already in order.
+            let s = all.len();
+            for &x in &ivs {
+                push_coalesced(&mut all, s, x);
             }
-            busy.push((g as u32, merged));
+            busy.push((g as u32, s as u32, all.len() as u32));
         }
-        busy.sort_by_key(|(_, iv)| iv.first().map_or(0, |x| x.0));
+        // By first point, in group order.
+        let mut keys: Vec<u64> = (busy.iter().enumerate())
+            .map(|(k, &(_, s, e))| {
+                (if s < e { all[s as usize].0 } else { 0 } as u64) << 32 | k as u64
+            })
+            .collect();
+        keys.sort_unstable();
         let mut slots: Vec<Vec<(Pos, Pos)>> = Vec::new();
-        for (g, ivs) in busy {
-            let k = match slots.iter().position(|s| intersect(s, &ivs, 0).is_none()) {
+        for (g, s, e) in keys.iter().map(|&k| busy[k as u32 as usize]) {
+            let ivs = &all[s as usize..e as usize];
+            let k = match (slots.iter())
+                .position(|x| intersect(Ivs::plain(x), Ivs::plain(ivs), 0).is_none())
+            {
                 Some(k) => k,
                 None => {
                     slots.push(Vec::new());
                     slots.len() - 1
                 }
             };
-            let s = &mut slots[k];
-            s.extend_from_slice(&ivs);
-            s.sort_unstable_by_key(|iv| iv.0);
+            let x = &mut slots[k];
+            let mid = x.len();
+            x.extend_from_slice(ivs);
+            merge_tail(x, 0, mid, |iv| iv.0, push_coalesced);
             self.vregs[g as usize].slot = k as u32;
         }
         self.num_slots = slots.len() as u32;
@@ -303,63 +332,108 @@ impl<I: TargetInst> Ra<'_, I> {
     /// source's location at `at`).
     fn mv(&self, v: u32, at: Pos, to: Allocation, cls: u8) -> Mv {
         let from = self.alloc_at(v, at).expect("live where it moves");
-        let (from, remat) = match (from.is_none(), self.f.remat[v as usize]) {
-            (true, crate::jit::backend::vcode::Remat::AndImm { src, .. }) => {
-                (self.alloc_at(src, at).expect("the source live"), true)
+        self.mv_from(v, from, at, to, cls)
+    }
+
+    /// `mv` with `v`'s location at `at` known.
+    fn mv_from(&self, v: u32, from: Allocation, at: Pos, to: Allocation, cls: u8) -> Mv {
+        match (from.is_none(), self.f.remat[v as usize]) {
+            (true, Remat::AndImm { src, .. }) => {
+                let src = self.alloc_at(src, at).expect("the source live");
+                mv(src, to, cls, v, true)
             }
-            (true, _) => (from, true),
-            (false, _) => (from, false),
-        };
-        Mv {
-            from,
-            to,
-            cls,
-            vreg: v,
-            remat,
+            (true, _) => mv(from, to, cls, v, true),
+            (false, _) => mv(from, to, cls, v, false),
         }
     }
 
     /// Moves on every edge whose ends hold a value in different places: on
     /// the successor's side when it has one predecessor (not a resume block,
     /// which a return enters past its moves), else on the predecessor's.
-    fn edge_moves(&self, moves: &mut Vec<(u32, u8, Mv)>) -> Result<(), String> {
+    /// Only values of split groups can be in two places.
+    fn edge_moves(&self, split: &[u64], moves: &mut Vec<(u32, u8, Mv)>) -> Result<(), String> {
         let f = self.f;
+        let mut once: Vec<u32> = Vec::new();
+        // The piece of each live value at the block's start, found by a
+        // cursor per group: blocks come in point order.
+        let mut cur = vec![0u32; self.vregs.len()];
+        let mut live: Vec<(u32, u32)> = Vec::new();
         for &s in &self.order {
             let preds = f.block_preds(s);
             let si = s.index();
             let resume = f.blocks[si].resume;
             let ss = self.block_start(si as u32);
+            live.clear();
+            // Live in, so some piece covers the start and every
+            // predecessor's end: the last one starting by there. One whose
+            // span holds every predecessor's end needs nothing here.
+            let pes = preds.iter().map(|p| 2 * self.last[p.index()] + 1);
+            let (lo, hi) = (pes.clone().min().unwrap_or(ss), pes.max().unwrap_or(ss));
+            for (k, (&w, &m)) in self.live_in(si).iter().zip(split).enumerate() {
+                for v in bits(k, w & m) {
+                    let g = self.rep[v as usize];
+                    let (a, b) = self.vregs[g as usize].flat;
+                    let starts = &self.flat_start[a as usize..b as usize];
+                    let mut c = cur[g as usize] as usize;
+                    while c + 1 < starts.len() && starts[c + 1] <= ss {
+                        c += 1;
+                    }
+                    cur[g as usize] = c as u32;
+                    let x = self.flat[a as usize + c];
+                    let (xs, xe) = (self.start(x), self.end(x));
+                    if !(xs <= ss && ss < xe) {
+                        return Err(format!("v{v} not live into b{si}"));
+                    }
+                    debug_assert!(self.ivs_of(x).covers(ss));
+                    if xs <= lo && hi < xe {
+                        continue;
+                    }
+                    live.push((v, x));
+                }
+            }
+            // The piece at a predecessor's end: the one at the start when
+            // its span holds it (the value is live there), its previous one
+            // when the predecessor falls through to a piece starting here,
+            // else looked up.
+            let from = |v: u32, x: u32, pi: usize| {
+                let pe = 2 * self.last[pi] + 1;
+                let p = &self.pieces[x as usize];
+                let y = if p.start <= pe && pe < p.end {
+                    x
+                } else if pe + 1 == ss {
+                    p.prev
+                } else {
+                    let (a, b) = self.vregs[self.rep[v as usize] as usize].flat;
+                    let k = self.flat_start[a as usize..b as usize].partition_point(|&s| s <= pe);
+                    if k == 0 {
+                        return Err(format!("v{v} not live out of b{pi}"));
+                    }
+                    self.flat[a as usize + k - 1]
+                };
+                debug_assert_eq!(Some(y), self.piece_at(self.rep[v as usize], pe));
+                Ok(y)
+            };
             // A constant no predecessor has where the join wants it: made
             // once at the join's start, not on every edge.
-            let mut once: Vec<u32> = Vec::new();
+            once.clear();
             if preds.len() > 1 && !resume {
-                for (k, &w) in self.live_in(si).iter().enumerate() {
-                    let mut w = w;
-                    while w != 0 {
-                        let v = (k * 64 + w.trailing_zeros() as usize) as u32;
-                        w &= w - 1;
-                        use crate::jit::backend::vcode::Remat;
-                        if !matches!(self.f.remat[v as usize], Remat::Int(_) | Remat::Float(_)) {
-                            continue;
-                        }
-                        let Some(to) = self.alloc_at(v, ss).filter(|a| a.is_reg()) else {
-                            continue;
-                        };
-                        let held = preds
-                            .iter()
-                            .any(|p| self.alloc_at(v, 2 * self.last[p.index()] + 1) == Some(to));
-                        if !held {
-                            let cls = self.vregs[v as usize].class;
-                            let m = Mv {
-                                from: Allocation::none(),
-                                to,
-                                cls,
-                                vreg: v,
-                                remat: true,
-                            };
-                            moves.push((self.first[si], EDGE_IN, m));
-                            once.push(v);
-                        }
+                for &(v, x) in &live {
+                    if !matches!(f.remat[v as usize], Remat::Int(_) | Remat::Float(_)) {
+                        continue;
+                    }
+                    let to = self.alloc_of(x);
+                    if !to.is_reg() {
+                        continue;
+                    }
+                    let mut held = false;
+                    for p in preds {
+                        held |= self.alloc_of(from(v, x, p.index())?) == to;
+                    }
+                    if !held {
+                        let cls = self.vregs[v as usize].class;
+                        let m = mv(Allocation::none(), to, cls, v, true);
+                        moves.push((self.first[si], EDGE_IN, m));
+                        once.push(v);
                     }
                 }
             }
@@ -375,32 +449,25 @@ impl<I: TargetInst> Ra<'_, I> {
                     (self.last[pi], EDGE_OUT)
                 };
                 let before = moves.len();
-                for (k, &w) in self.live_in(si).iter().enumerate() {
-                    let mut w = w;
-                    while w != 0 {
-                        let v = (k * 64 + w.trailing_zeros() as usize) as u32;
-                        w &= w - 1;
-                        let from = self.alloc_at(v, pe);
-                        let to = self.alloc_at(v, ss);
-                        let (Some(from), Some(to)) = (from, to) else {
-                            return Err(format!("v{v} not live across b{pi} -> b{si}"));
-                        };
-                        // The slot has held it since its definition; a
-                        // constant is computed again where it is needed.
-                        let g = self.rep[v as usize] as usize;
-                        if from != to
-                            && !to.is_none()
-                            && (!to.is_stack() || self.deferred[g])
-                            && !once.contains(&v)
-                        {
-                            let cls = self.vregs[v as usize].class;
-                            moves.push((at, phase, self.mv(v, pe, to, cls)));
-                        }
+                for &(v, y) in &live {
+                    let x = from(v, y, pi)?;
+                    if x == y {
+                        continue;
+                    }
+                    let (from, to) = (self.alloc_of(x), self.alloc_of(y));
+                    // The slot has held it since its definition; a
+                    // constant is computed again where it is needed.
+                    let g = self.rep[v as usize] as usize;
+                    if from != to
+                        && !to.is_none()
+                        && (!to.is_stack() || self.deferred[g])
+                        && !once.contains(&v)
+                    {
+                        let cls = self.vregs[v as usize].class;
+                        moves.push((at, phase, self.mv_from(v, from, pe, to, cls)));
                     }
                 }
-                let k = f
-                    .block_succs(p)
-                    .iter()
+                let k = (f.block_succs(p).iter())
                     .position(|&x| x == s)
                     .expect("an edge");
                 let args = f.branch_blockparams(p, k);
@@ -409,12 +476,11 @@ impl<I: TargetInst> Ra<'_, I> {
                     let Some(to) = self.alloc_at(q, ss) else {
                         continue;
                     };
-                    let from = self
-                        .alloc_at(a.vreg() as u32, pe)
+                    let from = (self.alloc_at(a.vreg() as u32, pe))
                         .ok_or_else(|| format!("argument v{} not live at b{pi}'s end", a.vreg()))?;
                     if from != to {
                         let cls = self.vregs[q as usize].class;
-                        moves.push((at, phase, self.mv(a.vreg() as u32, pe, to, cls)));
+                        moves.push((at, phase, self.mv_from(a.vreg() as u32, from, pe, to, cls)));
                     }
                 }
                 if resume && moves.len() != before {
@@ -431,7 +497,7 @@ impl<I: TargetInst> Ra<'_, I> {
     /// Emit a parallel move as a sequence: a move goes once nothing else
     /// still reads its target; a cycle parks one value in the scratch
     /// register; stack-to-stack goes through the transport register.
-    fn sequence(&self, mut ms: Vec<Mv>, mut emit: impl FnMut(Edit)) -> Result<(), String> {
+    fn sequence(&self, ms: &mut Vec<Mv>, mut emit: impl FnMut(Edit)) -> Result<(), String> {
         ms.retain(|m| m.remat || m.from != m.to);
         let transport = Allocation::reg(self.env.transport);
         let mut put = |m: Mv| {
@@ -483,14 +549,8 @@ impl<I: TargetInst> Ra<'_, I> {
             if ms.iter().any(|m| m.from == scratch || m.to == scratch) {
                 return Err("the scratch register in a parallel move".into());
             }
-            put(Mv {
-                from: t,
-                to: scratch,
-                cls: reader.cls,
-                vreg: reader.vreg,
-                remat: false,
-            });
-            for m in &mut ms {
+            put(mv(t, scratch, reader.cls, reader.vreg, false));
+            for m in ms.iter_mut() {
                 if m.from == t {
                     m.from = scratch;
                 }
@@ -498,4 +558,25 @@ impl<I: TargetInst> Ra<'_, I> {
         }
         Ok(())
     }
+}
+
+fn mv(from: Allocation, to: Allocation, cls: u8, vreg: u32, remat: bool) -> Mv {
+    Mv {
+        from,
+        to,
+        cls,
+        vreg,
+        remat,
+    }
+}
+
+/// The values of word `k` of a set.
+fn bits(k: usize, mut w: u64) -> impl Iterator<Item = u32> {
+    std::iter::from_fn(move || {
+        (w != 0).then(|| {
+            let v = (k * 64) as u32 + w.trailing_zeros();
+            w &= w - 1;
+            v
+        })
+    })
 }
