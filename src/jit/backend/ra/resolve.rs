@@ -36,6 +36,8 @@ impl<I: TargetInst> Ra<'_, I> {
     pub(super) fn resolve(&mut self) -> Result<Output, String> {
         let split = self.index_pieces();
         self.slot_derived();
+        self.color_slots();
+        self.snapshot_allocs();
         // A group is stored where it goes from a register to the stack when
         // that runs no more often than storing after its definitions (V8's
         // `DecideSpillingMode`; cold-only spills always), its slot uses
@@ -44,7 +46,6 @@ impl<I: TargetInst> Ra<'_, I> {
         self.deferred = (0..self.vregs.len())
             .map(|g| self.stores_at_transitions(g))
             .collect();
-        self.color_slots();
         for x in 0..self.pieces.len() as u32 {
             let p = self.pieces[x as usize];
             if p.dead() {
@@ -61,7 +62,6 @@ impl<I: TargetInst> Ra<'_, I> {
                         _ => return Err(format!("v{} needs a register at {}", p.g, u.pos)),
                     },
                     Need::Any => self.alloc_of(x),
-                    Need::Stack => self.slot(p.g),
                     Need::Fixed(r) => Allocation::reg(r),
                 };
                 self.allocs[u.alloc as usize] = a;
@@ -218,7 +218,7 @@ impl<I: TargetInst> Ra<'_, I> {
             let p = &self.pieces[x as usize];
             if p.loc == Loc::Stack {
                 at_transitions += self.freq_at(p.start);
-            } else if self.uses_of(x).iter().any(|u| u.need == Need::Stack) {
+            } else if p.stack {
                 return false;
             }
         }
@@ -232,6 +232,34 @@ impl<I: TargetInst> Ra<'_, I> {
             }
         }
         at_transitions <= at_defs
+    }
+
+    /// Each snapshot operand's allocation: its group's slot, or where the
+    /// piece at its point is. Pieces come by start, the operands by point.
+    fn snapshot_allocs(&mut self) {
+        for v in 0..self.vregs.len() {
+            let (a, b) = (self.snap_off[v] as usize, self.snap_off[v + 1] as usize);
+            if a == b {
+                continue;
+            }
+            let g = self.rep[v];
+            let (fa, fb) = self.vregs[g as usize].flat;
+            let mut c = fa as usize;
+            for k in a..b {
+                let (pos, op) = self.snaps[k];
+                while c + 1 < fb as usize && self.flat_start[c + 1] <= pos {
+                    c += 1;
+                }
+                let x = self.flat[c];
+                debug_assert!(self.ivs_of(x).covers(pos));
+                self.allocs[(op >> 1) as usize] = if op & 1 != 0 {
+                    self.pieces[x as usize].stack = true;
+                    self.slot(g)
+                } else {
+                    self.alloc_of(x)
+                };
+            }
+        }
     }
 
     /// A value computed from one on the stack costs a load and the

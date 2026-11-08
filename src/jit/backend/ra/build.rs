@@ -68,6 +68,7 @@ impl<I: TargetInst> Ra<'_, I> {
             last: vec![NONE; nv],
         };
         let mut usr: Vec<(u32, Use)> = Vec::with_capacity(n as usize);
+        let mut snr: Vec<(u32, (Pos, u32))> = Vec::new();
         let mut fixtmp: Vec<(u32, Pos, Pos, u32)> = Vec::new();
         let mut fixed_def = vec![None; nv];
         let mut stack_use = vec![false; nv];
@@ -148,10 +149,11 @@ impl<I: TargetInst> Ra<'_, I> {
                             }
                             let need = match op.constraint() {
                                 OperandConstraint::Reg => Need::Reg,
-                                OperandConstraint::Any => Need::Any,
-                                OperandConstraint::Stack => {
-                                    stack_use[v] = true;
-                                    Need::Stack
+                                OperandConstraint::Any | OperandConstraint::Stack => {
+                                    let stack = op.constraint() == OperandConstraint::Stack;
+                                    stack_use[v] |= stack;
+                                    snr.push((v as u32, (pos, alloc << 1 | stack as u32)));
+                                    continue;
                                 }
                                 OperandConstraint::FixedReg(r) => {
                                     fixtmp.push((r.index() as u32, early, pos + 1, v as u32));
@@ -222,6 +224,7 @@ impl<I: TargetInst> Ra<'_, I> {
         Ok(Walk {
             ivr: ivr.recs,
             usr,
+            snr,
             fixtmp,
             fixed_def,
             stack_use,
@@ -254,6 +257,13 @@ impl<I: TargetInst> Ra<'_, I> {
         for &(v, u) in usr {
             at[v as usize] -= 1;
             vuse[at[v as usize] as usize] = u;
+        }
+        self.snap_off = runs(nv, w.snr.iter().map(|r| r.0));
+        self.snaps = vec![(0, 0); w.snr.len()];
+        let mut at: Vec<u32> = self.snap_off[1..].to_vec();
+        for &(v, s) in &w.snr {
+            at[v as usize] -= 1;
+            self.snaps[at[v as usize] as usize] = s;
         }
         debug_assert!((0..nv).all(|v| {
             let ivs = &self.ivs[span[v].0 as usize..span[v].1 as usize];
@@ -454,6 +464,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 next: NONE,
                 loc: Loc::None,
                 fixed: false,
+                stack: false,
             });
             self.vregs[v].head = x;
             // Each fixed definition's own point in its register; the rest is
@@ -555,11 +566,13 @@ impl<I: TargetInst> Ra<'_, I> {
     }
 }
 
-/// What the backward walk records: intervals and uses as `(vreg, ..)`,
-/// fixed operands' reservations as `(register, from, to, owner)`.
+/// What the backward walk records: intervals, uses and snapshot operands
+/// (`Ra::snaps`) as `(vreg, ..)`, fixed operands' reservations as
+/// `(register, from, to, owner)`.
 struct Walk {
     ivr: Vec<(u32, Pos, Pos)>,
     usr: Vec<(u32, Use)>,
+    snr: Vec<(u32, (Pos, u32))>,
     fixtmp: Vec<(u32, Pos, Pos, u32)>,
     fixed_def: Vec<Option<PReg>>,
     stack_use: Vec<bool>,

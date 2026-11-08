@@ -131,14 +131,15 @@ impl Loc {
     }
 }
 
-/// What a use position asks of the location.
+/// What a use position asks of the location. Operands taking the value from
+/// wherever it is or from its slot (snapshots, a call's kept values) are no
+/// uses here: they only extend the range (`Ra::snaps`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Need {
     /// A register: a register use or a definition.
     Reg,
+    /// The definition of a value computed again where needed.
     Any,
-    /// The spill slot: the value is stored after its definition.
-    Stack,
     /// Copied into the register before the instruction; being there
     /// already saves the copy.
     Fixed(PReg),
@@ -171,6 +172,8 @@ struct Piece {
     loc: Loc,
     /// A fixed definition's point in its register: never moved or spilled.
     fixed: bool,
+    /// Taken from its slot by some operand (`resolve`).
+    stack: bool,
 }
 
 impl Piece {
@@ -333,6 +336,11 @@ struct Ra<'a, I: TargetInst> {
     /// Intervals and uses, a run per group (`Piece`).
     ivs: Vec<(Pos, Pos)>,
     uses: Vec<Use>,
+    /// Per value (a run `snap_off[v]..snap_off[v + 1]`, by point) the
+    /// operands taking it from wherever it is, as `operand << 1 | from its
+    /// slot`: placed after the scan from the piece at their point.
+    snaps: Vec<(Pos, u32)>,
+    snap_off: Vec<u32>,
     /// Per use: the index of the first use from it on (in its group) that
     /// needs a register, that a register serves, that is fixed (`Want`);
     /// past the group's last otherwise.
@@ -477,6 +485,8 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             live_in: Vec::new(),
             ivs: Vec::new(),
             uses: Vec::new(),
+            snaps: Vec::new(),
+            snap_off: Vec::new(),
             next_of: Vec::new(),
             defs: Vec::new(),
             members: Vec::new(),
