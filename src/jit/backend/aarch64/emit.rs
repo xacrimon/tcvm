@@ -105,7 +105,7 @@ pub(crate) struct ExitOut {
 fn emits_nothing(l: &Lowered, out: &Output, i: usize) -> bool {
     match l.vcode.insts[i] {
         MInst::MovImm(_) | MInst::FImm(_) | MInst::AluImm(..) => {
-            out.inst_allocs(crate::jit::backend::reg::Inst::new(i))[0].is_none()
+            out.inst_allocs(&l.vcode, crate::jit::backend::reg::Inst::new(i))[0].is_none()
         }
         _ => false,
     }
@@ -826,7 +826,7 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
     let mut consts = Vec::new();
     let mut entries = Vec::new();
     let inst = e.inst.expect("an exit without an instruction");
-    let allocs = out.inst_allocs(crate::jit::backend::reg::Inst::new(inst));
+    let allocs = out.inst_allocs(&l.vcode, crate::jit::backend::reg::Inst::new(inst));
     let base = l.snap_ops[inst] as usize;
     let (nil, f, t) = (
         Value::nil().to_raw(),
@@ -869,7 +869,8 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
 
 impl Em<'_> {
     fn allocs(&self, i: usize) -> &[Allocation] {
-        self.out.inst_allocs(crate::jit::backend::reg::Inst::new(i))
+        self.out
+            .inst_allocs(self.v, crate::jit::backend::reg::Inst::new(i))
     }
 
     /// The registers of instruction `i`'s words for a test of `set` whose

@@ -8,7 +8,7 @@ use crate::jit::backend::reg::Allocation;
 use crate::jit::backend::reg::{PReg, ProgPoint, RegClass, VReg};
 use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
-const MAGIC: u32 = 0x5241_0001;
+const MAGIC: u32 = 0x5241_0002;
 
 /// One compile's allocation problem and the allocation it got.
 pub(crate) fn write<I: TargetInst>(
@@ -85,7 +85,6 @@ pub(crate) fn write<I: TargetInst>(
         }
     }
     w.list(out.allocs.iter().map(|&a| alloc_bits(a)));
-    w.list(out.inst_alloc_offsets.iter().copied());
     w.0
 }
 
@@ -178,7 +177,6 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
         })
         .collect();
     let allocs = r.list().map(alloc).collect();
-    let inst_alloc_offsets = r.list().collect();
     if r.1 != d.len() {
         return Err("trailing bytes".into());
     }
@@ -191,7 +189,6 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
             num_spillslots,
             edits,
             allocs,
-            inst_alloc_offsets,
         },
     })
 }

@@ -14,8 +14,6 @@ impl Ra {
         w: &mut Build,
     ) -> Result<(), String> {
         let nv = f.num_vregs();
-        // Instructions' operands lie in order (`VCode::push`).
-        self.alloc_base = f.ops.iter().map(|o| o.0).collect();
         let n = f.operands.len() as u32;
         self.allocs = vec![Allocation::none(); n as usize];
         self.vregs.extend((0..nv).map(|v| VInfo {
@@ -109,7 +107,7 @@ impl Ra {
             }
             for l in (self.first[b]..=self.last[b]).rev() {
                 let i = self.at_lin[l as usize];
-                let base = self.alloc_base[i.index()];
+                let base = f.ops[i.index()].0;
                 let ops = f.inst_operands(i);
                 let (early, late) = (2 * l, 2 * l + 1);
                 for pos in [late, early] {

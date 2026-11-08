@@ -213,7 +213,6 @@ impl Ra {
             num_spillslots: self.num_slots as usize,
             edits,
             allocs: std::mem::take(&mut self.allocs),
-            inst_alloc_offsets: std::mem::take(&mut self.alloc_base),
         })
     }
 

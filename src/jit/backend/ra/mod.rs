@@ -55,7 +55,6 @@ pub(crate) struct Output {
     pub(crate) num_spillslots: usize,
     pub(crate) edits: Vec<(ProgPoint, Edit)>,
     pub(crate) allocs: Vec<Allocation>,
-    pub(crate) inst_alloc_offsets: Vec<u32>,
 }
 
 pub(crate) enum InstOrEdit<'a> {
@@ -64,11 +63,9 @@ pub(crate) enum InstOrEdit<'a> {
 }
 
 impl Output {
-    pub(crate) fn inst_allocs(&self, inst: Inst) -> &[Allocation] {
-        let start = self.inst_alloc_offsets[inst.index()] as usize;
-        let end = (self.inst_alloc_offsets.get(inst.index() + 1))
-            .map_or(self.allocs.len(), |&e| e as usize);
-        &self.allocs[start..end]
+    pub(crate) fn inst_allocs<I: TargetInst>(&self, f: &VCode<I>, inst: Inst) -> &[Allocation] {
+        let (a, b) = f.ops[inst.index()];
+        &self.allocs[a as usize..b as usize]
     }
 
     /// A block's instructions with the edits before each.
@@ -404,7 +401,7 @@ impl Live {
     }
 }
 
-/// The function in hand; `allocs` and `alloc_base` leave in its `Output`.
+/// The function in hand; `allocs` leaves in its `Output`.
 struct Ra {
     env: Env,
     /// Blocks in allocation order.
@@ -474,7 +471,6 @@ struct Ra {
     /// Per `PReg::index()`: its place in `env.regs` of its class, or `NONE`.
     reg_idx: Vec<u32>,
     allocs: Vec<Allocation>,
-    alloc_base: Vec<u32>,
     num_slots: u32,
     /// Pieces to allocate by start: those `build` made, sorted, and a heap
     /// of the ones queued since.
@@ -500,7 +496,7 @@ pub(crate) fn check_operands<I: TargetInst>(v: &VCode<I>, out: &Output) -> Resul
     use crate::jit::backend::reg::OperandPos::{Early, Late};
     for i in 0..v.insts.len() {
         let ops = v.inst_operands_of(i);
-        let al = out.inst_allocs(Inst::new(i));
+        let al = out.inst_allocs(v, Inst::new(i));
         for a in 0..ops.len() {
             for b in a + 1..ops.len() {
                 let (oa, ob) = (ops[a], ops[b]);
@@ -587,7 +583,6 @@ impl Ra {
             clobs: Vec::new(),
             reg_idx,
             allocs: Vec::new(),
-            alloc_base: Vec::new(),
             num_slots: 0,
             initial: Vec::new(),
             next_initial: 0,

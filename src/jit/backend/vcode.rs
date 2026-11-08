@@ -201,7 +201,7 @@ impl<I: TargetInst + std::fmt::Debug> VCode<I> {
             for ie in out.block_insts_and_edits(self, rb) {
                 match ie {
                     InstOrEdit::Inst(i) => {
-                        let ops = self.inst_operands(i).iter().zip(out.inst_allocs(i));
+                        let ops = self.inst_operands(i).iter().zip(out.inst_allocs(self, i));
                         let side = |kind| {
                             (ops.clone())
                                 .filter(|(o, _)| o.kind() == kind)

@@ -815,7 +815,7 @@ impl<'a, I: TargetInst> Checker<'a, I> {
             .inst_operands(inst)
             .iter()
             .cloned()
-            .zip(out.inst_allocs(inst).iter().cloned())
+            .zip(out.inst_allocs(self.f, inst).iter().cloned())
             .filter(|(op, a)| {
                 !(op.kind() == OperandKind::Def
                     && a.is_none()

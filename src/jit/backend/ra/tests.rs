@@ -706,8 +706,7 @@ fn recorded_allocations_stay_the_same() {
             (ctx.run(&c.f, &c.order, c.hot)).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         let same = out.num_spillslots == c.out.num_spillslots
             && out.edits == c.out.edits
-            && out.allocs == c.out.allocs
-            && out.inst_alloc_offsets == c.out.inst_alloc_offsets;
+            && out.allocs == c.out.allocs;
         if !same {
             differ += 1;
             if differ <= 5 {
