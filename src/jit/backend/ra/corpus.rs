@@ -5,10 +5,13 @@
 use super::{Edit, Env, Output};
 use crate::jit::backend::reg::Allocation;
 #[cfg(test)]
-use crate::jit::backend::reg::{PReg, ProgPoint, RegClass, VReg};
+use crate::jit::backend::reg::{Inst, PReg, ProgPoint, RegClass, VReg};
 use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
-const MAGIC: u32 = 0x5241_0002;
+const MAGIC: u32 = 0x5241_0003;
+/// Format 2: no edge edits (every edge was split).
+#[cfg(test)]
+const MAGIC_2: u32 = 0x5241_0002;
 
 /// One compile's allocation problem and the allocation it got.
 pub(crate) fn write<I: TargetInst>(
@@ -67,22 +70,29 @@ pub(crate) fn write<I: TargetInst>(
     w.list(order.iter().copied());
     w.u32(hot as u32);
     w.u32(out.num_spillslots as u32);
+    let edit = |w: &mut W, e: &Edit| match *e {
+        Edit::Move { from, to } => {
+            w.u32(0);
+            w.u32(alloc_bits(from));
+            w.u32(alloc_bits(to));
+        }
+        Edit::Remat { to, vreg, src } => {
+            w.u32(1);
+            w.u32(alloc_bits(to));
+            w.u32(vreg.bits() as u32);
+            w.u32(alloc_bits(src));
+        }
+    };
     w.u32(out.edits.len() as u32);
     for (p, e) in &out.edits {
         w.u32(p.to_index());
-        match *e {
-            Edit::Move { from, to } => {
-                w.u32(0);
-                w.u32(alloc_bits(from));
-                w.u32(alloc_bits(to));
-            }
-            Edit::Remat { to, vreg, src } => {
-                w.u32(1);
-                w.u32(alloc_bits(to));
-                w.u32(vreg.bits() as u32);
-                w.u32(alloc_bits(src));
-            }
-        }
+        edit(&mut w, e);
+    }
+    w.u32(out.edge_edits.len() as u32);
+    for (i, k, e) in &out.edge_edits {
+        w.u32(i.index() as u32);
+        w.u32(*k as u32);
+        edit(&mut w, e);
     }
     w.list(out.allocs.iter().map(|&a| alloc_bits(a)));
     w.0
@@ -103,7 +113,8 @@ pub(crate) struct Case<I> {
 pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Case<I>, String> {
     use crate::jit::backend::reg::{Block, Operand, PRegSet};
     let mut r = R(d, 0);
-    if r.u32() != MAGIC {
+    let magic = r.u32();
+    if magic != MAGIC && magic != MAGIC_2 {
         return Err("not a recorded allocation".into());
     }
     let preg = |x: u32| PReg::from_index(x as usize);
@@ -159,21 +170,28 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
     let order = r.list().collect();
     let hot = r.u32() as usize;
     let num_spillslots = r.u32() as usize;
+    let edit = |r: &mut R| match r.u32() {
+        0 => Edit::Move {
+            from: alloc(r.u32()),
+            to: alloc(r.u32()),
+        },
+        _ => Edit::Remat {
+            to: alloc(r.u32()),
+            vreg: VReg::from_bits(r.u32()),
+            src: alloc(r.u32()),
+        },
+    };
     let edits = (0..r.u32())
         .map(|_| {
             let p = ProgPoint::from_index(r.u32());
-            let e = match r.u32() {
-                0 => Edit::Move {
-                    from: alloc(r.u32()),
-                    to: alloc(r.u32()),
-                },
-                _ => Edit::Remat {
-                    to: alloc(r.u32()),
-                    vreg: VReg::from_bits(r.u32()),
-                    src: alloc(r.u32()),
-                },
-            };
-            (p, e)
+            (p, edit(&mut r))
+        })
+        .collect();
+    let edge_edits = (0..if magic == MAGIC { r.u32() } else { 0 })
+        .map(|_| {
+            let i = Inst::new(r.u32() as usize);
+            let k = r.u32() as u8;
+            (i, k, edit(&mut r))
         })
         .collect();
     let allocs = r.list().map(alloc).collect();
@@ -188,6 +206,7 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
         out: Output {
             num_spillslots,
             edits,
+            edge_edits,
             allocs,
         },
     })

@@ -232,9 +232,26 @@ impl<I: TargetInst + std::fmt::Debug> VCode<I> {
                     }
                 }
             }
+            let term = RInst::new(self.blocks[b as usize].end as usize - 1);
             for (k, succ) in self.block_succs(rb).iter().enumerate() {
                 let args = self.branch_blockparams(rb, k);
                 let _ = writeln!(s, "  -> b{}({})", succ.index(), vregs(args));
+                for (_, _, e) in out.edge_edits(term, k) {
+                    match e {
+                        Edit::Move { from, to } => {
+                            let _ = writeln!(s, "        move {} <- {}", loc(*to), loc(*from));
+                        }
+                        Edit::Remat { to, vreg, src } => {
+                            let _ = writeln!(
+                                s,
+                                "        remat {} <- v{} {}",
+                                loc(*to),
+                                vreg.vreg(),
+                                loc(*src)
+                            );
+                        }
+                    }
+                }
             }
         }
         s

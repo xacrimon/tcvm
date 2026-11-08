@@ -248,9 +248,6 @@ pub(crate) fn build_ir<'gc>(
     if times.timed("jumps", || opt::jumps::thread(&mut f)) {
         times.timed("verify", || check(&f, "jumps"))?;
     }
-    // Edge arguments (the boxes `narrow` makes for them among them) sink
-    // to their edges.
-    times.timed("split edges", || opt::split_critical_edges(&mut f));
     if times.timed("sink", || opt::sink::sink(&mut f)) {
         times.timed("verify", || check(&f, "sink"))?;
     }
@@ -431,7 +428,7 @@ pub(crate) fn compile<'gc>(
     let opts = Options::of(config);
     note_upvalues_offset(closure);
     let mut times = Times::new();
-    let (mut f, cfg) = build_ir(ctx, closure, pc, &opts, frame, seen, &mut times)?;
+    let (f, cfg) = build_ir(ctx, closure, pc, &opts, frame, seen, &mut times)?;
     let mut nest = Vec::new();
     if f.meta.loop_entry {
         let mut l = cfg.loop_of[cfg.block_of[pc as usize] as usize];
@@ -439,12 +436,6 @@ pub(crate) fn compile<'gc>(
             nest.push(cfg.blocks[cfg.loops[i].header as usize].start);
             l = cfg.loops[i].parent;
         }
-    }
-    opt::split_critical_edges(&mut f);
-    #[cfg(feature = "tcvm-dev")]
-    if opts.check {
-        verify(&f)
-            .map_err(|e| CompileError::Verify(format!("after splitting: {e}\n{}", f.print())))?;
     }
     #[cfg(feature = "tcvm-dev")]
     if config.dev.dump.ir || config.dev.dump.opt {

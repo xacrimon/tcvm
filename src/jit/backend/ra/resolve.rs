@@ -4,7 +4,7 @@
 
 use super::build::{merge_tail, push_coalesced};
 use super::{Edit, Ivs, Loc, NONE, Need, Output, Pos, Ra, Want, intersect};
-use crate::jit::backend::reg::{Allocation, ProgPoint, RegClass, SpillSlot, VReg};
+use crate::jit::backend::reg::{Allocation, Inst, ProgPoint, RegClass, SpillSlot, VReg};
 use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
 /// A move of a value of class `cls`, or with `remat` its computation
@@ -23,7 +23,9 @@ struct Mv {
 /// stores of its parameters, across the edges out of it (a block of one
 /// instruction has both), cold stores of a piece ending at the
 /// instruction's late point (from where the moves before left it), and
-/// copies into the instruction's fixed registers.
+/// copies into the instruction's fixed registers. Moves on an edge of a
+/// branch into a join go on that edge (`Output::edge_edits`), the edge's
+/// index above the phase.
 const DEF_STORE: u8 = 0;
 const CONNECT: u8 = 1;
 const EDGE_IN: u8 = 2;
@@ -31,6 +33,7 @@ const PARAM_STORE: u8 = 3;
 const EDGE_OUT: u8 = 4;
 const LATE_STORE: u8 = 5;
 const FIXED_COPY: u8 = 6;
+const EDGE: u8 = 7;
 
 /// `resolve`'s buffers: the values of split groups; the moves as
 /// `(linear index, phase, move)`, then sorted, and one gap's; slot
@@ -192,12 +195,13 @@ impl Ra {
         } = t;
         keys.clear(); // `color_slots` sorted with them too.
         keys.extend((moves.iter().enumerate()).map(|(k, &(l, phase, _))| {
-            ((self.at_lin[l as usize].index() as u64) << 3 | phase as u64) << 32 | k as u64
+            ((self.at_lin[l as usize].index() as u64) << 8 | phase as u64) << 32 | k as u64
         }));
         keys.sort_unstable();
         sorted.extend(keys.iter().map(|&k| moves[k as u32 as usize]));
         let moves = sorted;
         let mut edits: Vec<(ProgPoint, Edit)> = Vec::with_capacity(moves.len());
+        let mut edge_edits: Vec<(Inst, u8, Edit)> = Vec::new();
         let mut k = 0;
         while k < moves.len() {
             let (l, phase) = (moves[k].0, moves[k].1);
@@ -206,12 +210,18 @@ impl Ra {
                 group.push(moves[k].2);
                 k += 1;
             }
-            let at = ProgPoint::before(self.at_lin[l as usize]);
-            self.sequence(group, |e| edits.push((at, e)))?;
+            let i = self.at_lin[l as usize];
+            if phase & 7 == EDGE {
+                self.sequence(group, |e| edge_edits.push((i, phase >> 3, e)))?;
+            } else {
+                let at = ProgPoint::before(i);
+                self.sequence(group, |e| edits.push((at, e)))?;
+            }
         }
         Ok(Output {
             num_spillslots: self.num_slots as usize,
             edits,
+            edge_edits,
             allocs: std::mem::take(&mut self.allocs),
         })
     }
@@ -528,58 +538,67 @@ impl Ra {
                     }
                 }
             }
-            for &p in preds {
+            // A branch with both edges here is in `preds` once per edge.
+            for (n, &p) in preds.iter().enumerate() {
+                if preds[..n].contains(&p) {
+                    continue;
+                }
                 let pi = p.index();
                 let pe = 2 * self.last[pi] + 1;
-                let (at, phase) = if preds.len() == 1 && !resume {
-                    (self.first[si], EDGE_IN)
-                } else {
-                    if f.block_succs(p).len() != 1 {
-                        return Err(format!("critical edge b{pi} -> b{si}"));
-                    }
-                    (self.last[pi], EDGE_OUT)
-                };
-                let before = moves.len();
-                for &(v, y) in live.iter() {
-                    let x = from(v, y, pi)?;
-                    if x == y {
+                let succs = f.block_succs(p);
+                for k in 0..succs.len() {
+                    if succs[k] != s {
                         continue;
                     }
-                    let (from, to) = (self.alloc_of(x), self.alloc_of(y));
-                    // The slot has held it since its definition; a
-                    // constant is computed again where it is needed.
-                    let g = self.rep[v as usize] as usize;
-                    if from != to
-                        && !to.is_none()
-                        && (!to.is_stack() || self.deferred[g])
-                        && !once.contains(&v)
-                    {
-                        let cls = self.vregs[v as usize].class;
-                        moves.push((at, phase, self.mv_from(f, v, from, pe, to, cls)));
-                    }
-                }
-                let k = (f.block_succs(p).iter())
-                    .position(|&x| x == s)
-                    .expect("an edge");
-                let args = f.branch_blockparams(p, k);
-                for (q, a) in f.block_params(s).iter().zip(args) {
-                    let q = q.vreg() as u32;
-                    let Some(to) = self.alloc_at(q, ss) else {
-                        continue;
+                    // Into the block's start, before the predecessor's jump,
+                    // or on the edge itself when both have company.
+                    let (at, phase) = if preds.len() == 1 && !resume {
+                        (self.first[si], EDGE_IN)
+                    } else if succs.len() == 1 {
+                        (self.last[pi], EDGE_OUT)
+                    } else {
+                        (self.last[pi], EDGE | (k as u8) << 3)
                     };
-                    let from = (self.alloc_at(a.vreg() as u32, pe))
-                        .ok_or_else(|| format!("argument v{} not live at b{pi}'s end", a.vreg()))?;
-                    if from != to {
-                        let cls = self.vregs[q as usize].class;
-                        let m = self.mv_from(f, a.vreg() as u32, from, pe, to, cls);
-                        moves.push((at, phase, m));
+                    let before = moves.len();
+                    for &(v, y) in live.iter() {
+                        let x = from(v, y, pi)?;
+                        if x == y {
+                            continue;
+                        }
+                        let (from, to) = (self.alloc_of(x), self.alloc_of(y));
+                        // The slot has held it since its definition; a
+                        // constant is computed again where it is needed.
+                        let g = self.rep[v as usize] as usize;
+                        if from != to
+                            && !to.is_none()
+                            && (!to.is_stack() || self.deferred[g])
+                            && !once.contains(&v)
+                        {
+                            let cls = self.vregs[v as usize].class;
+                            moves.push((at, phase, self.mv_from(f, v, from, pe, to, cls)));
+                        }
                     }
-                }
-                if resume && moves.len() != before {
-                    return Err(format!(
-                        "moves into resume block b{si}: {:?}",
-                        &moves[before..]
-                    ));
+                    let args = f.branch_blockparams(p, k);
+                    for (q, a) in f.block_params(s).iter().zip(args) {
+                        let q = q.vreg() as u32;
+                        let Some(to) = self.alloc_at(q, ss) else {
+                            continue;
+                        };
+                        let from = (self.alloc_at(a.vreg() as u32, pe)).ok_or_else(|| {
+                            format!("argument v{} not live at b{pi}'s end", a.vreg())
+                        })?;
+                        if from != to {
+                            let cls = self.vregs[q as usize].class;
+                            let m = self.mv_from(f, a.vreg() as u32, from, pe, to, cls);
+                            moves.push((at, phase, m));
+                        }
+                    }
+                    if resume && moves.len() != before {
+                        return Err(format!(
+                            "moves into resume block b{si}: {:?}",
+                            &moves[before..]
+                        ));
+                    }
                 }
             }
         }

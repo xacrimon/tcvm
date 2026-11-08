@@ -19,7 +19,7 @@ use crate::jit::backend::aarch64::asm::{
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
 use crate::jit::backend::aarch64::lower::{LExit, Lowered, Src, float_cond, int_cond};
 use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
-use crate::jit::backend::reg::{Allocation, PReg, RegClass};
+use crate::jit::backend::reg::{Allocation, Inst, PReg, RegClass};
 use crate::jit::backend::vcode::{Remat, VCode};
 use crate::jit::ir::ops::{Cc, Ctx};
 use crate::jit::ir::types::TypeSet;
@@ -176,11 +176,9 @@ fn rotate_loops(
 
 /// Where branches to each block go, whether it is left out, and where a
 /// resume block's other returns (`resume_based`) go when not into it.
-/// Branches go past a block that is only a `Jump` once allocated (an edge
-/// split for moves that needed none), unless the chain is a loop, and to
-/// the exit of one that is only a `Deopt`. A resume block that is only the
-/// `Resume` and a `Jump`, emitting nothing past its `BASE` fixup, has its
-/// slow and native returns go where the jump does.
+/// Branches to a block that is only a `Deopt` go to its exit. A resume
+/// block that is only the `Resume` and a `Jump`, emitting nothing past its
+/// `BASE` fixup, has its slow and native returns go where the jump does.
 fn thread_jumps(
     l: &Lowered,
     out: &Output,
@@ -203,40 +201,16 @@ fn thread_jumps(
             .collect();
         insts.filter(|v| v.len() == n)
     };
-    enum End {
-        Jump(usize),
-        Exit(u32),
-    }
-    let ends: Vec<Option<End>> = (0..nb)
-        .map(|b| {
-            if l.vcode.blocks[b].resume {
-                return None;
-            }
-            match l.vcode.insts[only(b, 1)?[0]] {
-                MInst::Jump => Some(End::Jump(l.vcode.succs(b)[0].index())),
-                MInst::Deopt { exit } => Some(End::Exit(exit)),
-                _ => None,
-            }
-        })
-        .collect();
     let mut dest = labels.to_vec();
     let mut skip = vec![false; nb];
     for b in 0..nb {
-        let mut t = b;
-        let mut n = 0;
-        while let Some(End::Jump(s)) = ends[t] {
-            t = s;
-            n += 1;
-            if n > nb {
-                t = b;
-                break;
-            }
+        if !l.vcode.blocks[b].resume
+            && let Some(i) = only(b, 1)
+            && let MInst::Deopt { exit } = l.vcode.insts[i[0]]
+        {
+            dest[b] = exit_of(exit);
+            skip[b] = true;
         }
-        dest[b] = match ends[t] {
-            Some(End::Exit(exit)) => exit_of(exit),
-            _ => labels[t],
-        };
-        skip[b] = t != b || matches!(ends[b], Some(End::Exit(_)));
     }
     let resume_to = (0..nb)
         .map(|b| {
@@ -267,7 +241,8 @@ struct Em<'a> {
     out: &'a Output,
     frame: u32,
     labels: Vec<Label>,
-    /// Where a branch to each block goes: past blocks that only jump (E6).
+    /// Where a branch to each block goes: a block that is only a deopt is
+    /// its exit (`thread_jumps`).
     dest: Vec<Label>,
     exit_labels: Vec<Label>,
     exit_region: Label,
@@ -320,6 +295,8 @@ struct Em<'a> {
     ool: Vec<OolPath<'a>>,
     /// Bit tests branch with `tbz`/`tbnz` (±32 KB), else `tst` and `b.cond`.
     bit_branches: bool,
+    /// With `trace`: each code word's origin (`Emitted::origins`).
+    origins: Option<Vec<(u32, u32)>>,
 }
 
 /// A function region's fast entry: what `enter` would check of the callee.
@@ -476,12 +453,6 @@ fn emit_with(
     trace: bool,
     bit_branches: bool,
 ) -> Result<Emitted, String> {
-    let mut origins: Vec<(u32, u32)> = Vec::new();
-    let mut origin = |a: &Asm, o: u32| {
-        if trace {
-            origins.push(((a.offset() / 4) as u32, o));
-        }
-    };
     if out.num_spillslots > MAX_SPILLS {
         return Err(format!("{} spill slots", out.num_spillslots));
     }
@@ -540,8 +511,9 @@ fn emit_with(
         level_tail,
         ool: Vec::new(),
         bit_branches,
+        origins: trace.then(Vec::new),
     };
-    origin(&em.a, Origin::Entry as u32);
+    em.origin(Origin::Entry as u32);
     em.a.bind(em.region_word);
     em.a.emit(0);
     em.a.emit(0);
@@ -644,20 +616,11 @@ fn emit_with(
                     if let Some((r, _)) = em.pending_based.take() {
                         em.a.bind(em.resume_based[r]);
                     }
-                    match *e {
-                        Edit::Move { from, to } => {
-                            origin(&em.a, Origin::Move as u32);
-                            em.mov(from, to)
-                        }
-                        Edit::Remat { to, vreg, src } => {
-                            origin(&em.a, Origin::Remat as u32);
-                            em.remat(to, vreg.vreg(), src)
-                        }
-                    }
+                    em.edit(e);
                 }
                 InstOrEdit::Inst(i) => {
                     let next = laid.get(at + 1).map(|&x| em.labels[x]);
-                    origin(&em.a, i.index() as u32);
+                    em.origin(i.index() as u32);
                     em.inst(i.index(), b, next)?;
                 }
             }
@@ -666,11 +629,11 @@ fn emit_with(
     if !cold_bound {
         em.a.bind(cold);
     }
-    origin(&em.a, Origin::OutOfLine as u32);
+    em.origin(Origin::OutOfLine as u32);
     for f in std::mem::take(&mut em.ool) {
         f(&mut em);
     }
-    origin(&em.a, Origin::Stubs as u32);
+    em.origin(Origin::Stubs as u32);
     // Dispatch enters through `level_enter`, which returns to `level_land`.
     let dispatch = em.a.new_label();
     em.a.bind(dispatch);
@@ -817,7 +780,7 @@ fn emit_with(
         landings: em.landings,
         hot: hot_starts,
         cold,
-        origins,
+        origins: em.origins.unwrap_or_default(),
     })
 }
 
@@ -867,7 +830,7 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
     }
 }
 
-impl Em<'_> {
+impl<'a> Em<'a> {
     fn allocs(&self, i: usize) -> &[Allocation] {
         self.out
             .inst_allocs(self.v, crate::jit::backend::reg::Inst::new(i))
@@ -890,6 +853,130 @@ impl Em<'_> {
 
     fn fr(&self, i: usize, k: usize) -> Fpr {
         fpr(self.allocs(i)[k].as_reg().expect("a register operand"))
+    }
+
+    /// The branch `i` to `lt` where its test holds, else `lf`.
+    fn br(&mut self, i: usize, test: Test, cond: Cond, lt: Label, lf: Label, next: Option<Label>) {
+        let multi = matches!(test, Test::Type(set, _) if !is_single_test(set));
+        if test == Test::B1 || multi {
+            // Where `cond` holds, and where it does not.
+            let (yes, no) = if cond == Cond::Eq || (test == Test::B1 && cond == Cond::Ne) {
+                (lt, lf)
+            } else {
+                (lf, lt)
+            };
+            let v = self.r(i, 0);
+            let w = match test {
+                Test::Type(set, words) => self.words(i, 0, set, words),
+                _ => Vec::new(),
+            };
+            if Some(yes) == next {
+                match test {
+                    Test::Type(set, _) => type_fail(&mut self.a, v, set, no, &w),
+                    _ => self.a.cbz(Sz::W, v, no),
+                }
+                return;
+            }
+            match test {
+                Test::Type(set, _) => type_branch(&mut self.a, v, set, yes, &w),
+                _ => self.a.cbnz(Sz::W, v, yes),
+            }
+            if Some(no) != next {
+                self.a.b(no);
+            }
+            return;
+        }
+        if let Test::Bit(b) = test
+            && self.bit_branches
+        {
+            let x = self.r(i, 0);
+            let (set, clear) = if cond == Cond::Ne { (lt, lf) } else { (lf, lt) };
+            if Some(set) == next {
+                self.a.tbz(x, b as u32, clear);
+            } else {
+                self.a.tbnz(x, b as u32, set);
+                if Some(clear) != next {
+                    self.a.b(clear);
+                }
+            }
+            return;
+        }
+        if let Some(sz) = zero_test(test, cond) {
+            // `cbz` where the operand is zero (`Eq` holding).
+            let v = self.r(i, 0);
+            let (on_zero, on_other) = if cond == Cond::Eq { (lt, lf) } else { (lf, lt) };
+            if Some(on_zero) == next {
+                self.a.cbnz(sz, v, on_other);
+            } else {
+                self.a.cbz(sz, v, on_zero);
+                if Some(on_other) != next {
+                    self.a.b(on_other);
+                }
+            }
+            return;
+        }
+        let c = self.test(i, 0, test, cond);
+        if Some(lt) == next {
+            self.a.b_cond(c.invert(), lf);
+        } else {
+            self.a.b_cond(c, lt);
+            if Some(lf) != next {
+                self.a.b(lf);
+            }
+        }
+    }
+
+    fn origin(&mut self, o: u32) {
+        if let Some(v) = &mut self.origins {
+            v.push(((self.a.offset() / 4) as u32, o));
+        }
+    }
+
+    fn edit(&mut self, e: &Edit) {
+        match *e {
+            Edit::Move { from, to } => {
+                self.origin(Origin::Move as u32);
+                self.mov(from, to)
+            }
+            Edit::Remat { to, vreg, src } => {
+                self.origin(Origin::Remat as u32);
+                self.remat(to, vreg.vreg(), src)
+            }
+        }
+    }
+
+    /// A branch's targets, with the allocator's moves on its edges: the
+    /// edge falling through has them in line after the branch (returned),
+    /// any other in a stub out of line that jumps on.
+    fn edge_labels(
+        &mut self,
+        i: usize,
+        block: usize,
+        next: Option<Label>,
+    ) -> ([Label; 2], &'a [(Inst, u8, Edit)]) {
+        let succs = self.v.succs(block);
+        let mut labels = [self.dest[succs[0].index()], self.dest[succs[1].index()]];
+        let mut inline: &'a [(Inst, u8, Edit)] = &[];
+        for (k, l) in labels.iter_mut().enumerate() {
+            let edits = self.out.edge_edits(Inst::new(i), k);
+            if edits.is_empty() {
+                continue;
+            }
+            if Some(*l) == next && inline.is_empty() {
+                inline = edits;
+                continue;
+            }
+            let (stub, to) = (self.a.new_label(), *l);
+            *l = stub;
+            self.ool.push(Box::new(move |em: &mut Em<'a>| {
+                em.a.bind(stub);
+                for (_, _, e) in edits {
+                    em.edit(e);
+                }
+                em.a.b(to);
+            }));
+        }
+        (labels, inline)
     }
 
     fn mov(&mut self, from: Allocation, to: Allocation) {
@@ -2548,77 +2635,10 @@ impl Em<'_> {
                 }
             }
             Br { test, cond } => {
-                let (t, f) = (
-                    self.v.succs(block)[0].index(),
-                    self.v.succs(block)[1].index(),
-                );
-                let (lt, lf) = (self.dest[t], self.dest[f]);
-                let multi = matches!(test, Test::Type(set, _) if !is_single_test(set));
-                if test == Test::B1 || multi {
-                    // Where `cond` holds, and where it does not.
-                    let (yes, no) = if cond == Cond::Eq || (test == Test::B1 && cond == Cond::Ne) {
-                        (lt, lf)
-                    } else {
-                        (lf, lt)
-                    };
-                    let v = self.r(i, 0);
-                    let w = match test {
-                        Test::Type(set, words) => self.words(i, 0, set, words),
-                        _ => Vec::new(),
-                    };
-                    if Some(yes) == next {
-                        match test {
-                            Test::Type(set, _) => type_fail(&mut self.a, v, set, no, &w),
-                            _ => self.a.cbz(Sz::W, v, no),
-                        }
-                        return Ok(());
-                    }
-                    match test {
-                        Test::Type(set, _) => type_branch(&mut self.a, v, set, yes, &w),
-                        _ => self.a.cbnz(Sz::W, v, yes),
-                    }
-                    if Some(no) != next {
-                        self.a.b(no);
-                    }
-                    return Ok(());
-                }
-                if let Test::Bit(b) = test
-                    && self.bit_branches
-                {
-                    let x = self.r(i, 0);
-                    let (set, clear) = if cond == Cond::Ne { (lt, lf) } else { (lf, lt) };
-                    if Some(set) == next {
-                        self.a.tbz(x, b as u32, clear);
-                    } else {
-                        self.a.tbnz(x, b as u32, set);
-                        if Some(clear) != next {
-                            self.a.b(clear);
-                        }
-                    }
-                    return Ok(());
-                }
-                if let Some(sz) = zero_test(test, cond) {
-                    // `cbz` where the operand is zero (`Eq` holding).
-                    let v = self.r(i, 0);
-                    let (on_zero, on_other) = if cond == Cond::Eq { (lt, lf) } else { (lf, lt) };
-                    if Some(on_zero) == next {
-                        self.a.cbnz(sz, v, on_other);
-                    } else {
-                        self.a.cbz(sz, v, on_zero);
-                        if Some(on_other) != next {
-                            self.a.b(on_other);
-                        }
-                    }
-                    return Ok(());
-                }
-                let c = self.test(i, 0, test, cond);
-                if Some(lt) == next {
-                    self.a.b_cond(c.invert(), lf);
-                } else {
-                    self.a.b_cond(c, lt);
-                    if Some(lf) != next {
-                        self.a.b(lf);
-                    }
+                let ([lt, lf], inline) = self.edge_labels(i, block, next);
+                self.br(i, test, cond, lt, lf, next);
+                for (_, _, e) in inline {
+                    self.edit(e);
                 }
             }
             Call {

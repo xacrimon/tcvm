@@ -201,32 +201,3 @@ pub(crate) fn dce(f: &mut Func<'_>) {
         f.retain(Block(b as u32), |_, i| !dead[i.idx()]);
     }
 }
-
-/// Split every edge from a block with several successors to a block with
-/// several predecessors, so the register allocator has a place for the
-/// edge's moves.
-pub(crate) fn split_critical_edges(f: &mut Func<'_>) {
-    let cfg = f.cfg();
-    for &b in &cfg.rpo {
-        let Some(t) = f.terminator(b) else {
-            continue;
-        };
-        let n = f.edges(t).len();
-        if n < 2 {
-            continue;
-        }
-        for k in 0..n {
-            let e = f.edges(t)[k];
-            if cfg.preds(e.target).len() < 2 {
-                continue;
-            }
-            let mid = f.new_block();
-            f.blocks[mid.idx()].cold = f.blocks[e.target.idx()].cold;
-            let j = f.make_inst(Op::Jump, &[], None, crate::jit::ir::ops::ExitTag::Type);
-            f.append(mid, j);
-            f.set_edges(j, &[e]);
-            f.set_target(t, k, mid);
-            f.set_edge_args(t, k, &[]);
-        }
-    }
-}

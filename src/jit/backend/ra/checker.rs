@@ -768,7 +768,10 @@ impl<'a, I: TargetInst> Checker<'a, I> {
             }
         }
 
-        bb_in.insert(f.entry_block(), CheckerState::default());
+        bb_in.insert(
+            f.entry_block(),
+            CheckerState::Allocations(FxHashMap::default()),
+        );
 
         Checker {
             f,
@@ -836,6 +839,11 @@ impl<'a, I: TargetInst> Checker<'a, I> {
         // edge as necessary to handle blockparams.
         if self.f.is_branch(inst) {
             for (i, &succ) in self.f.block_succs(block).iter().enumerate() {
+                // The allocator's moves on the edge come before its params.
+                for &(_, _, ref edit) in out.edge_edits(inst, i) {
+                    let ci = self.edit_inst(edit);
+                    self.edge_insts.get_mut(&(block, succ)).unwrap().push(ci);
+                }
                 let args = self.f.branch_blockparams(block, i);
                 let params = self.f.block_params(succ);
                 assert_eq!(
@@ -858,27 +866,24 @@ impl<'a, I: TargetInst> Checker<'a, I> {
         }
     }
 
-    fn handle_edit(&mut self, block: Block, edit: &Edit) {
-        trace!("checker: adding edit {:?}", edit);
+    fn edit_inst(&self, edit: &Edit) -> CheckerInst {
         match edit {
-            &Edit::Move { from, to } => {
-                self.bb_insts
-                    .get_mut(&block)
-                    .unwrap()
-                    .push(CheckerInst::Move { into: to, from });
-            }
+            &Edit::Move { from, to } => CheckerInst::Move { into: to, from },
             &Edit::Remat { to, vreg, src } => {
                 let from = (!src.is_none()).then(|| (src, self.remat_src[vreg.vreg()]));
-                self.bb_insts
-                    .get_mut(&block)
-                    .unwrap()
-                    .push(CheckerInst::Remat {
-                        into: to,
-                        vreg,
-                        from,
-                    });
+                CheckerInst::Remat {
+                    into: to,
+                    vreg,
+                    from,
+                }
             }
         }
+    }
+
+    fn handle_edit(&mut self, block: Block, edit: &Edit) {
+        trace!("checker: adding edit {:?}", edit);
+        let ci = self.edit_inst(edit);
+        self.bb_insts.get_mut(&block).unwrap().push(ci);
     }
 
     /// Perform the dataflow analysis to compute checker state at each BB entry.
@@ -904,6 +909,12 @@ impl<'a, I: TargetInst> Checker<'a, I> {
             queue_set.remove(&block);
             let mut state = self.bb_in.get(&block).cloned().unwrap();
             trace!("analyze: block {} has state {:?}", block.index(), state);
+            // Not reached yet: what it would compute from nothing would
+            // meet into its successors for good. (Upstream processes it,
+            // which is right only with predecessors numbered first.)
+            if matches!(state, CheckerState::Top) {
+                continue;
+            }
             for inst in self.bb_insts.get(&block).unwrap() {
                 state.update(inst);
                 trace!("analyze: inst {:?} -> state {:?}", inst, state);
@@ -1041,7 +1052,13 @@ impl<'a, I: TargetInst> Checker<'a, I> {
                                 .collect::<Vec<_>>();
                             trace!("    parallel_move {}", moves.join(", "));
                         }
-                        _ => panic!("unexpected edge_inst: not a parallel move"),
+                        &CheckerInst::Move { from, into } => {
+                            trace!("    {} -> {}", from, into);
+                        }
+                        &CheckerInst::Remat { into, vreg, .. } => {
+                            trace!("    remat {} -> {}", vreg, into);
+                        }
+                        _ => panic!("unexpected edge_inst"),
                     }
                     state.update(edge_inst);
                     print_state(&state);

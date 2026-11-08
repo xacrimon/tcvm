@@ -351,23 +351,47 @@ impl Gen {
         self.edge(from, to, args);
     }
 
+    /// A branch's edge straight into `j`, a join (critical), when `direct`
+    /// allows, or through an arm of `depth`; the arguments are made before
+    /// the branch.
+    fn arm(
+        &mut self,
+        cur: u32,
+        j: u32,
+        depth: u32,
+        direct: bool,
+        avail: &mut Vec<VReg>,
+    ) -> Option<Vec<VReg>> {
+        if direct && self.rng.chance(30) {
+            return Some(self.args_for(cur, j, avail));
+        }
+        let a = self.block();
+        let al = self.region(a, depth + 1, avail);
+        self.jump(al, j, avail);
+        self.blocks[cur as usize].succs.push(a);
+        self.blocks[cur as usize].args.push(Vec::new());
+        self.blocks[a as usize].preds.push(cur);
+        None
+    }
+
     fn diamond(&mut self, cur: u32, depth: u32, avail: &mut Vec<VReg>) -> u32 {
-        self.br(cur, avail);
-        let t = self.block();
-        self.edge(cur, t, Vec::new());
-        let mut at = avail.clone();
-        let tl = self.region(t, depth + 1, &mut at);
-        let was = self.in_cold;
-        self.in_cold |= self.rng.chance(25);
-        let e = self.block();
-        self.edge(cur, e, Vec::new());
-        let mut ae = avail.clone();
-        let el = self.region(e, depth + 1, &mut ae);
-        self.in_cold = was;
         let j = self.block();
         self.params(j);
-        self.jump(tl, j, &mut at);
-        self.jump(el, j, &mut ae);
+        let mut at = avail.clone();
+        let mut ae = avail.clone();
+        let direct_t = self.arm(cur, j, depth, true, &mut at).map(|a| (0, a));
+        let was = self.in_cold;
+        self.in_cold |= self.rng.chance(25);
+        // Both edges to the join would be no branch.
+        let direct_e = (self.arm(cur, j, depth, direct_t.is_none(), &mut ae)).map(|a| (1, a));
+        self.in_cold = was;
+        self.br(cur, avail);
+        // The branch's edges in order: a direct one sits where its arm would.
+        for (k, args) in direct_t.into_iter().chain(direct_e) {
+            self.blocks[cur as usize].succs.insert(k, j);
+            self.blocks[cur as usize].args.insert(k, args);
+            self.blocks[j as usize].preds.push(cur);
+        }
         avail.extend(self.blocks[j as usize].params.clone());
         j
     }
@@ -378,10 +402,17 @@ impl Gen {
         self.jump(cur, h, avail);
         avail.extend(self.blocks[h as usize].params.clone());
         let latch = self.region(h, depth + 1, avail);
+        // The back edge straight from the branch (critical) or via a block.
+        let direct = self.rng.chance(30).then(|| self.args_for(latch, h, avail));
         self.br(latch, avail);
-        let back = self.block();
-        self.edge(latch, back, Vec::new());
-        self.jump(back, h, avail);
+        match direct {
+            Some(args) => self.edge(latch, h, args),
+            None => {
+                let back = self.block();
+                self.edge(latch, back, Vec::new());
+                self.jump(back, h, avail);
+            }
+        }
         let x = self.block();
         self.edge(latch, x, Vec::new());
         x
@@ -706,6 +737,7 @@ fn recorded_allocations_stay_the_same() {
             (ctx.run(&c.f, &c.order, c.hot)).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         let same = out.num_spillslots == c.out.num_spillslots
             && out.edits == c.out.edits
+            && out.edge_edits == c.out.edge_edits
             && out.allocs == c.out.allocs;
         if !same {
             differ += 1;

@@ -48,12 +48,14 @@ pub(crate) enum Edit {
     },
 }
 
-/// The allocation: each operand's location, and the edits between
-/// instructions, sorted by program point.
+/// The allocation: each operand's location, the edits between
+/// instructions, sorted by program point, and those on the edges of
+/// branches into joins, by (branch, edge).
 #[derive(Debug)]
 pub(crate) struct Output {
     pub(crate) num_spillslots: usize,
     pub(crate) edits: Vec<(ProgPoint, Edit)>,
+    pub(crate) edge_edits: Vec<(Inst, u8, Edit)>,
     pub(crate) allocs: Vec<Allocation>,
 }
 
@@ -66,6 +68,14 @@ impl Output {
     pub(crate) fn inst_allocs<I: TargetInst>(&self, f: &VCode<I>, inst: Inst) -> &[Allocation] {
         let (a, b) = f.ops[inst.index()];
         &self.allocs[a as usize..b as usize]
+    }
+
+    /// The edits on edge `k` of the branch `inst`.
+    pub(crate) fn edge_edits(&self, inst: Inst, k: usize) -> &[(Inst, u8, Edit)] {
+        let key = (inst, k as u8);
+        let a = self.edge_edits.partition_point(|e| (e.0, e.1) < key);
+        let n = self.edge_edits[a..].partition_point(|e| (e.0, e.1) == key);
+        &self.edge_edits[a..a + n]
     }
 
     /// A block's instructions with the edits before each.

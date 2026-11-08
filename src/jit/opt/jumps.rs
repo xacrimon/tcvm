@@ -1,13 +1,12 @@
 //! Jump threading: a block that only jumps on is left out, each edge into it
-//! going where the jump went with the arguments it would pass, unless that
-//! edge would then come from a branch into a join (a critical edge, which
-//! the allocator has no place to put moves on; `split_critical_edges`); a
-//! block whose jump is its successor's only entry takes the successor's
-//! instructions. Inlined callees' returns funnel through such blocks, and
-//! folds leave arms empty.
+//! going where the jump went with the arguments it would pass; a block whose
+//! jump is its successor's only entry takes the successor's instructions.
+//! Inlined callees' returns funnel through such blocks, and folds leave arms
+//! empty. A branch's edge into a join carries its own moves
+//! (`ra::Output::edge_edits`), so nothing stays for them.
 
 use crate::jit::ir::ops::Op;
-use crate::jit::ir::{Block, CfgInfo, Func, Inst, Val, ValDef};
+use crate::jit::ir::{Block, BlockCall, CfgInfo, Func, Inst, Val, ValDef};
 
 pub(crate) fn thread(f: &mut Func<'_>) -> bool {
     let mut changed = false;
@@ -85,25 +84,44 @@ fn thread_block(f: &mut Func<'_>, cfg: &CfgInfo, npreds: &mut [u32], b: Block, t
     let mut any = false;
     for &(src, k) in cfg.incoming(b) {
         let k = k as usize;
-        // A call keeps its resume block. From a branch only where the join
-        // gains no second entry: `b` dies and was its one.
-        if !matches!(f.op(src), Op::Jump | Op::Br)
-            || f.edges(src)[k].target != b
-            || (f.edges(src).len() > 1 && !(npreds[s.idx()] == 1 && npreds[b.idx()] == 1))
-        {
+        // A call keeps its resume block.
+        if !matches!(f.op(src), Op::Jump | Op::Br) || f.edges(src)[k].target != b {
             continue;
         }
-        let args: Vec<Val> = (f.vl(e.args).iter())
+        let mut args: Vec<Val> = (f.vl(e.args).iter())
             .map(|&v| match f.vals[v.idx()].def {
                 ValDef::Param(pb, i) if pb == b => f.edge_args(src, k)[i as usize],
                 _ => v,
             })
             .collect();
+        npreds[b.idx()] -= 1;
+        any = true;
+        // A branch whose other edge reaches `s` too decides only arguments:
+        // a select for each the edges disagree on, and a jump.
+        if let Some(j) = (0..f.edges(src).len()).find(|&j| j != k && f.edges(src)[j].target == s) {
+            let (c, tag, sb) = (
+                f.args(src)[0],
+                f.insts[src.idx()].tag,
+                f.insts[src.idx()].block,
+            );
+            for (n, a) in args.iter_mut().enumerate() {
+                let o = f.edge_args(src, j)[n];
+                if *a != o {
+                    let (x, y) = if k == 0 { (*a, o) } else { (o, *a) };
+                    let sel = f.make_inst(Op::Select, &[c, x, y], None, tag);
+                    f.insert_before_term(sb, sel);
+                    *a = f.result(sel);
+                }
+            }
+            f.insts[src.idx()].op = Op::Jump;
+            f.insts[src.idx()].an = 0;
+            let args = f.new_vlist(&args);
+            f.set_edges(src, &[BlockCall { target: s, args }]);
+            continue;
+        }
         f.set_target(src, k, s);
         f.set_edge_args(src, k, &args);
-        npreds[b.idx()] -= 1;
         npreds[s.idx()] += 1;
-        any = true;
     }
     if npreds[b.idx()] == 0 {
         f.blocks[b.idx()].dead = true;

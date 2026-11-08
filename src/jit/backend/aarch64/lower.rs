@@ -1816,6 +1816,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::Jump, &[], none);
             }
             Op::Br => {
+                // The encoder lays one edge's moves in line past the branch.
+                if self.f.edges(i)[0].target == self.f.edges(i)[1].target {
+                    return Err(format!("i{} branches to one block both ways", i.0));
+                }
                 let c = args[0];
                 let (test, cond, targs) = if self.fused[c.idx()] {
                     self.test_of(c)
