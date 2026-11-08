@@ -1,94 +1,52 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+TCVM is a Lua 5.5 implementation in Rust: parser, compiler, direct-threaded interpreter, tracing GC, and an aarch64 method JIT. The goal is the best Lua implementation possible, not a luac clone: match observable semantics, not luac's bytecode or register layout.
 
-## Verification Standards
-- Never claim Lua semantics or reference compiler (luac) behavior without actually running it to verify. If asserting behavior, show the command and output.
-- When comparing against a reference implementation, cite the actual file/line or run the binary; do not fabricate output.
-Add as a new section near the top of CLAUDE.md, before tool-specific guidance.
+## Verification
+- Never claim Lua or luac behavior without running it; show the command and output. Reference `lua`/`luac` 5.5.1 and `luajit` are on PATH; the manual is `lua_manual.of`.
+- Differential runs: `lua x.lua` vs `target/release/tcvm-cli -f x.lua`, `luac -l -p x.lua` vs `tcvm-cli -l -f x.lua`. `tools/difflua.sh` does the same with every JIT region compiled at its first count.
+- macOS has no `timeout`: cap runs with `perl -e 'alarm 20; exec @ARGV' …`, and confirm a check produced output before reading silence as success.
+- Tests never shell out to `lua`. Derive expected output locally, then hardcode it in assertions or insta snapshots.
+- Some differences from PUC Lua are deliberate (yielding across natives and message handlers, main-thread yield to the host, `%.14g` float tostring, buffered non-flushing `print`, text-only chunks, 0x7fffff00 string cap, `global` always reserved, PCG `math.random`). Don't report or "fix" them.
 
-## Planning & Brainstorming
-- When the user invokes brainstorming or planning, engage in collaborative dialogue and ask clarifying questions ONE AT A TIME. Do not jump straight to creating tasks, invoking subagents, or writing plan files.
-- Wait for explicit approval before transitioning from discussion to execution.
-Add under a ## Code Style section (create if missing).
-
-## Code Style
-- Prefer inline match expressions over extracted helper functions for small primitive operations (e.g., comparisons). Do not introduce helpers like `primitive_lt`/`primitive_le` unless asked.
-- Skip confirmations for routine sed/file edits once a refactor is approved.
-- Comments: comment the non-obvious — invariants, "why this and not the obvious alternative", subtle safety/GC/ordering constraints. Do not narrate what the code plainly does, restate the function name, or annotate each step of a self-evident sequence. Prefer one tight sentence over a paragraph. Doc comments on public items are fine but should be terse.
-
-## Git & PR Conventions
-- Never add `Co-Authored-By: Claude` trailers, Claude Code footers, or any Claude attribution to commits or PRs.
-
-## Build Commands
-
-```bash
-cargo build          # Build the project
-cargo check          # Type-check without full compilation
-cargo test           # Run tests (none exist yet)
-cargo clippy         # Lint
-cargo fmt            # Format code
+## Build and test
+```sh
+cargo build --release --workspace   # plain `cargo build` does not rebuild cli/, so tcvm-cli goes stale
+cargo test --workspace
+INSTA_UPDATE=always cargo test       # accept new snapshots, then check them against `lua`
+cargo clippy --workspace
+cargo fmt
 ```
+Workspace: `tcvm` (root), `derive/` (`#[derive(Collect)]`), `cli/` (`tcvm-cli`). Toolchain is pinned nightly (`rust-toolchain.toml`), edition 2024; nightly features are listed in `src/lib.rs`.
 
-This is a Cargo workspace with two crates: `tcvm` (main) and `tcvm-derive` (proc-macro at `derive/`).
+Tests: `tests/suite/*.rs` (runtime), `test-files/*.lua` (snapshots), `src/compiler/snapshots`, `cli/tests`. Fix a behavior bug together with a regression test. Never reach the tested path through a limitation that planned work removes; force it explicitly (e.g. `Lua::set_jit_inline(false)`).
 
-## Toolchain
+## Layout
+- `src/parser`, `src/compiler`: source → bytecode (`src/instruction.rs`; `OP_INFO` describes each opcode's family and forms).
+- `src/vm`: interpreter. `extern "rust-preserve-none"` handlers dispatched with `become`; `ops/` holds handlers by family, `frame.rs` the frame layout, `native.rs`/`async_native.rs`/`ff.rs` the native protocols, `coro.rs`/`unwind.rs` the coroutine switches and unwinding.
+- `src/env`: values, tables, shapes, strings, functions, threads.
+- `src/dmm`: GC. `Gc<'gc, T>` with invariant lifetimes, `Collect` trait, barriers, non-moving Immix heap (`heap.rs`).
+- `src/jit`: method JIT. Regions start at function entry or a hot loop, run through IR → `opt/` → `backend/` (aarch64, own regalloc or regalloc2).
+- `src/builtin`: standard library. `src/lua`: embedding API and executor.
+- `tools/`: perf and differential scripts (`gate.sh`, `opcost.py`, `ljr.py`, `corpus/`).
 
-Requires **nightly Rust** (nightly-2026-08-15, pinned in `rust-toolchain.toml`). Uses these nightly features:
-- `explicit_tail_calls` (`become` keyword) — core to the interpreter dispatch loop
-- `rust_preserve_none_cc` — calling convention for VM opcode handlers
-- `naked_functions_rustic_abi` — the JIT's naked `dispatch_entry` with the handler ABI
-- `fn_align` — `#[rustc_align(32)]` on dispatch targets
-- `try_trait_v2` — `?` in natives that return `NativeOut`
-- `macro_metavar_expr`
-- `likely_unlikely`
-- `allocator_api`
-- `variant_count`
-- `offset_of_enum`
+Use rust-analyzer for anything the module docs don't answer; don't rely on this file for details.
 
-Edition 2024.
+## JIT knobs (env)
+`TCVM_JIT=off`, `TCVM_JIT_HOT_CALL=N`/`TCVM_JIT_HOT_LOOP=N` (1 = compile at first count), `TCVM_JIT_DEOPT_ALL=1`, `TCVM_JIT_INLINE=0`, `TCVM_JIT_DUMP=ir,opt,vcode,asm`, `TCVM_JIT_LOG=1`, `TCVM_JIT_CHECK=1`, `TCVM_JIT_ONLY=…`, `TCVM_JIT_RA=regalloc2`, `TCVM_GC_STRESS`. The Bash tool runs zsh: `env $m` with several variables in `$m` sets only the first, so use `env ${=m}`.
 
-## What This Is
+## Working style
+- Planning or brainstorming: ask clarifying questions one at a time; don't create tasks, spawn subagents, or write plan files until explicitly approved.
+- Disclose every deviation from an agreed design when you make it, with its cost.
+- Don't run unbounded-recursion scripts on builds without the stack limit, and never switch the user's checkout to compare builds; use a worktree.
 
-TCVM is a Lua 5.5 bytecode virtual machine written in Rust. It interprets Lua bytecode (does not compile from source yet — the parser is incomplete/early-stage). Reference projects: [piccolo](https://github.com/kyren/piccolo), [dolang](https://github.com/bkoropoff/dolang).
+## Code style
+- Inline match expressions over small helpers for primitive operations (no `primitive_lt`-style helpers unless asked).
+- Comments: only the non-obvious (invariants, why-not-the-alternative, GC/safety/ordering constraints). One-line contracts; no narration of code or generated asm, no restated signatures. Match the density of neighboring comments.
+- When basing code on an upstream implementation, vendor it verbatim and change only what the design requires.
+- Skip confirmations for routine edits once a refactor is approved.
 
-## Architecture
-
-### DMM — Garbage Collector (`src/dmm/`)
-
-A custom tracing GC ("Dioxygen Memory Management") using invariant lifetimes (`'gc`) for safety. Key concepts:
-
-- **`Gc<'gc, T>`** (`gc.rs`): The GC smart pointer. Copy, lifetime-bound.
-- **`Arena`** (`arena.rs`): Owns all GC-managed objects. Requires a `Rootable<'a>` type parameter for the root set.
-- **`Mutation<'gc>`** / **`Finalization<'gc>`** (`context.rs`): Context handles for mutating or finalizing GC objects.
-- **`Collect` trait** (`collect.rs`): Types must implement this to be GC-managed. Derive it with `#[derive(Collect)]` from `tcvm-derive`.
-- **Write barriers** (`barrier.rs`): Forward and backward barriers maintain GC invariants when mutating object graphs.
-- **Heap** (`heap.rs`): A non-moving Immix (blocks of lines in mmap'd chunks) with sticky-mark minor collections; every collection is stop-the-world.
-
-The derive macro (`derive/src/lib.rs`) supports attributes: `#[collect(no_drop)]`, `#[collect(require_static)]`, `#[collect(unsafe_drop)]`.
-
-### Environment / Runtime Types (`src/env/`)
-
-Lua runtime value types, all GC-aware:
-
-- **`Value<'gc>`** (`value.rs`): Core enum — Nil, Boolean, Integer, Float, String, Table, Function, Thread, Userdata. Small wrapper types (Function, Thread, etc.) are Copy wrappers around `Gc` pointers.
-- **`Table`** (`table/mod.rs`): Array + hash map, metamethod support.
-- **`Function`** (`function.rs`): `LuaClosure` (bytecode + upvalues) and `NativeClosure`. `Prototype` holds bytecode, constants, and sub-prototypes.
-- **`Thread`** (`thread.rs`): Coroutine with value stack, call frames, and open upvalues.
-- **`LuaString`** (`string.rs`): Interned strings with cached hash.
-
-### VM Interpreter (`src/vm/`)
-
-- **Handlers** (`abi.rs`, `ops/`): Direct-threaded interpreter. Each handler is an `extern "rust-preserve-none"` function declared with `handler!` and dispatched through the runtime's tables (`dispatch.rs`) with explicit tail calls (`become`); `ops/` holds the opcode handlers by family. Debug builds assert register indices; release uses raw pointer arithmetic.
-- **Frames** (`frame.rs`): Four header words below each base in the value stack; every callee returns through its header's continuation.
-- **Natives** (`native.rs`, `async_native.rs`, `ff.rs`): Plain natives, continuation natives that return a `NativeOut` naming a `CONT_TABLE` continuation, async natives, and fast entries for hot builtins.
-- **`coro.rs`** / **`unwind.rs`**: Coroutine switches and error unwinding, both inside dispatch.
-- **`num.rs`**: Arithmetic and bitwise operation helpers.
-
-### Instruction Set (`src/instruction.rs`)
-
-Lua 5.5's operations as 64-bit instructions, plus forms the compiler emits (compare-and-branch, CALL by result count, fused MOVE + CALL) and forms adaptive sites rewrite themselves to (arithmetic, compares, loops, constant-key table access). `OP_INFO` describes each opcode's family and forms.
-
-### Lua reference
-
-A copy of the raw Lua 5.5 reference manual exists in `manual.of`; reference it to verify language specifics.
+## Git
+- No Claude attribution in commits or PRs (no `Co-Authored-By`, no footers).
+- `main` is linear with signed commits. Land PRs by fast-forward (`git push origin <sha>:refs/heads/main`), not GitHub's rebase merge, which strips signatures. Rebase onto `origin/main`, not local `main`.
+- Label every new issue: run `gh label list` first and apply every label that fits.
