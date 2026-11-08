@@ -4,7 +4,7 @@
 //! checked by the vendored checker and for operands sharing a register
 //! within an instruction, which that checker does not see.
 
-use super::{Env, Output, run};
+use super::{Ctx, Env, Output};
 use crate::jit::backend::reg::{
     Block as RBlock, Inst, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
     ProgPoint, RegClass, VReg,
@@ -640,6 +640,7 @@ fn check_operands(v: &VCode<T>, out: &Output) -> Result<(), String> {
 #[test]
 fn random_functions_allocate_correctly() {
     let env = env();
+    let mut ctx = Ctx::new(env.clone());
     let n: u64 = std::env::var("TCVM_RA_CASES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -651,7 +652,7 @@ fn random_functions_allocate_correctly() {
     let record = std::env::var("TCVM_RA_RECORD").ok();
     for seed in first..first + n {
         let (v, order, hot) = generate(seed);
-        let out = match run(&v, &env, &order, hot) {
+        let out = match ctx.run(&v, &order, hot) {
             Ok(out) => out,
             Err(e) => panic!("seed {seed}: {e}"),
         };
@@ -696,10 +697,13 @@ fn recorded_allocations_stay_the_same() {
             super::corpus::read(&d, mk).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
         })
         .collect();
+    // One allocator for all of them, as the JIT runs: its buffers carry over.
+    let mut ctx = Ctx::new(cases.first().expect("a non-empty corpus").env.clone());
     let mut differ = 0;
     for (p, c) in paths.iter().zip(&cases) {
+        assert!(c.env == *ctx.env(), "{}: other registers", p.display());
         let out =
-            run(&c.f, &c.env, &c.order, c.hot).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            (ctx.run(&c.f, &c.order, c.hot)).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         let same = out.num_spillslots == c.out.num_spillslots
             && out.edits == c.out.edits
             && out.allocs == c.out.allocs
@@ -708,6 +712,10 @@ fn recorded_allocations_stay_the_same() {
             differ += 1;
             if differ <= 5 {
                 eprintln!("{}: allocation differs", p.display());
+            }
+            if differ == 1 {
+                let (got, want) = (c.f.print(&out, &c.order), c.f.print(&c.out, &c.order));
+                eprintln!("-- got\n{got}\n-- recorded\n{want}");
             }
         }
         let mut checker = super::checker::Checker::new(&c.f);
@@ -723,7 +731,7 @@ fn recorded_allocations_stay_the_same() {
         let t = std::time::Instant::now();
         for _ in 0..rounds {
             for c in &cases {
-                std::hint::black_box(run(&c.f, &c.env, &c.order, c.hot).expect("allocated once"));
+                std::hint::black_box(ctx.run(&c.f, &c.order, c.hot).expect("allocated once"));
             }
         }
         let ns = t.elapsed().as_nanos() as f64 / rounds as f64;

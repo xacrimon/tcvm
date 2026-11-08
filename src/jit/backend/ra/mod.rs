@@ -12,6 +12,12 @@
 //!
 //! Storage: a group's intervals and uses are runs of two flat arrays, and
 //! a piece is a window of its group's runs, so splitting copies nothing.
+//! A `Ctx` keeps every buffer across compiles: emptied, not freed.
+
+/// Empty the listed buffers, keeping their storage.
+macro_rules! clear {
+    ($s:expr; $($f:ident),* $(,)?) => { $($s.$f.clear();)* };
+}
 
 mod build;
 #[cfg(feature = "tcvm-dev")]
@@ -95,6 +101,7 @@ const NONE: u32 = u32::MAX;
 const MAX_REGS: usize = 32;
 
 /// The registers the allocator hands out and the ones its moves borrow.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Env {
     /// Allocatable registers per class (int, float), preferred first.
     pub(crate) regs: [Vec<PReg>; 2],
@@ -319,9 +326,75 @@ struct VInfo {
     flat: (u32, u32),
 }
 
-struct Ra<'a, I: TargetInst> {
-    f: &'a VCode<I>,
-    env: &'a Env,
+/// The allocator, kept by the JIT runtime: the state of the function in
+/// hand and each phase's working buffers.
+pub(crate) struct Ctx {
+    ra: Ra,
+    live: Live,
+    build: build::Build,
+    resolve: resolve::Resolve,
+}
+
+impl Ctx {
+    pub(crate) fn new(env: Env) -> Self {
+        Ctx {
+            ra: Ra::new(env),
+            live: Live::default(),
+            build: build::Build::default(),
+            resolve: resolve::Resolve::default(),
+        }
+    }
+
+    pub(crate) fn env(&self) -> &Env {
+        &self.ra.env
+    }
+
+    /// Allocate `f`'s registers, its blocks taken in `order`: the first
+    /// `hot` of them hot, the rest (exits, cold arms) after them all.
+    pub(crate) fn run<I: TargetInst>(
+        &mut self,
+        f: &VCode<I>,
+        order: &[u32],
+        hot: usize,
+    ) -> Result<Output, String> {
+        let Ctx {
+            ra,
+            live,
+            build,
+            resolve,
+        } = self;
+        ra.clear();
+        live.clear();
+        build.clear();
+        resolve.clear();
+        ra.layout(f, order, hot)?;
+        ra.liveness(f, live)?;
+        ra.build(f, build)?;
+        ra.scan(f)?;
+        ra.resolve(f, resolve)
+    }
+}
+
+/// `liveness`'s buffers: each block's gen and kill sets, a block's
+/// live-out, the worklist and the blocks on it.
+#[derive(Default)]
+struct Live {
+    gen_: Vec<u64>,
+    kill: Vec<u64>,
+    out: Vec<u64>,
+    queued: Vec<bool>,
+    work: std::collections::VecDeque<u32>,
+}
+
+impl Live {
+    fn clear(&mut self) {
+        clear!(self; gen_, kill, out, queued, work);
+    }
+}
+
+/// The function in hand; `allocs` and `alloc_base` leave in its `Output`.
+struct Ra {
+    env: Env,
     /// Blocks in allocation order.
     order: Vec<Block>,
     /// Position of each block in `order`.
@@ -336,9 +409,10 @@ struct Ra<'a, I: TargetInst> {
     freq: Vec<f32>,
     cold_start: Pos,
     /// Header of the innermost loop holding each block (itself for a
-    /// header), else `NONE`; the enclosing loop's header of each header.
-    inner: &'a [u32],
-    outer: &'a [u32],
+    /// header), else `NONE`; the enclosing loop's header of each header
+    /// (`VCode::loop_of`, `loop_parent`).
+    inner: Vec<u32>,
+    outer: Vec<u32>,
     /// Per loop header: the end of the last hot block of its loop, 0 for
     /// none.
     hot_end: Vec<Pos>,
@@ -405,22 +479,6 @@ struct Ra<'a, I: TargetInst> {
     scratch: Vec<Held>,
 }
 
-/// Allocate `f`'s registers, its blocks taken in `order`: the first `hot`
-/// of them hot, the rest (exits, cold arms) after them all.
-pub(crate) fn run<I: TargetInst>(
-    f: &VCode<I>,
-    env: &Env,
-    order: &[u32],
-    hot: usize,
-) -> Result<Output, String> {
-    let mut ra = Ra::new(f, env);
-    ra.layout(order, hot)?;
-    ra.liveness()?;
-    ra.build()?;
-    ra.scan()?;
-    ra.resolve()
-}
-
 /// Operands of one instruction that may not share a register: an early
 /// definition with any use, a late definition with a late use, two
 /// definitions.
@@ -471,8 +529,8 @@ pub(crate) fn remat_table<I: TargetInst>(f: &VCode<I>) -> (Vec<bool>, Vec<Option
     (remat, src)
 }
 
-impl<'a, I: TargetInst> Ra<'a, I> {
-    fn new(f: &'a VCode<I>, env: &'a Env) -> Self {
+impl Ra {
+    fn new(env: Env) -> Self {
         let mut reg_idx = vec![NONE; PReg::NUM_INDEX];
         for regs in &env.regs {
             assert!(regs.len() <= MAX_REGS, "more registers than a mask holds");
@@ -481,7 +539,6 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             }
         }
         Ra {
-            f,
             env,
             order: Vec::new(),
             rank: Vec::new(),
@@ -491,8 +548,8 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             at_lin: Vec::new(),
             freq: Vec::new(),
             cold_start: Pos::MAX,
-            inner: &[],
-            outer: &[],
+            inner: Vec::new(),
+            outer: Vec::new(),
             hot_end: Vec::new(),
             words: 0,
             live_in: Vec::new(),
@@ -530,6 +587,25 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         }
     }
 
+    /// Ready for another function.
+    fn clear(&mut self) {
+        clear!(self; order, rank, first, last, lin_block, at_lin, freq, inner, outer, hot_end,
+            live_in, anyuse, ivs, uses, snaps, snap_off, next_of, defs, members, pieces, flat,
+            flat_start, vregs, rep, deferred, clobs, initial, unhandled, active, inactive, scratch);
+        for l in &mut self.fixres {
+            l.clear();
+        }
+        self.cold_start = Pos::MAX;
+        self.words = 0;
+        self.fixregs = [0; 2];
+        self.clobregs = [0; 2];
+        self.fixcur = [std::cell::Cell::new(0), std::cell::Cell::new(0)];
+        self.clobcur.set(0);
+        self.num_slots = 0;
+        self.next_initial = 0;
+        self.next_change = 0;
+    }
+
     fn block_of_pos(&self, p: Pos) -> u32 {
         self.lin_block[(p / 2) as usize]
     }
@@ -545,8 +621,12 @@ impl<'a, I: TargetInst> Ra<'a, I> {
     /// The linear order (blocks as numbered: `order.rs` lays out the
     /// allocator's order), its loops (`VCode::loop_of`), and the static
     /// frequencies.
-    fn layout(&mut self, order: &[u32], hot: usize) -> Result<(), String> {
-        let f = self.f;
+    fn layout<I: TargetInst>(
+        &mut self,
+        f: &VCode<I>,
+        order: &[u32],
+        hot: usize,
+    ) -> Result<(), String> {
         let nb = f.num_blocks();
         if order.len() != nb {
             return Err("an order not of every block".into());
@@ -554,15 +634,16 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         if f.loop_of.len() != nb || f.loop_parent.len() != nb {
             return Err("no loop nesting".into());
         }
-        self.inner = &f.loop_of;
-        self.outer = &f.loop_parent;
-        self.order = order.iter().map(|&b| Block::new(b as usize)).collect();
-        self.rank = vec![NONE; nb];
+        self.inner.extend_from_slice(&f.loop_of);
+        self.outer.extend_from_slice(&f.loop_parent);
+        self.order
+            .extend(order.iter().map(|&b| Block::new(b as usize)));
+        self.rank.resize(nb, NONE);
         for (k, &b) in order.iter().enumerate() {
             self.rank[b as usize] = k as u32;
         }
-        self.first = vec![0; nb];
-        self.last = vec![0; nb];
+        self.first.resize(nb, 0);
+        self.last.resize(nb, 0);
         self.at_lin.reserve(f.num_insts());
         self.lin_block.reserve(f.num_insts());
         for &b in &self.order {
@@ -580,21 +661,20 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         // Static frequencies: eight times per loop level, cold code next to
         // nothing.
         self.cold_start = order.get(hot).map_or(Pos::MAX, |&b| self.block_start(b));
-        self.freq = (0..nb)
-            .map(|b| {
-                if self.rank[b] as usize >= hot {
-                    return 1.0 / 1024.0;
-                }
-                let mut depth = 0;
-                let mut h = self.inner[b];
-                while h != NONE {
-                    depth += 1;
-                    h = self.outer[h as usize];
-                }
-                8f32.powi(depth.min(6))
-            })
-            .collect();
-        self.hot_end = vec![0; nb];
+        let (rank, inner, outer) = (&self.rank, &self.inner, &self.outer);
+        self.freq.extend((0..nb).map(|b| {
+            if rank[b] as usize >= hot {
+                return 1.0 / 1024.0;
+            }
+            let mut depth = 0;
+            let mut h = inner[b];
+            while h != NONE {
+                depth += 1;
+                h = outer[h as usize];
+            }
+            8f32.powi(depth.min(6))
+        }));
+        self.hot_end.resize(nb, 0);
         for &b in &order[..hot.min(nb)] {
             let end = self.block_end(b);
             let mut h = self.inner[b as usize];
@@ -626,15 +706,22 @@ impl<'a, I: TargetInst> Ra<'a, I> {
     }
 
     /// Live-in sets by a backward dataflow fixpoint.
-    fn liveness(&mut self) -> Result<(), String> {
+    fn liveness<I: TargetInst>(&mut self, f: &VCode<I>, t: &mut Live) -> Result<(), String> {
         use crate::jit::backend::reg::{OperandConstraint, OperandKind};
-        let f = self.f;
         let nb = f.num_blocks();
         let w = f.num_vregs().div_ceil(64);
         self.words = w;
-        let mut gen_ = vec![0u64; nb * w];
-        let mut kill = vec![0u64; nb * w];
-        let mut anyuse = vec![0u64; w];
+        let Live {
+            gen_,
+            kill,
+            out,
+            queued,
+            work,
+        } = t;
+        gen_.resize(nb * w, 0);
+        kill.resize(nb * w, 0);
+        let anyuse = &mut self.anyuse;
+        anyuse.resize(w, 0);
         let set = |s: &mut [u64], v: usize| s[v / 64] |= 1 << (v % 64);
         let has = |s: &[u64], v: usize| s[v / 64] >> (v % 64) & 1 != 0;
         for b in 0..nb {
@@ -654,7 +741,7 @@ impl<'a, I: TargetInst> Ra<'a, I> {
                             op.constraint(),
                             OperandConstraint::Any | OperandConstraint::Stack
                         ) {
-                            set(&mut anyuse, v);
+                            set(anyuse, v);
                         }
                     }
                 }
@@ -674,11 +761,11 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         }
         // A worklist from the last block: a block is done again only when
         // a successor's set grew.
-        let mut live_in = vec![0u64; nb * w];
-        let mut out = vec![0u64; w];
-        let mut queued = vec![true; nb];
-        let mut work: std::collections::VecDeque<u32> =
-            self.order.iter().rev().map(|b| b.index() as u32).collect();
+        let live_in = &mut self.live_in;
+        live_in.resize(nb * w, 0);
+        out.resize(w, 0);
+        queued.resize(nb, true);
+        work.extend(self.order.iter().rev().map(|b| b.index() as u32));
         while let Some(b) = work.pop_front() {
             let b = b as usize;
             queued[b] = false;
@@ -713,8 +800,6 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         if live_in[e * w..(e + 1) * w].iter().any(|&x| x != 0) {
             return Err("a value is used before any definition".into());
         }
-        self.live_in = live_in;
-        self.anyuse = anyuse;
         Ok(())
     }
 

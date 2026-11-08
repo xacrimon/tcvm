@@ -454,14 +454,9 @@ pub(crate) fn compile<'gc>(
     let lowered = lower::lower(&f, closure.code as usize, own).map_err(CompileError::Backend)?;
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Lower);
-    let env = abi::ra_env();
-    let out = &crate::jit::backend::ra::run(
-        &lowered.vcode,
-        &env,
-        &lowered.emit_order,
-        lowered.hot_blocks,
-    )
-    .map_err(|e| CompileError::Backend(format!("regalloc: {e}")))?;
+    let out = &(ctx.jit().ra.borrow_mut())
+        .run(&lowered.vcode, &lowered.emit_order, lowered.hot_blocks)
+        .map_err(|e| CompileError::Backend(format!("regalloc: {e}")))?;
     #[cfg(feature = "tcvm-dev")]
     if let Some(dir) = &config.dev.ra_capture {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -469,7 +464,7 @@ pub(crate) fn compile<'gc>(
         let path = format!("{dir}/{}-{n:05}.ra", std::process::id());
         let rec = crate::jit::backend::ra::corpus::write(
             &lowered.vcode,
-            &env,
+            ctx.jit().ra.borrow().env(),
             &lowered.emit_order,
             lowered.hot_blocks,
             out,

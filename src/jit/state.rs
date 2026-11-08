@@ -176,6 +176,9 @@ pub(crate) struct JitRuntime {
     #[cfg(target_arch = "aarch64")]
     trampoline_code: RefCell<Vec<crate::jit::backend::alloc::CodeBlock>>,
     code: RefCell<Option<std::rc::Rc<crate::jit::backend::alloc::CodeAllocator>>>,
+    /// The register allocator, its buffers kept from compile to compile.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) ra: RefCell<crate::jit::backend::ra::Ctx>,
     /// Compile failures from running out of code memory turn the JIT off.
     pub(crate) exhausted: Cell<bool>,
     /// Where handlers return in a level (`abi::level_return`).
@@ -216,6 +219,10 @@ impl JitRuntime {
             #[cfg(target_arch = "aarch64")]
             trampoline_code: RefCell::new(Vec::new()),
             code: RefCell::new(None),
+            #[cfg(target_arch = "aarch64")]
+            ra: RefCell::new(crate::jit::backend::ra::Ctx::new(
+                crate::jit::backend::aarch64::abi::ra_env(),
+            )),
             exhausted: Cell::new(false),
             #[cfg(target_arch = "aarch64")]
             level_ret: crate::jit::backend::aarch64::abi::level_return_addr(),

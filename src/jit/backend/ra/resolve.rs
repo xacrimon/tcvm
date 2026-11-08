@@ -5,7 +5,7 @@
 use super::build::{merge_tail, push_coalesced};
 use super::{Edit, Ivs, Loc, NONE, Need, Output, Pos, Ra, Want, intersect};
 use crate::jit::backend::reg::{Allocation, ProgPoint, RegClass, SpillSlot, VReg};
-use crate::jit::backend::vcode::{Remat, TargetInst};
+use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
 /// A move of a value of class `cls`, or with `remat` its computation
 /// again from `from` (`Allocation::none()` for a constant).
@@ -32,20 +32,55 @@ const EDGE_OUT: u8 = 4;
 const LATE_STORE: u8 = 5;
 const FIXED_COPY: u8 = 6;
 
-impl<I: TargetInst> Ra<'_, I> {
-    pub(super) fn resolve(&mut self) -> Result<Output, String> {
-        let split = self.index_pieces();
-        self.slot_derived();
-        self.color_slots();
+/// `resolve`'s buffers: the values of split groups; the moves as
+/// `(linear index, phase, move)`, then sorted, and one gap's; slot
+/// coloring's groups with their run of `all` (`busy`), a group's padded
+/// intervals and each slot's; `edge_moves`'s constants made once, piece
+/// cursors and live values.
+#[derive(Default)]
+pub(super) struct Resolve {
+    split: Vec<u64>,
+    moves: Vec<(u32, u8, Mv)>,
+    sorted: Vec<(u32, u8, Mv)>,
+    keys: Vec<u64>,
+    group: Vec<Mv>,
+    busy: Vec<(u32, u32, u32)>,
+    all: Vec<(Pos, Pos)>,
+    ivs: Vec<(Pos, Pos)>,
+    slots: Vec<Vec<(Pos, Pos)>>,
+    once: Vec<u32>,
+    cur: Vec<u32>,
+    live: Vec<(u32, u32)>,
+}
+
+impl Resolve {
+    pub(super) fn clear(&mut self) {
+        clear!(self; split, moves, sorted, keys, group, busy, all, ivs, once, cur, live);
+        for s in &mut self.slots {
+            s.clear();
+        }
+    }
+}
+
+impl Ra {
+    pub(super) fn resolve<I: TargetInst>(
+        &mut self,
+        f: &VCode<I>,
+        t: &mut Resolve,
+    ) -> Result<Output, String> {
+        self.index_pieces(&mut t.split);
+        self.slot_derived(f);
+        self.color_slots(t);
         self.snapshot_allocs();
         // A group is stored where it goes from a register to the stack when
         // that runs no more often than storing after its definitions (V8's
         // `DecideSpillingMode`; cold-only spills always), its slot uses
         // falling in stack pieces; else once after each definition, its slot
         // holding it from there on.
-        self.deferred = (0..self.vregs.len())
-            .map(|g| self.stores_at_transitions(g))
-            .collect();
+        for g in 0..self.vregs.len() {
+            let d = self.stores_at_transitions(g);
+            self.deferred.push(d);
+        }
         for x in 0..self.pieces.len() as u32 {
             let p = self.pieces[x as usize];
             if p.dead() {
@@ -67,7 +102,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 self.allocs[u.alloc as usize] = a;
             }
         }
-        let mut moves: Vec<(u32, u8, Mv)> = Vec::new();
+        let moves = &mut t.moves;
         for v in 0..self.vregs.len() as u32 {
             let gr = self.rep[v as usize];
             let g = &self.vregs[gr as usize];
@@ -121,7 +156,11 @@ impl<I: TargetInst> Ra<'_, I> {
                     return Err(format!("v{g} reloaded inside instruction {}", at / 2));
                 }
                 let phase = if at & 1 != 0 { LATE_STORE } else { CONNECT };
-                moves.push((at / 2, phase, self.mv(g, at - 1, self.alloc_of(w[1]), cls)));
+                moves.push((
+                    at / 2,
+                    phase,
+                    self.mv(f, g, at - 1, self.alloc_of(w[1]), cls),
+                ));
             }
             // Into fixed registers, from wherever the value is when the
             // instruction starts.
@@ -134,7 +173,7 @@ impl<I: TargetInst> Ra<'_, I> {
                         unreachable!("a fixed use")
                     };
                     let n = u.pos / 2;
-                    let m = self.mv(g, 2 * n, Allocation::reg(r), cls);
+                    let m = self.mv(f, g, 2 * n, Allocation::reg(r), cls);
                     if m.remat || m.from != m.to {
                         moves.push((n, FIXED_COPY, m));
                     }
@@ -142,17 +181,23 @@ impl<I: TargetInst> Ra<'_, I> {
                 }
             }
         }
-        self.edge_moves(&split, &mut moves)?;
+        self.edge_moves(f, t)?;
         // By instruction and phase, in the order pushed.
-        let mut keys: Vec<u64> = (moves.iter().enumerate())
-            .map(|(k, &(l, phase, _))| {
-                ((self.at_lin[l as usize].index() as u64) << 3 | phase as u64) << 32 | k as u64
-            })
-            .collect();
+        let Resolve {
+            moves,
+            sorted,
+            keys,
+            group,
+            ..
+        } = t;
+        keys.clear(); // `color_slots` sorted with them too.
+        keys.extend((moves.iter().enumerate()).map(|(k, &(l, phase, _))| {
+            ((self.at_lin[l as usize].index() as u64) << 3 | phase as u64) << 32 | k as u64
+        }));
         keys.sort_unstable();
-        let moves: Vec<_> = keys.iter().map(|&k| moves[k as u32 as usize]).collect();
+        sorted.extend(keys.iter().map(|&k| moves[k as u32 as usize]));
+        let moves = sorted;
         let mut edits: Vec<(ProgPoint, Edit)> = Vec::with_capacity(moves.len());
-        let mut group = Vec::new();
         let mut k = 0;
         while k < moves.len() {
             let (l, phase) = (moves[k].0, moves[k].1);
@@ -162,7 +207,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 k += 1;
             }
             let at = ProgPoint::before(self.at_lin[l as usize]);
-            self.sequence(&mut group, |e| edits.push((at, e)))?;
+            self.sequence(group, |e| edits.push((at, e)))?;
         }
         Ok(Output {
             num_spillslots: self.num_slots as usize,
@@ -175,8 +220,8 @@ impl<I: TargetInst> Ra<'_, I> {
     /// Each group's pieces by start as a run of `flat`, for lookups; the
     /// values whose group's pieces are not all in one place, as a set over
     /// vregs (only those can be in two places at an edge's ends).
-    fn index_pieces(&mut self) -> Vec<u64> {
-        let mut split = vec![0u64; self.words];
+    fn index_pieces(&mut self, split: &mut Vec<u64>) {
+        split.resize(self.words, 0);
         for g in 0..self.vregs.len() {
             let s = self.flat.len() as u32;
             let mut x = self.vregs[g].head;
@@ -196,7 +241,6 @@ impl<I: TargetInst> Ra<'_, I> {
                 }
             }
         }
-        split
     }
 
     fn slot(&self, g: u32) -> Allocation {
@@ -266,9 +310,9 @@ impl<I: TargetInst> Ra<'_, I> {
     /// computation where reloading it costs the load alone: one spilled
     /// where its source is on the stack gets a slot, stored after its
     /// definition, when that is in a register.
-    fn slot_derived(&mut self) {
+    fn slot_derived<I: TargetInst>(&mut self, f: &VCode<I>) {
         for v in 0..self.vregs.len() {
-            let Remat::AndImm { src, .. } = self.f.remat[v] else {
+            let Remat::AndImm { src, .. } = f.remat[v] else {
                 continue;
             };
             let vi = &self.vregs[v];
@@ -302,10 +346,15 @@ impl<I: TargetInst> Ra<'_, I> {
     /// is busy over its group's whole range (stores in cold mode may sit at
     /// a hot predecessor's end); groups take the first slot free over
     /// theirs, in start order.
-    fn color_slots(&mut self) {
-        let mut busy: Vec<(u32, u32, u32)> = Vec::new();
-        let mut all: Vec<(Pos, Pos)> = Vec::new();
-        let mut ivs: Vec<(Pos, Pos)> = Vec::new();
+    fn color_slots(&mut self, t: &mut Resolve) {
+        let Resolve {
+            busy,
+            all,
+            ivs,
+            keys,
+            slots,
+            ..
+        } = t;
         for g in 0..self.vregs.len() {
             if self.rep[g] != g as u32 || self.vregs[g].slot == NONE {
                 continue;
@@ -322,28 +371,29 @@ impl<I: TargetInst> Ra<'_, I> {
             }
             // Pieces by start: already in order.
             let s = all.len();
-            for &x in &ivs {
-                push_coalesced(&mut all, s, x);
+            for &x in ivs.iter() {
+                push_coalesced(all, s, x);
             }
             busy.push((g as u32, s as u32, all.len() as u32));
         }
         // By first point, in group order.
-        let mut keys: Vec<u64> = (busy.iter().enumerate())
-            .map(|(k, &(_, s, e))| {
-                (if s < e { all[s as usize].0 } else { 0 } as u64) << 32 | k as u64
-            })
-            .collect();
+        keys.extend((busy.iter().enumerate()).map(|(k, &(_, s, e))| {
+            (if s < e { all[s as usize].0 } else { 0 } as u64) << 32 | k as u64
+        }));
         keys.sort_unstable();
-        let mut slots: Vec<Vec<(Pos, Pos)>> = Vec::new();
+        let mut used = 0;
         for (g, s, e) in keys.iter().map(|&k| busy[k as u32 as usize]) {
             let ivs = &all[s as usize..e as usize];
-            let k = match (slots.iter())
+            let k = match (slots[..used].iter())
                 .position(|x| intersect(Ivs::plain(x), Ivs::plain(ivs), 0).is_none())
             {
                 Some(k) => k,
                 None => {
-                    slots.push(Vec::new());
-                    slots.len() - 1
+                    if used == slots.len() {
+                        slots.push(Vec::new());
+                    }
+                    used += 1;
+                    used - 1
                 }
             };
             let x = &mut slots[k];
@@ -352,20 +402,28 @@ impl<I: TargetInst> Ra<'_, I> {
             merge_tail(x, 0, mid, |iv| iv.0, push_coalesced);
             self.vregs[g as usize].slot = k as u32;
         }
-        self.num_slots = slots.len() as u32;
+        self.num_slots = used as u32;
     }
 
     /// The move of `v` to `to` from where it is at `at`: computed again when
     /// it is there (a constant from nothing, a derived value from its
     /// source's location at `at`).
-    fn mv(&self, v: u32, at: Pos, to: Allocation, cls: u8) -> Mv {
+    fn mv<I: TargetInst>(&self, f: &VCode<I>, v: u32, at: Pos, to: Allocation, cls: u8) -> Mv {
         let from = self.alloc_at(v, at).expect("live where it moves");
-        self.mv_from(v, from, at, to, cls)
+        self.mv_from(f, v, from, at, to, cls)
     }
 
     /// `mv` with `v`'s location at `at` known.
-    fn mv_from(&self, v: u32, from: Allocation, at: Pos, to: Allocation, cls: u8) -> Mv {
-        match (from.is_none(), self.f.remat[v as usize]) {
+    fn mv_from<I: TargetInst>(
+        &self,
+        f: &VCode<I>,
+        v: u32,
+        from: Allocation,
+        at: Pos,
+        to: Allocation,
+        cls: u8,
+    ) -> Mv {
+        match (from.is_none(), f.remat[v as usize]) {
             (true, Remat::AndImm { src, .. }) => {
                 let src = self.alloc_at(src, at).expect("the source live");
                 mv(src, to, cls, v, true)
@@ -380,13 +438,18 @@ impl<I: TargetInst> Ra<'_, I> {
     /// which a return enters past its moves), else on the predecessor's.
     /// Only values of split groups can be in two places.
     #[inline(never)]
-    fn edge_moves(&self, split: &[u64], moves: &mut Vec<(u32, u8, Mv)>) -> Result<(), String> {
-        let f = self.f;
-        let mut once: Vec<u32> = Vec::new();
+    fn edge_moves<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve) -> Result<(), String> {
+        let Resolve {
+            split,
+            moves,
+            once,
+            cur,
+            live,
+            ..
+        } = t;
         // The piece of each live value at the block's start, found by a
         // cursor per group: blocks come in point order.
-        let mut cur = vec![0u32; self.vregs.len()];
-        let mut live: Vec<(u32, u32)> = Vec::new();
+        cur.resize(self.vregs.len(), 0);
         for &s in &self.order {
             let preds = f.block_preds(s);
             let si = s.index();
@@ -398,7 +461,7 @@ impl<I: TargetInst> Ra<'_, I> {
             // span holds every predecessor's end needs nothing here.
             let pes = preds.iter().map(|p| 2 * self.last[p.index()] + 1);
             let (lo, hi) = (pes.clone().min().unwrap_or(ss), pes.max().unwrap_or(ss));
-            for (k, (&w, &m)) in self.live_in(si).iter().zip(split).enumerate() {
+            for (k, (&w, &m)) in self.live_in(si).iter().zip(split.iter()).enumerate() {
                 for v in bits(k, w & m) {
                     let g = self.rep[v as usize];
                     let (a, b) = self.vregs[g as usize].flat;
@@ -446,7 +509,7 @@ impl<I: TargetInst> Ra<'_, I> {
             // once at the join's start, not on every edge.
             once.clear();
             if preds.len() > 1 && !resume {
-                for &(v, x) in &live {
+                for &(v, x) in live.iter() {
                     if !matches!(f.remat[v as usize], Remat::Int(_) | Remat::Float(_)) {
                         continue;
                     }
@@ -478,7 +541,7 @@ impl<I: TargetInst> Ra<'_, I> {
                     (self.last[pi], EDGE_OUT)
                 };
                 let before = moves.len();
-                for &(v, y) in &live {
+                for &(v, y) in live.iter() {
                     let x = from(v, y, pi)?;
                     if x == y {
                         continue;
@@ -493,7 +556,7 @@ impl<I: TargetInst> Ra<'_, I> {
                         && !once.contains(&v)
                     {
                         let cls = self.vregs[v as usize].class;
-                        moves.push((at, phase, self.mv_from(v, from, pe, to, cls)));
+                        moves.push((at, phase, self.mv_from(f, v, from, pe, to, cls)));
                     }
                 }
                 let k = (f.block_succs(p).iter())
@@ -509,7 +572,8 @@ impl<I: TargetInst> Ra<'_, I> {
                         .ok_or_else(|| format!("argument v{} not live at b{pi}'s end", a.vreg()))?;
                     if from != to {
                         let cls = self.vregs[q as usize].class;
-                        moves.push((at, phase, self.mv_from(a.vreg() as u32, from, pe, to, cls)));
+                        let m = self.mv_from(f, a.vreg() as u32, from, pe, to, cls);
+                        moves.push((at, phase, m));
                     }
                 }
                 if resume && moves.len() != before {

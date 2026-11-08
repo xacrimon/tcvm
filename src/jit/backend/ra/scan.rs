@@ -6,7 +6,7 @@ use std::cmp::Reverse;
 
 use super::{Held, Loc, MAX_REGS, NONE, Piece, Pos, Ra, Want, intersect};
 use crate::jit::backend::reg::PReg;
-use crate::jit::backend::vcode::TargetInst;
+use crate::jit::backend::vcode::{TargetInst, VCode};
 
 type Regs = [Pos; MAX_REGS];
 
@@ -22,8 +22,8 @@ struct Avail {
     use_pos: Option<Regs>,
 }
 
-impl<I: TargetInst> Ra<'_, I> {
-    pub(super) fn scan(&mut self) -> Result<(), String> {
+impl Ra {
+    pub(super) fn scan<I: TargetInst>(&mut self, f: &VCode<I>) -> Result<(), String> {
         // Every step moves forward, so a function of `n` instructions takes
         // far fewer; past this the scan is going round in circles.
         let mut budget = 64 * self.at_lin.len() + 10_000;
@@ -46,7 +46,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 self.spill_tail(c)?;
                 continue;
             }
-            self.process(c)?;
+            self.process(f, c)?;
         }
         Ok(())
     }
@@ -332,7 +332,7 @@ impl<I: TargetInst> Ra<'_, I> {
         self.pieces[c as usize].loc = Loc::Reg(r);
     }
 
-    fn process(&mut self, c: u32) -> Result<(), String> {
+    fn process<I: TargetInst>(&mut self, f: &VCode<I>, c: u32) -> Result<(), String> {
         // A value computed again is made where a register first serves it
         // (V8 spills a range with a spill operand until then): holding it
         // before costs a materialization on each path into the stretch
@@ -352,7 +352,7 @@ impl<I: TargetInst> Ra<'_, I> {
                 Some(_) => {}
             }
             // Nor held into a join a path enters without it.
-            if let Some(j) = self.entered_without(c) {
+            if let Some(j) = self.entered_without(f, c) {
                 let t = self.split_at(c, j).expect("a split inside the piece");
                 self.queue(t);
             }
@@ -486,14 +486,14 @@ impl<I: TargetInst> Ra<'_, I> {
 
     /// The first block inside piece `c` that a hot edge from outside it
     /// enters, back edges aside.
-    fn entered_without(&self, c: u32) -> Option<Pos> {
+    fn entered_without<I: TargetInst>(&self, f: &VCode<I>, c: u32) -> Option<Pos> {
         let (s, e) = (self.start(c), self.end(c));
         for &b in &self.order[self.rank[self.block_of_pos(s) as usize] as usize + 1..] {
             let j = b.index() as u32;
             if self.block_start(j) >= e {
                 break;
             }
-            let outside = self.f.block_preds(b).iter().any(|p| {
+            let outside = f.block_preds(b).iter().any(|p| {
                 let p = p.index() as u32;
                 let end = self.block_end(p) - 1;
                 end < self.cold_start && !(s..e).contains(&end) && !self.in_loop(p, j)

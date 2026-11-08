@@ -5,30 +5,31 @@ use super::{Ivs, Loc, NONE, Need, Piece, Pos, Ra, Use, VInfo, Want, class_index,
 use crate::jit::backend::reg::{
     Allocation, Block, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
 };
-use crate::jit::backend::vcode::{Remat, TargetInst};
+use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
-impl<I: TargetInst> Ra<'_, I> {
-    pub(super) fn build(&mut self) -> Result<(), String> {
-        let f = self.f;
+impl Ra {
+    pub(super) fn build<I: TargetInst>(
+        &mut self,
+        f: &VCode<I>,
+        w: &mut Build,
+    ) -> Result<(), String> {
         let nv = f.num_vregs();
         // Instructions' operands lie in order (`VCode::push`).
         self.alloc_base = f.ops.iter().map(|o| o.0).collect();
         let n = f.operands.len() as u32;
         self.allocs = vec![Allocation::none(); n as usize];
-        self.vregs = (0..nv)
-            .map(|v| VInfo {
-                class: class_index(f.vreg_classes[v]) as u8,
-                remat: f.remat[v] != Remat::None,
-                args_in_group: false,
-                def: NONE,
-                param_of: NONE,
-                head: NONE,
-                slot: NONE,
-                defs: (0, 0),
-                members: (0, 0),
-                flat: (0, 0),
-            })
-            .collect();
+        self.vregs.extend((0..nv).map(|v| VInfo {
+            class: class_index(f.vreg_classes[v]) as u8,
+            remat: f.remat[v] != Remat::None,
+            args_in_group: false,
+            def: NONE,
+            param_of: NONE,
+            head: NONE,
+            slot: NONE,
+            defs: (0, 0),
+            members: (0, 0),
+            flat: (0, 0),
+        }));
         // A constant some use takes from wherever it is (a snapshot, a
         // call's slots) is spilled as any value: such a use has no register.
         for (k, &w) in self.anyuse.iter().enumerate() {
@@ -38,41 +39,45 @@ impl<I: TargetInst> Ra<'_, I> {
                 w &= w - 1;
             }
         }
-        let w = self.walk(n)?;
-        self.reservations(&w.fixtmp);
-        let (mut span, mut vuse, uoff) = self.value_runs(&w);
-        self.group(&mut span, &mut vuse, &uoff);
-        self.members_and_defs();
-        self.make_pieces(&w, &span, &vuse, &uoff);
+        self.walk(f, n, w)?;
+        self.reservations(f, w);
+        self.value_runs(w);
+        self.group(f, &mut w.span, &mut w.vuse, &w.uoff);
+        self.members_and_defs(w);
+        self.make_pieces(w);
         Ok(())
     }
 
     /// The backward walk: interval, use and reservation records.
     #[inline(never)]
-    fn walk(&mut self, n: u32) -> Result<Walk, String> {
-        let f = self.f;
+    fn walk<I: TargetInst>(&mut self, f: &VCode<I>, n: u32, w: &mut Build) -> Result<(), String> {
         let nv = f.num_vregs();
         // Intervals and uses as `(vreg, ..)` records, blocks last to first,
         // an instruction's late point before its early one, operands last to
         // first: each value's come in descending order. An interval joins
         // the value's previous one when they touch (`last`).
-        let mut ivr = Recs {
-            recs: Vec::with_capacity(n as usize),
-            last: vec![NONE; nv],
-        };
-        let mut usr: Vec<(u32, Use)> = Vec::with_capacity(n as usize);
-        let mut snr: Vec<(u32, (Pos, u32))> = Vec::new();
-        let mut fixtmp: Vec<(u32, Pos, Pos, u32)> = Vec::new();
-        let mut fixed_def = vec![None; nv];
-        let mut stack_use = vec![false; nv];
-        // Per value not live out, the end of the interval open above the
-        // current point.
-        let mut open = vec![NONE; nv];
-        let mut touched: Vec<u32> = Vec::new();
-        // Live out of the block, and of those the ones defined in it.
-        let mut out = vec![0u64; self.words];
-        let mut defined = vec![0u64; self.words];
-        let mut defs: Vec<u32> = Vec::new();
+        let Build {
+            ivr,
+            usr,
+            snr,
+            fixtmp,
+            fixed_def,
+            stack_use,
+            open,
+            touched,
+            out,
+            defined,
+            defs,
+            ..
+        } = w;
+        ivr.recs.reserve(n as usize);
+        ivr.last.resize(nv, NONE);
+        usr.reserve(n as usize);
+        fixed_def.resize(nv, None);
+        stack_use.resize(nv, false);
+        open.resize(nv, NONE);
+        out.resize(self.words, 0);
+        defined.resize(self.words, 0);
         let has = |s: &[u64], v: usize| s[v / 64] >> (v % 64) & 1 != 0;
         // A register definition's need: a constant's only where it is used;
         // a value derived from another is made where it is defined, and
@@ -96,7 +101,7 @@ impl<I: TargetInst> Ra<'_, I> {
             for s in 0..f.block_succs(Block::new(b)).len() {
                 for a in f.branch_blockparams(Block::new(b), s) {
                     let a = a.vreg();
-                    if !has(&out, a) && open[a] == NONE {
+                    if !has(out, a) && open[a] == NONE {
                         open[a] = end;
                         touched.push(a as u32);
                     }
@@ -133,7 +138,7 @@ impl<I: TargetInst> Ra<'_, I> {
                             continue;
                         }
                         if op.kind() == OperandKind::Use {
-                            if has(&out, v) {
+                            if has(out, v) {
                             } else if open[v] == NONE {
                                 open[v] = pos + 1;
                                 touched.push(v as u32);
@@ -159,7 +164,7 @@ impl<I: TargetInst> Ra<'_, I> {
                         }
                         // A definition holds its location through the
                         // instruction at least.
-                        let to = if has(&out, v) {
+                        let to = if has(out, v) {
                             defined[v / 64] |= 1 << (v % 64);
                             defs.push(v as u32);
                             end
@@ -209,52 +214,58 @@ impl<I: TargetInst> Ra<'_, I> {
                     open[v] = NONE;
                 }
             }
-            ivr.live_through(&out, &defined, start, end);
+            ivr.live_through(out, defined, start, end);
             for v in defs.drain(..) {
                 defined[v as usize / 64] = 0;
             }
         }
-        Ok(Walk {
-            ivr: ivr.recs,
-            usr,
-            snr,
-            fixtmp,
-            fixed_def,
-            stack_use,
-        })
+        Ok(())
     }
 
     /// Each value's intervals and uses ascending, runs of `ivs` (`span`)
-    /// and of the uses returned (`uoff`).
-    fn value_runs(&mut self, w: &Walk) -> (Vec<(u32, u32)>, Vec<Use>, Vec<u32>) {
-        let nv = self.f.num_vregs();
-        let (ivr, usr) = (&w.ivr, &w.usr);
-        let ioff = runs(nv, ivr.iter().map(|r| r.0));
-        self.ivs = vec![(0, 0); ivr.len()];
-        let mut at: Vec<u32> = ioff[1..].to_vec();
+    /// and of `vuse` (`uoff`).
+    fn value_runs(&mut self, w: &mut Build) {
+        let nv = self.vregs.len();
+        let Build {
+            ivr,
+            usr,
+            snr,
+            ioff,
+            uoff,
+            at,
+            span,
+            vuse,
+            ..
+        } = w;
+        let ivr = &ivr.recs;
+        runs(ioff, nv, ivr.iter().map(|r| r.0));
+        self.ivs.resize(ivr.len(), (0, 0));
+        at.extend_from_slice(&ioff[1..]);
         for &(v, a, b) in ivr {
             at[v as usize] -= 1;
             self.ivs[at[v as usize] as usize] = (a, b);
         }
-        let span: Vec<(u32, u32)> = (0..nv).map(|v| (ioff[v], ioff[v + 1])).collect();
-        let uoff = runs(nv, usr.iter().map(|r| r.0));
-        let mut vuse = vec![
+        span.extend((0..nv).map(|v| (ioff[v], ioff[v + 1])));
+        runs(uoff, nv, usr.iter().map(|r| r.0));
+        vuse.resize(
+            usr.len(),
             Use {
                 pos: 0,
                 alloc: 0,
-                need: Need::Any
-            };
-            usr.len()
-        ];
-        let mut at: Vec<u32> = uoff[1..].to_vec();
-        for &(v, u) in usr {
+                need: Need::Any,
+            },
+        );
+        at.clear();
+        at.extend_from_slice(&uoff[1..]);
+        for &(v, u) in usr.iter() {
             at[v as usize] -= 1;
             vuse[at[v as usize] as usize] = u;
         }
-        self.snap_off = runs(nv, w.snr.iter().map(|r| r.0));
-        self.snaps = vec![(0, 0); w.snr.len()];
-        let mut at: Vec<u32> = self.snap_off[1..].to_vec();
-        for &(v, s) in &w.snr {
+        runs(&mut self.snap_off, nv, snr.iter().map(|r| r.0));
+        self.snaps.resize(snr.len(), (0, 0));
+        at.clear();
+        at.extend_from_slice(&self.snap_off[1..]);
+        for &(v, s) in snr.iter() {
             at[v as usize] -= 1;
             self.snaps[at[v as usize] as usize] = s;
         }
@@ -266,13 +277,17 @@ impl<I: TargetInst> Ra<'_, I> {
                     .windows(2)
                     .all(|w| (w[0].pos, w[0].alloc) < (w[1].pos, w[1].alloc))
         }));
-        (span, vuse, uoff)
     }
 
     /// Values computed again, and the groups of parameters and arguments.
-    fn group(&mut self, span: &mut [(u32, u32)], vuse: &mut [Use], uoff: &[u32]) {
-        let f = self.f;
-        let nv = f.num_vregs();
+    fn group<I: TargetInst>(
+        &mut self,
+        f: &VCode<I>,
+        span: &mut [(u32, u32)],
+        vuse: &mut [Use],
+        uoff: &[u32],
+    ) {
+        let nv = self.vregs.len();
         // The definition of a value that loses its remat needs a register.
         let need_reg_at_def = |vuse: &mut [Use], vi: &VInfo, v: usize| {
             for u in &mut vuse[uoff[v] as usize..uoff[v + 1] as usize] {
@@ -306,7 +321,7 @@ impl<I: TargetInst> Ra<'_, I> {
         // (V8's `BundleBuilder`, allocated as one range), so the edge needs
         // no move unless a split moves one of them. A merged group's
         // intervals are written after the rest of `ivs`.
-        self.rep = (0..nv as u32).collect();
+        self.rep.extend(0..nv as u32);
         for bi in 0..self.order.len() {
             let b = self.order[bi];
             for (k, q) in f.block_params(b).iter().enumerate() {
@@ -364,12 +379,14 @@ impl<I: TargetInst> Ra<'_, I> {
     }
 
     /// Each group's members, then their definitions.
-    fn members_and_defs(&mut self) {
-        let nv = self.f.num_vregs();
+    fn members_and_defs(&mut self, w: &mut Build) {
+        let nv = self.vregs.len();
         self.defs.reserve(nv);
-        let moff = runs(nv, self.rep.iter().copied());
-        self.members = vec![0; nv];
-        let mut at = moff.clone();
+        let Build { moff, at, .. } = w;
+        runs(moff, nv, self.rep.iter().copied());
+        self.members.resize(nv, 0);
+        at.clear();
+        at.extend_from_slice(moff);
         for v in 0..nv {
             let r = self.rep[v] as usize;
             self.members[at[r] as usize] = v as u32;
@@ -393,15 +410,22 @@ impl<I: TargetInst> Ra<'_, I> {
 
     /// Each group's uses and first piece, its fixed definitions' pieces,
     /// and the queue.
-    fn make_pieces(&mut self, w: &Walk, span: &[(u32, u32)], vuse: &[Use], uoff: &[u32]) {
-        let nv = self.f.num_vregs();
-        let (fixed_def, stack_use) = (&w.fixed_def, &w.stack_use);
+    fn make_pieces(&mut self, w: &mut Build) {
+        let nv = self.vregs.len();
+        let Build {
+            fixed_def,
+            stack_use,
+            span,
+            vuse,
+            uoff,
+            fx,
+            ..
+        } = w;
         // Scans split about half as many pieces again.
         self.pieces.reserve(2 * nv);
-        let mut queue: Vec<u64> = Vec::with_capacity(nv);
-        let mut fx: Vec<u64> = Vec::new();
-        self.uses = Vec::with_capacity(vuse.len());
-        self.next_of = vec![[0; 3]; vuse.len()];
+        self.initial.reserve(nv);
+        self.uses.reserve(vuse.len());
+        self.next_of.resize(vuse.len(), [0; 3]);
         for (v, &(lo, hi)) in span.iter().enumerate() {
             if self.rep[v] != v as u32 || lo == hi {
                 continue;
@@ -464,12 +488,12 @@ impl<I: TargetInst> Ra<'_, I> {
             // allocated like any value.
             fx.sort_unstable();
             let mut rest = Some(x);
-            for &d in &fx {
+            for &d in fx.iter() {
                 let (def, r) = ((d >> 32) as Pos, PReg::from_index(d as u32 as usize));
                 let Some(cur) = rest else { break };
                 let at = match self.split_at(cur, def) {
                     Some(y) if y != cur => {
-                        queue.push(key(self.start(cur), cur));
+                        self.initial.push(key(self.start(cur), cur));
                         y
                     }
                     Some(y) => y,
@@ -480,37 +504,39 @@ impl<I: TargetInst> Ra<'_, I> {
                 rest = self.split_at(at, (def & !1) + 2);
             }
             if let Some(cur) = rest {
-                queue.push(key(self.start(cur), cur));
+                self.initial.push(key(self.start(cur), cur));
             }
         }
-        queue.sort_unstable();
-        self.initial = queue;
+        self.initial.sort_unstable();
         self.next_of.truncate(self.uses.len());
     }
 
     /// Fixed operands' reservations per class by point, and each clobbering
     /// instruction's registers, in point order.
-    fn reservations(&mut self, fixtmp: &[(u32, Pos, Pos, u32)]) {
+    fn reservations<I: TargetInst>(&mut self, f: &VCode<I>, w: &mut Build) {
+        let Build {
+            fixtmp, keys, seen, ..
+        } = w;
         // By class and point; only allocatable registers are asked about.
-        let mut keys: Vec<u64> = (fixtmp.iter().enumerate())
-            .filter(|(_, e)| self.reg_idx[e.0 as usize] != NONE)
-            .map(|(k, e)| {
-                let c = class_index(PReg::from_index(e.0 as usize).class()) as u64;
-                c << 56 | (e.1 as u64) << 24 | k as u64
-            })
-            .collect();
+        keys.extend(
+            (fixtmp.iter().enumerate())
+                .filter(|(_, e)| self.reg_idx[e.0 as usize] != NONE)
+                .map(|(k, e)| {
+                    let c = class_index(PReg::from_index(e.0 as usize).class()) as u64;
+                    c << 56 | (e.1 as u64) << 24 | k as u64
+                }),
+        );
         assert!(fixtmp.len() < 1 << 24, "too many fixed operands");
         keys.sort_unstable();
-        for &key in &keys {
+        for &key in keys.iter() {
             let (r, a, b, o) = fixtmp[(key & 0xff_ffff) as usize];
             let (c, k) = ((key >> 56) as usize, self.reg_idx[r as usize]);
             self.fixregs[c] |= 1 << k;
             self.fixres[c].push((a, b, o, k as u8));
         }
         // Calls clobber one of a few sets: each translated once.
-        let mut seen: Vec<(PRegSet, [u32; 2])> = Vec::new();
         for (l, &i) in self.at_lin.iter().enumerate() {
-            let set = self.f.inst_clobbers(i);
+            let set = f.inst_clobbers(i);
             if set == PRegSet::empty() {
                 continue;
             }
@@ -552,19 +578,52 @@ impl<I: TargetInst> Ra<'_, I> {
     }
 }
 
-/// What the backward walk records: intervals, uses and snapshot operands
-/// (`Ra::snaps`) as `(vreg, ..)`, fixed operands' reservations as
-/// `(register, from, to, owner)`.
-struct Walk {
-    ivr: Vec<(u32, Pos, Pos)>,
+/// `build`'s buffers. The backward walk records intervals, uses and
+/// snapshot operands (`Ra::snaps`) as `(vreg, ..)`, fixed operands'
+/// reservations as `(register, from, to, owner)`, and per value its fixed
+/// definition and whether a use takes it from the stack.
+#[derive(Default)]
+pub(super) struct Build {
+    ivr: Recs,
     usr: Vec<(u32, Use)>,
     snr: Vec<(u32, (Pos, u32))>,
     fixtmp: Vec<(u32, Pos, Pos, u32)>,
     fixed_def: Vec<Option<PReg>>,
     stack_use: Vec<bool>,
+    /// Per value not live out, the end of the interval open above the
+    /// walk's point; the values with one.
+    open: Vec<u32>,
+    touched: Vec<u32>,
+    /// Live out of the block, and of those the ones defined in it.
+    out: Vec<u64>,
+    defined: Vec<u64>,
+    defs: Vec<u32>,
+    /// Each value's run of intervals (`span`, by `ioff`) and of uses
+    /// (`vuse`, by `uoff`), each group's run of members (`moff`), and the
+    /// cursors scattering into the runs.
+    ioff: Vec<u32>,
+    uoff: Vec<u32>,
+    moff: Vec<u32>,
+    at: Vec<u32>,
+    span: Vec<(u32, u32)>,
+    vuse: Vec<Use>,
+    /// Sort keys, a group's fixed definitions, and the clobber sets
+    /// translated so far.
+    keys: Vec<u64>,
+    fx: Vec<u64>,
+    seen: Vec<(PRegSet, [u32; 2])>,
+}
+
+impl Build {
+    pub(super) fn clear(&mut self) {
+        clear!(self; usr, snr, fixtmp, fixed_def, stack_use, open, touched, out, defined, defs,
+            ioff, uoff, moff, at, span, vuse, keys, fx, seen);
+        clear!(self.ivr; recs, last);
+    }
 }
 
 /// Interval records as the walk makes them, each value's last (lowest).
+#[derive(Default)]
 struct Recs {
     recs: Vec<(u32, Pos, Pos)>,
     last: Vec<u32>,
@@ -607,17 +666,17 @@ fn run_ivs(ivs: &[(Pos, Pos)], (a, b): (u32, u32)) -> Ivs<'_> {
     Ivs::plain(&ivs[a as usize..b as usize])
 }
 
-/// Offsets of the runs of a counting sort by `keys` (each below `n`):
-/// key `k`'s run is `off[k]..off[k + 1]`.
-fn runs(n: usize, keys: impl Iterator<Item = u32>) -> Vec<u32> {
-    let mut off = vec![0u32; n + 1];
+/// Offsets of the runs of a counting sort by `keys` (each below `n`), into
+/// `off`: key `k`'s run is `off[k]..off[k + 1]`.
+fn runs(off: &mut Vec<u32>, n: usize, keys: impl Iterator<Item = u32>) {
+    off.clear();
+    off.resize(n + 1, 0);
     for k in keys {
         off[k as usize + 1] += 1;
     }
     for k in 0..n {
         off[k + 1] += off[k];
     }
-    off
 }
 
 /// Append to `v` (from `s`, by `put`) the merge of its sorted runs `a` and
