@@ -5,6 +5,7 @@ pub(crate) mod alloc;
 pub(crate) mod code;
 pub(crate) mod order;
 pub(crate) mod ra;
+pub(crate) mod reg;
 pub(crate) mod vcode;
 
 #[cfg(target_arch = "aarch64")]

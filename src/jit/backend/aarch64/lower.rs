@@ -3,13 +3,12 @@
 //! small immediates folded, refining guards and i32 unboxes aliased to their
 //! operand's register, and snapshot values attached as `Any` uses.
 
-use regalloc2::{Block as RBlock, Operand, PRegSet, RegClass, VReg};
-
 use crate::env::value::Value;
 use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, preg_int};
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Shift, Sz, logical_imm};
 use crate::jit::backend::aarch64::emit::is_single_test;
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
+use crate::jit::backend::reg::{Block as RBlock, Operand, PRegSet, RegClass, VReg};
 use crate::jit::backend::vcode::{Remat, VCode};
 use crate::jit::ir::ops::{Cc, ExitTag, NO_PROTO, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -842,9 +841,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     // before it exits, and the value must survive that.
                     ops.push(Operand::new(
                         vr,
-                        regalloc2::OperandConstraint::Any,
-                        regalloc2::OperandKind::Use,
-                        regalloc2::OperandPos::Late,
+                        crate::jit::backend::reg::OperandConstraint::Any,
+                        crate::jit::backend::reg::OperandKind::Use,
+                        crate::jit::backend::reg::OperandPos::Late,
                     ));
                     seen.push((vr, k));
                     k
@@ -946,9 +945,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     let k = (ops.len() - base) as u16;
                     ops.push(Operand::new(
                         vr,
-                        regalloc2::OperandConstraint::Stack,
-                        regalloc2::OperandKind::Use,
-                        regalloc2::OperandPos::Late,
+                        crate::jit::backend::reg::OperandConstraint::Stack,
+                        crate::jit::backend::reg::OperandKind::Use,
+                        crate::jit::backend::reg::OperandPos::Late,
                     ));
                     seen.push((vr, k));
                     k
@@ -1325,9 +1324,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::NamedNext => {
                 let d = Operand::new(
                     self.vr(res.unwrap()),
-                    regalloc2::OperandConstraint::Reg,
-                    regalloc2::OperandKind::Def,
-                    regalloc2::OperandPos::Early,
+                    crate::jit::backend::reg::OperandConstraint::Reg,
+                    crate::jit::backend::reg::OperandKind::Def,
+                    crate::jit::backend::reg::OperandPos::Early,
                 );
                 let mut ops = vec![d, self.use_(args[0]), self.use_(args[1])];
                 for _ in 0..3 {
@@ -1352,9 +1351,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 // Both written while the operands are still read.
                 let d = Operand::new(
                     self.vr(res.unwrap()),
-                    regalloc2::OperandConstraint::Reg,
-                    regalloc2::OperandKind::Def,
-                    regalloc2::OperandPos::Early,
+                    crate::jit::backend::reg::OperandConstraint::Reg,
+                    crate::jit::backend::reg::OperandKind::Def,
+                    crate::jit::backend::reg::OperandPos::Early,
                 );
                 let v = Operand::reg_temp(self.v.new_vreg(RegClass::Int));
                 let ops = [d, self.use_(args[0]), self.use_(args[1]), v];
@@ -1671,9 +1670,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::StrLt | Op::StrLe => {
                 let d = Operand::new(
                     self.vr(res.unwrap()),
-                    regalloc2::OperandConstraint::Reg,
-                    regalloc2::OperandKind::Def,
-                    regalloc2::OperandPos::Early,
+                    crate::jit::backend::reg::OperandConstraint::Reg,
+                    crate::jit::backend::reg::OperandKind::Def,
+                    crate::jit::backend::reg::OperandPos::Early,
                 );
                 let mut ops = vec![d, self.use_(args[0]), self.use_(args[1])];
                 for _ in 0..5 {
@@ -1732,9 +1731,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::Helper(crate::jit::ir::ops::HelperId::FMod) => {
                 let d = Operand::new(
                     self.vr(res.unwrap()),
-                    regalloc2::OperandConstraint::Reg,
-                    regalloc2::OperandKind::Def,
-                    regalloc2::OperandPos::Early,
+                    crate::jit::backend::reg::OperandConstraint::Reg,
+                    crate::jit::backend::reg::OperandKind::Def,
+                    crate::jit::backend::reg::OperandPos::Early,
                 );
                 let q = Operand::reg_temp(self.v.new_vreg(RegClass::Float));
                 let ops = [d, q, self.use_(args[0]), self.use_(args[1])];

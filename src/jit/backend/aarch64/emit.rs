@@ -2,8 +2,6 @@
 //! allocator's moves, every instruction's sequence, the exit stubs and the
 //! region's exit trampoline in the cold section.
 
-use regalloc2::{Allocation, PReg, RegClass};
-
 use crate::env::function::NativeClosure;
 use crate::env::table::SlotLoc;
 pub(crate) use crate::env::value::BOX;
@@ -21,6 +19,7 @@ use crate::jit::backend::aarch64::asm::{
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
 use crate::jit::backend::aarch64::lower::{LExit, Lowered, Src, float_cond, int_cond};
 use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
+use crate::jit::backend::reg::{Allocation, PReg, RegClass};
 use crate::jit::backend::vcode::{Remat, VCode};
 use crate::jit::ir::ops::{Cc, Ctx};
 use crate::jit::ir::types::TypeSet;
@@ -103,7 +102,7 @@ pub(crate) struct ExitOut {
 fn emits_nothing(l: &Lowered, out: &Output, i: usize) -> bool {
     match l.vcode.insts[i] {
         MInst::MovImm(_) | MInst::FImm(_) | MInst::AluImm(..) => {
-            out.inst_allocs(regalloc2::Inst::new(i))[0].is_none()
+            out.inst_allocs(crate::jit::backend::reg::Inst::new(i))[0].is_none()
         }
         _ => false,
     }
@@ -192,7 +191,7 @@ fn thread_jumps(
             return None;
         }
         let insts: Option<Vec<usize>> = out
-            .block_insts_and_edits(&l.vcode, regalloc2::Block::new(b))
+            .block_insts_and_edits(&l.vcode, crate::jit::backend::reg::Block::new(b))
             .filter(|ie| !matches!(ie, InstOrEdit::Inst(i) if emits_nothing(l, out, i.index())))
             .map(|ie| match ie {
                 InstOrEdit::Inst(i) => Some(i.index()),
@@ -629,7 +628,7 @@ fn emit_with(
         }
         em.a.bind(em.labels[b]);
         for (k, ie) in out
-            .block_insts_and_edits(&l.vcode, regalloc2::Block::new(b))
+            .block_insts_and_edits(&l.vcode, crate::jit::backend::reg::Block::new(b))
             .enumerate()
         {
             match ie {
@@ -824,7 +823,7 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
     let mut consts = Vec::new();
     let mut entries = Vec::new();
     let inst = e.inst.expect("an exit without an instruction");
-    let allocs = out.inst_allocs(regalloc2::Inst::new(inst));
+    let allocs = out.inst_allocs(crate::jit::backend::reg::Inst::new(inst));
     let base = l.snap_ops[inst] as usize;
     let (nil, f, t) = (
         Value::nil().to_raw(),
@@ -867,7 +866,7 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
 
 impl Em<'_> {
     fn allocs(&self, i: usize) -> &[Allocation] {
-        self.out.inst_allocs(regalloc2::Inst::new(i))
+        self.out.inst_allocs(crate::jit::backend::reg::Inst::new(i))
     }
 
     /// The registers of instruction `i`'s words for a test of `set` whose

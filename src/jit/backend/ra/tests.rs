@@ -1,15 +1,14 @@
 //! Random functions shaped like lowering's (loops and joins with block
 //! parameters, calls into resume blocks clobbering everything, helpers with
 //! fixed registers, snapshot uses), allocated with few registers and
-//! checked by regalloc2's checker and for operands sharing a register
+//! checked by the vendored checker and for operands sharing a register
 //! within an instruction, which that checker does not see.
 
-use regalloc2::{
-    Block as RBlock, Inst, MachineEnv, Operand, OperandConstraint, OperandKind, OperandPos, PReg,
-    PRegSet, ProgPoint, RegClass, VReg,
-};
-
 use super::{Env, Output, run};
+use crate::jit::backend::reg::{
+    Block as RBlock, Inst, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
+    ProgPoint, RegClass, VReg,
+};
 use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
 #[derive(Clone, Debug)]
@@ -24,10 +23,6 @@ enum T {
 impl TargetInst for T {
     fn is_branch(&self) -> bool {
         matches!(self, T::Jump | T::Br | T::Call)
-    }
-
-    fn is_ret(&self) -> bool {
-        matches!(self, T::Ret)
     }
 }
 
@@ -61,28 +56,15 @@ fn float(r: usize) -> PReg {
     PReg::new(r, RegClass::Float)
 }
 
-fn envs() -> (Env, MachineEnv) {
-    let ints: Vec<PReg> = INTS.iter().map(|&r| int(r)).collect();
-    let floats: Vec<PReg> = FLOATS.iter().map(|&r| float(r)).collect();
-    let set = |rs: &[PReg]| {
-        let mut s = PRegSet::empty();
-        for &r in rs {
-            s.add(r);
-        }
-        s
-    };
-    let me = MachineEnv {
-        preferred_regs_by_class: [set(&ints[..6]), set(&floats[..4]), PRegSet::empty()],
-        non_preferred_regs_by_class: [set(&ints[6..]), set(&floats[4..]), PRegSet::empty()],
-        scratch_by_class: [Some(int(17)), Some(float(31)), None],
-        fixed_stack_slots: Vec::new(),
-    };
-    let env = Env {
-        regs: [ints, floats],
+fn env() -> Env {
+    Env {
+        regs: [
+            INTS.iter().map(|&r| int(r)).collect(),
+            FLOATS.iter().map(|&r| float(r)).collect(),
+        ],
         scratch: [int(17), float(31)],
         transport: int(16),
-    };
-    (env, me)
+    }
 }
 
 fn all_regs() -> PRegSet {
@@ -536,7 +518,7 @@ fn check_operands(v: &VCode<T>, out: &Output) -> Result<(), String> {
 /// allocator wants 100k or more, in a release build), from `TCVM_RA_SEED`.
 #[test]
 fn random_functions_allocate_correctly() {
-    let (env, me) = envs();
+    let env = env();
     let n: u64 = std::env::var("TCVM_RA_CASES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -551,7 +533,7 @@ fn random_functions_allocate_correctly() {
             Ok(out) => out,
             Err(e) => panic!("seed {seed}: {e}"),
         };
-        let mut checker = super::checker::Checker::new(&v, &me);
+        let mut checker = super::checker::Checker::new(&v);
         let (remat, src) = super::remat_table(&v);
         checker.allow_unmaterialized(remat, src);
         checker.prepare(&out);

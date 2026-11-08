@@ -1,9 +1,8 @@
 //! Registers of a region (Appendix A), the allocator's machine environment,
 //! the register image order, and `exit_common`.
 
-use regalloc2::{MachineEnv, PReg, PRegSet, RegClass};
-
 use crate::jit::backend::aarch64::asm::{Fpr, Gpr};
+use crate::jit::backend::reg::{PReg, PRegSet, RegClass};
 use crate::jit::state::EXIT_REGS;
 pub(crate) use crate::jit::state::IMAGE_SPILLS;
 
@@ -34,35 +33,6 @@ pub(crate) const FLOAT_PREFERRED: [u8; 23] = [
     0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 ];
 pub(crate) const FLOAT_OTHER: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
-
-pub(crate) fn machine_env() -> MachineEnv {
-    let mut ip = PRegSet::empty();
-    for r in INT_PREFERRED {
-        ip.add(PReg::new(r as usize, RegClass::Int));
-    }
-    let mut io = PRegSet::empty();
-    for r in INT_OTHER {
-        io.add(PReg::new(r as usize, RegClass::Int));
-    }
-    let mut fp = PRegSet::empty();
-    for r in FLOAT_PREFERRED {
-        fp.add(PReg::new(r as usize, RegClass::Float));
-    }
-    let mut fo = PRegSet::empty();
-    for r in FLOAT_OTHER {
-        fo.add(PReg::new(r as usize, RegClass::Float));
-    }
-    MachineEnv {
-        preferred_regs_by_class: [ip, fp, PRegSet::empty()],
-        non_preferred_regs_by_class: [io, fo, PRegSet::empty()],
-        scratch_by_class: [
-            Some(PReg::new(17, RegClass::Int)),
-            Some(PReg::new(31, RegClass::Float)),
-            None,
-        ],
-        fixed_stack_slots: Vec::new(),
-    }
-}
 
 /// The allocator's registers: its classes' allocatable ones, preferred
 /// first; x17 and d31 park a value in a cycle of moves, x16 carries

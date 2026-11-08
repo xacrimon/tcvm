@@ -1,9 +1,10 @@
 //! Live ranges: each value's intervals, its use positions, and the points
 //! fixed operands and clobbers reserve registers over.
 
-use regalloc2::{Allocation, Block, Function, Inst, OperandConstraint, OperandKind, OperandPos};
-
 use super::{NONE, Need, Piece, Pos, Ra, Use, VInfo, class_index};
+use crate::jit::backend::reg::{
+    Allocation, Block, Inst, OperandConstraint, OperandKind, OperandPos,
+};
 use crate::jit::backend::vcode::TargetInst;
 
 impl<I: TargetInst> Ra<'_, I> {
@@ -63,9 +64,8 @@ impl<I: TargetInst> Ra<'_, I> {
                     touched.push(v as u32);
                 }
             }
-            let term = self.at_lin[self.last[b] as usize];
             for s in 0..f.block_succs(Block::new(b)).len() {
-                for a in f.branch_blockparams(Block::new(b), term, s) {
+                for a in f.branch_blockparams(Block::new(b), s) {
                     if open[a.vreg()] == NONE {
                         open[a.vreg()] = end;
                         touched.push(a.vreg() as u32);
@@ -238,10 +238,10 @@ impl<I: TargetInst> Ra<'_, I> {
         }
         // Groups: a block parameter shares one allocation unit with each
         // argument passed to it whose range stays clear of the group's
-        // (V8's `BundleBuilder`, allocated as one range as regalloc2 does), so
+        // (V8's `BundleBuilder`, allocated as one range), so
         // the edge needs no move unless a split moves one of them.
         self.rep = (0..nv as u32).collect();
-        let mut fixed: Vec<Vec<(Pos, regalloc2::PReg)>> = fixed_def
+        let mut fixed: Vec<Vec<(Pos, crate::jit::backend::reg::PReg)>> = fixed_def
             .iter()
             .enumerate()
             .map(|(v, r)| r.map(|r| (self.vregs[v].def, r)).into_iter().collect())
@@ -256,8 +256,7 @@ impl<I: TargetInst> Ra<'_, I> {
                         .iter()
                         .position(|&x| x == b)
                         .expect("an edge");
-                    let term = self.at_lin[self.last[p.index()] as usize];
-                    let a = f.branch_blockparams(p, term, pk)[k];
+                    let a = f.branch_blockparams(p, pk)[k];
                     let (gq, ga) = (self.find(q.vreg() as u32), self.find(a.vreg() as u32));
                     if gq == ga {
                         continue;

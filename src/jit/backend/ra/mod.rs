@@ -1,6 +1,6 @@
 //! The register allocator (M1, `m1-regalloc.md`): an SSA linear scan with
 //! V8's split and spill positions (TurboFan `register-allocator.cc`) over a
-//! `VCode`, writing regalloc2's `Output`.
+//! `VCode`, writing an `Output`.
 //!
 //! Positions: instruction `n` of the linear order has an early point `2n`
 //! (uses read, early defs and temporaries written) and a late point
@@ -17,8 +17,7 @@ mod scan;
 #[cfg(test)]
 mod tests;
 
-use regalloc2::{Allocation, Block, Function, Inst, PReg, ProgPoint, RegClass, VReg};
-
+use crate::jit::backend::reg::{Allocation, Block, Inst, PReg, ProgPoint, RegClass, VReg};
 use crate::jit::backend::vcode::{TargetInst, VCode};
 
 /// What goes between two instructions.
@@ -61,9 +60,9 @@ impl Output {
     }
 
     /// A block's instructions with the edits before each.
-    pub(crate) fn block_insts_and_edits<'a, F: Function>(
+    pub(crate) fn block_insts_and_edits<'a, I: TargetInst>(
         &'a self,
-        f: &F,
+        f: &VCode<I>,
         block: Block,
     ) -> impl Iterator<Item = InstOrEdit<'a>> + 'a {
         let range = f.block_insns(block);
@@ -80,26 +79,6 @@ impl Output {
             }
             insts.next().map(InstOrEdit::Inst)
         })
-    }
-
-    /// regalloc2's allocation in these terms.
-    pub(crate) fn from_regalloc2(o: &regalloc2::Output) -> Output {
-        Output {
-            num_spillslots: o.num_spillslots,
-            edits: (o.edits.iter())
-                .map(|(p, regalloc2::Edit::Move { from, to })| {
-                    (
-                        *p,
-                        Edit::Move {
-                            from: *from,
-                            to: *to,
-                        },
-                    )
-                })
-                .collect(),
-            allocs: o.allocs.clone(),
-            inst_alloc_offsets: o.inst_alloc_offsets.clone(),
-        }
     }
 }
 
@@ -321,8 +300,8 @@ pub(crate) fn run<I: TargetInst + std::fmt::Debug>(
 /// definition with any use, a late definition with a late use, two
 /// definitions.
 pub(crate) fn check_operands<I: TargetInst>(v: &VCode<I>, out: &Output) -> Result<(), String> {
-    use regalloc2::OperandKind::{Def, Use};
-    use regalloc2::OperandPos::{Early, Late};
+    use crate::jit::backend::reg::OperandKind::{Def, Use};
+    use crate::jit::backend::reg::OperandPos::{Early, Late};
     for i in 0..v.insts.len() {
         let ops = v.inst_operands_of(i);
         let al = out.inst_allocs(Inst::new(i));
@@ -661,19 +640,20 @@ impl<'a, I: TargetInst> Ra<'a, I> {
             let insns = f.block_insns(Block::new(b));
             for i in insns.iter() {
                 for op in f.inst_operands(i) {
-                    if op.kind() == regalloc2::OperandKind::Use && !has(k, op.vreg().vreg()) {
+                    if op.kind() == crate::jit::backend::reg::OperandKind::Use
+                        && !has(k, op.vreg().vreg())
+                    {
                         set(g, op.vreg().vreg());
                     }
                 }
                 for op in f.inst_operands(i) {
-                    if op.kind() == regalloc2::OperandKind::Def {
+                    if op.kind() == crate::jit::backend::reg::OperandKind::Def {
                         set(k, op.vreg().vreg());
                     }
                 }
             }
-            let term = insns.last();
             for s in 0..f.block_succs(Block::new(b)).len() {
-                for v in f.branch_blockparams(Block::new(b), term, s) {
+                for v in f.branch_blockparams(Block::new(b), s) {
                     if !has(k, v.vreg()) {
                         set(g, v.vreg());
                     }
@@ -770,7 +750,7 @@ impl<'a, I: TargetInst> Ra<'a, I> {
         match p.loc {
             Loc::Reg(r) => Allocation::reg(r),
             Loc::Remat => Allocation::none(),
-            Loc::Stack => Allocation::stack(regalloc2::SpillSlot::new(
+            Loc::Stack => Allocation::stack(crate::jit::backend::reg::SpillSlot::new(
                 self.vregs[p.vreg as usize].slot as usize,
             )),
             Loc::None => panic!("piece {x} of v{} unallocated", p.vreg),

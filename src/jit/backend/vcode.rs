@@ -1,16 +1,14 @@
 //! Target-neutral machine code before register allocation: instructions of a
 //! target's `Inst` type in blocks with parameters, each with its operands in
-//! a flat pool, as `regalloc2::Function`.
+//! a flat pool.
 
-use regalloc2::{
-    Block as RBlock, Function, Inst as RInst, InstRange, Operand, OperandKind, PRegSet, RegClass,
-    VReg,
+use crate::jit::backend::reg::{
+    Block as RBlock, Inst as RInst, InstRange, Operand, OperandKind, PRegSet, RegClass, VReg,
 };
 
 /// What a target's instruction type tells the allocator.
 pub(crate) trait TargetInst: Clone {
     fn is_branch(&self) -> bool;
-    fn is_ret(&self) -> bool;
 }
 
 pub(crate) struct VBlock {
@@ -152,9 +150,8 @@ impl<I: TargetInst + std::fmt::Debug> VCode<I> {
     pub(crate) fn print(&self, out: &crate::jit::backend::ra::Output, order: &[u32]) -> String {
         use std::fmt::Write;
 
-        use regalloc2::{Allocation, AllocationKind};
-
         use crate::jit::backend::ra::{Edit, InstOrEdit};
+        use crate::jit::backend::reg::{Allocation, AllocationKind};
         let loc = |a: Allocation| match a.kind() {
             AllocationKind::Reg => {
                 let r = a.as_reg().unwrap();
@@ -226,8 +223,7 @@ impl<I: TargetInst + std::fmt::Debug> VCode<I> {
                 }
             }
             for (k, succ) in self.block_succs(rb).iter().enumerate() {
-                let end = RInst::new(self.blocks[b as usize].end as usize - 1);
-                let args = self.branch_blockparams(rb, end, k);
+                let args = self.branch_blockparams(rb, k);
                 let _ = writeln!(s, "  -> b{}({})", succ.index(), vregs(args));
             }
         }
@@ -235,64 +231,56 @@ impl<I: TargetInst + std::fmt::Debug> VCode<I> {
     }
 }
 
-impl<I: TargetInst> Function for VCode<I> {
-    fn num_insts(&self) -> usize {
+impl<I: TargetInst> VCode<I> {
+    pub(crate) fn num_insts(&self) -> usize {
         self.insts.len()
     }
 
-    fn num_blocks(&self) -> usize {
+    pub(crate) fn num_blocks(&self) -> usize {
         self.blocks.len()
     }
 
-    fn entry_block(&self) -> RBlock {
+    pub(crate) fn entry_block(&self) -> RBlock {
         self.entry
     }
 
-    fn block_insns(&self, block: RBlock) -> InstRange {
+    pub(crate) fn block_insns(&self, block: RBlock) -> InstRange {
         let b = &self.blocks[block.index()];
         InstRange::new(RInst::new(b.start as usize), RInst::new(b.end as usize))
     }
 
-    fn block_succs(&self, block: RBlock) -> &[RBlock] {
+    pub(crate) fn block_succs(&self, block: RBlock) -> &[RBlock] {
         self.succs(block.index())
     }
 
-    fn block_preds(&self, block: RBlock) -> &[RBlock] {
+    pub(crate) fn block_preds(&self, block: RBlock) -> &[RBlock] {
         let (s, e) = self.blocks[block.index()].preds;
         &self.bpool[s as usize..e as usize]
     }
 
-    fn block_params(&self, block: RBlock) -> &[VReg] {
+    pub(crate) fn block_params(&self, block: RBlock) -> &[VReg] {
         let (s, e) = self.blocks[block.index()].params;
         &self.rpool[s as usize..e as usize]
     }
 
-    fn is_ret(&self, insn: RInst) -> bool {
-        self.insts[insn.index()].is_ret()
-    }
-
-    fn is_branch(&self, insn: RInst) -> bool {
+    pub(crate) fn is_branch(&self, insn: RInst) -> bool {
         self.insts[insn.index()].is_branch()
     }
 
-    fn branch_blockparams(&self, block: RBlock, _insn: RInst, succ_idx: usize) -> &[VReg] {
+    pub(crate) fn branch_blockparams(&self, block: RBlock, succ_idx: usize) -> &[VReg] {
         let (s, e) = self.args[self.blocks[block.index()].args as usize + succ_idx];
         &self.rpool[s as usize..e as usize]
     }
 
-    fn inst_operands(&self, insn: RInst) -> &[Operand] {
+    pub(crate) fn inst_operands(&self, insn: RInst) -> &[Operand] {
         self.inst_operands_of(insn.index())
     }
 
-    fn inst_clobbers(&self, insn: RInst) -> PRegSet {
+    pub(crate) fn inst_clobbers(&self, insn: RInst) -> PRegSet {
         self.clobbers[insn.index()]
     }
 
-    fn num_vregs(&self) -> usize {
+    pub(crate) fn num_vregs(&self) -> usize {
         self.vreg_classes.len()
-    }
-
-    fn spillslot_size(&self, _regclass: RegClass) -> usize {
-        1
     }
 }

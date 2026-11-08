@@ -37,8 +37,6 @@ pub(crate) struct JitConfig {
     pub(crate) check: bool,
     /// Log each compile's time per stage.
     pub(crate) time: bool,
-    /// Allocate with regalloc2 (`TCVM_JIT_RA=regalloc2`) instead of `ra`.
-    pub(crate) regalloc2: bool,
     pub(crate) only: Option<String>,
     pub(crate) deopt_all: bool,
     /// Inline known small callees (E1); `TCVM_JIT_INLINE=0` turns it off.
@@ -95,7 +93,6 @@ impl JitConfig {
             dump,
             check: flag("TCVM_JIT_CHECK") || cfg!(debug_assertions),
             time: flag("TCVM_JIT_TIME"),
-            regalloc2: var("TCVM_JIT_RA").is_some_and(|v| v == "regalloc2"),
             only: var("TCVM_JIT_ONLY"),
             deopt_all: flag("TCVM_JIT_DEOPT_ALL"),
             inline: var("TCVM_JIT_INLINE").is_none_or(|v| v != "0" && v != "off"),
@@ -129,8 +126,6 @@ pub(crate) struct JitRuntime {
     code: RefCell<Option<std::rc::Rc<crate::jit::backend::alloc::CodeAllocator>>>,
     /// Compile failures from running out of code memory turn the JIT off.
     pub(crate) exhausted: Cell<bool>,
-    /// The register allocator's buffers, kept between compiles.
-    pub(crate) ra: RefCell<regalloc2::Ctx>,
     /// Where handlers return in a level (`abi::level_return`).
     pub(crate) level_ret: usize,
     /// The return address of a region dispatch entered (`abi::level_land`):
@@ -169,7 +164,6 @@ impl JitRuntime {
             trampoline_code: RefCell::new(Vec::new()),
             code: RefCell::new(None),
             exhausted: Cell::new(false),
-            ra: RefCell::new(regalloc2::Ctx::default()),
             #[cfg(target_arch = "aarch64")]
             level_ret: crate::jit::backend::aarch64::abi::level_return_addr(),
             #[cfg(not(target_arch = "aarch64"))]

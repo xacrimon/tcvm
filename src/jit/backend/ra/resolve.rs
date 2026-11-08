@@ -2,9 +2,8 @@
 //! across edges, into fixed registers, and the stores after definitions,
 //! each gap's moves sequenced as one parallel move.
 
-use regalloc2::{Allocation, Function, ProgPoint, RegClass, VReg};
-
 use super::{Edit, Loc, NONE, Need, Output, Pos, Ra, intersect};
+use crate::jit::backend::reg::{Allocation, ProgPoint, RegClass, VReg};
 use crate::jit::backend::vcode::TargetInst;
 
 /// A move of a value of class `cls`, or with `remat` its computation
@@ -60,7 +59,7 @@ impl<I: TargetInst> Ra<'_, I> {
                         _ => return Err(format!("v{} needs a register at {}", p.vreg, u.pos)),
                     },
                     Need::Any => self.alloc_of(x),
-                    Need::Stack => Allocation::stack(regalloc2::SpillSlot::new(
+                    Need::Stack => Allocation::stack(crate::jit::backend::reg::SpillSlot::new(
                         self.vregs[p.vreg as usize].slot as usize,
                     )),
                     Need::Fixed(r) => Allocation::reg(r),
@@ -77,7 +76,7 @@ impl<I: TargetInst> Ra<'_, I> {
             }
             let (cls, slot) = (
                 g.class,
-                Allocation::stack(regalloc2::SpillSlot::new(g.slot as usize)),
+                Allocation::stack(crate::jit::backend::reg::SpillSlot::new(g.slot as usize)),
             );
             let vi = &self.vregs[v as usize];
             if vi.def != NONE {
@@ -404,7 +403,7 @@ impl<I: TargetInst> Ra<'_, I> {
                     .iter()
                     .position(|&x| x == s)
                     .expect("an edge");
-                let args = f.branch_blockparams(p, self.at_lin[self.last[pi] as usize], k);
+                let args = f.branch_blockparams(p, k);
                 for (q, a) in f.block_params(s).iter().zip(args) {
                     let q = q.vreg() as u32;
                     let Some(to) = self.alloc_at(q, ss) else {

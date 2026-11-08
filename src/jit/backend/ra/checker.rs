@@ -98,17 +98,18 @@
 use core::hash::Hash;
 use core::ops::Range;
 
-use regalloc2::{
-    Allocation, AllocationKind, Block, Function, Inst, InstPosition, MachineEnv, Operand,
-    OperandConstraint, OperandKind, OperandPos, PReg, PRegSet, VReg,
-};
-
 use super::{Edit, InstOrEdit, Output};
+use crate::jit::backend::reg::{
+    Allocation, AllocationKind, Block, Inst, InstPosition, Operand, OperandConstraint, OperandKind,
+    OperandPos, PReg, VReg,
+};
+use crate::jit::backend::vcode::{TargetInst, VCode};
 
 // Vendored from regalloc2 0.15.2 `src/checker.rs` (M1 step 2a): std maps for
 // FxHash, `Vec` for `SmallVec`, no tracing; `Edit::Remat` defines its target
 // as the value, and a constant's definition left unmaterialized (allocation
-// none) defines nothing.
+// none) defines nothing. Checks `VCode` directly (no `Function` trait), without
+// fixed stack slots (no `MachineEnv`).
 type FxHashMap<K, V> = std::collections::HashMap<K, V>;
 type FxHashSet<K> = std::collections::HashSet<K>;
 
@@ -286,7 +287,7 @@ impl CheckerValue {
     }
 }
 
-fn visit_all_vregs<F: Function, V: FnMut(VReg)>(f: &F, mut v: V) {
+fn visit_all_vregs<I: TargetInst, V: FnMut(VReg)>(f: &VCode<I>, mut v: V) {
     for block in 0..f.num_blocks() {
         let block = Block::new(block);
         for inst in f.block_insns(block).iter() {
@@ -295,7 +296,7 @@ fn visit_all_vregs<F: Function, V: FnMut(VReg)>(f: &F, mut v: V) {
             }
             if f.is_branch(inst) {
                 for succ_idx in 0..f.block_succs(block).len() {
-                    for &param in f.branch_blockparams(block, inst, succ_idx) {
+                    for &param in f.branch_blockparams(block, succ_idx) {
                         v(param);
                     }
                 }
@@ -454,14 +455,13 @@ impl CheckerState {
         }
     }
 
-    fn check_val<'a, F: Function>(
+    fn check_val(
         &self,
         inst: Inst,
         op: Operand,
         alloc: Allocation,
         val: &CheckerValue,
         allocs: &[Allocation],
-        checker: &Checker<'a, F>,
     ) -> Result<(), CheckerError> {
         if alloc == Allocation::none() {
             return Err(CheckerError::MissingAllocation { inst, op });
@@ -484,7 +484,7 @@ impl CheckerState {
             }
         }
 
-        self.check_constraint(inst, op, alloc, allocs, checker)?;
+        self.check_constraint(inst, op, alloc, allocs)?;
 
         Ok(())
     }
@@ -492,12 +492,7 @@ impl CheckerState {
     /// Check an instruction against this state. This must be called
     /// twice: once with `InstPosition::Before`, and once with
     /// `InstPosition::After` (after updating state with defs).
-    fn check<'a, F: Function>(
-        &self,
-        pos: InstPosition,
-        checkinst: &CheckerInst,
-        checker: &Checker<'a, F>,
-    ) -> Result<(), CheckerError> {
+    fn check(&self, pos: InstPosition, checkinst: &CheckerInst) -> Result<(), CheckerError> {
         let default_val = Default::default();
         match checkinst {
             &CheckerInst::Op {
@@ -534,19 +529,12 @@ impl CheckerState {
                         "checker: checkinst {:?}: op {:?}, alloc {:?}, checker value {:?}",
                         checkinst, op, alloc, val
                     );
-                    self.check_val(inst, *op, *alloc, val, allocs, checker)?;
+                    self.check_val(inst, *op, *alloc, val, allocs)?;
                 }
             }
             &CheckerInst::Move { into, from } => {
                 // Ensure that the allocator never returns stack-to-stack moves.
-                let is_stack = |alloc: Allocation| {
-                    if let Some(reg) = alloc.as_reg() {
-                        checker.stack_pregs.contains(reg)
-                    } else {
-                        alloc.is_stack()
-                    }
-                };
-                if is_stack(into) && is_stack(from) {
+                if into.is_stack() && from.is_stack() {
                     return Err(CheckerError::StackToStackMove { into, from });
                 }
             }
@@ -661,33 +649,22 @@ impl CheckerState {
         }
     }
 
-    fn check_constraint<'a, F: Function>(
+    fn check_constraint(
         &self,
         inst: Inst,
         op: Operand,
         alloc: Allocation,
         allocs: &[Allocation],
-        checker: &Checker<'a, F>,
     ) -> Result<(), CheckerError> {
         match op.constraint() {
             OperandConstraint::Any => {}
             OperandConstraint::Reg => {
-                if let Some(preg) = alloc.as_reg() {
-                    // Reject pregs that represent a fixed stack slot.
-                    if !checker.machine_env.fixed_stack_slots.contains(&preg) {
-                        return Ok(());
-                    }
+                if alloc.as_reg().is_none() {
+                    return Err(CheckerError::AllocationIsNotReg { inst, op, alloc });
                 }
-                return Err(CheckerError::AllocationIsNotReg { inst, op, alloc });
             }
             OperandConstraint::Stack => {
                 if alloc.kind() != AllocationKind::Stack {
-                    // Accept pregs that represent a fixed stack slot.
-                    if let Some(preg) = alloc.as_reg() {
-                        if checker.machine_env.fixed_stack_slots.contains(&preg) {
-                            return Ok(());
-                        }
-                    }
                     return Err(CheckerError::AllocationIsNotStack { inst, op, alloc });
                 }
             }
@@ -761,26 +738,23 @@ pub(crate) enum CheckerInst {
     },
 }
 
-#[derive(Debug)]
-pub struct Checker<'a, F: Function> {
-    f: &'a F,
+pub struct Checker<'a, I: TargetInst> {
+    f: &'a VCode<I>,
     bb_in: FxHashMap<Block, CheckerState>,
     bb_insts: FxHashMap<Block, Vec<CheckerInst>>,
     edge_insts: FxHashMap<(Block, Block), Vec<CheckerInst>>,
-    machine_env: &'a MachineEnv,
-    stack_pregs: PRegSet,
     /// Per vreg: a value whose definition may be left unmaterialized, and
     /// the value one is computed from.
     remat: Vec<bool>,
     remat_src: Vec<Option<VReg>>,
 }
 
-impl<'a, F: Function> Checker<'a, F> {
+impl<'a, I: TargetInst> Checker<'a, I> {
     /// Create a new checker for the given function, initializing CFG
     /// info immediately.  The client should call the `add_*()`
     /// methods to add abstract instructions to each BB before
     /// invoking `run()` to check for errors.
-    pub fn new(f: &'a F, machine_env: &'a MachineEnv) -> Checker<'a, F> {
+    pub fn new(f: &'a VCode<I>) -> Checker<'a, I> {
         let mut bb_in = FxHashMap::default();
         let mut bb_insts = FxHashMap::default();
         let mut edge_insts = FxHashMap::default();
@@ -796,18 +770,11 @@ impl<'a, F: Function> Checker<'a, F> {
 
         bb_in.insert(f.entry_block(), CheckerState::default());
 
-        let mut stack_pregs = PRegSet::empty();
-        for &preg in &machine_env.fixed_stack_slots {
-            stack_pregs.add(preg);
-        }
-
         Checker {
             f,
             bb_in,
             bb_insts,
             edge_insts,
-            machine_env,
-            stack_pregs,
             remat: Vec::new(),
             remat_src: Vec::new(),
         }
@@ -869,7 +836,7 @@ impl<'a, F: Function> Checker<'a, F> {
         // edge as necessary to handle blockparams.
         if self.f.is_branch(inst) {
             for (i, &succ) in self.f.block_succs(block).iter().enumerate() {
-                let args = self.f.branch_blockparams(block, inst, i);
+                let args = self.f.branch_blockparams(block, i);
                 let params = self.f.block_params(succ);
                 assert_eq!(
                     args.len(),
@@ -988,12 +955,12 @@ impl<'a, F: Function> Checker<'a, F> {
         for (block, input) in &self.bb_in {
             let mut state = input.clone();
             for inst in self.bb_insts.get(block).unwrap() {
-                if let Err(e) = state.check(InstPosition::Before, inst, self) {
+                if let Err(e) = state.check(InstPosition::Before, inst) {
                     trace!("Checker error: {:?}", e);
                     errors.push(e);
                 }
                 state.update(inst);
-                if let Err(e) = state.check(InstPosition::After, inst, self) {
+                if let Err(e) = state.check(InstPosition::After, inst) {
                     trace!("Checker error: {:?}", e);
                     errors.push(e);
                 }

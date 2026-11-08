@@ -4,9 +4,8 @@
 
 use std::cmp::Reverse;
 
-use regalloc2::{Block, Function, PReg};
-
 use super::{Loc, NONE, Piece, Pos, Ra, intersect, needs_reg, reg_beneficial};
+use crate::jit::backend::reg::{Block, PReg};
 use crate::jit::backend::vcode::TargetInst;
 
 impl<I: TargetInst> Ra<'_, I> {

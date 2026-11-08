@@ -1,6 +1,6 @@
 //! The aarch64 machine instructions, before register allocation. Each
 //! variant's operands (in its `VCode` operand pool, in the order its doc
-//! gives) are allocated by regalloc2; x16 and x17 are scratch inside one
+//! gives) are allocated by `ra`; x16 and x17 are scratch inside one
 //! instruction, never allocated.
 
 use crate::jit::backend::aarch64::asm::{Cond, Shift, Sz};
@@ -477,16 +477,6 @@ impl TargetInst for MInst {
         matches!(
             self,
             MInst::Jump | MInst::Br { .. } | MInst::Call { .. } | MInst::CallMm { .. }
-        )
-    }
-
-    fn is_ret(&self) -> bool {
-        matches!(
-            self,
-            MInst::Return { .. }
-                | MInst::Deopt { .. }
-                | MInst::Dispatch { .. }
-                | MInst::TailEnter { .. }
         )
     }
 }

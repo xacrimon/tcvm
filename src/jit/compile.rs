@@ -382,27 +382,13 @@ pub(crate) fn compile<'gc>(
     let lowered = lower::lower(&f, closure.code as usize, own).map_err(CompileError::Backend)?;
     times.lower = t.elapsed().as_micros();
     let t = std::time::Instant::now();
-    let env = abi::machine_env();
-    let out = if config.regalloc2 {
-        let ra = regalloc2::RegallocOptions {
-            verbose_log: false,
-            validate_ssa: opts.check,
-            algorithm: regalloc2::Algorithm::Ion,
-        };
-        let mut rctx = ctx.jit().ra.borrow_mut();
-        let o = regalloc2::run_with_ctx(&lowered.vcode, &env, &ra, &mut rctx)
-            .map_err(|e| CompileError::Backend(format!("regalloc: {e:?}")))?;
-        crate::jit::backend::ra::Output::from_regalloc2(o)
-    } else {
-        crate::jit::backend::ra::run(
-            &lowered.vcode,
-            &abi::ra_env(),
-            &lowered.emit_order,
-            lowered.hot_blocks,
-        )
-        .map_err(|e| CompileError::Backend(format!("regalloc: {e}")))?
-    };
-    let out = &out;
+    let out = &crate::jit::backend::ra::run(
+        &lowered.vcode,
+        &abi::ra_env(),
+        &lowered.emit_order,
+        lowered.hot_blocks,
+    )
+    .map_err(|e| CompileError::Backend(format!("regalloc: {e}")))?;
     if config.dump.vcode {
         eprintln!(
             "-- jit vcode {} pc{pc}, {} spill slots\n{}",
@@ -412,7 +398,7 @@ pub(crate) fn compile<'gc>(
         );
     }
     if opts.check {
-        let mut checker = crate::jit::backend::ra::checker::Checker::new(&lowered.vcode, &env);
+        let mut checker = crate::jit::backend::ra::checker::Checker::new(&lowered.vcode);
         let (remat, src) = crate::jit::backend::ra::remat_table(&lowered.vcode);
         checker.allow_unmaterialized(remat, src);
         checker.prepare(out);

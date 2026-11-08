@@ -26,14 +26,14 @@ Tests: `tests/suite/*.rs` (runtime), `test-files/*.lua` (snapshots), `src/compil
 - `src/vm`: interpreter. `extern "rust-preserve-none"` handlers dispatched with `become`; `ops/` holds handlers by family, `frame.rs` the frame layout, `native.rs`/`async_native.rs`/`ff.rs` the native protocols, `coro.rs`/`unwind.rs` the coroutine switches and unwinding.
 - `src/env`: values, tables, shapes, strings, functions, threads.
 - `src/dmm`: GC. `Gc<'gc, T>` with invariant lifetimes, `Collect` trait, barriers, non-moving Immix heap (`heap.rs`).
-- `src/jit`: method JIT. Regions start at function entry or a hot loop, run through IR → `opt/` → `backend/` (aarch64, own regalloc or regalloc2).
+- `src/jit`: method JIT. Regions start at function entry or a hot loop, run through IR → `opt/` → `backend/` (aarch64, own register allocator).
 - `src/builtin`: standard library. `src/lua`: embedding API and executor.
 - `tools/`: perf and differential scripts (`gate.sh`, `opcost.py`, `ljr.py`, `corpus/`).
 
 Use rust-analyzer for anything the module docs don't answer; don't rely on this file for details.
 
 ## JIT knobs (env)
-`TCVM_JIT=off`, `TCVM_JIT_HOT_CALL=N`/`TCVM_JIT_HOT_LOOP=N` (1 = compile at first count), `TCVM_JIT_DEOPT_ALL=1`, `TCVM_JIT_INLINE=0`, `TCVM_JIT_DUMP=ir,opt,vcode,asm`, `TCVM_JIT_LOG=1`, `TCVM_JIT_CHECK=1`, `TCVM_JIT_ONLY=…`, `TCVM_JIT_RA=regalloc2`, `TCVM_GC_STRESS`. The Bash tool runs zsh: `env $m` with several variables in `$m` sets only the first, so use `env ${=m}`.
+`TCVM_JIT=off`, `TCVM_JIT_HOT_CALL=N`/`TCVM_JIT_HOT_LOOP=N` (1 = compile at first count), `TCVM_JIT_DEOPT_ALL=1`, `TCVM_JIT_INLINE=0`, `TCVM_JIT_DUMP=ir,opt,vcode,asm`, `TCVM_JIT_LOG=1`, `TCVM_JIT_CHECK=1`, `TCVM_JIT_ONLY=…`, `TCVM_GC_STRESS`. The Bash tool runs zsh: `env $m` with several variables in `$m` sets only the first, so use `env ${=m}`.
 
 ## Working style
 - Planning or brainstorming: ask clarifying questions one at a time; don't create tasks, spawn subagents, or write plan files until explicitly approved.
