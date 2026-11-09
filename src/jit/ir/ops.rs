@@ -532,6 +532,11 @@ pub(crate) enum Op {
     // --- home slots -----------------------------------------------------------
     /// `R[r]` as a `Val`.
     Load(u8),
+    /// A load whose slot holds its value wherever its register is read, and
+    /// which a call's snapshot names only for that slot, kept in place
+    /// (`opt::snaps`, the last pass): the allocator loads it from the slot
+    /// where it is wanted, and an exit reads it there.
+    Home(u8),
     /// Parameter `k` of a function region, which every entry passes in
     /// `x_k` (W4 §2): no slot holds it until an exit writes it.
     Param(u8),
@@ -970,7 +975,7 @@ impl Op {
         const DEOPT: Flags = Flags::MAY_DEOPT;
         let e = Effects::new;
         match self {
-            Load(_) => Effects::reads(Mem::SLOT),
+            Load(_) | Home(_) => Effects::reads(Mem::SLOT),
             // Its register is the entry's: nothing may move or copy it
             // (after a call no register or slot holds it).
             Param(_) => Effects::flags(Flags::SIDE_EFFECT),
@@ -1017,7 +1022,7 @@ impl Op {
     /// accesses with other keys never alias it.
     pub(crate) fn mem_key(self) -> Option<u32> {
         match self {
-            Op::Load(r) | Op::Store(r) => Some(r as u32),
+            Op::Load(r) | Op::Home(r) | Op::Store(r) => Some(r as u32),
             Op::TabLoad { key, .. } | Op::TabStore { key, .. } => Some(key),
             Op::ArrLoad | Op::ArrStore => Some(ARR_ITEMS),
             Op::TabASize | Op::TabArray => Some(ARR_SIZE),
@@ -1035,6 +1040,33 @@ impl Op {
 
     pub(crate) fn is_pure(self) -> bool {
         self.effects().is_pure()
+    }
+
+    /// What lowering may compute where it is used instead: a test a
+    /// branch, guard or select takes, a product a sum takes, a tested bit.
+    /// Its operands are read there (`Op::Home` counts on the set).
+    pub(crate) fn folds(self) -> bool {
+        use Op::*;
+        matches!(
+            self,
+            ICmp(_)
+                | LCmp(_)
+                | FCmp(_)
+                | IsType(_)
+                | IsFalsy
+                | SameBits
+                | ShapeIs(_)
+                | ShapeIn(_)
+                | HasFlag(_)
+                | NumMtSet
+                | TypeMtIs { .. }
+                | FnFixedLua
+                | FnFits
+                | TabHasRoom(_)
+                | IMulNo
+                | LMul
+                | IAnd
+        )
     }
 
     /// How many values the instruction defines.
@@ -1091,9 +1123,13 @@ impl Op {
             KB1(_) => Ty::B1,
             KI64(_) => Ty::I64,
             KF64(_) => Ty::F64,
-            Load(_) | Param(_) | UpvalValue(_) | UpvalValueOf(_) | CellLoad | Resume { .. } => {
-                Ty::ANY
-            }
+            Load(_)
+            | Home(_)
+            | Param(_)
+            | UpvalValue(_)
+            | UpvalValueOf(_)
+            | CellLoad
+            | Resume { .. } => Ty::ANY,
             UpvalCell(_) | UpvalCellOf(_) => Ty::PTR,
             FrameFn => Ty::val(TypeSet::FUN),
             NumVarargs | ClassBits(_) | TabASize | ArrNext | TabMmBits | NamedNext => Ty::I32,
@@ -1164,6 +1200,7 @@ impl Op {
             KF64(b) => format!("kf64 {:?}", f64::from_bits(b)),
             IUMulShr(s) => format!("iumulshr {s}"),
             Load(r) => format!("load r{r}"),
+            Home(r) => format!("home r{r}"),
             Param(k) => format!("param {k}"),
             Store(r) => format!("store r{r}"),
             Box => "box".into(),

@@ -432,12 +432,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         v
     }
 
-    /// The slot of a home load (`Func::home_loads`) `v` shares a register
-    /// with.
+    /// The slot of the home load `v` shares a register with.
     fn home_load(&self, v: Val) -> Option<u8> {
-        let v = self.alias(v);
-        match self.f.def_op(v) {
-            Some(Op::Load(r)) if self.f.home_loads.get(v.idx()) == Some(&true) => Some(r),
+        match self.f.def_op(self.alias(v)) {
+            Some(Op::Home(r)) => Some(r),
             _ => None,
         }
     }
@@ -649,6 +647,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     Op::IsType(set) => op != Op::Select || is_single_test(set),
                     _ => false,
                 };
+                debug_assert!(!fusable || f.op(di).folds());
                 let mut n = 0;
                 f.for_each_use(i, |v| n += (v == c) as u32);
                 if fusable && n == 1 {
@@ -1041,9 +1040,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::KI64(n) => self.constant(res.unwrap(), Remat::Int(n as u64)),
             Op::KB1(c) => self.constant(res.unwrap(), Remat::Int(c as u64)),
             Op::KF64(b) => self.constant(res.unwrap(), Remat::Float(b)),
-            Op::Load(r) if self.home_load(res.unwrap()) == Some(r) => {
-                self.constant(res.unwrap(), Remat::Slot(r))
-            }
+            Op::Home(r) => self.constant(res.unwrap(), Remat::Slot(r)),
             Op::Load(r) => {
                 let d = self.def(res.unwrap());
                 self.push(MInst::LoadSlot(r), &[d], none);
@@ -1183,7 +1180,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::Select { test, cond, float }, &ops, none);
             }
             Op::Guard(set) if f.insts[i.idx()].tag == ExitTag::Entry => {
-                let (Some(Op::Load(r)) | Some(Op::Param(r))) = f.def_op(args[0]) else {
+                let Some(Op::Load(r) | Op::Home(r) | Op::Param(r)) = f.def_op(args[0]) else {
                     return Err("an entry guard of no entry load".into());
                 };
                 self.entry_regs.push(r);

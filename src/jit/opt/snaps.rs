@@ -5,10 +5,9 @@
 //! a call clears what it keeps neither in its homes (`Func::call_homes`)
 //! nor in a slot its snapshot names with that very value, which joins its
 //! homes (the collector traces the slot in place while the call runs,
-//! `ThreadState::trace`). The same walk finds the home loads
-//! (`Func::home_loads`): a load whose slot holds its value wherever the
-//! value is live, which the allocator may load from the slot again instead
-//! of spilling.
+//! `ThreadState::trace`). The same walk finds the home loads (`Op::Home`):
+//! a load whose slot holds its value wherever its register is read, which
+//! the allocator may load from the slot again instead of spilling.
 
 use crate::jit::FastMap;
 use crate::jit::build::cfg::RegSet;
@@ -33,17 +32,32 @@ fn canon(f: &Func<'_>, mut v: Val) -> Val {
 }
 
 /// What an instruction does to the slots followed: sets one (a load tells,
-/// a store puts), is a call, writes the captured ones (a cell store),
-/// those from a slot up or any, or exits with a snapshot, read before the
-/// instruction acts.
+/// a store puts), is a call, writes the captured ones (a cell store) or
+/// those from a slot up, or exits with a snapshot, read before the
+/// instruction acts. And where a load's register is read.
 #[derive(Clone, Copy)]
 enum Ev {
     Set(u16, Val),
     Call(Inst),
     Cells,
     From(u8),
-    All,
     Exit(Inst),
+    Read(Val),
+}
+
+/// The loads an instruction using `v` reads: `v`'s own (`Slots::load_of`),
+/// or those of the operands of what lowering computes at its use.
+fn reads(f: &Func<'_>, load_of: &[Val], v: Val, evs: &mut Vec<Ev>) {
+    let l = load_of[v.idx()];
+    if l != UNKNOWN {
+        evs.push(Ev::Read(l));
+    } else if let Some(d) = f.def_inst(v)
+        && f.op(d).folds()
+    {
+        for &a in f.args(d) {
+            reads(f, load_of, a, evs);
+        }
+    }
 }
 
 /// The contents of the slots snapshots name and the region loads or
@@ -54,16 +68,9 @@ struct Slots<'a, 'gc> {
     /// The slots followed, and each slot's index among them.
     regs: Vec<u8>,
     idx: [u16; 256],
-    /// Each block's events, a range of `evs`, and each event's instruction
-    /// index in its block.
+    /// Each block's events, a range of `evs`.
     evs: Vec<Ev>,
-    pos: Vec<u32>,
     range: Vec<(u32, u32)>,
-    /// The loads (the first 65535), each with its slot's index; each
-    /// value's load or `NONE`, and each slot's loads.
-    loads: Vec<(Val, u16)>,
-    load_of: Vec<u16>,
-    of_slot: Vec<Vec<u16>>,
     /// Registers a call's snapshot names with the slot's own value that it
     /// does not keep after all: another call of the snapshot does not.
     forbid: FastMap<u32, RegSet>,
@@ -73,7 +80,9 @@ struct Slots<'a, 'gc> {
 }
 
 impl<'a, 'gc> Slots<'a, 'gc> {
-    fn new(f: &'a Func<'gc>, cfg: &'a CfgInfo) -> Option<Self> {
+    /// And the load each value is, unchanged (`canon`, or narrowed):
+    /// lowering has those share its register or reads it for them.
+    fn new(f: &'a Func<'gc>, cfg: &'a CfgInfo) -> Option<(Self, Vec<Val>)> {
         let (mut named, mut touched, mut loaded) = (RegSet::EMPTY, RegSet::EMPTY, RegSet::EMPTY);
         for &b in &cfg.rpo {
             for &i in f.insts_of(b) {
@@ -104,29 +113,27 @@ impl<'a, 'gc> Slots<'a, 'gc> {
             idx[r as usize] = k as u16;
         }
         let cells = regs.iter().any(|&r| f.captured.contains(r as usize));
-        let (mut evs, mut pos, mut range) = (Vec::new(), Vec::new(), vec![(0, 0); f.blocks.len()]);
-        let mut loads = Vec::new();
-        let mut load_of = vec![NONE; f.vals.len()];
-        let mut of_slot = vec![Vec::new(); regs.len()];
+        let (mut evs, mut range) = (Vec::new(), vec![(0, 0); f.blocks.len()]);
+        let mut load_of = vec![UNKNOWN; f.vals.len()];
         for &b in &cfg.rpo {
             let start = evs.len() as u32;
-            for (j, &i) in f.insts_of(b).iter().enumerate() {
+            for &i in f.insts_of(b) {
                 let op = f.op(i);
+                if let Op::Box | Op::Unbox(_) | Op::Guard(_) | Op::Refine(_) | Op::LToI = op {
+                    load_of[f.result(i).idx()] = load_of[f.args(i)[0].idx()];
+                }
+                f.for_each_use(i, |v| reads(f, &load_of, v, &mut evs));
                 match op {
                     Op::Call { .. } | Op::CallMm { .. } => evs.push(Ev::Call(i)),
                     _ if f.insts[i.idx()].snap != NO_SNAP => evs.push(Ev::Exit(i)),
                     _ => {}
                 }
+                let written = evs.len();
                 match op {
                     Op::Load(r) => {
-                        let k = idx[r as usize];
                         let v = f.result(i);
-                        evs.push(Ev::Set(k, v));
-                        if loads.len() < NONE as usize {
-                            load_of[v.idx()] = loads.len() as u16;
-                            of_slot[k as usize].push(loads.len() as u16);
-                            loads.push((v, k));
-                        }
+                        evs.push(Ev::Set(idx[r as usize], v));
+                        load_of[v.idx()] = v;
                     }
                     Op::Store(r) if idx[r as usize] != NONE => {
                         evs.push(Ev::Set(idx[r as usize], canon(f, f.args(i)[0])));
@@ -136,14 +143,19 @@ impl<'a, 'gc> Slots<'a, 'gc> {
                     Op::CellStore if cells => evs.push(Ev::Cells),
                     // Its control and loop variables (`jit_tfor_next`).
                     Op::Helper(HelperId::TforNext { a, .. }) => evs.push(Ev::From(a)),
-                    op if op.effects().writes.contains(Mem::SLOT) => evs.push(Ev::All),
+                    op if op.effects().writes.contains(Mem::SLOT) => evs.push(Ev::From(0)),
                     _ => {}
                 }
-                pos.resize(evs.len(), j as u32);
+                // An exit reads its snapshot after what it wrote itself.
+                if evs.len() > written {
+                    for &(_, v) in f.snap_entries(i) {
+                        reads(f, &load_of, v, &mut evs);
+                    }
+                }
             }
             range[b.idx()] = (start, evs.len() as u32);
         }
-        Some(Slots {
+        let slots = Slots {
             f,
             cfg,
             out: vec![UNKNOWN; f.blocks.len() * regs.len()],
@@ -151,13 +163,10 @@ impl<'a, 'gc> Slots<'a, 'gc> {
             regs,
             idx,
             evs,
-            pos,
             range,
-            loads,
-            load_of,
-            of_slot,
             forbid: FastMap::default(),
-        })
+        };
+        Some((slots, load_of))
     }
 
     fn events(&self, b: Block) -> &[Ev] {
@@ -231,15 +240,9 @@ impl<'a, 'gc> Slots<'a, 'gc> {
                     }
                 }
             }
-            Ev::From(lo) => {
-                for (x, &r) in st.iter_mut().zip(&self.regs) {
-                    if r >= lo {
-                        *x = UNKNOWN;
-                    }
-                }
-            }
-            Ev::All => st.fill(UNKNOWN),
-            Ev::Exit(_) => {}
+            // `regs` ascends.
+            Ev::From(lo) => st[self.regs.partition_point(|&r| r < lo)..].fill(UNKNOWN),
+            Ev::Exit(_) | Ev::Read(_) => {}
         }
     }
 
@@ -302,83 +305,9 @@ impl<'a, 'gc> Slots<'a, 'gc> {
     }
 }
 
-/// Where the loads are live, for the home loads: those live into each
-/// block (a bitset of `words`), and each one's last use in each block that
-/// has any (`uses`, a range per block).
-struct Live {
-    words: usize,
-    live_in: Vec<u64>,
-    uses: Vec<(u32, u32)>,
-    range: Vec<(u32, u32)>,
-}
-
-impl Live {
-    fn new(f: &Func<'_>, cfg: &CfgInfo, load_of: &[u16], loads: usize) -> Live {
-        let (words, nb) = (loads.div_ceil(64), f.blocks.len());
-        let (mut live_in, mut kill) = (vec![0u64; nb * words], vec![0u64; nb * words]);
-        let (mut uses, mut range) = (Vec::new(), vec![(0, 0); nb]);
-        // Each load's entry of `uses` in the block walked.
-        const NO: u32 = u32::MAX;
-        let mut at = vec![NO; loads];
-        for &b in &cfg.rpo {
-            let (start, w) = (uses.len(), b.idx() * words);
-            for (j, &i) in f.insts_of(b).iter().enumerate() {
-                f.for_each_use(i, |v| match load_of[v.idx()] {
-                    NONE => {}
-                    l if at[l as usize] == NO => {
-                        at[l as usize] = uses.len() as u32;
-                        uses.push((l as u32, j as u32));
-                    }
-                    l => uses[at[l as usize] as usize].1 = j as u32,
-                });
-                if let Op::Load(_) = f.op(i) {
-                    let l = load_of[f.result(i).idx()];
-                    if l != NONE {
-                        kill[w + l as usize / 64] |= 1 << (l % 64);
-                    }
-                }
-            }
-            // Used here and defined elsewhere: live in.
-            for &(l, _) in &uses[start..] {
-                let l = l as usize;
-                at[l] = NO;
-                live_in[w + l / 64] |= !kill[w + l / 64] & 1 << (l % 64);
-            }
-            range[b.idx()] = (start as u32, uses.len() as u32);
-        }
-        loop {
-            let mut changed = false;
-            for &b in cfg.rpo.iter().rev() {
-                let w = b.idx() * words;
-                for s in f.succs(b) {
-                    for k in 0..words {
-                        let x = live_in[s.idx() * words + k] & !kill[w + k];
-                        changed |= x & !live_in[w + k] != 0;
-                        live_in[w + k] |= x;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        Live {
-            words,
-            live_in,
-            uses,
-            range,
-        }
-    }
-
-    fn live_in(&self, b: Block) -> &[u64] {
-        &self.live_in[b.idx() * self.words..][..self.words]
-    }
-}
-
 pub(crate) fn prune_snapshots(f: &mut Func<'_>) {
     let cfg = f.cfg();
-    let Some(mut slots) = Slots::new(f, &cfg) else {
-        f.home_loads.clear();
+    let Some((mut slots, mut load_of)) = Slots::new(f, &cfg) else {
         return;
     };
     loop {
@@ -387,65 +316,38 @@ pub(crate) fn prune_snapshots(f: &mut Func<'_>) {
             break;
         }
     }
-    let live = Live::new(f, &cfg, &slots.load_of, slots.loads.len());
     // Each exit's entries whose slot holds the value, what each call keeps
-    // in place, and the loads whose slot does not hold them somewhere they
-    // are live, or that a call still names (for another slot, or for their
-    // own without keeping it): those stay ordinary values. An exit naming
-    // one for another slot copies it from its own (`Loc::Slot`).
+    // in place, and the loads read where their slot does not hold them (or
+    // that a call names other than for their own slot, kept): those stay
+    // ordinary values. An exit naming a home load for another slot copies
+    // it from its own (`Loc::Slot`).
     let mut pruned: Vec<(Inst, u32, u32)> = Vec::new();
     let mut bits: Vec<bool> = Vec::new();
     let mut homes: Vec<(u32, RegSet)> = Vec::new();
-    let mut dirty = vec![false; slots.loads.len()];
-    // In the block walked: each load's last use (its instruction's index
-    // and one, or none), and those live out.
-    let mut last = vec![0u32; slots.loads.len()];
-    let mut out = vec![0u64; live.words];
-    let n = slots.regs.len();
-    let mut st = vec![UNKNOWN; n];
+    let mut st = vec![UNKNOWN; slots.regs.len()];
     for &b in &cfg.rpo {
         slots.meet(b, &mut st);
-        for (w, &x) in live.live_in(b).iter().enumerate() {
-            let mut x = x;
-            while x != 0 {
-                let l = w * 64 + x.trailing_zeros() as usize;
-                x &= x - 1;
-                let (v, k) = slots.loads[l];
-                dirty[l] |= st[k as usize] != v;
-            }
-        }
-        out.fill(0);
-        for s in f.succs(b) {
-            for (o, &x) in out.iter_mut().zip(live.live_in(s)) {
-                *o |= x;
-            }
-        }
-        let (ulo, uhi) = live.range[b.idx()];
-        for &(l, j) in &live.uses[ulo as usize..uhi as usize] {
-            last[l as usize] = j + 1;
-        }
-        let (lo, hi) = slots.range[b.idx()];
-        // The exiting instruction last seen: its snapshot is read after
-        // what it writes itself.
-        let mut exit = None;
-        for e in lo as usize..hi as usize {
-            let (ev, j) = (slots.evs[e], slots.pos[e]);
+        for &ev in slots.events(b) {
             let mut kept = RegSet::EMPTY;
-            // The slots written: one, or those left unknown.
-            let one = match ev {
+            match ev {
+                Ev::Read(v) => {
+                    if let Some(Op::Load(r)) = f.def_op(v)
+                        && st[slots.at(r) as usize] != v
+                    {
+                        load_of[v.idx()] = UNKNOWN;
+                    }
+                }
                 Ev::Exit(i) => {
                     let from = bits.len();
-                    for &(r, v) in f.snap_entries(i) {
+                    bits.extend((f.snap_entries(i).iter()).map(|&(r, v)| {
                         let k = slots.at(r);
-                        bits.push(k != NONE && st[k as usize] == canon(f, v));
-                    }
+                        k != NONE && st[k as usize] == canon(f, v)
+                    }));
                     if bits[from..].contains(&true) {
                         pruned.push((i, from as u32, bits.len() as u32));
                     } else {
                         bits.truncate(from);
                     }
-                    exit = Some((i, j));
-                    continue;
                 }
                 Ev::Call(i) => {
                     slots.step(&mut st, ev, Some(&mut kept));
@@ -453,64 +355,30 @@ pub(crate) fn prune_snapshots(f: &mut Func<'_>) {
                     if kept != RegSet::EMPTY {
                         homes.push((s, kept));
                     }
-                    if let Some(h) = f.call_homes.get(&s) {
-                        kept.union(h);
-                    }
-                    // Named for its own slot, which the call keeps: a home.
-                    for &(r, v) in f.entries(s) {
-                        let l = slots.load_of[canon(f, v).idx()];
-                        if l != NONE {
-                            let k = slots.loads[l as usize].1;
-                            dirty[l as usize] |= r == KEPT
-                                || slots.regs[k as usize] != r
-                                || !kept.contains(r as usize);
+                    for &(r, e) in f.entries(s) {
+                        let v = load_of[e.idx()];
+                        if v != UNKNOWN
+                            && (r == KEPT
+                                || f.def_op(v) != Some(Op::Load(r))
+                                || st[slots.at(r) as usize] != v)
+                        {
+                            load_of[v.idx()] = UNKNOWN;
                         }
                     }
-                    None
                 }
-                Ev::Set(k, _) => {
-                    slots.step(&mut st, ev, None);
-                    Some(k as usize)
-                }
-                Ev::Cells | Ev::From(_) | Ev::All => {
-                    slots.step(&mut st, ev, None);
-                    None
-                }
-            };
-            let named = |v: Val| {
-                exit.is_some_and(|(i, at)| {
-                    at == j && f.snap_entries(i).iter().any(|&(_, e)| canon(f, e) == v)
-                })
-            };
-            let written = match one {
-                Some(k) => k..k + 1,
-                None => 0..n,
-            };
-            for k in written {
-                if one.is_none() && st[k] != UNKNOWN {
-                    continue;
-                }
-                for &l in &slots.of_slot[k] {
-                    let (l, v) = (l as usize, slots.loads[l as usize].0);
-                    if st[k] != v
-                        && !dirty[l]
-                        && (last[l] > j + 1 || out[l / 64] >> (l % 64) & 1 != 0 || named(v))
-                    {
-                        dirty[l] = true;
-                    }
-                }
+                ev => slots.step(&mut st, ev, None),
             }
         }
-        for &(l, _) in &live.uses[ulo as usize..uhi as usize] {
-            last[l as usize] = 0;
-        }
-    }
-    let mut home = vec![false; f.vals.len()];
-    for (&(v, _), &d) in slots.loads.iter().zip(&dirty) {
-        home[v.idx()] = !d;
     }
     drop(slots);
-    f.home_loads = home;
+    for (v, &l) in load_of.iter().enumerate() {
+        if l == Val(v as u32)
+            && let i = f.def_inst(l).unwrap()
+            && let Op::Load(r) = f.op(i)
+        {
+            f.insts[i.idx()].op = Op::Home(r);
+        }
+    }
     for (s, kept) in homes {
         f.call_homes.entry(s).or_default().union(&kept);
     }

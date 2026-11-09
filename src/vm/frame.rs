@@ -590,15 +590,12 @@ impl<'gc> Walk<'gc> {
             self.queued += 1;
             let v = if fr.func & DYNAMIC != 0 {
                 let reg = unsafe { cur.base.offset_from_unsigned(f0.base) } + fr.a as usize;
-                let e = snap
-                    .entries()
-                    .find(|e| e.reg as usize == reg)
-                    .expect("an entry for a dynamic callee");
+                let e = snap.entry(reg).expect("an entry for a dynamic callee");
                 let w = match e.loc {
                     Loc::Spill(i) => unsafe {
                         *((fp + crate::jit::FRAME_SPILLS + 8 * i as usize) as *const u64)
                     },
-                    Loc::Home => unsafe { *(f0.base.add(reg) as *const u64) },
+                    Loc::Slot(r) => unsafe { *(f0.base.add(r as usize) as *const u64) },
                     loc => crate::jit::const_word(region, loc),
                 };
                 unsafe { Value::from_raw(w) }

@@ -288,11 +288,6 @@ pub(crate) struct Func<'gc> {
     /// hold what they will be read as after it, which the collector traces
     /// while the call runs (H11); it clears the frame's other slots there.
     pub(crate) call_homes: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
-    /// By value: a load whose slot holds its value wherever the value is
-    /// live, and which a call's snapshot names only for that slot, kept in
-    /// place (`opt::snaps`): the allocator loads it from the slot where it
-    /// is wanted, and an exit reads it there.
-    pub(crate) home_loads: Vec<bool>,
     /// The region slots closures capture, of every frame the region inlines,
     /// which a call may write through their cells.
     pub(crate) captured: crate::jit::build::cfg::RegSet,
@@ -386,7 +381,6 @@ impl<'gc> Func<'gc> {
             landings: Vec::new(),
             boundaries: false,
             call_homes: Default::default(),
-            home_loads: Vec::new(),
             captured: Default::default(),
             exit_sites: Default::default(),
             inline_frames: Vec::new(),

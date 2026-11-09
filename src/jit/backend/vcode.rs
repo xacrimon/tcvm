@@ -63,7 +63,7 @@ pub(crate) enum Remat {
         imm: u64,
     },
     /// The value of frame slot `r`, which holds it wherever the value is
-    /// live (`Func::home_loads`).
+    /// read (`Op::Home`).
     Slot(u8),
 }
 

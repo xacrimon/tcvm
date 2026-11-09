@@ -3771,3 +3771,28 @@ fn joined_table_pointers_across_calls() {
         true,
     );
 }
+
+/// A loaded value read after its slot is written again is not read from the
+/// slot: an exit of a loop's first compiled iteration names a local's old
+/// value, after a closure's capture had the new one stored.
+#[test]
+fn loaded_values_outlive_their_slots() {
+    agrees(
+        r##"
+        local tbl = {}
+        for i = 1, 400 do tbl[i] = i end
+        tbl[300], tbl[301], tbl[302] = 0.5, 0.5, 0.5
+        local a = 5
+        local res = 0
+        for i = 1, 400 do
+            local t = a
+            a = i
+            local c = function() return a end
+            local y = tbl[i] + 1
+            if y > 100000 then res = 0 end
+            res = res + t
+        end
+        return tostring(res)
+"##,
+    );
+}

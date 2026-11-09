@@ -1525,7 +1525,7 @@ impl<'a> Em<'a> {
             entries.push(SnapEntry {
                 reg: r as u8,
                 rep: SRep::Val,
-                loc: Loc::Home,
+                loc: Loc::Slot(r as u8),
             });
         }
         (entries, consts)

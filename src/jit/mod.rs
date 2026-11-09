@@ -289,7 +289,7 @@ pub(crate) fn const_word(region: &Region<'_>, loc: Loc) -> u64 {
         Loc::Nil => Value::nil().to_raw(),
         Loc::False => Value::boolean(false).to_raw(),
         Loc::True => Value::boolean(true).to_raw(),
-        Loc::Reg(_) | Loc::Spill(_) | Loc::Home | Loc::Slot(_) => {
+        Loc::Reg(_) | Loc::Spill(_) | Loc::Slot(_) => {
             unreachable!("not a constant location")
         }
     }

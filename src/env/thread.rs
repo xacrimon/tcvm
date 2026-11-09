@@ -283,7 +283,7 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
                                     as *const Value<'gc>;
                                 cc.trace(&*p);
                             }
-                            (Loc::Home, _) => homes.insert(e.reg as usize),
+                            (Loc::Slot(r), _) => homes.insert(r as usize),
                             _ => {}
                         }
                     }

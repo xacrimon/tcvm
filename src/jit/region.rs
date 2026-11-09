@@ -33,10 +33,9 @@ pub(crate) enum Loc {
     Nil,
     False,
     True,
-    /// At a call site: the register's home slot holds its value.
-    Home,
-    /// At an exit: the frame slot of this register holds the value, as the
-    /// exit finds it (before any entry is written).
+    /// The frame slot of this register holds the value: the entry's own at
+    /// a call site, its home; at an exit, as the exit finds it (before any
+    /// entry is written).
     Slot(u8),
 }
 
@@ -99,8 +98,7 @@ pub(crate) fn encode_snap(
             Loc::Nil => (3, 0),
             Loc::False => (4, 0),
             Loc::True => (5, 0),
-            Loc::Home => (6, 0),
-            Loc::Slot(r) => (7, r as u32),
+            Loc::Slot(r) => (6, r as u32),
         };
         assert!(index < 1 << 18);
         out.push(e.reg as u32 | (e.rep as u32) << 8 | loc << 11 | index << 14);
@@ -150,31 +148,38 @@ impl<'a> SnapView<'a> {
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = SnapEntry> + 'a {
-        self.entries.iter().map(|&w| {
-            let index = w >> 14;
-            let rep = match w >> 8 & 7 {
-                0 => SRep::Val,
-                1 => SRep::I32,
-                2 => SRep::I64,
-                3 => SRep::F64,
-                _ => SRep::B1,
-            };
-            let loc = match w >> 11 & 7 {
-                0 => Loc::Reg(index as u8),
-                1 => Loc::Spill(index as u16),
-                2 => Loc::Const(index),
-                3 => Loc::Nil,
-                4 => Loc::False,
-                5 => Loc::True,
-                6 => Loc::Home,
-                _ => Loc::Slot(index as u8),
-            };
-            SnapEntry {
-                reg: w as u8,
-                rep,
-                loc,
-            }
-        })
+        self.entries.iter().map(|&w| Self::entry_of(w))
+    }
+
+    /// The entry of register `reg`.
+    pub(crate) fn entry(&self, reg: usize) -> Option<SnapEntry> {
+        let w = self.entries.iter().find(|&&w| w as u8 as usize == reg)?;
+        Some(Self::entry_of(*w))
+    }
+
+    fn entry_of(w: u32) -> SnapEntry {
+        let index = w >> 14;
+        let rep = match w >> 8 & 7 {
+            0 => SRep::Val,
+            1 => SRep::I32,
+            2 => SRep::I64,
+            3 => SRep::F64,
+            _ => SRep::B1,
+        };
+        let loc = match w >> 11 & 7 {
+            0 => Loc::Reg(index as u8),
+            1 => Loc::Spill(index as u16),
+            2 => Loc::Const(index),
+            3 => Loc::Nil,
+            4 => Loc::False,
+            5 => Loc::True,
+            _ => Loc::Slot(index as u8),
+        };
+        SnapEntry {
+            reg: w as u8,
+            rep,
+            loc,
+        }
     }
 }
 
