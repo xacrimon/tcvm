@@ -29,7 +29,7 @@ pub enum ValueKind {
 // default NaN and its negation (`0x7FF8…`/`0xFFF8…`, the only NaNs arithmetic produces) stay plain
 // floats; only a NaN with a crafted payload can reach the box space, and `float` remaps it.
 const QNAN_NEG: u64 = 0xFFF8_0000_0000_0000;
-const TAG_SHIFT: u32 = 48;
+pub(crate) const TAG_SHIFT: u32 = 48;
 /// The first word of a box: every word below is a float.
 pub(crate) const BOX: u64 = QNAN_NEG | 1 << TAG_SHIFT;
 pub(crate) const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
@@ -39,11 +39,11 @@ const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 // word is 0xFFFF_FFFF: boxing a zero-extended i32 is one `orr` with a logical immediate and the
 // low word can be used as a `w` register without sign extension. nil/false/true sit just below.
 const TAG_USERDATA: u64 = 1;
-const TAG_BOXED_INT: u64 = 2;
-const TAG_STRING: u64 = 3;
+pub(crate) const TAG_BOXED_INT: u64 = 2;
+pub(crate) const TAG_STRING: u64 = 3;
 /// A string value's bits above its payload, the value address of its box.
 pub(crate) const STRING_BITS: u64 = QNAN_NEG | TAG_STRING << TAG_SHIFT;
-const TAG_TABLE: u64 = 4;
+pub(crate) const TAG_TABLE: u64 = 4;
 const TAG_FUNCTION: u64 = 5;
 /// A function value's bits but its payload, the closure's address.
 pub(crate) const FUNCTION_BITS: u64 = QNAN_NEG | TAG_FUNCTION << TAG_SHIFT;
