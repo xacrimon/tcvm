@@ -480,6 +480,10 @@ fn inline_site(
             called: false,
             region_return,
             counted: multi,
+            mm: match &b.inline {
+                Some(i) if tail => i.mm,
+                _ => mm.is_some(),
+            },
             cont,
             wanted,
             depth: depth + 1,
@@ -941,10 +945,12 @@ fn return_values(b: &mut Builder<'_, '_>, res: &[Val], seen: Vec<Val>, count: Op
 /// The body's `TAILCALL` of `callee` with `nargs` arguments from `R[a+4]`
 /// as a real call replacing its frame (W3 §5): from the body's header
 /// slot, wanting what its caller wanted, its results the body's returns.
-/// A lazy exit past it leaves as the caller, after the call it made.
+/// A lazy exit past it leaves as the caller, after the call it made; after
+/// a metamethod's instruction, which makes its own once `R[A]` holds the
+/// result (`mm_call_a`'s callers).
 pub(super) fn tail_call(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8, callee: Val) {
     let i = b.inline.as_ref().expect("an inlined body");
-    let (base, wanted) = (i.base, i.wanted);
+    let (base, wanted, mm) = (i.base, i.wanted, i.mm);
     let x = b.f.inline_frames[i.frame as usize];
     let seen = watched(b);
     let (callee, proto) = super::emit::known_callee(b, pc, callee);
@@ -978,14 +984,16 @@ pub(super) fn tail_call(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8, call
     } else {
         (0..wanted).map(|k| b.ins(Op::Load(hdr + k), &[])).collect()
     };
-    let from = b.f.snap_pool.len();
-    let outer = b.inline.as_ref().unwrap().outer_entries();
-    b.f.snap_pool.extend_from_slice(&outer);
-    for (k, &v) in res.iter().enumerate() {
-        b.f.snap_pool.push((hdr + k as u8, v));
+    if !mm {
+        let from = b.f.snap_pool.len();
+        let outer = b.inline.as_ref().unwrap().outer_entries();
+        b.f.snap_pool.extend_from_slice(&outer);
+        for (k, &v) in res.iter().enumerate() {
+            b.f.snap_pool.push((hdr + k as u8, v));
+        }
+        let s =
+            b.f.finish_snap(x.parent, x.caller_pc, crate::jit::ir::ExitKind::After, from);
+        b.lazy_exit(s);
     }
-    let s =
-        b.f.finish_snap(x.parent, x.caller_pc, crate::jit::ir::ExitKind::After, from);
-    b.lazy_exit(s);
     return_values(b, &res, seen, None);
 }

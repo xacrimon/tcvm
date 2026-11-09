@@ -316,6 +316,8 @@ pub(crate) struct Inline {
     /// Its call wants every result (W3 §7): its returns pass `wanted`
     /// values, nil past theirs, and their count.
     pub(crate) counted: bool,
+    /// Its call is a metamethod's, or the one of the body it replaces was.
+    pub(crate) mm: bool,
     /// Parameters the body never writes whose arguments the caller's
     /// registers hold after the call, reported at each return.
     pub(crate) watch: Vec<u8>,
