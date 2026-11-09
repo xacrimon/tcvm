@@ -561,7 +561,7 @@ pub(crate) fn compile<'gc>(
         native_act: crate::vm::native::native_act as *const () as usize,
         dead_entry: crate::jit::jit_dead_entry as *const () as usize,
         level_enter: abi::level_enter as *const () as usize,
-        call_miss: abi::call_miss as *const () as usize,
+        fast_miss: abi::direct_miss as *const () as usize,
         rt: crate::jit::layout::rt_word(ctx) as u64,
         metrics: crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64,
         type_mt_cells: std::array::from_fn(|s| {

@@ -360,11 +360,11 @@ pub(crate) unsafe extern "C" fn level_return() {
     )
 }
 
-/// Where a direct call goes while its callee's prototype has no fast entry
-/// (`jit::direct_target`): what a fast entry's failed check does (`emit`'s
-/// `fast_miss`). A tail call from a frame dispatch entered has its landing
-/// for a return address: `enter` runs the call from the header the tail
-/// call wrote, in the level. Otherwise on to the caller's slow path.
+/// Where a fast entry's failed checks go, and a direct call while its
+/// callee's prototype has no fast entry (`jit::direct_target`). A tail call
+/// from a frame dispatch entered has its landing for a return address:
+/// `enter` runs the call from the header the tail call wrote, in the level.
+/// Otherwise on to the caller's slow path.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn direct_miss() {
     core::arch::naked_asm!(
