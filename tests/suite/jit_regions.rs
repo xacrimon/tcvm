@@ -2112,6 +2112,27 @@ fn register_arguments_and_results() {
     );
 }
 
+/// A recursion going deeper each time, its inlined callee's frame past its
+/// own window: the entry makes sure of both, growing the stack where the
+/// interpreter's call grew it for the recursing frame alone.
+#[test]
+fn inlined_frames_window_grows() {
+    agrees(
+        "local function wide(x)
+          local a, b, c, d, e, f, g, h, i, j = x, x + 1, x + 2, x + 3, x + 4, x + 5, x + 6, x + 7, x + 8, x + 9
+          local k, l, m, n, o, p, q, r, s, t = a + b, c + d, e + f, g + h, i + j, a * b, c * d, e * f, g * h, i * j
+          return k + l + m + n + o + p + q + r + s + t
+        end
+        local function down(n)
+          if n == 0 then return 0 end
+          return wide(n) + down(n - 1)
+        end
+        local s = 0
+        for i = 1, 300 do s = s + down(i) end
+        return tostring(s)",
+    );
+}
+
 /// Float constants reaching loop-carried floats that live in stack slots
 /// across a call: the allocator computes each in the transport register,
 /// as its word, and stores that (a float register took it, unstored).

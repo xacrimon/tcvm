@@ -295,6 +295,11 @@ pub(crate) struct Func<'gc> {
     /// guard hoisted out of a loop (E2), and the access it stands for.
     pub(crate) exit_sites: crate::jit::FastMap<Inst, ExitSite>,
     pub(crate) inline_frames: Vec<InlineFrame>,
+    /// The slots past the region's base its inlined frames, staged calls
+    /// and reads up to `top` take, which every entry makes sure of once
+    /// (`Lowered::window`): the stack never moves or shrinks, and every
+    /// exit and call comes after the entry.
+    pub(crate) window: u16,
     /// The prototypes guards prove callees closures of, which the region
     /// keeps alive.
     pub(crate) protos: Vec<Gc<'gc, Prototype<'gc>>>,
@@ -384,6 +389,7 @@ impl<'gc> Func<'gc> {
             captured: Default::default(),
             exit_sites: Default::default(),
             inline_frames: Vec::new(),
+            window: 0,
             protos: Vec::new(),
             deps: Vec::new(),
             stable_used: RefCell::new(Vec::new()),

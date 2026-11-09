@@ -244,6 +244,9 @@ pub(crate) struct Region<'gc> {
     /// The functions of exits' sites outside their snapshots' frames.
     pub(crate) site_protos: Box<[Gc<'gc, Prototype<'gc>>]>,
     pub(crate) entry_pc: u32,
+    /// The slots past its base the region's inlined frames take, past the
+    /// frame's own window (`Lowered::window`), else 0.
+    pub(crate) window: u16,
     /// The entry's loop nest, innermost first (`Entry::nest`).
     #[collect(require_static)]
     pub(crate) nest: Box<[u32]>,

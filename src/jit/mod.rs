@@ -234,11 +234,22 @@ handler! {
         let region: &Region<'gc> = unsafe { &*(insn.raw() as *const Region<'gc>) };
         let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
         on_entry_fail(rt, closure, base, region);
-        let site = unsafe { closure.code.add(region.entry_pc as usize) };
-        let mut word = unsafe { *site };
-        if word.is_jit_word() {
-            word = original_of(closure, word);
-        }
+        let (site, word) = entry_word(closure, region, false);
+        pc = unsafe { site.add(1) };
+        let h = rt.handler(word.opcode());
+        tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
+    }
+
+    /// An interpreter entry whose inlined frames' window does not fit (from
+    /// its stub, `insn` the region, its frame not open): grow the stack and
+    /// enter again, else run the original instruction, which overflows only
+    /// where the frames do.
+    slow fn jit_window {
+        let region: &Region<'gc> = unsafe { &*(insn.raw() as *const Region<'gc>) };
+        let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        let ts = thread!();
+        let end = ts.slot_index(base) + region.window as usize;
+        let (site, word) = entry_word(closure, region, ts.ensure_frame_slots(end));
         pc = unsafe { site.add(1) };
         let h = rt.handler(word.opcode());
         tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
@@ -251,11 +262,7 @@ handler! {
         let region: &Region<'gc> = unsafe { &*(insn.raw() as *const Region<'gc>) };
         let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
         retire_invalidated(rt, closure, region);
-        let site = unsafe { closure.code.add(region.entry_pc as usize) };
-        let mut word = unsafe { *site };
-        if word.is_jit_word() {
-            word = original_of(closure, word);
-        }
+        let (site, word) = entry_word(closure, region, false);
         pc = unsafe { site.add(1) };
         let h = rt.handler(word.opcode());
         tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
@@ -361,6 +368,23 @@ fn entry_site(closure: LuaFn<'_>, site: u32, word: Instruction) -> Option<u32> {
         _ => site,
     };
     (!code(at).is_jit_word()).then_some(at)
+}
+
+/// The site of `region`'s entry in `closure` and the word to run there: the
+/// entry's own to `enter` it again, else the instruction it replaced.
+fn entry_word<'gc>(
+    closure: LuaFn<'gc>,
+    region: &Region<'gc>,
+    enter: bool,
+) -> (*const Instruction, Instruction) {
+    // SAFETY: the entry is an instruction of the region's function.
+    let site = unsafe { closure.code.add(region.entry_pc as usize) };
+    let word = unsafe { *site };
+    if word.is_jit_word() && !enter {
+        (site, original_of(closure, word))
+    } else {
+        (site, word)
+    }
 }
 
 /// The word a JIT word replaced.
