@@ -232,6 +232,12 @@ pub(crate) struct CfgInfo {
     inc_at: Vec<u32>,
     inc: Vec<(Inst, u32)>,
     pub(crate) idom: Vec<Option<Block>>,
+    /// The dominator tree: each reachable block's children.
+    kids_at: Vec<u32>,
+    kids: Vec<Block>,
+    /// Each block's (preorder, postorder) number in the dominator tree, for
+    /// constant-time dominance; `(u32::MAX, 0)` for an unreachable one.
+    dfs: Vec<(u32, u32)>,
 }
 
 impl CfgInfo {
@@ -248,7 +254,14 @@ impl CfgInfo {
     }
 
     pub(crate) fn dominates(&self, a: Block, b: Block) -> bool {
-        verify::dominates(&self.idom, a, b)
+        let (x, y) = (self.dfs[a.idx()], self.dfs[b.idx()]);
+        a == b || x.0 <= y.0 && y.1 <= x.1 && self.idom[b.idx()].is_some()
+    }
+
+    /// The blocks `b` immediately dominates.
+    #[inline]
+    pub(crate) fn children(&self, b: Block) -> &[Block] {
+        &self.kids[self.kids_at[b.idx()] as usize..self.kids_at[b.idx() + 1] as usize]
     }
 }
 
@@ -455,8 +468,40 @@ impl<'gc> Func<'gc> {
             inc_at,
             inc,
             idom: Vec::new(),
+            kids_at: vec![0; n + 1],
+            kids: Vec::new(),
+            dfs: vec![(u32::MAX, 0); n],
         };
         info.idom = verify::dominators(self, &info);
+        let child = |b: Block| info.idom[b.idx()].filter(|_| b != self.entry);
+        for &b in &info.rpo {
+            if let Some(p) = child(b) {
+                info.kids_at[p.idx() + 1] += 1;
+            }
+        }
+        for k in 0..n {
+            info.kids_at[k + 1] += info.kids_at[k];
+        }
+        let mut fill = info.kids_at.clone();
+        info.kids = vec![Block(0); info.kids_at[n] as usize];
+        for &b in &info.rpo {
+            if let Some(p) = child(b) {
+                info.kids[fill[p.idx()] as usize] = b;
+                fill[p.idx()] += 1;
+            }
+        }
+        let mut count = 0;
+        let mut stack = vec![(self.entry, false)];
+        while let Some((b, done)) = stack.pop() {
+            count += 1;
+            if done {
+                info.dfs[b.idx()].1 = count;
+                continue;
+            }
+            info.dfs[b.idx()].0 = count;
+            stack.push((b, true));
+            stack.extend(info.children(b).iter().rev().map(|&c| (c, false)));
+        }
         info
     }
 
