@@ -134,7 +134,24 @@ struct InternerState<'gc> {
     young: Vec<LuaString<'gc>, MetricsAlloc<'gc>>,
     // Randomly seeded, like PUC's `luai_makeseed`; dictionary tables reuse this hash, so their
     // `pairs` order differs between runs.
-    hasher: foldhash::fast::RandomState,
+    hasher: StrHasher,
+}
+
+#[cfg(not(feature = "tcvm-dev"))]
+type StrHasher = foldhash::fast::RandomState;
+#[cfg(feature = "tcvm-dev")]
+type StrHasher = foldhash::fast::SeedableRandomState;
+
+/// `TCVM_HASH_SEED=N` (tcvm-dev) fixes the seed, and with it `pairs` orders.
+fn str_hasher() -> StrHasher {
+    #[cfg(feature = "tcvm-dev")]
+    if let Some(n) = std::env::var("TCVM_HASH_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return StrHasher::with_seed(n, foldhash::SharedSeed::global_fixed());
+    }
+    StrHasher::default()
 }
 
 // SAFETY: the entries are not traced on purpose (see `InternerState`).
@@ -147,7 +164,7 @@ impl<'gc> Interner<'gc> {
         let state = InternerState {
             table: HashTable::new_in(MetricsAlloc::new(mc)),
             young: Vec::new_in(MetricsAlloc::new(mc)),
-            hasher: foldhash::fast::RandomState::default(),
+            hasher: str_hasher(),
         };
 
         Self(Gc::new(mc, RefLock::new(state)))
