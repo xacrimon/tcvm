@@ -4,7 +4,7 @@
 local co = coroutine
 local create, resume, yield = co.create, co.resume, co.yield
 
-local N = tonumber(arg and arg[1]) or 10
+local N = math.floor(tonumber(arg and arg[1]) or 10)
 local first, second
 
 -- Meet another creature.

@@ -22,8 +22,8 @@ Vec2.__tostring = function(v) return format("(%.2f, %.2f)", v.x, v.y) end
 -- Deterministic LCG so the workload is identical across implementations.
 local seed = 42
 local function rand()
-    seed = (seed * 1103515245 + 12345) % 2147483648
-    return seed / 2147483648
+    seed = (seed * 69069 + 1) % 4294967296
+    return seed / 4294967296
 end
 
 -- Particle "class" with a per-instance update closure capturing p and drag.
@@ -114,7 +114,7 @@ function World:report()
     local ps = self.particles
     sort(ps, function(a, b) return a.id < b.id end)
     local lines = {}
-    local sumx, sumy = 0, 0
+    local sumx, sumy = 0.0, 0.0
     for _, p in ipairs(ps) do
         sumx, sumy = sumx + p.pos.x, sumy + p.pos.y
     end
@@ -126,6 +126,6 @@ function World:report()
 end
 
 local frames = tonumber(arg and arg[1]) or 600
-local world = World.new(400, 5)
+local world = World.new(400, 5.0)
 for _ = 1, frames do world:step(0.1) end
 print(world:report())

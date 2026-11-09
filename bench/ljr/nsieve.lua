@@ -24,7 +24,7 @@ if N < 2 then N = 2 end
 local primes = {}
 
 for i=0,2 do
-  local m = (2^(N-i))*10000
+  local m = math.floor((2^(N-i))*10000)
   io.write(string.format("Primes up to %8d %8d\n", m, nsieve(primes, m)))
 end
 

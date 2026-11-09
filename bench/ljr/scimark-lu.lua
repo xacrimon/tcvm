@@ -28,7 +28,7 @@ for i=1,17 do Rm[i] = 0 end
 function rand_init(seed)
   Rj = 1
   for i=17,1,-1 do
-    seed = (seed*9069) % (2^31)
+    seed = (seed*9069) % 2147483648
     Rm[i] = seed
   end
 end
@@ -71,7 +71,7 @@ local function fft_bitreverse(v, n)
       v[i+1], v[i+2], v[j+1], v[j+2] = v[j+1], v[j+2], v[i+1], v[i+2]
     end
     local k = n
-    while k <= j do j = j - k; k = k / 2 end
+    while k <= j do j = j - k; k = floor(k / 2) end
     j = j + k
   end
 end
@@ -181,7 +181,7 @@ end
 local function sparse_mult(n, cycles, vy, val, row, col, vx)
   for p=1,cycles do
     for r=1,n do
-      local sum = 0
+      local sum = 0.0
       for i=row[r],row[r+1]-1 do sum = sum + vx[col[i]] * val[i] end
       vy[r] = sum
     end
@@ -224,7 +224,7 @@ local function lu_factor(a, pivot, m, n)
       end
     end
     pivot[j] = jp
-    if a[jp][j] == 0 then error("zero pivot") end
+    if a[jp][j] == 0.0 then error("zero pivot") end
     if jp ~= j then a[j], a[jp] = a[jp], a[j] end
     if j < m then
       local recp = 1.0 / a[j][j]

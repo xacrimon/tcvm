@@ -908,7 +908,7 @@ function ScaleConstraint:execute ()
     if self.direction == 'forward' then
         self.v2.value = self.v1.value * self.scale.value + self.offset.value
     else
-        self.v1.value = (self.v2.value - self.offset.value) / self.scale.value
+        self.v1.value = math.floor((self.v2.value - self.offset.value) / self.scale.value)
     end
 end
 
@@ -1229,7 +1229,7 @@ end
 end -- object deltablue
 
 
-local benchmark_iterations = (arg[1] or 30000)
+local benchmark_iterations = tonumber(arg[1]) or 30000
 assert(deltablue:inner_benchmark_loop(benchmark_iterations),
        'Benchmark failed with incorrect result')
 

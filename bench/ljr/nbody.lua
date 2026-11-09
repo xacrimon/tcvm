@@ -11,12 +11,12 @@ local SOLAR_MASS = 4 * PI * PI
 local DAYS_PER_YEAR = 365.24
 local bodies = {
   { -- Sun
-    x = 0,
-    y = 0,
-    z = 0,
-    vx = 0,
-    vy = 0,
-    vz = 0,
+    x = 0.0,
+    y = 0.0,
+    z = 0.0,
+    vx = 0.0,
+    vy = 0.0,
+    vz = 0.0,
     mass = SOLAR_MASS
   },
   { -- Jupiter
@@ -86,7 +86,7 @@ local function advance(bodies, nbody, dt)
 end
 
 local function energy(bodies, nbody)
-  local e = 0
+  local e = 0.0
   for i=1,nbody do
     local bi = bodies[i]
     local vx, vy, vz, bim = bi.vx, bi.vy, bi.vz, bi.mass
@@ -102,7 +102,7 @@ local function energy(bodies, nbody)
 end
 
 local function offsetMomentum(b, nbody)
-  local px, py, pz = 0, 0, 0
+  local px, py, pz = 0.0, 0.0, 0.0
   for i=1,nbody do
     local bi = b[i]
     local bim = bi.mass

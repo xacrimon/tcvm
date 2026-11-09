@@ -16,12 +16,12 @@ local function series(n)
   local omega = math.pi
   local t = {}
 
-  t[1] = integrate(0, 2, 1000, 0, function() return 1 end) / 2
-  t[2] = 0
+  t[1] = integrate(0.0, 2.0, 1000, 0.0, function() return 1.0 end) / 2
+  t[2] = 0.0
 
   for i=2,n do
-    t[2*i-1] = integrate(0, 2, 1000, omega*i, cos)
-    t[2*i] = integrate(0, 2, 1000, omega*i, sin)
+    t[2*i-1] = integrate(0.0, 2.0, 1000, omega*i, cos)
+    t[2*i] = integrate(0.0, 2.0, 1000, omega*i, sin)
   end
 
   return t

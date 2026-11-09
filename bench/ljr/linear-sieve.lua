@@ -22,6 +22,6 @@ sieve = function(n)
 	return cnt
 end
 
-local n = tonumber((arg and arg[1])) or 1000000
+local n = math.floor(tonumber((arg and arg[1])) or 1000000)
 print(sieve(n))
 

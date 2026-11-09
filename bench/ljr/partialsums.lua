@@ -4,9 +4,9 @@
 local n = tonumber(arg[1])
 local function pr(fmt, x) io.write(string.format(fmt, x)) end
 
-local a1, a2, a3, a4, a5, a6, a7, a8, a9, alt = 1, 0, 0, 0, 0, 0, 0, 0, 0, 1
+local a1, a2, a3, a4, a5, a6, a7, a8, a9, alt = 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
 local sqrt, sin, cos = math.sqrt, math.sin, math.cos
-for k=1,n do
+for k=1.0,n do
   local k2, sk, ck = k*k, sin(k), cos(k)
   local k3 = k2*k
   a1 = a1 + (2/3)^k

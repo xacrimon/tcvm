@@ -867,7 +867,7 @@ end
 end -- object json
 
 
-local benchmark_iterations = (arg[1] or 500)
+local benchmark_iterations = tonumber(arg[1]) or 500
 assert(json:inner_benchmark_loop(benchmark_iterations),
        'Benchmark failed with incorrect result')
 

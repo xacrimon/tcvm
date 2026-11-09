@@ -4,7 +4,7 @@ function create_rng(seed)
   local Rm, Rj = {}, 1
   for i=1,17 do Rm[i] = 0 end
   for i=17,1,-1 do
-    seed = (seed*9069) % (2^31)
+    seed = (seed*9069) % 2147483648
     Rm[i] = seed
   end
   return function()

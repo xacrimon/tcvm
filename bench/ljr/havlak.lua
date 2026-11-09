@@ -1191,7 +1191,7 @@ end
 
 end -- object havlak
 
-local benchmark_iterations = (arg[1] or 15)
+local benchmark_iterations = tonumber(arg[1]) or 15
 assert(havlak:inner_benchmark_loop(benchmark_iterations),
        'Benchmark failed with incorrect result')
 

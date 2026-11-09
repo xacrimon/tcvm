@@ -131,7 +131,7 @@ end
 
 end -- object bounce
 
-local benchmark_iterations = (arg[1] or 1)
+local benchmark_iterations = tonumber(arg[1]) or 1
 assert(bounce:inner_benchmark_loop(benchmark_iterations),
        'Benchmark failed with incorrect result')
 

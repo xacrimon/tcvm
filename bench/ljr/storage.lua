@@ -88,6 +88,6 @@ end
 
 end -- object storage
 
-local benchmark_iterations = (arg[1] or 2000)
+local benchmark_iterations = tonumber(arg[1]) or 2000
 assert(storage:inner_benchmark_loop(benchmark_iterations),
        'Benchmark failed with incorrect result')

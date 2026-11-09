@@ -78,7 +78,7 @@ end
 
 end -- object permute
 
-local benchmark_iterations = (arg[1] or 7000)
+local benchmark_iterations = tonumber(arg[1]) or 7000
 assert(permute:inner_benchmark_loop(benchmark_iterations),
        'Benchmark failed with incorrect result')
 

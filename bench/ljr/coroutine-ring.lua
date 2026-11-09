@@ -3,7 +3,7 @@
 -- contributed by Sam Roberts
 -- reviewed by Bruno Massa
 
-local n         = tonumber(arg and arg[1]) or 2e7
+local n         = math.floor(tonumber(arg and arg[1]) or 20000000)
 
 -- fixed size pool
 local poolsize  = 503

@@ -9,9 +9,9 @@ local function array_set(self, x, y, z, p)
   local image = self.image
   if self.packed then
     local maxv = self.max_voltage
-    if p > maxv then self.max_voltage = p*2.0 end
-    local oldp = image[pos] or 0.0 -- Works with uninitialized table, too
-    if oldp > maxv then p = p + maxv*2.0 end
+    if p > maxv then self.max_voltage = p*2 end
+    local oldp = image[pos] or 0 -- Works with uninitialized table, too
+    if oldp > maxv then p = p + maxv*2 end
     image[pos] = p
   else
     image[pos] = p
@@ -42,7 +42,7 @@ end
 local function array_new(nx, ny, nz, packed)
   return {
     nx = nx, ny = ny, nz = nz,
-    packed = packed, max_voltage = 0.0,
+    packed = packed, max_voltage = 0,
     changed = false, changed_recently = false,
     image = {}, -- Preferably use a fixed-type, pre-sized array here.
     set = array_set,

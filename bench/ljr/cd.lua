@@ -1075,10 +1075,10 @@ function CollisionDetector:voxel_hash (position)
     local x = GOOD_VOXEL_SIZE * x_div
     local y = GOOD_VOXEL_SIZE * y_div
 
-    if position.x < 0 then
+    if position.x < 0.0 then
         x = x - GOOD_VOXEL_SIZE
     end
-    if position.y < 0 then
+    if position.y < 0.0 then
         y = y - GOOD_VOXEL_SIZE
     end
 
@@ -1123,11 +1123,11 @@ function Simulator:simulate (time)
     for i = 1, self.aircraft:size() - 1, 2 do
         frame:append(Aircraft.new(self.aircraft:at(i),
                                   Vector3D.new(time,
-                                               cos(time) * 2 + (i - 1) * 3,
+                                               cos(time) * 2.0 + (i - 1) * 3,
                                                10.0)))
         frame:append(Aircraft.new(self.aircraft:at(i + 1),
                                   Vector3D.new(time,
-                                               sin(time) * 2 + (i - 1) * 3,
+                                               sin(time) * 2.0 + (i - 1) * 3,
                                                10.0)))
     end
     return frame
@@ -1180,7 +1180,7 @@ end
 
 end -- object cd
 
-local benchmark_iterations = (arg[1] or 1000)
+local benchmark_iterations = tonumber(arg[1]) or 1000
 assert(cd:inner_benchmark_loop(benchmark_iterations),
        'Benchmark failed with incorrect result')
 

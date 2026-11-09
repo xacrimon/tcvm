@@ -382,11 +382,11 @@ function Scheduler:create_idler (identity, priority, work, state)
             return self:hold_self()
         else
             if 0 == data.control % 2 then
-                data.control = data.control / 2
+                data.control = math.floor(data.control / 2)
                 return self:release(DEVICE_A)
             else
                 -- data.control = bxor((data.control - 1) / 2, 53256)
-                local v = (data.control - 1) / 2
+                local v = math.floor((data.control - 1) / 2)
                 if (v % 65536 >= 32768) then v = v - 32768 else v = v + 32768 end
                 if (v % 32768 >= 16384) then v = v - 16384 else v = v + 16384 end
                 if (v % 8192 >= 4096) then v = v - 4096 else v = v + 4096 end
@@ -543,6 +543,6 @@ end
 end -- object richards
 
 
-local benchmark_iterations = (arg[1] or 100)
+local benchmark_iterations = tonumber(arg[1]) or 100
 assert(richards:inner_benchmark_loop(benchmark_iterations),
        'Benchmark failed with incorrect result')

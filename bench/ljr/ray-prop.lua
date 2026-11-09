@@ -6,7 +6,7 @@
 local sqrt = math.sqrt
 local huge = math.huge
 
-local delta = 1
+local delta = 1.0
 while delta * delta + 1 ~= 1 do
   delta = delta * 0.5
 end
@@ -33,12 +33,12 @@ local function sphere_distance(self, origin, dir)
   local b = dot(vx, vy, vz, dir.x, dir.y, dir.z)
   local r = self.radius
   local disc = r*r + b*b - vx*vx-vy*vy-vz*vz
-  if disc < 0 then return huge end
+  if disc < 0.0 then return huge end
   local d = sqrt(disc)
   local t2 = b + d
-  if t2 < 0 then return huge end
+  if t2 < 0.0 then return huge end
   local t1 = b - d
-  return t1 > 0 and t1 or t2
+  return t1 > 0.0 and t1 or t2
 end
 
 function sphere:intersect(origin, dir, best)
@@ -72,18 +72,18 @@ function group:intersect(origin, dir, best)
   end
 end
 
-local hit = { x = 0, y = 0, z = 0 }
+local hit = { x = 0.0, y = 0.0, z = 0.0 }
 local ilight
-local best = { huge, { x = 0, y = 0, z = 0 } }
+local best = { huge, { x = 0.0, y = 0.0, z = 0.0 } }
 
 local function ray_trace(light, camera, dir, scene)
   best[1] = huge
   scene:intersect(camera, dir, best)
   local b1 = best[1]
-  if b1 == huge then return 0 end
+  if b1 == huge then return 0.0 end
   local b2 = best[2]
   local g = vdot(b2, light)
-  if g >= 0 then return 0 end
+  if g >= 0.0 then return 0.0 end
   hit.x = camera.x + b1*dir.x + delta*b2.x
   hit.y = camera.y + b1*dir.y + delta*b2.y
   hit.z = camera.z + b1*dir.z + delta*b2.z
@@ -92,7 +92,7 @@ local function ray_trace(light, camera, dir, scene)
   if best[1] == huge then
     return -g
   else
-    return 0
+    return 0.0
   end
 end
 
@@ -118,17 +118,18 @@ local gf = 255/(ss*ss)
 io.write(("P5\n%d %d\n255\n"):format(n, n))
 local light = unitise(-1, -3, 2)
 ilight = { x = -light.x, y = -light.y, z = -light.z }
-local camera = { x = 0, y = 0, z = -4 }
-local dir = { x = 0, y = 0, z = 0 }
+local camera = { x = 0.0, y = 0.0, z = -4.0 }
+local dir = { x = 0.0, y = 0.0, z = 0.0 }
 
-local scene = create(level, {x = 0, y = -1, z = 0}, 1)
+local scene = create(level, {x = 0.0, y = -1.0, z = 0.0}, 1.0)
 
+local nf = n + 0.0
 for y = n/2-1, -n/2, -1 do
   for x = -n/2, n/2-1 do
-    local g = 0
+    local g = 0.0
     for d = y, y+.99, iss do
       for e = x, x+.99, iss do
-        dir = unitise(e, d, n)
+        dir = unitise(e, d, nf)
         g = g + ray_trace(light, camera, dir, scene) 
       end
     end

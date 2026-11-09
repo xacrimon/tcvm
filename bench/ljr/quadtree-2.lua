@@ -244,7 +244,7 @@ end
 local function show(p)
 	local N=2^10
 	output(N)
-	save(root,0,0,N)
+	save(root,0.0,0.0,N)
 end
 
 local t0=0
