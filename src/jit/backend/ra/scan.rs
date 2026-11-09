@@ -274,6 +274,29 @@ impl Ra {
         use_pos
     }
 
+    /// Whether piece `x`, with no register use left from `s`, wants one
+    /// again in the next iteration of a loop holding `s`: held from its
+    /// header to its back edge and used in it before `s`, where the
+    /// linear order hides that use. A constant hoisted before the loop
+    /// would else be the first to give up its register.
+    fn loop_carried(&self, x: u32, s: Pos) -> bool {
+        let mut h = self.inner[self.block_of_pos(s) as usize];
+        while h != NONE {
+            let (hs, he) = (self.block_start(h), self.hot_end[h as usize]);
+            if he <= s || self.start(x) > hs || self.end(x) < he {
+                return false;
+            }
+            if self
+                .next_use(x, hs, Want::Beneficial)
+                .is_some_and(|u| u.pos < s)
+            {
+                return true;
+            }
+            h = self.outer[h as usize];
+        }
+        false
+    }
+
     /// The register `c` would like: that of its first fixed use, else its
     /// previous piece's, else that of the fixed definition right after it.
     fn hint(&self, c: u32) -> Option<usize> {
@@ -386,11 +409,14 @@ impl Ra {
             let idle = |x: &Held| {
                 x.cls as usize != cls
                     || x.k as usize != h
-                    || self.next_use(x.x, s, Want::Beneficial).is_none_or(|u| {
-                        self.vregs[self.pieces[x.x as usize].g as usize].remat
-                            && u.pos > s
-                            && self.freq_at(u.pos) < here
-                    })
+                    || match self.next_use(x.x, s, Want::Beneficial) {
+                        None => !self.loop_carried(x.x, s),
+                        Some(u) => {
+                            self.vregs[self.pieces[x.x as usize].g as usize].remat
+                                && u.pos > s
+                                && self.freq_at(u.pos) < here
+                        }
+                    }
             };
             if a.free[h] < e
                 && a.fixed[h] >= e
