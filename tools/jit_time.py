@@ -12,18 +12,20 @@ import subprocess
 import tempfile
 import time
 
+from ljr import SUITE, programs, source
+
 STAGES = ["build", "passes", "lower", "regalloc", "emit"]
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--suite", default=os.path.expanduser("~/repos/luajit-remake/luabench"))
+    ap.add_argument("--suite", default=SUITE)
     ap.add_argument("--only", default="")
     ap.add_argument("--passes", action="store_true")
     ap.add_argument("--bin", default=os.path.join(os.path.dirname(__file__), "..",
                                                   "target", "release", "tcvm-cli"))
     a = ap.parse_args()
-    names = sorted(f[:-4] for f in os.listdir(a.suite) if f.endswith(".lua") and f != "life.lua")
+    names = programs(a.suite)
     if a.only:
         names = [n for n in names if n in set(a.only.split(","))]
     wrapdir = tempfile.mkdtemp(prefix="jit-time-")
@@ -33,7 +35,7 @@ def main():
         w = os.path.join(wrapdir, n + ".lua")
         with open(w, "w") as fh:
             fh.write("unpack = unpack or table.unpack\nloadstring = loadstring or load\n"
-                     f"return assert(loadfile({os.path.join(a.suite, n + '.lua')!r}))(...)\n")
+                     f"return assert(loadfile({source(a.suite, n, True)!r}))(...)\n")
         args = ["200000"] if n == "partialsums" else []
         t = time.time()
         p = subprocess.run([a.bin, "-f", w] + args, cwd=a.suite, capture_output=True, text=True,

@@ -2,14 +2,16 @@
 """Run the LJR benchmark suite in interleaved rounds and report cycles and
 instructions per benchmark and mode, from `/usr/bin/time -l`.
 
-Modes: `jit` (tcvm-cli), `interp` (tcvm-cli with TCVM_JIT=off), `luajit`,
-`luajit-joff`, and per `--tcvm NAME=PATH` the modes `NAME` and `NAME-off`. Each benchmark runs through a wrapper that defines
-`unpack` and `loadstring` first and is loaded from its own directory.
-life.lua is skipped: its source is Latin-1, which tcvm-cli rejects.
+Modes: `jit` (tcvm-cli), `interp` (tcvm-cli with TCVM_JIT=off), `lua`, `luajit`,
+`luajit-joff`, and per `--tcvm NAME=PATH` the modes `NAME` and `NAME-off`. The suite
+defaults to bench/ljr. A benchmark NAME runs as NAME-5.5.lua under the Lua 5.5 modes (tcvm,
+lua) when the suite has that file, and as NAME.lua otherwise and under LuaJIT. Every mode
+but LuaJIT runs it through a wrapper that defines `unpack` and `loadstring` first; the cwd
+is the suite. life.lua is skipped: its source is Latin-1, which tcvm-cli rejects.
 
     tools/ljr.py [--suite DIR] [--bin PATH] [--modes jit,interp,luajit]
                  [--rounds N] [--only a,b] [--json OUT] [--timeout S]
-                 [--tcvm NAME=PATH ...]
+                 [--tcvm NAME=PATH ...] [--lua PATH] [--luajit PATH]
 """
 import argparse
 import json
@@ -25,17 +27,32 @@ SKIP = {"life"}
 # revcomp read the output of `fasta.lua 5000000` on stdin.
 ARGS = {
     "array3d": ["300", "packed"], "binary-trees-num": ["16"], "binary-trees-name": ["15"],
-    "bounce": ["3000"], "chameneos": ["1e7"], "coroutine-ring": ["2e7"],
-    "fannkuch": ["11"], "fasta": ["5e6"], "fixpoint-fact": ["1000"],
-    "heapsort": ["1", "3000000"], "k-nucleotide": ["5e6"], "linear-sieve": ["3e7"],
-    "mandelbrot": ["3000"], "mandel-metatable": ["256"], "nbody": ["5e6"], "nsieve": ["12"],
-    "partialsums": ["3e7"], "particles": ["10000"], "pidigits-nogmp": ["5000"], "qt": ["14"],
+    "bounce": ["3000"], "chameneos": ["10000000"], "coroutine-ring": ["20000000"],
+    "fannkuch": ["11"], "fasta": ["5000000"], "fixpoint-fact": ["1000"],
+    "heapsort": ["1", "3000000"], "k-nucleotide": ["5000000"], "linear-sieve": ["30000000"],
+    "mandelbrot": ["3000"], "mandel-metatable": ["256"], "nbody": ["5000000"], "nsieve": ["12"],
+    "partialsums": ["30000000"], "particles": ["10000"], "pidigits-nogmp": ["5000"], "qt": ["14"],
     "quadtree-2": ["14"], "queen": ["12"], "ray": ["9"], "ray-prop": ["9"],
-    "recursive-fib-uv": ["40"], "recursive-fib-gv": ["40"], "revcomp": ["5e6"],
+    "recursive-fib-uv": ["40"], "recursive-fib-gv": ["40"], "revcomp": ["5000000"],
     "scimark-fft": ["10"], "scimark-lu": ["5"], "scimark-sor": ["5"], "scimark-sparse": ["300"],
-    "series": ["5000"], "spectral-norm": ["2000"], "table-sort": ["5e6"], "table-sort-cmp": ["1e6"],
+    "series": ["5000"], "spectral-norm": ["2000"], "table-sort": ["5000000"],
+    "table-sort-cmp": ["1000000"],
 }
 STDIN = {"k-nucleotide", "revcomp"}
+SUITE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bench", "ljr")
+VARIANT = "-5.5"
+
+
+def programs(suite):
+    """Benchmark names in `suite`: its NAME.lua files but SKIP and the NAME-5.5.lua variants."""
+    return sorted(f[:-4] for f in os.listdir(suite)
+                  if f.endswith(".lua") and not f[:-4].endswith(VARIANT) and f[:-4] not in SKIP)
+
+
+def source(suite, name, lua55):
+    """The file benchmark `name` runs from: NAME-5.5.lua for a Lua 5.5 VM when it exists."""
+    v = os.path.join(suite, name + VARIANT + ".lua")
+    return v if lua55 and os.path.exists(v) else os.path.join(suite, name + ".lua")
 
 
 def measure(cmd, cwd, env, timeout, stdin=None):
@@ -63,10 +80,11 @@ def measure(cmd, cwd, env, timeout, stdin=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--suite", default=os.path.expanduser("~/repos/luajit-remake/luabench"))
+    ap.add_argument("--suite", default=SUITE)
     ap.add_argument("--bin", default=os.path.join(os.path.dirname(__file__), "..",
                                                   "target", "release", "tcvm-cli"))
     ap.add_argument("--luajit", default="luajit")
+    ap.add_argument("--lua", default="lua", help="Lua 5.5, for the `lua` mode")
     ap.add_argument("--modes", default="jit,interp,luajit")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--only", default="")
@@ -85,8 +103,11 @@ def main():
         name, _, path = spec.partition("=")
         bins[name] = os.path.abspath(path)
     modes = [m for m in a.modes.split(",") if m]
-    names = sorted(f[:-4] for f in os.listdir(a.suite) if f.endswith(".lua"))
-    names = [n for n in names if n not in SKIP]
+    tcvm = {m: m for m in bins} | {m + "-off": m for m in bins} | {"interp": "jit"}
+    bad = [m for m in modes if m not in tcvm and m not in ("lua", "luajit", "luajit-joff")]
+    if bad:
+        sys.exit(f"ljr.py: unknown modes {','.join(bad)}")
+    names = programs(a.suite)
     if a.only:
         want = set(a.only.split(","))
         names = [n for n in names if n in want]
@@ -98,21 +119,21 @@ def main():
     results = {n: {m: [] for m in modes} for n in names}
 
     def command(name, mode):
-        src = os.path.join(a.suite, name + ".lua")
         args = ARGS.get(name, [])
-        base = "jit" if mode == "interp" else mode.removesuffix("-off")
-        if base in bins:
-            w = os.path.join(wrapdir, name + ".lua")
-            with open(w, "w") as fh:
-                fh.write("unpack = unpack or table.unpack\n"
-                         "loadstring = loadstring or load\n"
-                         f"return assert(loadfile({src!r}))(...)\n")
-            env = dict(os.environ)
-            if mode == "interp" or mode.endswith("-off"):
-                env["TCVM_JIT"] = "off"
-            return [bins[base], "-f", w] + args, env
-        flags = ["-joff"] if mode == "luajit-joff" else []
-        return [a.luajit] + flags + [src] + args, dict(os.environ)
+        env = dict(os.environ)
+        if mode.startswith("luajit"):
+            flags = ["-joff"] if mode == "luajit-joff" else []
+            return [a.luajit] + flags + [source(a.suite, name, False)] + args, env
+        w = os.path.join(wrapdir, name + ".lua")
+        with open(w, "w") as fh:
+            fh.write("unpack = unpack or table.unpack\n"
+                     "loadstring = loadstring or load\n"
+                     f"return assert(loadfile({source(a.suite, name, True)!r}))(...)\n")
+        if mode == "lua":
+            return [a.lua, w] + args, env
+        if mode == "interp" or mode.endswith("-off"):
+            env["TCVM_JIT"] = "off"
+        return [bins[tcvm[mode]], "-f", w] + args, env
 
     for r in range(a.rounds):
         for n in names:

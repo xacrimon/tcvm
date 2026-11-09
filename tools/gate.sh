@@ -6,12 +6,11 @@
 # go to OUT (default: a fresh temporary directory). Copy the binaries out of
 # target/ first: a rebuild during the run would replace them.
 #
-# The program runs use tools/ljr.py; LJR is expected at
-# ~/repos/luajit-remake/luabench (LJR=dir overrides).
+# The program runs use tools/ljr.py on bench/ljr (LJR=dir overrides).
 set -e
 NEW=$1; OLD=$2; OUT=${3:-$(mktemp -d -t gate)}
 HERE=$(cd "$(dirname "$0")" && pwd)
-LJR=${LJR:-$HOME/repos/luajit-remake/luabench}
+LJR=${LJR:-$HERE/../bench/ljr}
 ROUNDS=${ROUNDS:-2}
 mkdir -p "$OUT"
 echo "gate: results in $OUT" >&2
