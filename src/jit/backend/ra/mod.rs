@@ -239,8 +239,8 @@ pub(crate) enum Why {
     Gap,
     /// No register free: cut where the first one is taken.
     Blocked,
-    /// Spilled for another piece needing its register.
-    Evicted,
+    /// Spilled for another piece needing its register, starting there.
+    Evicted(Pos),
     /// Spilled from here (its best spilling position).
     Spilled,
     /// Reloaded here for the register use after.
@@ -1118,8 +1118,14 @@ impl Ctx {
                     continue;
                 }
                 let _ = write!(s, " | {}..{} {}", pos(p.start), pos(p.end), loc(p.loc));
-                if p.why != Why::Head {
-                    let _ = write!(s, " <{:?}>", p.why);
+                match p.why {
+                    Why::Head => {}
+                    Why::Evicted(by) => {
+                        let _ = write!(s, " <Evicted@{}>", pos(by));
+                    }
+                    why => {
+                        let _ = write!(s, " <{why:?}>");
+                    }
                 }
                 if p.flags & STACK != 0 {
                     let _ = write!(s, " S");

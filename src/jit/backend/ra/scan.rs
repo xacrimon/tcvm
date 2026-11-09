@@ -605,8 +605,10 @@ impl Ra {
             let (begin, at) = self.optimal_spilling_pos(a, s);
             self.maybe_spill_previous(begin, at, a);
             match next {
-                None => self.spill_after(a, at, Why::Evicted),
-                Some(u) if u.pos > s => self.spill_between_until(a, at, s, u.pos, Why::Evicted)?,
+                None => self.spill_after(a, at, Why::Evicted(s)),
+                Some(u) if u.pos > s => {
+                    self.spill_between_until(a, at, s, u.pos, Why::Evicted(s))?
+                }
                 Some(_) => {
                     return Err(format!(
                         "v{} and v{} need one register at {s}",
@@ -627,8 +629,8 @@ impl Ra {
             };
             self.inactive.swap_remove(k);
             match self.next_use(i, s, Want::Reg) {
-                None => self.spill_after(i, s, Why::Evicted),
-                Some(u) => self.spill_between_until(i, s, s, x.min(u.pos), Why::Evicted)?,
+                None => self.spill_after(i, s, Why::Evicted(s)),
+                Some(u) => self.spill_between_until(i, s, s, x.min(u.pos), Why::Evicted(s))?,
             }
         }
         Ok(())
