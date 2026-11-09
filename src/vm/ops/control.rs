@@ -122,53 +122,42 @@ pub(crate) fn new_closure<'gc>(
     mark: bool,
 ) -> Function<'gc> {
     let proto = closure.proto.prototypes[idx];
-    let mut self_slot = None;
+    // SAFETY: every upvalue is written below; allocation does not collect.
+    let func = unsafe { Function::new_lua_unwritten(ctx.mutation(), proto) };
+    let f = unsafe { LuaFn::from_function_unchecked(func) };
     let mut captured = false;
-    let func = Function::new_lua(ctx.mutation(), proto, |slots| {
-        for (i, desc) in proto.upvalue_desc.iter().enumerate() {
-            let slot = match desc.source {
-                // A local function's capture of itself: its register is
-                // only written below.
-                UpvalSource::ParentLocal(idx) if desc.by_value && idx == dst => {
-                    self_slot = Some(i);
-                    UpvalueSlot {
-                        value: Value::nil(),
+    for (i, desc) in proto.upvalue_desc.iter().enumerate() {
+        let slot = match desc.source {
+            // A local function's capture of itself, which needs no barrier.
+            UpvalSource::ParentLocal(idx) if desc.by_value && idx == dst => UpvalueSlot {
+                value: Value::function(func),
+            },
+            UpvalSource::ParentLocal(idx) if desc.by_value => UpvalueSlot {
+                value: unsafe { *base.add(idx as usize) },
+            },
+            UpvalSource::ParentLocal(idx) => {
+                let slot = unsafe { base.add(idx as usize) };
+                // Sorted by slot, so this frame's are at the end.
+                let open = &ts.open_upvalues;
+                let below = open.iter().rposition(|uv| uv.slot() <= slot);
+                let cell = match below {
+                    Some(i) if open[i].slot() == slot => open[i],
+                    _ => {
+                        let uv = UpvalueCell::new_open(ctx.mutation(), ts.handle(), slot);
+                        let at = below.map_or(0, |i| i + 1);
+                        ts.open_upvalues.insert(at, uv);
+                        captured = true;
+                        uv
                     }
-                }
-                UpvalSource::ParentLocal(idx) if desc.by_value => UpvalueSlot {
-                    value: unsafe { *base.add(idx as usize) },
-                },
-                UpvalSource::ParentLocal(idx) => {
-                    let slot = unsafe { base.add(idx as usize) };
-                    // Sorted by slot, so this frame's are at the end.
-                    let open = &ts.open_upvalues;
-                    let below = open.iter().rposition(|uv| uv.slot() <= slot);
-                    let cell = match below {
-                        Some(i) if open[i].slot() == slot => open[i],
-                        _ => {
-                            let uv = UpvalueCell::new_open(ctx.mutation(), ts.handle(), slot);
-                            let at = below.map_or(0, |i| i + 1);
-                            ts.open_upvalues.insert(at, uv);
-                            captured = true;
-                            uv
-                        }
-                    };
-                    UpvalueSlot { cell }
-                }
-                UpvalSource::ParentUpvalue(idx) => unsafe {
-                    *closure.upvalue_ptr().add(idx as usize)
-                },
-            };
-            unsafe { slots.add(i).write(slot) };
-        }
-    });
+                };
+                UpvalueSlot { cell }
+            }
+            UpvalSource::ParentUpvalue(idx) => unsafe { *closure.upvalue_ptr().add(idx as usize) },
+        };
+        unsafe { f.upvalue_ptr().add(i).write(slot) };
+    }
     if captured && mark {
         unsafe { frame::set_flags(base, flag::HAS_OPEN) };
-    }
-    let f = unsafe { LuaFn::from_function_unchecked(func) };
-    if let Some(i) = self_slot {
-        // The fresh closure pointing at itself needs no barrier.
-        unsafe { (*f.upvalue_ptr().add(i)).value = Value::function(func) };
     }
     proto.feedback.note_closure(f);
     func
