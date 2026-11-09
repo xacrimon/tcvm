@@ -65,6 +65,7 @@ pub(crate) struct DumpFlags {
     pub(crate) ir: bool,
     pub(crate) opt: bool,
     pub(crate) vcode: bool,
+    pub(crate) ra: bool,
     pub(crate) asm: bool,
 }
 
@@ -122,12 +123,14 @@ impl Dev {
                     "ir" => dump.ir = true,
                     "opt" => dump.opt = true,
                     "vcode" => dump.vcode = true,
+                    "ra" => dump.ra = true,
                     "asm" => dump.asm = true,
                     "all" => {
                         dump = DumpFlags {
                             ir: true,
                             opt: true,
                             vcode: true,
+                            ra: true,
                             asm: true,
                         }
                     }

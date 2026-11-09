@@ -4,7 +4,7 @@
 
 use std::cmp::Reverse;
 
-use super::{Held, Loc, MAX_REGS, NONE, Piece, Pos, Ra, Want, intersect};
+use super::{Held, Loc, MAX_REGS, NONE, Piece, Pos, Ra, Want, Why, intersect};
 use crate::jit::backend::reg::PReg;
 use crate::jit::backend::vcode::{TargetInst, VCode};
 
@@ -354,7 +354,9 @@ impl Ra {
             }
             // Nor held into a join a path enters without it.
             if let Some(j) = self.entered_without(f, c) {
-                let t = self.split_at(c, j).expect("a split inside the piece");
+                let t = self
+                    .split_at(c, j, Why::Join)
+                    .expect("a split inside the piece");
                 self.queue(t);
             }
         }
@@ -398,7 +400,9 @@ impl Ra {
         {
             let cut = (u.pos & !1) + 2;
             if a.free[h] >= cut && cut < e {
-                let tail = self.split_at(c, cut).expect("a split inside the piece");
+                let tail = self
+                    .split_at(c, cut, Why::Hold)
+                    .expect("a split inside the piece");
                 self.queue(tail);
                 self.assign(c, h);
                 self.activate(c);
@@ -428,7 +432,7 @@ impl Ra {
             if until & 1 != 0 && !self.needs_reg_at(c, until) && self.used_in_block_before(c, until)
             {
                 let tail = self
-                    .split_at(c, self.cut_after_last_use(c, until))
+                    .split_at(c, self.cut_after_last_use(c, until), Why::Taken)
                     .expect("a split inside the piece");
                 self.assign(c, k);
                 self.activate(c);
@@ -438,7 +442,9 @@ impl Ra {
             // before it is taken.
             let gap = until & !1;
             if gap > s {
-                let tail = self.split_at(c, gap).expect("a split inside the piece");
+                let tail = self
+                    .split_at(c, gap, Why::Gap)
+                    .expect("a split inside the piece");
                 self.queue(tail);
                 let k = match hint {
                     Some(h) if a.free[h] >= gap => h,
@@ -553,7 +559,7 @@ impl Ra {
             // Blocked at a late point after its register use: hold the
             // register to its last use before there, the stack after.
             let t = self
-                .split_at(c, self.cut_after_last_use(c, new_end))
+                .split_at(c, self.cut_after_last_use(c, new_end), Why::Blocked)
                 .expect("a split inside the piece");
             self.assign(c, k);
             self.split_and_spill_intersecting(c)?;
@@ -569,9 +575,9 @@ impl Ra {
             return Err(format!("no register for v{g} at {s}"));
         }
         if new_end < e {
-            let mut t = self.split_between(c, s, new_end);
+            let mut t = self.split_between(c, s, new_end, Why::Blocked);
             if t == Some(c) {
-                t = self.split_at(c, new_end);
+                t = self.split_at(c, new_end, Why::Blocked);
             }
             let t = t.expect("a split inside the piece");
             self.queue(t);
@@ -599,8 +605,8 @@ impl Ra {
             let (begin, at) = self.optimal_spilling_pos(a, s);
             self.maybe_spill_previous(begin, at, a);
             match next {
-                None => self.spill_after(a, at),
-                Some(u) if u.pos > s => self.spill_between_until(a, at, s, u.pos)?,
+                None => self.spill_after(a, at, Why::Evicted),
+                Some(u) if u.pos > s => self.spill_between_until(a, at, s, u.pos, Why::Evicted)?,
                 Some(_) => {
                     return Err(format!(
                         "v{} and v{} need one register at {s}",
@@ -621,8 +627,8 @@ impl Ra {
             };
             self.inactive.swap_remove(k);
             match self.next_use(i, s, Want::Reg) {
-                None => self.spill_after(i, s),
-                Some(u) => self.spill_between(i, s, x.min(u.pos))?,
+                None => self.spill_after(i, s, Why::Evicted),
+                Some(u) => self.spill_between_until(i, s, s, x.min(u.pos), Why::Evicted)?,
             }
         }
         Ok(())
@@ -630,7 +636,9 @@ impl Ra {
 
     /// Split `x` at `pos`: `None` when nothing of it lies at or after `pos`,
     /// `x` itself when all of it does, else the new piece from `pos`.
-    pub(super) fn split_at(&mut self, x: u32, pos: Pos) -> Option<u32> {
+    pub(super) fn split_at(&mut self, x: u32, pos: Pos, why: Why) -> Option<u32> {
+        #[cfg(not(feature = "tcvm-dev"))]
+        let _ = why;
         let p = self.pieces[x as usize];
         debug_assert!(
             !(self.active.iter().chain(&self.inactive)).any(|h| h.x == x),
@@ -660,6 +668,8 @@ impl Ra {
             prev: x,
             loc: Loc::None,
             flags: 0,
+            #[cfg(feature = "tcvm-dev")]
+            why,
             ..p
         });
         if p.next != NONE {
@@ -691,9 +701,9 @@ impl Ra {
         d.next = NONE;
     }
 
-    fn split_between(&mut self, x: u32, start: Pos, end: Pos) -> Option<u32> {
+    fn split_between(&mut self, x: u32, start: Pos, end: Pos, why: Why) -> Option<u32> {
         let at = self.optimal_split_pos(start, end);
-        self.split_at(x, at)
+        self.split_at(x, at, why)
     }
 
     /// V8's `FindOptimalSplitPos`: across blocks, at the header of the
@@ -775,7 +785,7 @@ impl Ra {
         }
         let keep = |p: &Piece| p.loc.spilled() || p.flags & super::FIXED != 0;
         if !keep(&self.pieces[begin as usize]) {
-            self.spill_after(begin, pos);
+            self.spill_after(begin, pos, Why::Spilled);
         }
         let mut y = self.pieces[begin as usize].next;
         while y != NONE && y != end {
@@ -825,28 +835,29 @@ impl Ra {
         }
     }
 
-    fn spill_after(&mut self, x: u32, pos: Pos) {
-        if let Some(t) = self.split_at(x, pos) {
+    fn spill_after(&mut self, x: u32, pos: Pos, why: Why) {
+        if let Some(t) = self.split_at(x, pos, why) {
             self.spill(t);
         }
     }
 
     fn spill_between(&mut self, x: u32, start: Pos, end: Pos) -> Result<(), String> {
-        self.spill_between_until(x, start, start, end)
+        self.spill_between_until(x, start, start, end, Why::Spilled)
     }
 
-    /// V8's `SpillBetweenUntil`: spill `x` from `start`, staying spilled
-    /// until `until` at least, and reload it for `end` (a register use) in
-    /// the best gap before it.
+    /// V8's `SpillBetweenUntil`: spill `x` from `start` (`why`), staying
+    /// spilled until `until` at least, and reload it for `end` (a register
+    /// use) in the best gap before it.
     fn spill_between_until(
         &mut self,
         x: u32,
         start: Pos,
         until: Pos,
         end: Pos,
+        why: Why,
     ) -> Result<(), String> {
         debug_assert!(start < end);
-        let Some(second) = self.split_at(x, start) else {
+        let Some(second) = self.split_at(x, start, why) else {
             return Ok(());
         };
         let s2 = self.start(second);
@@ -858,7 +869,7 @@ impl Ra {
         let g = self.pieces[second as usize].g;
         if self.is_def(g, end) && end >= until {
             let third = self
-                .split_at(second, end)
+                .split_at(second, end, Why::Reload)
                 .expect("a split inside the piece");
             self.queue(third);
             if third != second {
@@ -871,7 +882,7 @@ impl Ra {
         if end == self.block_start(self.block_of_pos(end)) {
             third_end = split_start.max(end);
         }
-        let third = match self.split_between(second, split_start, third_end) {
+        let third = match self.split_between(second, split_start, third_end, Why::Reload) {
             Some(t) => t,
             None => {
                 self.spill(second);

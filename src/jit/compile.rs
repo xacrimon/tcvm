@@ -467,6 +467,14 @@ pub(crate) fn compile<'gc>(
             .map_err(|e| CompileError::Backend(format!("writing {path}: {e}")))?;
     }
     #[cfg(feature = "tcvm-dev")]
+    if config.dev.dump.ra {
+        eprintln!(
+            "-- jit ra {} pc{pc}\n{}",
+            chunk_name(closure),
+            ctx.jit().ra.borrow().print(&lowered.vcode)
+        );
+    }
+    #[cfg(feature = "tcvm-dev")]
     if config.dev.dump.vcode {
         eprintln!(
             "-- jit vcode {} pc{pc}, {} spill slots\n{}",

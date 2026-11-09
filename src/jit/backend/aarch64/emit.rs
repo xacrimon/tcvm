@@ -629,8 +629,9 @@ fn emit_with(
     if !cold_bound {
         em.a.bind(cold);
     }
-    em.origin(Origin::OutOfLine as u32);
+    // Each stub anew: an edge's moves inside one set the origin to theirs.
     for f in std::mem::take(&mut em.ool) {
+        em.origin(Origin::OutOfLine as u32);
         f(&mut em);
     }
     em.origin(Origin::Stubs as u32);

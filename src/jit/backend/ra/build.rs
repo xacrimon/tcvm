@@ -1,7 +1,7 @@
 //! Live ranges: each group's intervals and use positions, the points fixed
 //! operands reserve registers over, and the clobbers.
 
-use super::{FIXED, Ivs, Loc, NONE, Need, Piece, Pos, Ra, Use, VInfo, class_index, intersect};
+use super::{FIXED, Ivs, Loc, NONE, Need, Piece, Pos, Ra, Use, VInfo, Why, class_index, intersect};
 use crate::jit::backend::reg::{
     Allocation, Block, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
 };
@@ -491,6 +491,8 @@ impl Ra {
                 next: NONE,
                 loc: Loc::None,
                 flags: 0,
+                #[cfg(feature = "tcvm-dev")]
+                why: Why::Head,
             });
             self.vregs[v].head = x;
             // Each fixed definition's own point in its register; the rest is
@@ -500,7 +502,7 @@ impl Ra {
             for &d in fx.iter() {
                 let (def, r) = ((d >> 32) as Pos, PReg::from_index(d as u32 as usize));
                 let Some(cur) = rest else { break };
-                let at = match self.split_at(cur, def) {
+                let at = match self.split_at(cur, def, Why::Fixed) {
                     Some(y) if y != cur => {
                         self.initial.push(key(self.start(cur), cur));
                         y
@@ -510,7 +512,7 @@ impl Ra {
                 };
                 self.pieces[at as usize].loc = Loc::Reg(r);
                 self.pieces[at as usize].flags |= FIXED;
-                rest = self.split_at(at, (def & !1) + 2);
+                rest = self.split_at(at, (def & !1) + 2, Why::Fixed);
             }
             if let Some(cur) = rest {
                 self.initial.push(key(self.start(cur), cur));

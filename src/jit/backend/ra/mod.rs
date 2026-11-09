@@ -216,6 +216,35 @@ struct Piece {
     prev: u32,
     next: u32,
     loc: Loc,
+    /// What cut it off the piece before it (`TCVM_JIT_DUMP=ra`).
+    #[cfg(feature = "tcvm-dev")]
+    why: Why,
+}
+
+/// Why a piece starts where it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Why {
+    /// The group's first piece.
+    #[cfg_attr(not(feature = "tcvm-dev"), allow(dead_code))]
+    Head,
+    /// A fixed definition's own point, and the rest after it.
+    Fixed,
+    /// A join a path enters without the value (a value computed again).
+    Join,
+    /// The register held to a fixed use, the rest after.
+    Hold,
+    /// The register taken at a late point: held to the last use before it.
+    Taken,
+    /// The register free to the gap before it is taken.
+    Gap,
+    /// No register free: cut where the first one is taken.
+    Blocked,
+    /// Spilled for another piece needing its register.
+    Evicted,
+    /// Spilled from here (its best spilling position).
+    Spilled,
+    /// Reloaded here for the register use after.
+    Reload,
 }
 
 const FIXED: u8 = 1;
@@ -378,6 +407,7 @@ impl Ctx {
         }))
     }
 
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) fn env(&self) -> &Env {
         &self.0.ra.env
     }
@@ -983,5 +1013,120 @@ impl Ra {
             )),
             Loc::None => panic!("piece {x} of v{} unallocated", p.g),
         }
+    }
+}
+
+#[cfg(feature = "tcvm-dev")]
+impl Ctx {
+    /// Each group's intervals, uses and pieces with their locations and
+    /// what cut them (`TCVM_JIT_DUMP=ra`), positions as `<inst><e|l>`.
+    pub(crate) fn print<I: TargetInst>(&self, f: &VCode<I>) -> String {
+        use std::fmt::Write;
+        let ra = &self.0.ra;
+        let pos = |p: Pos| {
+            let l = (p / 2) as usize;
+            match ra.at_lin.get(l) {
+                Some(i) => format!("{}{}", i.index(), if p & 1 == 0 { 'e' } else { 'l' }),
+                None => format!("end+{}", p - 2 * ra.at_lin.len() as u32),
+            }
+        };
+        let loc = |l: Loc| match l {
+            Loc::None => "?".to_string(),
+            Loc::Reg(r) => format!(
+                "{}{}",
+                if r.class() == RegClass::Float {
+                    'd'
+                } else {
+                    'x'
+                },
+                r.hw_enc()
+            ),
+            Loc::Stack => "stack".to_string(),
+            Loc::Remat => "remat".to_string(),
+        };
+        let mut s = String::new();
+        for g in 0..ra.vregs.len() {
+            let gi = &ra.vregs[g];
+            if ra.rep[g] as usize != g || gi.head == NONE {
+                continue;
+            }
+            let members: Vec<String> = ra
+                .members_of(g as u32)
+                .iter()
+                .map(|m| format!("v{m}"))
+                .collect();
+            let _ = write!(s, "v{g}");
+            if members.len() > 1 {
+                let _ = write!(s, " [{}]", members.join(" "));
+            }
+            let _ = write!(s, " {}", if gi.class == 0 { "int" } else { "float" });
+            if f.remat[g] != crate::jit::backend::vcode::Remat::None {
+                let _ = write!(s, " {}", if gi.remat { "remat" } else { "remat-off" });
+            }
+            if gi.slot != NONE {
+                let _ = write!(
+                    s,
+                    " slot {}{}",
+                    gi.slot,
+                    if ra.deferred.get(g).copied().unwrap_or(false) {
+                        " deferred"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            let _ = write!(s, "\n  ivs");
+            for &(a, b) in ra.pieces[gi.head as usize].ivs(&ra.ivs).raw {
+                let _ = write!(s, " {}..{}", pos(a), pos(b));
+            }
+            let _ = write!(s, "\n  uses");
+            let p = &ra.pieces[gi.head as usize];
+            // The group's uses span its pieces' runs.
+            let mut k = p.ulo;
+            let hi = if ra.flat_off.is_empty() {
+                p.uhi
+            } else {
+                ra.pieces_of(g as u32)
+                    .last()
+                    .map_or(p.uhi, |&x| ra.pieces[x as usize].uhi)
+            };
+            while k < hi {
+                let u = ra.uses[k as usize];
+                let need = match u.need() {
+                    Need::Reg => "R".to_string(),
+                    Need::Any => "A".to_string(),
+                    Need::Fixed(r) => format!("F{}", r.hw_enc()),
+                };
+                let _ = write!(s, " {}{need}", pos(u.pos));
+                k += 1;
+            }
+            let _ = write!(s, "\n  pieces");
+            let pieces: Vec<u32> = if ra.flat_off.is_empty() {
+                let mut v = Vec::new();
+                let mut x = gi.head;
+                while x != NONE {
+                    v.push(x);
+                    x = ra.pieces[x as usize].next;
+                }
+                v
+            } else {
+                ra.pieces_of(g as u32).to_vec()
+            };
+            for x in pieces {
+                let p = &ra.pieces[x as usize];
+                if p.dead() {
+                    continue;
+                }
+                let _ = write!(s, " | {}..{} {}", pos(p.start), pos(p.end), loc(p.loc));
+                if p.why != Why::Head {
+                    let _ = write!(s, " <{:?}>", p.why);
+                }
+                if p.flags & STACK != 0 {
+                    let _ = write!(s, " S");
+                }
+            }
+            let _ = writeln!(s);
+        }
+        s
     }
 }
