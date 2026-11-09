@@ -506,12 +506,18 @@ impl<'gc> Value<'gc> {
             )
     }
 
+    #[inline(always)]
+    fn is_object(self) -> bool {
+        // Objects' words run from the first box to the immediates (`TYPE_WORDS`).
+        self.bits.wrapping_sub(BOX) < (TAG_IMMEDIATE - TAG_USERDATA) << TAG_SHIFT
+    }
+
     /// This value's object, erased; `None` for non-objects.
-    #[inline]
+    #[inline(always)]
     fn object(self) -> Option<Gc<'gc, ()>> {
         // The range check with an unreachable fallthrough, and `from_inner` over `get_*`, let
         // LLVM fold the arms into one address computation.
-        if !(self.is_boxed() && matches!(self.tag(), TAG_USERDATA..=TAG_THREAD)) {
+        if !self.is_object() {
             return None;
         }
         // `from_ptr` steps back over the header using each type's own layout.
@@ -561,24 +567,10 @@ pub(crate) fn value_hash(v: Value<'_>) -> u64 {
 }
 
 unsafe impl<'gc> Collect<'gc> for Value<'gc> {
-    #[inline]
+    #[inline(always)]
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
-        if !self.is_boxed() {
-            return;
-        }
-
-        // `from_ptr` recovers the header from the value's layout, so each type has to be traced
-        // as itself rather than through an erased pointer.
-        unsafe {
-            match self.tag() {
-                TAG_BOXED_INT => self.ptr::<i64>().trace(cc),
-                TAG_STRING => self.get_string().unwrap_unchecked().trace(cc),
-                TAG_TABLE => self.get_table().unwrap_unchecked().trace(cc),
-                TAG_FUNCTION => self.get_function().unwrap_unchecked().trace(cc),
-                TAG_THREAD => self.get_thread().unwrap_unchecked().trace(cc),
-                TAG_USERDATA => self.get_userdata().unwrap_unchecked().trace(cc),
-                _ => (),
-            }
+        if let Some(gc) = self.object() {
+            cc.trace_gc(gc);
         }
     }
 }
