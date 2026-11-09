@@ -57,7 +57,7 @@ def main():
             if len(tail) == 2:
                 for part in tail[1].split(", "):
                     name, _, us = part.rpartition(" ")
-                    passes[name] += int(us)
+                    passes[name] += float(us)
         total = sum(stages.values()) / 1000
         print(f"{n:24}{count:>9}{total:>12.1f}{wall:>10.0f}{total / wall * 100:>7.1f}%  "
               + " ".join(f"{stages[s] / 1000:>8.1f}" for s in STAGES))
