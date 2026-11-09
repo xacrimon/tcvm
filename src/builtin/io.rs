@@ -493,29 +493,6 @@ fn count_write<W: Write>(w: &mut W, buf: &[u8]) -> (std::io::Result<()>, u64) {
     (Ok(()), written)
 }
 
-fn write_bytes(fs: &mut FileState, buf: &[u8]) -> WriteOutcome {
-    let (stream, writable) = match fs {
-        FileState::Closed => return WriteOutcome::Closed,
-        FileState::Open {
-            stream, writable, ..
-        } => (stream, *writable),
-    };
-    if !writable {
-        // Mirror the OS EBADF a write to a non-writable handle would hit.
-        return WriteOutcome::Io(std::io::Error::from_raw_os_error(9), 0);
-    }
-    let (res, written) = match stream {
-        Stream::File(file) => file.write(buf),
-        Stream::Stdout => stdout().write_counted(buf),
-        Stream::Stderr => count_write(&mut std::io::stderr(), buf),
-        Stream::Stdin => (Err(std::io::Error::from_raw_os_error(9)), 0),
-    };
-    match res {
-        Ok(()) => WriteOutcome::Ok,
-        Err(e) => WriteOutcome::Io(e, written),
-    }
-}
-
 fn flush_stream(fs: &mut FileState) -> WriteOutcome {
     let stream = match fs {
         FileState::Closed => return WriteOutcome::Closed,
@@ -710,9 +687,9 @@ fn read_number<R: BufRead>(r: &mut R) -> std::io::Result<ReadOne> {
 // Mid-level helpers shared by free functions and methods
 // ---------------------------------------------------------------------------
 
-/// Serialize `vals` (strings and numbers only) and write them to `u`.
-/// Returns the write outcome; a non-string/number arg is a (raised) Lua
-/// error. `fname`/`first_arg` shape the bad-argument index.
+/// Write `vals`, strings and numbers, to `u` one at a time as `g_write` does: a bad argument
+/// raises once the ones before it are written, and a failed write ends the call with the count
+/// so far. `fname`/`first_arg` shape the bad-argument index.
 fn do_write<'gc>(
     ctx: Context<'gc>,
     u: Userdata<'gc>,
@@ -720,25 +697,50 @@ fn do_write<'gc>(
     fname: &str,
     first_arg: usize,
 ) -> Result<WriteOutcome, Error<'gc>> {
-    let mut buf = Vec::new();
-    for (i, v) in vals.iter().enumerate() {
-        if let Some(s) = v.get_string() {
-            buf.extend_from_slice(s.as_bytes());
-        } else if let Some(n) = v.get_integer() {
-            util::push_int(&mut buf, n);
-        } else if let Some(f) = v.get_float() {
-            util::push_float(&mut buf, f);
-        } else {
-            return Err(util::type_error(
-                ctx,
-                fname,
-                first_arg + i,
-                "string",
-                Some(*v),
-            ));
+    with_state(u, |fs| {
+        let FileState::Open {
+            stream, writable, ..
+        } = fs
+        else {
+            return Ok(WriteOutcome::Closed);
+        };
+        let writable = *writable;
+        // Stdout's lock is taken once for the call.
+        let mut out = (writable && matches!(stream, Stream::Stdout)).then(stdout);
+        let mut write = |b: &[u8]| match (&mut *stream, &mut out) {
+            (Stream::File(file), _) if writable => file.write(b),
+            (Stream::Stdout, Some(out)) => out.write_counted(b),
+            (Stream::Stderr, _) if writable => count_write(&mut std::io::stderr(), b),
+            // The EBADF the OS gives a write to a handle not open for writing.
+            _ => (Err(std::io::Error::from_raw_os_error(9)), 0),
+        };
+        let mut total = 0;
+        for (i, v) in vals.iter().enumerate() {
+            let (res, n) = if let Some(s) = v.get_string() {
+                write(s.as_bytes())
+            } else if let Some(n) = v.get_integer() {
+                write(n.format_into(&mut core::fmt::NumBuffer::new()).as_bytes())
+            } else if let Some(f) = v.get_float() {
+                ctx.with_buf(|buf| {
+                    util::push_float(buf, f);
+                    write(buf)
+                })
+            } else {
+                return Err(util::type_error(
+                    ctx,
+                    fname,
+                    first_arg + i,
+                    "string",
+                    Some(*v),
+                ));
+            };
+            total += n;
+            if let Err(e) = res {
+                return Ok(WriteOutcome::Io(e, total));
+            }
         }
-    }
-    Ok(with_state(u, |fs| write_bytes(fs, &buf)))
+        Ok(WriteOutcome::Ok)
+    })
 }
 
 /// Read `fmt_vals` from `u` (`g_read`), no formats meaning one line. Each
@@ -923,9 +925,8 @@ fn lua_write<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
     let out = io_file(ctx, closure, OUTPUT, "output")?;
-    let vals: Vec<Value<'gc>> = stack.as_slice().to_vec();
-    match do_write(ctx, out, &vals, "write", 1)? {
-        WriteOutcome::Ok => stack.replace(&[Value::userdata(out)]),
+    match do_write(ctx, out, stack.as_slice(), "write", 1)? {
+        WriteOutcome::Ok => stack.ret1(Value::userdata(out)),
         WriteOutcome::Closed => return Err(closed_file_error(ctx)),
         WriteOutcome::Io(e, written) => stack.replace(&write_fail(ctx, &e, written)),
     }
@@ -1123,9 +1124,8 @@ fn lua_file_write<'gc>(
 ) -> Result<(), Error<'gc>> {
     let self_val = stack.get(0);
     let u = check_file(ctx, closure, self_val, "write", 1)?;
-    let vals: Vec<Value<'gc>> = stack.as_slice()[1..].to_vec();
-    match do_write(ctx, u, &vals, "write", 2)? {
-        WriteOutcome::Ok => stack.replace(&[self_val]),
+    match do_write(ctx, u, &stack.as_slice()[1..], "write", 2)? {
+        WriteOutcome::Ok => stack.ret1(self_val),
         WriteOutcome::Closed => return Err(closed_file_error(ctx)),
         WriteOutcome::Io(e, written) => stack.replace(&write_fail(ctx, &e, written)),
     }
