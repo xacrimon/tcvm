@@ -207,14 +207,27 @@ impl<'gc> Context<'gc> {
     /// string. A nested use gets a fresh buffer.
     #[inline]
     pub(crate) fn with_buf<R>(self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        let mut buf = self.take_buf();
+        let r = f(&mut buf);
+        self.put_buf(buf);
+        r
+    }
+
+    /// The buffer of [`with_buf`](Self::with_buf), empty, for a user that may keep it; given
+    /// back with [`put_buf`](Self::put_buf).
+    #[inline]
+    pub(crate) fn take_buf(self) -> Vec<u8> {
         let mut buf = self.state.buf.take();
         buf.clear();
-        let r = f(&mut buf);
+        buf
+    }
+
+    #[inline]
+    pub(crate) fn put_buf(self, buf: Vec<u8>) {
         // Not to hold on to the memory of one huge string.
         if buf.capacity() <= 1 << 16 {
             self.state.buf.set(buf);
         }
-        r
     }
 
     /// Intern the string `f` writes, built in the buffer of [`with_buf`](Self::with_buf).

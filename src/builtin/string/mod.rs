@@ -1,5 +1,5 @@
 use core::fmt::NumBuffer;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 
 use crate::Context;
 use crate::builtin::strfmt_num::{
@@ -57,8 +57,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("upper", lua_upper),
     ];
 
-    // `format`'s reusable output buffer, upvalue 0.
-    let fmt_buf = Userdata::new(ctx.mutation(), Cell::new(Vec::<u8>::new()), 0);
     let lib = Table::new(ctx);
     for &(name, handler) in fns {
         let handler = Function::new_native(ctx.mutation(), handler, &[]);
@@ -76,7 +74,7 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         Value::string(LuaString::new(ctx, b"sub")),
         Value::function(sub),
     );
-    let format = Function::new_cont(ctx.mutation(), lua_format, &[Value::userdata(fmt_buf)]);
+    let format = Function::new_cont(ctx.mutation(), lua_format, &[]);
     lib.raw_set(
         ctx,
         Value::string(LuaString::new(ctx, b"format")),
@@ -256,12 +254,9 @@ fn lua_find<'gc>(
     Ok(())
 }
 
-/// The most `format` keeps allocated in its buffer between calls.
-const FORMAT_BUF_KEEP: usize = 64 * 1024;
-
 fn lua_format<'gc>(
     ctx: Context<'gc>,
-    closure: &NativeClosure<'gc>,
+    _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
     let fmt_val = stack.get(0);
@@ -270,37 +265,23 @@ fn lua_format<'gc>(
         .ok_or_else(|| util::type_error(ctx, "format", 1, "string", stack.arg(0)))?;
     let fmt = fmt_str.as_bytes();
 
-    // Taken rather than borrowed: a `__tostring` below can re-enter `format`, which then
-    // finds the cell empty and allocates its own.
-    let buf = closure.upvalues()[0]
-        .get_userdata()
-        .expect("format upvalue 0 must be its buffer");
-    let mut out = buf
-        .with_data(|c: &Cell<Vec<u8>>| c.take())
-        .expect("format upvalue 0 must be its buffer");
-    out.reserve(64);
+    // The context's scratch buffer; a pending conversion keeps it for its future, where a
+    // `__tostring` re-entering `format` gets a fresh one.
     let mut f = Formatter {
         i: 0,
         arg_idx: 1,
-        out,
+        out: ctx.take_buf(),
     };
-    let res = f.run(ctx, fmt, &stack);
-    let give_back = |mut out: Vec<u8>| {
-        if out.capacity() <= FORMAT_BUF_KEEP {
-            out.clear();
-            buf.with_data(|c: &Cell<Vec<u8>>| c.set(out));
-        }
-    };
-    let pending = match res {
+    let pending = match f.run(ctx, fmt, &stack) {
         Ok(Some(pending)) => pending,
         Ok(None) => {
-            let s = LuaString::checked(ctx, &f.out)?;
-            give_back(f.out);
-            stack.ret1(Value::string(s));
+            let s = LuaString::checked(ctx, &f.out);
+            ctx.put_buf(f.out);
+            stack.ret1(Value::string(s?));
             return NativeOut::RETURN;
         }
         Err(e) => {
-            give_back(f.out);
+            ctx.put_buf(f.out);
             return NativeOut::error(e);
         }
     };
