@@ -762,13 +762,20 @@ impl<'gc> TableState<'gc> {
         core::mem::offset_of!(TableState<'static>, spill_cap);
     pub(crate) const ARRAY_OFFSET: usize = core::mem::offset_of!(TableState<'static>, array);
     pub(crate) const ASIZE_OFFSET: usize = core::mem::offset_of!(TableState<'static>, asize);
-    /// The `aux` cell, null when there is none, and in it the count of the
-    /// integer keys its hash part holds.
+    /// The `aux` cell, null when there is none, and in it how many keys
+    /// each hash part holds.
     pub(crate) const AUX_OFFSET: usize = core::mem::offset_of!(TableState<'static>, aux);
-    pub(crate) const AUX_INTS_OFFSET: usize = Gc::<'static, Owned<Aux<'static>>>::VALUE_OFFSET
-        + Owned::<Aux<'static>>::VALUE_OFFSET
+    const AUX_VALUE: usize =
+        Gc::<'static, Owned<Aux<'static>>>::VALUE_OFFSET + Owned::<Aux<'static>>::VALUE_OFFSET;
+    pub(crate) const AUX_INTS_OFFSET: usize = Self::AUX_VALUE
         + core::mem::offset_of!(Aux<'static>, ints)
         + hash_part::Part::<'static, i64, GcAlloc<'static>>::ITEMS_OFFSET;
+    pub(crate) const AUX_STRS_OFFSET: usize = Self::AUX_VALUE
+        + core::mem::offset_of!(Aux<'static>, strs)
+        + hash_part::Part::<'static, LuaString<'static>, GcAlloc<'static>>::ITEMS_OFFSET;
+    pub(crate) const AUX_MISC_OFFSET: usize = Self::AUX_VALUE
+        + core::mem::offset_of!(Aux<'static>, misc)
+        + hash_part::Part::<'static, Value<'static>, GcAlloc<'static>>::ITEMS_OFFSET;
 
     #[inline]
     pub fn shape(&self) -> Shape<'gc> {

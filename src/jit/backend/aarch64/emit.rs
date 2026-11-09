@@ -1650,13 +1650,30 @@ impl<'a> Em<'a> {
                 }
                 cond
             }
-            // No cell, or none of its integer part's items: zero.
-            Test::TabNoInts => {
+            // No cell, or the parts' counts or'd: zero. The cell is loaded
+            // again for each part past the second, x16 taking the counts.
+            Test::TabNoKeys(parts) => {
                 let t = self.r(i, k);
                 let done = self.a.new_label();
                 self.a.ldr(X16, t, layout::T_AUX as i32);
                 self.a.cbz(Sz::X, X16, done);
-                self.a.ldr(X16, X16, layout::AUX_INTS as i32);
+                let mut offs = layout::aux_counts(parts).peekable();
+                let first = offs.next().expect("a part");
+                if offs.peek().is_none() {
+                    self.a.ldr(X16, X16, first as i32);
+                } else {
+                    self.a.ldr(X17, X16, first as i32);
+                    let mut again = false;
+                    while let Some(off) = offs.next() {
+                        if again {
+                            self.a.ldr(X16, t, layout::T_AUX as i32);
+                        }
+                        self.a.ldr(X16, X16, off as i32);
+                        let d = if offs.peek().is_some() { X17 } else { X16 };
+                        self.a.orr(Sz::X, d, X17, X16);
+                        again = true;
+                    }
+                }
                 self.a.bind(done);
                 self.a.cmp_imm(Sz::X, X16, 0);
                 cond

@@ -11,7 +11,9 @@ use crate::instruction::{Instruction, Op as BcOp, TFOR_VARS};
 use crate::jit::build::Builder;
 use crate::jit::build::emit::{branch_arm, cold, enter_join, staged_call};
 use crate::jit::build::tables::class_bit;
-use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
+use crate::jit::ir::ops::{
+    Cc, ExitTag, HASH_INTS, HASH_MISC, HASH_STRS, HELPER_FAIL_VAL, HelperId, Op,
+};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
 use crate::vm::ops::control::TFOR_IPAIRS;
@@ -59,8 +61,9 @@ pub(super) fn emit_tforprep(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction,
 
 /// `TFORCALL_NEXT a count` and its `TFORLOOP`, to `exit` or `body`:
 /// `next`'s walk at the position in `R[a+3]`, the array part and named
-/// slots inline, the other parts and the step from one part to the next by
-/// helper through the slots, its first variable then tested.
+/// slots inline, and the steps past parts that hold no key: on to the named
+/// slots, or to the end; the other parts by helper through the slots, its
+/// first variable then tested.
 pub(super) fn emit_tforcall_next(
     b: &mut Builder<'_, '_>,
     a: u8,
@@ -97,12 +100,51 @@ pub(super) fn emit_tforcall_next(
     let after = b.ins(Op::Box, &[after]);
     b.set(a + 3, after);
     step_to(b, body, vars, count, k, v);
+    // Past the array part: the integer keys, then the named slots.
+    b.switch_to(past);
+    let no_ints = b.ins(Op::TabNoKeys(HASH_INTS), &[t]);
+    let ints = branch_arm(b, no_ints);
+    named_step(b, a, count, t, zero, [exit, body, slow]);
+    b.switch_to(ints);
+    b.jump(slow);
     // The named slots, part 2, at the index after the position's part.
     b.switch_to(rest);
     let named = b.ki32(2 << POS_PART_SHIFT);
     let rel = b.ins(Op::ISubNo, &[p, named]);
     let in_named = b.ins(Op::ICmp(Cc::Lo), &[rel, part]);
     let other = branch_arm(b, in_named);
+    named_step(b, a, count, t, rel, [exit, body, slow]);
+    b.switch_to(other);
+    b.jump(slow);
+    enter_join(b, slow);
+    cold(b, |b| {
+        b.store_regs([a as usize + 1, a as usize + 3]);
+        let at = b.slot_of(a);
+        b.push(Op::Helper(HelperId::TforNext { a: at, count }), &[]);
+        for k in 0..count {
+            b.reload(vars + k);
+        }
+        b.reload(a + 3);
+        b.flush();
+        let k = b.reg(vars);
+        let k = b.boxed(k);
+        let end = b.ins(Op::IsType(TypeSet::NIL), &[k]);
+        b.br(end, exit, body);
+    });
+}
+
+/// `next`'s step through the named slots of table `t` (a `Ptr`) from index
+/// `rel`: the next one to `body`; past the last, the end at `exit` when the
+/// parts after them hold no key, else the helper at `slow`.
+fn named_step(
+    b: &mut Builder<'_, '_>,
+    a: u8,
+    count: u8,
+    t: Val,
+    rel: Val,
+    [exit, body, slow]: [Block; 3],
+) {
+    let vars = a + TFOR_VARS;
     let j = b.ins(Op::NamedNext, &[t, rel]);
     let none = b.ki32(-1);
     let found = b.ins(Op::ICmp(Cc::Ne), &[j, none]);
@@ -114,23 +156,13 @@ pub(super) fn emit_tforcall_next(
     let after = b.ins(Op::Box, &[after]);
     b.set(a + 3, after);
     step_to(b, body, vars, count, k, v);
-    for blk in [past, other, gone] {
-        b.switch_to(blk);
-        b.jump(slow);
-    }
-    enter_join(b, slow);
-    b.store_regs([a as usize + 1, a as usize + 3]);
-    let at = b.slot_of(a);
-    b.push(Op::Helper(HelperId::TforNext { a: at, count }), &[]);
-    for k in 0..count {
-        b.reload(vars + k);
-    }
-    b.reload(a + 3);
-    b.flush();
-    let k = b.reg(vars);
-    let k = b.boxed(k);
-    let end = b.ins(Op::IsType(TypeSet::NIL), &[k]);
-    b.br(end, exit, body);
+    b.switch_to(gone);
+    let empty = b.ins(Op::TabNoKeys(HASH_STRS | HASH_MISC), &[t]);
+    let more = branch_arm(b, empty);
+    let nil = b.konst(Value::nil());
+    step_to(b, exit, vars, count, nil, nil);
+    b.switch_to(more);
+    b.jump(slow);
 }
 
 /// `TFORCALL_IPAIRS a count` and its `TFORLOOP`, to `exit` or `body`: the
@@ -174,7 +206,7 @@ pub(super) fn emit_tforcall_ipairs(
     // the hash part holds.
     b.switch_to(outside);
     cold(b, |b| {
-        let no_ints = b.ins(Op::TabNoInts, &[t]);
+        let no_ints = b.ins(Op::TabNoKeys(HASH_INTS), &[t]);
         let hashed = branch_arm(b, no_ints);
         b.jump(raw_nil);
         b.switch_to(hashed);

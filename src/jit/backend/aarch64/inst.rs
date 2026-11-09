@@ -72,8 +72,8 @@ pub(crate) enum Test {
     FnFits,
     /// The table's spill cell has room for the spilled `loc` (`Hi`): `[t]`.
     TabHasRoom(u32),
-    /// The table's hash part holds no integer key (`Eq`): `[t]`.
-    TabNoInts,
+    /// The table's hash parts in the mask hold no key (`Eq`): `[t]`.
+    TabNoKeys(u8),
 }
 
 /// A call's callee, known at compile time.

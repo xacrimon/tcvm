@@ -744,8 +744,9 @@ pub(crate) enum Op {
     ClassMm(u8),
     /// The live metamethod bits (`I32`) of the table's class, 0 without one.
     TabMmBits,
-    /// Whether the table's hash part holds no integer key, a `B1`.
-    TabNoInts,
+    /// Whether the table's hash parts in the mask (`HASH_*`) hold no key, a
+    /// `B1`.
+    TabNoKeys(u8),
     /// A string's length (`I32`: strings are capped below 2^31), the operand
     /// its value's payload (`Ptr`).
     StrLenOf,
@@ -901,6 +902,12 @@ bitflags::bitflags! {
     }
 }
 
+/// `Op::TabNoKeys` parts: integer keys, dictionary-mode string keys, other
+/// keys.
+pub(crate) const HASH_INTS: u8 = 1;
+pub(crate) const HASH_STRS: u8 = 2;
+pub(crate) const HASH_MISC: u8 = 4;
+
 /// The key of an array part's items within `Mem::ARR`.
 pub(crate) const ARR_ITEMS: u32 = 0;
 /// The key of an array part's size and cell, which only a resize changes.
@@ -994,7 +1001,7 @@ impl Op {
             ClassBits(_) | ClassIndex(_) | ClassMm(_) | TabMmBits | NumMtSet | TypeMtIs { .. } => {
                 Effects::reads(Mem::META)
             }
-            TabLoad { .. } | TabNoInts => Effects::reads(Mem::TAB),
+            TabLoad { .. } | TabNoKeys(_) => Effects::reads(Mem::TAB),
             TabStore { .. } => e(Flags::empty(), Mem::empty(), Mem::TAB),
             TabASize | TabArray | ArrLoad | ArrNext => Effects::reads(Mem::ARR),
             ArrStore => e(Flags::empty(), Mem::empty(), Mem::ARR),
@@ -1065,7 +1072,7 @@ impl Op {
                 | FnFixedLua
                 | FnFits
                 | TabHasRoom(_)
-                | TabNoInts
+                | TabNoKeys(_)
                 | IMulNo
                 | LMul
                 | IAnd
@@ -1140,7 +1147,7 @@ impl Op {
             NamedKey => Ty::val(TypeSet::STR),
             ClassIndex(_) | TabLoad { .. } | ArrLoad => Ty::ANY,
             TabArray => Ty::PTR,
-            TabHasRoom(_) | TabNoInts | ShapeIs(_) | ShapeIn(_) => Ty::B1,
+            TabHasRoom(_) | TabNoKeys(_) | ShapeIs(_) | ShapeIn(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
             HasFlag(_) | FnFixedLua | FnFits | NumMtSet | TypeMtIs { .. } => Ty::B1,
             ClassMm(_) => Ty::ANY,

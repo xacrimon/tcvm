@@ -643,7 +643,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     | Op::FnFixedLua
                     | Op::FnFits
                     | Op::TabHasRoom(_)
-                    | Op::TabNoInts => true,
+                    | Op::TabNoKeys(_) => true,
                     // A select takes flags: no test that branches.
                     Op::IsType(set) => op != Op::Select || is_single_test(set),
                     _ => false,
@@ -795,7 +795,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::FnFixedLua => (Test::FnFixedLua, Cond::Eq, args),
             Op::FnFits => (Test::FnFits, Cond::Ls, args),
             Op::TabHasRoom(loc) => (Test::TabHasRoom(loc), Cond::Hi, args),
-            Op::TabNoInts => (Test::TabNoInts, Cond::Eq, args),
+            Op::TabNoKeys(parts) => (Test::TabNoKeys(parts), Cond::Eq, args),
             op => panic!("test_of {op:?}"),
         }
     }
@@ -1261,7 +1261,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             | Op::FnFixedLua
             | Op::FnFits
             | Op::TabHasRoom(_)
-            | Op::TabNoInts => {
+            | Op::TabNoKeys(_) => {
                 let r = res.unwrap();
                 let (test, cond, targs) = self.test_of(r);
                 let mut ops = vec![self.def(r)];
