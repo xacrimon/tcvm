@@ -99,13 +99,26 @@ fn peel_round(f: &mut Func<'_>, inner: Option<&[(Block, usize)]>) -> bool {
     changed
 }
 
+/// Where a block is as a loop is peeled.
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    Out,
+    Loop,
+    Copy,
+}
+
 fn peel_loop(f: &mut Func<'_>, h: Block, body: &[Block]) {
+    // Each block's side: the loop's, its copy's, or neither's.
+    let mut side = vec![Side::Out; f.blocks.len()];
+    for &b in body {
+        side[b.idx()] = Side::Loop;
+    }
     let order: Vec<Block> = f
         .cfg()
         .rpo
         .iter()
         .copied()
-        .filter(|b| body.contains(b))
+        .filter(|b| side[b.idx()] == Side::Loop)
         .collect();
     let mut bmap: HashMap<Block, Block> = HashMap::default();
     for &b in &order {
@@ -113,6 +126,7 @@ fn peel_loop(f: &mut Func<'_>, h: Block, body: &[Block]) {
         f.blocks[nb.idx()].resume = f.blocks[b.idx()].resume;
         f.blocks[nb.idx()].cold = f.blocks[b.idx()].cold;
         bmap.insert(b, nb);
+        side.push(Side::Copy);
     }
     let mut vmap: HashMap<Val, Val> = HashMap::default();
     for &b in &order {
@@ -162,9 +176,9 @@ fn peel_loop(f: &mut Func<'_>, h: Block, body: &[Block]) {
     }
     // Entries into the loop now enter the copy.
     let nh = bmap[&h];
-    for bd in 0..f.blocks.len() {
+    for (bd, &sd) in side.iter().enumerate() {
         let b = Block(bd as u32);
-        if f.blocks[bd].dead || body.contains(&b) || bmap.values().any(|&x| x == b) {
+        if f.blocks[bd].dead || sd != Side::Out {
             continue;
         }
         if let Some(t) = f.terminator(b) {
@@ -175,59 +189,56 @@ fn peel_loop(f: &mut Func<'_>, h: Block, body: &[Block]) {
             }
         }
     }
-    repair_ssa(f, body, &bmap, &vmap);
+    repair_ssa(f, &side, &vmap);
 }
 
 /// Values of the loop used after it now have two definitions, the loop's and
 /// the copy's: give their uses outside both the reaching one, with block
 /// parameters where the two meet.
-fn repair_ssa(
-    f: &mut Func<'_>,
-    body: &[Block],
-    bmap: &HashMap<Block, Block>,
-    vmap: &HashMap<Val, Val>,
-) {
-    let in_body = |b: Block| body.contains(&b);
-    let in_copy = |b: Block| bmap.values().any(|&x| x == b);
+fn repair_ssa(f: &mut Func<'_>, side: &[Side], vmap: &HashMap<Val, Val>) {
     let defined = |f: &Func<'_>, v: Val| match f.vals[v.idx()].def {
-        ValDef::Param(b, _) => in_body(b),
-        ValDef::Inst(i, _) => in_body(f.insts[i.idx()].block),
+        ValDef::Param(b, _) => side[b.idx()] == Side::Loop,
+        ValDef::Inst(i, _) => side[f.insts[i.idx()].block.idx()] == Side::Loop,
     };
-    let outside: Vec<Block> = (0..f.blocks.len() as u32)
-        .map(Block)
-        .filter(|&b| !f.blocks[b.idx()].dead && !in_body(b) && !in_copy(b))
-        .collect();
+    // The escaping values in the order their uses outside come, each
+    // value's number in that order, and each use's (number, block).
     let mut escaping: Vec<Val> = Vec::new();
-    for &b in &outside {
+    let mut number = vec![u32::MAX; f.vals.len()];
+    let mut sites: Vec<(u32, Block)> = Vec::new();
+    for (b, &sd) in side.iter().enumerate() {
+        if f.blocks[b].dead || sd != Side::Out {
+            continue;
+        }
+        let b = Block(b as u32);
         for &i in f.insts_of(b) {
             f.for_each_use(i, |v| {
-                if defined(f, v) && !escaping.contains(&v) {
+                if !defined(f, v) {
+                    return;
+                }
+                if number[v.idx()] == u32::MAX {
+                    number[v.idx()] = escaping.len() as u32;
                     escaping.push(v);
                 }
+                sites.push((number[v.idx()], b));
             });
         }
     }
+    sites.sort_unstable();
+    sites.dedup();
     // The copy's edges into the loop and out of it are new.
     let cfg = f.cfg();
-    for v in escaping {
+    let mut sites = sites.into_iter().peekable();
+    for (n, v) in escaping.into_iter().enumerate() {
         let copy = vmap[&v];
         let mut memo: HashMap<Block, Val> = HashMap::default();
         let mut reach = Reach {
             v,
             copy,
-            body,
-            bmap,
+            side,
             cfg: &cfg,
             memo: &mut memo,
         };
-        for &b in &outside {
-            let mut uses = false;
-            for &i in f.insts_of(b) {
-                f.for_each_use(i, |x| uses |= x == v);
-            }
-            if !uses {
-                continue;
-            }
+        while let Some((_, b)) = sites.next_if(|s| s.0 == n as u32) {
             let r = reach.at(f, b);
             for k in 0..f.blocks[b.idx()].insts.len() {
                 let i = f.insts_of(b)[k];
@@ -259,8 +270,7 @@ fn repair_ssa(
 struct Reach<'a> {
     v: Val,
     copy: Val,
-    body: &'a [Block],
-    bmap: &'a HashMap<Block, Block>,
+    side: &'a [Side],
     cfg: &'a CfgInfo,
     memo: &'a mut HashMap<Block, Val>,
 }
@@ -269,11 +279,10 @@ impl Reach<'_> {
     /// The value at the start of `b`, or at its end for a block of the loop
     /// or the copy.
     fn at(&mut self, f: &mut Func<'_>, b: Block) -> Val {
-        if self.body.contains(&b) {
-            return self.v;
-        }
-        if self.bmap.values().any(|&x| x == b) {
-            return self.copy;
+        match self.side[b.idx()] {
+            Side::Loop => return self.v,
+            Side::Copy => return self.copy,
+            Side::Out => {}
         }
         if let Some(&r) = self.memo.get(&b) {
             return r;
