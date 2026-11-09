@@ -836,7 +836,7 @@ impl<'gc> MtCache<'gc> {
     /// metatable naming a new object at the dead one's address, whose tables
     /// would take what was compiled for the dead object's.
     pub(crate) fn retire_dead(fc: &Finalization<'gc>) {
-        for c in fc.deferred(crate::env::DEFER_CLASSES) {
+        for c in fc.deferred_repeated(crate::env::DEFER_CLASSES) {
             // SAFETY: only `MtCacheData::trace` defers to `DEFER_CLASSES`.
             let c = MtCache(unsafe { Gc::cast::<MtCacheData<'gc>>(c) });
             let d = c.0;

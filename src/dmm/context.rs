@@ -169,6 +169,13 @@ impl<'gc> Finalization<'gc> {
         boxes.into_iter().map(|b| unsafe { b.as_gc() }).collect()
     }
 
+    /// [`Self::deferred`] unsorted, an object once per trace of it this cycle (a barrier makes
+    /// for another): for a consumer that may see one twice.
+    pub fn deferred_repeated(&self, queue: usize) -> Vec<Gc<'gc, ()>> {
+        let boxes = self.context.deferred[queue].to_vec();
+        boxes.into_iter().map(|b| unsafe { b.as_gc() }).collect()
+    }
+
     /// Mark every [`Finalization::deferred`] object handled; sweeping refuses to start until they
     /// are.
     pub fn clear_deferred(&self) {
@@ -719,6 +726,13 @@ impl<T> Queue<T> {
 
     fn clear(&self) {
         unsafe { (*self.vec.get()).clear() }
+    }
+}
+
+impl<T: Copy> Queue<T> {
+    /// A copy of the contents, duplicates included.
+    fn to_vec(&self) -> Vec<T> {
+        unsafe { (*self.vec.get().cast_const()).clone() }
     }
 }
 
