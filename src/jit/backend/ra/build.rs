@@ -1,7 +1,7 @@
 //! Live ranges: each group's intervals and use positions, the points fixed
 //! operands reserve registers over, and the clobbers.
 
-use super::{Ivs, Loc, NONE, Need, Piece, Pos, Ra, Use, VInfo, Want, class_index, intersect};
+use super::{FIXED, Ivs, Loc, NONE, Need, Piece, Pos, Ra, Use, VInfo, class_index, intersect};
 use crate::jit::backend::reg::{
     Allocation, Block, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
 };
@@ -15,6 +15,9 @@ impl Ra {
     ) -> Result<(), String> {
         let nv = f.num_vregs();
         let n = f.operands.len() as u32;
+        if n >= 1 << 22 {
+            return Err("too many operands".into());
+        }
         self.allocs = vec![Allocation::none(); n as usize];
         self.vregs.extend((0..nv).map(|v| VInfo {
             class: class_index(f.vreg_classes[v]) as u8,
@@ -24,9 +27,6 @@ impl Ra {
             param_of: NONE,
             head: NONE,
             slot: NONE,
-            defs: (0, 0),
-            members: (0, 0),
-            flat: (0, 0),
         }));
         // A constant some use takes from wherever it is (a snapshot, a
         // call's slots) is spilled as any value: such a use has no register.
@@ -75,13 +75,9 @@ impl Ra {
         prefix(&mut self.snap_off);
         at.extend_from_slice(&uoff[1..]);
         sat.extend_from_slice(&self.snap_off[1..]);
-        let none = Use {
-            pos: 0,
-            alloc: 0,
-            need: Need::Any,
-        };
         self.uses.reserve_exact(uoff[nv] as usize);
-        self.uses.resize(uoff[nv] as usize, none);
+        self.uses
+            .resize(uoff[nv] as usize, Use::new(0, 0, Need::Any));
         self.snaps.reserve_exact(self.snap_off[nv] as usize);
         self.snaps.resize(self.snap_off[nv] as usize, (0, 0));
     }
@@ -162,7 +158,7 @@ impl Ra {
                                 && def_need(&self.vregs[v], f.remat[v]) == Need::Reg
                             {
                                 let need = Need::Reg;
-                                put(&mut self.uses, uat, v, Use { pos, alloc, need });
+                                put(&mut self.uses, uat, v, Use::new(pos, alloc, need));
                             }
                             continue;
                         }
@@ -188,7 +184,7 @@ impl Ra {
                                 }
                                 c => return Err(format!("unsupported use constraint {c:?}")),
                             };
-                            put(&mut self.uses, uat, v, Use { pos, alloc, need });
+                            put(&mut self.uses, uat, v, Use::new(pos, alloc, need));
                             continue;
                         }
                         // A definition holds its location through the
@@ -217,7 +213,7 @@ impl Ra {
                             }
                             OperandConstraint::Reg | OperandConstraint::Any => {
                                 let need = def_need(&self.vregs[v], f.remat[v]);
-                                put(&mut self.uses, uat, v, Use { pos, alloc, need });
+                                put(&mut self.uses, uat, v, Use::new(pos, alloc, need));
                             }
                             c => return Err(format!("unsupported def constraint {c:?}")),
                         }
@@ -252,7 +248,7 @@ impl Ra {
         debug_assert!((0..nv).all(|v| {
             let us = &self.uses[uoff[v] as usize..uoff[v + 1] as usize];
             us.windows(2)
-                .all(|w| (w[0].pos, w[0].alloc) < (w[1].pos, w[1].alloc))
+                .all(|w| (w[0].pos, w[0].alloc()) < (w[1].pos, w[1].alloc()))
         }));
         Ok(())
     }
@@ -290,7 +286,7 @@ impl Ra {
         let need_reg_at_def = |uses: &mut [Use], def: Pos, v: usize| {
             for u in &mut uses[uoff[v] as usize..uoff[v + 1] as usize] {
                 if u.pos == def {
-                    u.need = Need::Reg;
+                    u.set_need(Need::Reg);
                 }
             }
         };
@@ -379,31 +375,30 @@ impl Ra {
     /// Each group's members, then their definitions.
     fn members_and_defs(&mut self, w: &mut Build) {
         let nv = self.vregs.len();
-        self.defs.reserve(nv);
-        let Build { moff, at, .. } = w;
-        runs(moff, nv, self.rep.iter().copied());
+        self.defs.reserve_exact(nv);
+        self.defs_off.reserve_exact(nv + 1);
+        let Build { at, .. } = w;
+        runs(&mut self.members_off, nv, self.rep.iter().copied());
         self.members.resize(nv, 0);
         at.clear();
-        at.extend_from_slice(moff);
+        at.extend_from_slice(&self.members_off);
         for v in 0..nv {
             let r = self.rep[v] as usize;
             self.members[at[r] as usize] = v as u32;
             at[r] += 1;
         }
         for g in 0..nv {
-            let ms = (moff[g], moff[g + 1]);
-            self.vregs[g].members = ms;
-            let s = self.defs.len() as u32;
-            for &m in &self.members[ms.0 as usize..ms.1 as usize] {
-                let d = self.vregs[m as usize].def;
+            let s = self.defs.len();
+            self.defs_off.push(s as u32);
+            for k in self.members_off[g]..self.members_off[g + 1] {
+                let d = self.vregs[self.members[k as usize] as usize].def;
                 if d != NONE {
                     self.defs.push(d);
                 }
             }
-            let e = self.defs.len() as u32;
-            self.defs[s as usize..].sort_unstable();
-            self.vregs[g].defs = (s, e);
+            self.defs[s..].sort_unstable();
         }
+        self.defs_off.push(self.defs.len() as u32);
     }
 
     /// Each group's uses and first piece, its fixed definitions' pieces,
@@ -423,8 +418,8 @@ impl Ra {
         self.pieces.reserve(2 * nv);
         self.initial.reserve(nv);
         let merged = |v: usize| {
-            let (a, b) = self.vregs[self.rep[v] as usize].members;
-            b - a > 1
+            let g = self.rep[v] as usize;
+            self.members_off[g + 1] - self.members_off[g] > 1
         };
         let extra: u32 = (0..nv)
             .filter(|&v| merged(v))
@@ -438,7 +433,7 @@ impl Ra {
             }
             // The group's uses by point and operand: its own run, or its
             // members' merged after every value's (a cursor per run).
-            let (ma, mb) = self.vregs[v].members;
+            let (ma, mb) = (self.members_off[v], self.members_off[v + 1]);
             let (mut ulo, mut uhi) = (uoff[v] as usize, uoff[v + 1] as usize);
             if mb - ma > 1 {
                 ulo = self.uses.len();
@@ -450,7 +445,7 @@ impl Ra {
                 while let Some(c) = (keys.iter_mut().filter(|c| **c >> 32 != **c & 0xffff_ffff))
                     .min_by_key(|c| {
                         let u = self.uses[(**c >> 32) as usize];
-                        (u.pos, u.alloc)
+                        (u.pos, u.alloc())
                     })
                 {
                     let u = self.uses[(*c >> 32) as usize];
@@ -468,14 +463,14 @@ impl Ra {
                     fx.push((self.vregs[m].def as u64) << 32 | r.index() as u64);
                 }
             }
-            self.next_of.resize(self.uses.len(), [0; 3]);
+            self.next_of.resize(self.uses.len(), [0; 2]);
             let uhi = uhi as u32;
-            let mut next = [uhi; 3];
+            let mut next = [uhi; 2];
             for k in (ulo as u32..uhi).rev() {
-                for (n, w) in next.iter_mut().zip(Want::of(self.uses[k as usize].need)) {
-                    if w {
-                        *n = k;
-                    }
+                match self.uses[k as usize].need() {
+                    Need::Reg => next[0] = k,
+                    Need::Fixed(_) => next[1] = k,
+                    Need::Any => {}
                 }
                 self.next_of[k as usize] = next;
             }
@@ -495,8 +490,7 @@ impl Ra {
                 prev: NONE,
                 next: NONE,
                 loc: Loc::None,
-                fixed: false,
-                stack: false,
+                flags: 0,
             });
             self.vregs[v].head = x;
             // Each fixed definition's own point in its register; the rest is
@@ -515,7 +509,7 @@ impl Ra {
                     None => unreachable!("a definition past its range"),
                 };
                 self.pieces[at as usize].loc = Loc::Reg(r);
-                self.pieces[at as usize].fixed = true;
+                self.pieces[at as usize].flags |= FIXED;
                 rest = self.split_at(at, (def & !1) + 2);
             }
             if let Some(cur) = rest {
@@ -610,11 +604,10 @@ pub(super) struct Build {
     defined: Vec<u64>,
     defs: Vec<u32>,
     /// Each value's run of intervals (`span`, by `ioff`) and of uses
-    /// (`Ra::uses`, by `uoff`), each group's run of members (`moff`), and
-    /// the cursors filling the runs (`sat` the snapshot operands').
+    /// (`Ra::uses`, by `uoff`), and the cursors filling the runs (`sat`
+    /// the snapshot operands').
     ioff: Vec<u32>,
     uoff: Vec<u32>,
-    moff: Vec<u32>,
     at: Vec<u32>,
     sat: Vec<u32>,
     span: Vec<(u32, u32)>,
@@ -628,7 +621,7 @@ pub(super) struct Build {
 impl Build {
     pub(super) fn clear(&mut self) {
         clear!(self; fixtmp, fixed_def, stack_use, open, touched, out, defined, defs,
-            ioff, uoff, moff, at, sat, span, keys, fx, seen);
+            ioff, uoff, at, sat, span, keys, fx, seen);
         clear!(self.ivr; recs, last);
     }
 }
@@ -699,6 +692,7 @@ fn run_ivs(ivs: &[(Pos, Pos)], (a, b): (u32, u32)) -> Ivs<'_> {
 /// `off`: key `k`'s run is `off[k]..off[k + 1]`.
 fn runs(off: &mut Vec<u32>, n: usize, keys: impl Iterator<Item = u32>) {
     off.clear();
+    off.reserve_exact(n + 1);
     off.resize(n + 1, 0);
     for k in keys {
         off[k as usize + 1] += 1;

@@ -278,11 +278,12 @@ impl Ra {
     /// previous piece's.
     fn hint(&self, c: u32) -> Option<usize> {
         let p = &self.pieces[c as usize];
-        let fixed =
-            (self.want_from(p.ulo, p.uhi, Want::Fixed)).map(|j| match self.uses[j as usize].need {
+        let fixed = (self.want_from(p.ulo, p.uhi, Want::Fixed)).map(|j| {
+            match self.uses[j as usize].need() {
                 super::Need::Fixed(r) => r,
                 _ => unreachable!("a fixed use"),
-            });
+            }
+        });
         let prev = || (p.prev != NONE).then(|| self.reg_of(p.prev)).flatten();
         let r = fixed.or_else(prev)?;
         let k = self.reg_idx[r.index()];
@@ -319,7 +320,7 @@ impl Ra {
         us[..k]
             .iter()
             .rev()
-            .find(|u| Want::of(u.need)[Want::Beneficial as usize])
+            .find(|u| u.need() != super::Need::Any)
             .map_or(until, |u| ((u.pos & !1) + 2).min(until))
     }
 
@@ -392,7 +393,7 @@ impl Ra {
         // it to there (an argument made in its register), the rest after.
         if let Some(h) = hint
             && let Some(u) = (self.uses_of(c).iter())
-                .find(|u| u.need == super::Need::Fixed(self.env.regs[cls][h]))
+                .find(|u| u.need() == super::Need::Fixed(self.env.regs[cls][h]))
                 .copied()
         {
             let cut = (u.pos & !1) + 2;
@@ -658,7 +659,7 @@ impl Ra {
             ulo: p.ulo + u,
             prev: x,
             loc: Loc::None,
-            fixed: false,
+            flags: 0,
             ..p
         });
         if p.next != NONE {
@@ -772,7 +773,7 @@ impl Ra {
         if begin == end {
             return;
         }
-        let keep = |p: &Piece| p.loc.spilled() || p.fixed;
+        let keep = |p: &Piece| p.loc.spilled() || p.flags & super::FIXED != 0;
         if !keep(&self.pieces[begin as usize]) {
             self.spill_after(begin, pos);
         }

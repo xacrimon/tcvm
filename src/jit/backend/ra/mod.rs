@@ -159,12 +159,41 @@ enum Need {
     Fixed(PReg),
 }
 
+/// A use: its point, and in one word the operand's index in
+/// `Output::allocs` (22 bits), its `Need`'s tag and fixed register.
 #[derive(Clone, Copy)]
 struct Use {
     pos: Pos,
-    /// The operand's index in `Output::allocs`.
-    alloc: u32,
-    need: Need,
+    bits: u32,
+}
+
+impl Use {
+    fn new(pos: Pos, alloc: u32, need: Need) -> Use {
+        let mut u = Use { pos, bits: alloc };
+        u.set_need(need);
+        u
+    }
+
+    fn alloc(self) -> u32 {
+        self.bits & 0x3f_ffff
+    }
+
+    fn need(self) -> Need {
+        match self.bits >> 22 & 3 {
+            0 => Need::Reg,
+            1 => Need::Any,
+            _ => Need::Fixed(PReg::from_index((self.bits >> 24) as usize)),
+        }
+    }
+
+    fn set_need(&mut self, need: Need) {
+        let (tag, r) = match need {
+            Need::Reg => (0, 0),
+            Need::Any => (1, 0),
+            Need::Fixed(r) => (2, r.index() as u32),
+        };
+        self.bits = self.bits & 0x3f_ffff | tag << 22 | r << 24;
+    }
 }
 
 /// One piece of a group's live range, with one location: the group's
@@ -174,6 +203,9 @@ struct Use {
 struct Piece {
     g: u32,
     class: u8,
+    /// `FIXED`: a fixed definition's point in its register, never moved or
+    /// spilled. `STACK`: taken from its slot by some operand (`resolve`).
+    flags: u8,
     start: Pos,
     end: Pos,
     lo: u32,
@@ -184,11 +216,10 @@ struct Piece {
     prev: u32,
     next: u32,
     loc: Loc,
-    /// A fixed definition's point in its register: never moved or spilled.
-    fixed: bool,
-    /// Taken from its slot by some operand (`resolve`).
-    stack: bool,
 }
+
+const FIXED: u8 = 1;
+const STACK: u8 = 2;
 
 impl Piece {
     /// Merged back into the piece before it.
@@ -259,23 +290,13 @@ impl<'a> Ivs<'a> {
     }
 }
 
-/// The uses `next_use` looks for: needing a register, served by one,
-/// wanting a fixed one.
+/// The uses `next_use` looks for: needing a register, served by one (any
+/// but a constant's definition), wanting a fixed one.
 #[derive(Clone, Copy)]
 enum Want {
-    Reg = 0,
-    Beneficial = 1,
-    Fixed = 2,
-}
-
-impl Want {
-    fn of(n: Need) -> [bool; 3] {
-        [
-            n == Need::Reg,
-            matches!(n, Need::Reg | Need::Fixed(_)),
-            matches!(n, Need::Fixed(_)),
-        ]
-    }
+    Reg,
+    Beneficial,
+    Fixed,
 }
 
 /// The first point at or after `from` both interval lists cover.
@@ -324,13 +345,6 @@ struct VInfo {
     head: u32,
     /// Its spill slot, once spilled anywhere or used from the stack.
     slot: u32,
-    /// Its members' definition points, sorted (a run of `Ra::defs`): a
-    /// piece may start at one without a move.
-    defs: (u32, u32),
-    /// Its members, ascending (a run of `Ra::members`).
-    members: (u32, u32),
-    /// Its pieces by start, after the scan (a run of `Ra::flat`).
-    flat: (u32, u32),
 }
 
 /// The allocator, kept by the JIT runtime: the state of the function in
@@ -452,13 +466,18 @@ struct Ra {
     snaps: Vec<(Pos, u32)>,
     snap_off: Vec<u32>,
     /// Per use: the index of the first use from it on (in its group) that
-    /// needs a register, that a register serves, that is fixed (`Want`);
-    /// past the group's last otherwise.
-    next_of: Vec<[u32; 3]>,
+    /// needs a register and that is fixed; past the group's last otherwise.
+    next_of: Vec<[u32; 2]>,
+    /// Per group (runs by `_off`): its members' definition points, sorted
+    /// (a piece may start at one without a move); its members, ascending;
+    /// its pieces by start, after the scan, and their starts.
     defs: Vec<Pos>,
+    defs_off: Vec<u32>,
     members: Vec<u32>,
+    members_off: Vec<u32>,
     pieces: Vec<Piece>,
     flat: Vec<u32>,
+    flat_off: Vec<u32>,
     flat_start: Vec<Pos>,
     /// Per value; a group's pieces and slot are its representative's.
     vregs: Vec<VInfo>,
@@ -582,9 +601,12 @@ impl Ra {
             snap_off: Vec::new(),
             next_of: Vec::new(),
             defs: Vec::new(),
+            defs_off: Vec::new(),
             members: Vec::new(),
+            members_off: Vec::new(),
             pieces: Vec::new(),
             flat: Vec::new(),
+            flat_off: Vec::new(),
             flat_start: Vec::new(),
             vregs: Vec::new(),
             rep: Vec::new(),
@@ -611,8 +633,9 @@ impl Ra {
     /// Ready for another function.
     fn clear(&mut self) {
         clear!(self; order, rank, first, last, lin_block, at_lin, freq, inner, outer, hot_end,
-            live_in, anyuse, ivs, uses, snaps, snap_off, next_of, defs, members, pieces, flat,
-            flat_start, vregs, rep, deferred, clobs, initial, unhandled, active, inactive, scratch);
+            live_in, anyuse, ivs, uses, snaps, snap_off, next_of, defs, defs_off, members,
+            members_off, pieces, flat, flat_off, flat_start, vregs, rep, deferred, clobs, initial,
+            unhandled, active, inactive, scratch);
         for l in &mut self.fixres {
             l.clear();
         }
@@ -864,6 +887,28 @@ impl Ra {
         self.pieces[x as usize].uses(&self.uses)
     }
 
+    fn members_of(&self, g: u32) -> &[u32] {
+        let (a, b) = (
+            self.members_off[g as usize],
+            self.members_off[g as usize + 1],
+        );
+        &self.members[a as usize..b as usize]
+    }
+
+    fn defs_of(&self, g: u32) -> &[Pos] {
+        let (a, b) = (self.defs_off[g as usize], self.defs_off[g as usize + 1]);
+        &self.defs[a as usize..b as usize]
+    }
+
+    fn flat_run(&self, g: u32) -> (u32, u32) {
+        (self.flat_off[g as usize], self.flat_off[g as usize + 1])
+    }
+
+    fn pieces_of(&self, g: u32) -> &[u32] {
+        let (a, b) = self.flat_run(g);
+        &self.flat[a as usize..b as usize]
+    }
+
     fn start(&self, x: u32) -> Pos {
         self.pieces[x as usize].start
     }
@@ -885,23 +930,27 @@ impl Ra {
         if k >= hi {
             return None;
         }
-        let j = self.next_of[k as usize][want as usize];
+        let [r, f] = self.next_of[k as usize];
+        let j = match want {
+            Want::Reg => r,
+            Want::Fixed => f,
+            Want::Beneficial => r.min(f),
+        };
         (j < hi).then_some(j)
     }
 
     /// The piece of group `g` covering `p`: from the index `resolve` makes,
     /// or along the list before it.
     fn piece_at(&self, g: u32, p: Pos) -> Option<u32> {
-        let vi = &self.vregs[g as usize];
-        let x = if vi.flat.1 > vi.flat.0 {
-            let ps = &self.flat[vi.flat.0 as usize..vi.flat.1 as usize];
+        let x = if !self.flat_off.is_empty() {
+            let ps = self.pieces_of(g);
             let k = ps.partition_point(|&x| self.start(x) <= p);
             if k == 0 {
                 return None;
             }
             ps[k - 1]
         } else {
-            let (mut x, mut at) = (vi.head, NONE);
+            let (mut x, mut at) = (self.vregs[g as usize].head, NONE);
             while x != NONE && self.start(x) <= p {
                 at = x;
                 x = self.pieces[x as usize].next;
@@ -916,8 +965,7 @@ impl Ra {
 
     /// Whether a member of group `g` is defined at `p`.
     fn is_def(&self, g: u32, p: Pos) -> bool {
-        let (a, b) = self.vregs[g as usize].defs;
-        self.defs[a as usize..b as usize].binary_search(&p).is_ok()
+        self.defs_of(g).binary_search(&p).is_ok()
     }
 
     /// Whether a piece of `g` spilled from `s` can be back in a register

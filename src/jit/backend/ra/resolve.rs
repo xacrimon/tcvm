@@ -3,7 +3,7 @@
 //! each gap's moves sequenced as one parallel move.
 
 use super::build::{merge_tail, push_coalesced};
-use super::{Edit, Ivs, Loc, NONE, Need, Output, Pos, Ra, Want, intersect};
+use super::{Edit, Ivs, Loc, NONE, Need, Output, Pos, Ra, STACK, Want, intersect};
 use crate::jit::backend::reg::{Allocation, Inst, ProgPoint, RegClass, SpillSlot, VReg};
 use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
@@ -94,7 +94,7 @@ impl Ra {
             }
             for k in p.ulo..p.uhi {
                 let u = self.uses[k as usize];
-                let a = match u.need {
+                let a = match u.need() {
                     Need::Reg => match p.loc {
                         Loc::Reg(r) => Allocation::reg(r),
                         _ => return Err(format!("v{} needs a register at {}", p.g, u.pos)),
@@ -102,7 +102,7 @@ impl Ra {
                     Need::Any => self.alloc_of(x),
                     Need::Fixed(r) => Allocation::reg(r),
                 };
-                self.allocs[u.alloc as usize] = a;
+                self.allocs[u.alloc() as usize] = a;
             }
         }
         let moves = &mut t.moves;
@@ -138,7 +138,7 @@ impl Ra {
                 continue;
             }
             let (cls, deferred) = (gi.class, self.deferred[g as usize]);
-            let ps = &self.flat[gi.flat.0 as usize..gi.flat.1 as usize];
+            let ps = self.pieces_of(g);
             // Between pieces inside a block; a stack piece needs a store only
             // in cold code, before the instruction it starts at.
             for w in ps.windows(2) {
@@ -172,7 +172,7 @@ impl Ra {
                 let mut k = p.ulo;
                 while let Some(j) = self.want_from(k, p.uhi, Want::Fixed) {
                     let u = self.uses[j as usize];
-                    let Need::Fixed(r) = u.need else {
+                    let Need::Fixed(r) = u.need() else {
                         unreachable!("a fixed use")
                     };
                     let n = u.pos / 2;
@@ -232,33 +232,27 @@ impl Ra {
     fn index_pieces(&mut self, split: &mut Vec<u64>) {
         split.resize(self.words, 0);
         for g in 0..self.vregs.len() {
-            let s = self.flat.len() as u32;
+            let s = self.flat.len();
+            self.flat_off.push(s as u32);
             let mut x = self.vregs[g].head;
             while x != NONE {
                 self.flat.push(x);
                 self.flat_start.push(self.start(x));
                 x = self.pieces[x as usize].next;
             }
-            let e = self.flat.len() as u32;
-            self.vregs[g].flat = (s, e);
-            let ps = &self.flat[s as usize..e as usize];
+            let ps = &self.flat[s..];
             let loc = |x: &u32| self.pieces[*x as usize].loc;
             if ps.iter().any(|x| loc(x) != loc(&ps[0])) {
-                let (a, b) = self.vregs[g].members;
-                for &m in &self.members[a as usize..b as usize] {
+                for &m in self.members_of(g as u32) {
                     split[m as usize / 64] |= 1 << (m % 64);
                 }
             }
         }
+        self.flat_off.push(self.flat.len() as u32);
     }
 
     fn slot(&self, g: u32) -> Allocation {
         Allocation::stack(SpillSlot::new(self.vregs[g as usize].slot as usize))
-    }
-
-    fn pieces_of(&self, g: u32) -> &[u32] {
-        let (a, b) = self.vregs[g as usize].flat;
-        &self.flat[a as usize..b as usize]
     }
 
     fn stores_at_transitions(&self, g: usize) -> bool {
@@ -271,12 +265,12 @@ impl Ra {
             let p = &self.pieces[x as usize];
             if p.loc == Loc::Stack {
                 at_transitions += self.freq_at(p.start);
-            } else if p.stack {
+            } else if p.flags & STACK != 0 {
                 return false;
             }
         }
         let mut at_defs = 0f32;
-        for &v in &self.members[gi.members.0 as usize..gi.members.1 as usize] {
+        for &v in self.members_of(g as u32) {
             let vi = &self.vregs[v as usize];
             if vi.def != NONE {
                 at_defs += self.freq_at(vi.def);
@@ -296,7 +290,7 @@ impl Ra {
                 continue;
             }
             let g = self.rep[v];
-            let (fa, fb) = self.vregs[g as usize].flat;
+            let (fa, fb) = self.flat_run(g);
             let mut c = fa as usize;
             for k in a..b {
                 let (pos, op) = self.snaps[k];
@@ -306,7 +300,7 @@ impl Ra {
                 let x = self.flat[c];
                 debug_assert!(self.ivs_of(x).covers(pos));
                 self.allocs[(op >> 1) as usize] = if op & 1 != 0 {
-                    self.pieces[x as usize].stack = true;
+                    self.pieces[x as usize].flags |= STACK;
                     self.slot(g)
                 } else {
                     self.alloc_of(x)
@@ -338,7 +332,7 @@ impl Ra {
                     })
             });
             if def_in_reg && src_on_stack {
-                let (a, b) = self.vregs[v].flat;
+                let (a, b) = self.flat_run(v as u32);
                 for k in a..b {
                     let x = self.flat[k as usize] as usize;
                     if self.pieces[x].loc == Loc::Remat {
@@ -473,7 +467,7 @@ impl Ra {
             for (k, (&w, &m)) in self.live_in(si).iter().zip(split.iter()).enumerate() {
                 for v in bits(k, w & m) {
                     let g = self.rep[v as usize];
-                    let (a, b) = self.vregs[g as usize].flat;
+                    let (a, b) = self.flat_run(g);
                     let starts = &self.flat_start[a as usize..b as usize];
                     let mut c = cur[g as usize] as usize;
                     while c + 1 < starts.len() && starts[c + 1] <= ss {
@@ -504,7 +498,7 @@ impl Ra {
                 } else if pe + 1 == ss {
                     p.prev
                 } else {
-                    let (a, b) = self.vregs[self.rep[v as usize] as usize].flat;
+                    let (a, b) = self.flat_run(self.rep[v as usize]);
                     let k = self.flat_start[a as usize..b as usize].partition_point(|&s| s <= pe);
                     if k == 0 {
                         return Err(format!("v{v} not live out of b{pi}"));
