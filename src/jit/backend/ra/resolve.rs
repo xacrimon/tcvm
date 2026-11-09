@@ -3,8 +3,10 @@
 //! each gap's moves sequenced as one parallel move.
 
 use super::build::{merge_tail, push_coalesced};
-use super::{Edit, Ivs, Loc, NONE, Need, Output, Pos, Ra, STACK, Want, intersect};
-use crate::jit::backend::reg::{Allocation, Inst, ProgPoint, RegClass, SpillSlot, VReg};
+use super::{Edit, Ivs, Loc, NONE, Need, Output, Pos, Ra, STACK, Want, class_index, intersect};
+use crate::jit::backend::reg::{
+    Allocation, Block, Inst, OperandKind, ProgPoint, RegClass, SpillSlot, VReg,
+};
 use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
 /// A move of a value of class `cls`, or with `remat` its computation
@@ -35,6 +37,15 @@ const LATE_STORE: u8 = 5;
 const FIXED_COPY: u8 = 6;
 const EDGE: u8 = 7;
 
+/// `cleanup`'s effect entries after the locations (a definition's, with
+/// its vreg): a clobber of the integer or the float registers of a mask, a
+/// register use, a move or an edge's move by its index in `sorted`.
+const CLOBBER: u32 = u32::MAX - 1;
+const CLOBBER1: u32 = u32::MAX - 2;
+const USE: u32 = u32::MAX - 3;
+const MOVE: u32 = u32::MAX - 4;
+const EDGE_MOVE: u32 = u32::MAX - 5;
+
 /// `resolve`'s buffers: the values of split groups; the moves as
 /// `(linear index, phase, move)`, then sorted, and one gap's; slot
 /// coloring's groups with their run of `all` (`busy`), a group's padded
@@ -54,11 +65,29 @@ pub(super) struct Resolve {
     once: Vec<u32>,
     cur: Vec<u32>,
     live: Vec<(u32, u32)>,
+    /// `cleanup`'s: the moves changing nothing, each block's contents at
+    /// its start and the two being worked on, the worklist.
+    dead: Vec<bool>,
+    held: Vec<u32>,
+    now: Vec<u32>,
+    next: Vec<u32>,
+    reached: Vec<bool>,
+    work: std::collections::VecDeque<u32>,
+    queued: Vec<bool>,
+    keep: Vec<bool>,
+    genkill: Vec<u32>,
+    mloc: Vec<(u32, u32)>,
+    eff: Vec<(u32, u32)>,
+    eoff: Vec<u32>,
+    held16: Vec<u16>,
+    now16: Vec<u16>,
+    next16: Vec<u16>,
 }
 
 impl Resolve {
     pub(super) fn clear(&mut self) {
-        clear!(self; split, moves, sorted, keys, group, busy, all, ivs, once, cur, live);
+        clear!(self; split, moves, sorted, keys, group, busy, all, ivs, once, cur, live, dead, held,
+            now, next, reached, work, queued, keep, genkill, mloc, eff, eoff, held16, now16, next16);
         for s in &mut self.slots {
             s.clear();
         }
@@ -159,10 +188,11 @@ impl Ra {
                     return Err(format!("v{g} reloaded inside instruction {}", at / 2));
                 }
                 let phase = if at & 1 != 0 { LATE_STORE } else { CONNECT };
+                let v = self.member_at(g, at - 1);
                 moves.push((
                     at / 2,
                     phase,
-                    self.mv(f, g, at - 1, self.alloc_of(w[1]), cls),
+                    self.mv(f, v, at - 1, self.alloc_of(w[1]), cls),
                 ));
             }
             // Into fixed registers, from wherever the value is when the
@@ -176,7 +206,7 @@ impl Ra {
                         unreachable!("a fixed use")
                     };
                     let n = u.pos / 2;
-                    let m = self.mv(f, g, 2 * n, Allocation::reg(r), cls);
+                    let m = self.mv(f, self.member_at(g, u.pos), 2 * n, Allocation::reg(r), cls);
                     if m.remat || m.from != m.to {
                         moves.push((n, FIXED_COPY, m));
                     }
@@ -190,7 +220,6 @@ impl Ra {
             moves,
             sorted,
             keys,
-            group,
             ..
         } = t;
         keys.clear(); // `color_slots` sorted with them too.
@@ -199,7 +228,13 @@ impl Ra {
         }));
         keys.sort_unstable();
         sorted.extend(keys.iter().map(|&k| moves[k as u32 as usize]));
-        let moves = sorted;
+        self.cleanup(f, t);
+        let Resolve {
+            sorted: moves,
+            dead,
+            group,
+            ..
+        } = t;
         let mut edits: Vec<(ProgPoint, Edit)> = Vec::with_capacity(moves.len());
         let mut edge_edits: Vec<(Inst, u8, Edit)> = Vec::new();
         let mut k = 0;
@@ -207,8 +242,13 @@ impl Ra {
             let (l, phase) = (moves[k].0, moves[k].1);
             group.clear();
             while k < moves.len() && moves[k].0 == l && moves[k].1 == phase {
-                group.push(moves[k].2);
+                if !dead[k] {
+                    group.push(moves[k].2);
+                }
                 k += 1;
+            }
+            if group.is_empty() {
+                continue;
             }
             let i = self.at_lin[l as usize];
             if phase & 7 == EDGE {
@@ -249,6 +289,484 @@ impl Ra {
             }
         }
         self.flat_off.push(self.flat.len() as u32);
+    }
+
+    /// The member of group `g` live at `p`: the last defined by there.
+    fn member_at(&self, g: u32, p: Pos) -> u32 {
+        let ms = self.members_of(g);
+        if ms.len() == 1 {
+            return g;
+        }
+        let def = |m: u32| {
+            let vi = &self.vregs[m as usize];
+            if vi.def != NONE {
+                vi.def
+            } else {
+                self.block_start(vi.param_of)
+            }
+        };
+        (ms.iter().copied().filter(|&m| def(m) <= p))
+            .max_by_key(|&m| def(m))
+            .unwrap_or(g)
+    }
+
+    /// The location index of an allocation: allocatable registers by class,
+    /// then the slots.
+    fn loc_index(&self, a: Allocation) -> Option<usize> {
+        if let Some(r) = a.as_reg() {
+            let k = self.reg_idx[r.index()];
+            (k != NONE).then(|| k as usize + class_index(r.class()) * self.env.regs[0].len())
+        } else {
+            a.as_stack()
+                .map(|s| s.index() + self.env.regs[0].len() + self.env.regs[1].len())
+        }
+    }
+
+    /// Drop the moves the code does not need: those that change nothing (a
+    /// reload or remat into a register still holding the value, a store into
+    /// a slot that kept it) and those into a register nothing reads before it
+    /// is written again. The scan's intervals are linear, so a register is
+    /// taken, or a piece reaches a block, at positions control flow need not
+    /// pass through; what each location holds on every path into a point
+    /// (forward), and which are read on some path from it (backward), are
+    /// followed instead, values by vreg so a group's members stay apart.
+    /// Dropping a dead write can leave an older value in place, so the passes
+    /// repeat while the backward one finds more.
+    #[inline(never)]
+    fn cleanup<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve) {
+        if f.num_vregs() >= UNKNOWN as usize {
+            return;
+        }
+        let width = self.env.regs[0].len() + self.env.regs[1].len() + self.num_slots as usize;
+        let Resolve {
+            sorted,
+            dead,
+            mloc,
+            eff,
+            eoff,
+            ..
+        } = t;
+        dead.resize(sorted.len(), false);
+        let loc = |a: Allocation| self.loc_index(a).map_or(NONE, |l| l as u32);
+        mloc.extend(sorted.iter().map(|m| (loc(m.2.to), loc(m.2.from))));
+        // Each instruction's effects in order (`eoff`): the moves before it
+        // (an edge's tagged apart), in phase order, its register uses,
+        // clobbers and definitions. `sorted` is by instruction, so a cursor
+        // finds the moves; a block's instructions are a range, so its effects
+        // are.
+        eoff.resize(f.num_insts() + 1, 0);
+        let mut k = 0;
+        for (n, off) in eoff[..f.num_insts()].iter_mut().enumerate() {
+            let i = Inst::new(n);
+            *off = eff.len() as u32;
+            while k < sorted.len() && self.at_lin[sorted[k].0 as usize].index() == n {
+                let tag = if sorted[k].1 & 7 == EDGE {
+                    EDGE_MOVE
+                } else {
+                    MOVE
+                };
+                eff.push((tag, k as u32));
+                k += 1;
+            }
+            // Reads before writes: backward, the writes kill first.
+            let base = f.ops[i.index()].0 as usize;
+            let ops = f.inst_operands(i);
+            for (k, op) in ops.iter().enumerate() {
+                if op.kind() == OperandKind::Use
+                    && self.allocs[base + k].is_reg()
+                    && let Some(l) = self.loc_index(self.allocs[base + k])
+                {
+                    eff.push((USE, l as u32));
+                }
+            }
+            let mut m = [0u32; 2];
+            for r in f.inst_clobbers(i) {
+                let k = self.reg_idx[r.index()];
+                if k != NONE {
+                    m[class_index(r.class())] |= 1 << k;
+                }
+            }
+            for (tag, &m) in [CLOBBER, CLOBBER1].iter().zip(&m) {
+                if m != 0 {
+                    eff.push((*tag, m));
+                }
+            }
+            for (k, op) in ops.iter().enumerate() {
+                if op.kind() == OperandKind::Def
+                    && let Some(l) = self.loc_index(self.allocs[base + k])
+                {
+                    eff.push((l as u32, op.vreg().vreg() as u32));
+                }
+            }
+        }
+        debug_assert_eq!(k, sorted.len());
+        eoff[f.num_insts()] = eff.len() as u32;
+        self.redundant(f, t, width);
+        while self.unread(f, t, width) && self.redundant(f, t, width) {}
+    }
+
+    /// Block `b`'s effects, and its last instruction's.
+    fn effects<I: TargetInst>(
+        &self,
+        f: &VCode<I>,
+        eoff: &[u32],
+        b: usize,
+    ) -> ((usize, usize), (usize, usize)) {
+        let r = f.block_insns(Block::new(b));
+        let (first, last) = (r.first().index(), r.last().index());
+        (
+            (eoff[first] as usize, eoff[last + 1] as usize),
+            (eoff[last] as usize, eoff[last + 1] as usize),
+        )
+    }
+
+    /// Forward over effects `a..e`, `edge`'s moves if any else a block's:
+    /// what each location holds after them. A run of moves of one phase is a
+    /// parallel move, read before written; those changing nothing are marked
+    /// when `mark`, dead ones skipped.
+    #[inline(never)]
+    fn hold(
+        &self,
+        ms: &mut Marks,
+        st: &mut [u16],
+        (a, e): (usize, usize),
+        edge: Option<u8>,
+        mark: bool,
+    ) {
+        let n0 = self.env.regs[0].len();
+        let Marks {
+            sorted,
+            dead,
+            eff,
+            mloc,
+            marked,
+            ..
+        } = ms;
+        let mut k = a;
+        while k < e {
+            let (tag, j) = eff[k];
+            if tag == MOVE || tag == EDGE_MOVE {
+                let phase = sorted[j as usize].1;
+                let mut e2 = k + 1;
+                while e2 < e && eff[e2].0 == tag && sorted[eff[e2].1 as usize].1 == phase {
+                    e2 += 1;
+                }
+                let mine = (phase & 7 == EDGE).then_some(phase >> 3) == edge;
+                if mine && mark {
+                    for &(_, j) in &eff[k..e2] {
+                        let j = j as usize;
+                        let l = mloc[j].0;
+                        if !dead[j] && l != NONE && st[l as usize] == sorted[j].2.vreg as u16 {
+                            dead[j] = true;
+                            *marked += 1;
+                        }
+                    }
+                }
+                if mine {
+                    for &(_, j) in &eff[k..e2] {
+                        let j = j as usize;
+                        if !dead[j] && mloc[j].0 != NONE {
+                            st[mloc[j].0 as usize] = sorted[j].2.vreg as u16;
+                        }
+                    }
+                }
+                k = e2;
+                continue;
+            }
+            if edge.is_none() {
+                match tag {
+                    USE => {}
+                    CLOBBER => clobber(st, 0, j),
+                    CLOBBER1 => clobber(st, n0, j),
+                    _ => st[tag as usize] = j as u16,
+                }
+            }
+            k += 1;
+        }
+    }
+
+    /// Forward: what each location holds on every path (`NONE` for
+    /// unknown), a fixpoint from the entry; then a pass marking the moves
+    /// changing nothing. Whether any was.
+    fn redundant<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve, width: usize) -> bool {
+        let Resolve {
+            sorted,
+            dead,
+            held16: held,
+            now16: now,
+            next16: next,
+            reached,
+            work,
+            queued,
+            keep,
+            mloc,
+            eff,
+            eoff,
+            ..
+        } = t;
+        let ms = &mut Marks {
+            sorted,
+            dead,
+            keep,
+            mloc,
+            eff,
+            marked: 0,
+        };
+        let nb = f.num_blocks();
+        held.clear();
+        held.resize(nb * width, UNKNOWN);
+        reached.clear();
+        reached.resize(nb, false);
+        queued.clear();
+        queued.resize(nb, false);
+        now.resize(width, UNKNOWN);
+        next.resize(width, UNKNOWN);
+        // Blocks in allocation order (predecessors first but for back
+        // edges), those not reached yet left for when they are.
+        reached[f.entry_block().index()] = true;
+        queued.fill(true);
+        work.extend(self.order.iter().map(|b| b.index() as u32));
+        let mut mark = false;
+        loop {
+            let b = match work.pop_front() {
+                Some(b) => b as usize,
+                // Settled: once more over every block, marking.
+                None if !mark => {
+                    mark = true;
+                    work.extend((0..nb as u32).filter(|&b| reached[b as usize]));
+                    continue;
+                }
+                None => break,
+            };
+            queued[b] = false;
+            if !reached[b] {
+                continue;
+            }
+            let (all, last) = self.effects(f, eoff, b);
+            now.copy_from_slice(&held[b * width..(b + 1) * width]);
+            self.hold(ms, now, all, None, mark);
+            // Only a branch has moves on its edges: a jump's successor takes
+            // the state as it is.
+            let edges = eff[last.0..last.1].iter().any(|x| x.0 == EDGE_MOVE);
+            for (k, s) in f.block_succs(Block::new(b)).iter().enumerate() {
+                let si = s.index();
+                let out: &[u16] = if edges {
+                    next.copy_from_slice(now);
+                    self.hold(ms, next, last, Some(k as u8), mark);
+                    next
+                } else {
+                    now
+                };
+                if mark {
+                    continue;
+                }
+                let into = &mut held[si * width..(si + 1) * width];
+                let changed = if !reached[si] {
+                    reached[si] = true;
+                    into.copy_from_slice(out);
+                    true
+                } else {
+                    let mut c = false;
+                    for (h, &n) in into.iter_mut().zip(out.iter()) {
+                        if *h != n && *h != UNKNOWN {
+                            *h = UNKNOWN;
+                            c = true;
+                        }
+                    }
+                    c
+                };
+                if changed && !std::mem::replace(&mut queued[si], true) {
+                    work.push_back(si as u32);
+                }
+            }
+        }
+        ms.marked != 0
+    }
+
+    /// Backward over effects `a..e` (`edge`'s moves, or a block's): the
+    /// locations live before them. A move into a register not read after it
+    /// is unread, marked dead when `mark`, and reads nothing; with `exact`
+    /// off every move reads its source (a block summary). Stores stay: a
+    /// slot's readers are explicit, but the saving is small and the frame
+    /// image copies them all.
+    #[inline(never)]
+    fn read(
+        &self,
+        ms: &mut Marks,
+        live: &mut [u32],
+        kill: &mut [u32],
+        (a, e): (usize, usize),
+        edge: Option<u8>,
+        mode: Mode,
+    ) {
+        let (exact, mark) = (mode != Mode::Summary, mode == Mode::Mark);
+        let write = |live: &mut [u32], kill: &mut [u32], l: usize| {
+            clr(live, l);
+            if !kill.is_empty() {
+                set(kill, l);
+            }
+        };
+        let n0 = self.env.regs[0].len();
+        let Marks {
+            sorted,
+            dead,
+            keep,
+            eff,
+            mloc,
+            marked,
+        } = ms;
+        let mut e = e;
+        while e > a {
+            let (tag, j) = eff[e - 1];
+            if tag == MOVE || tag == EDGE_MOVE {
+                let phase = sorted[j as usize].1;
+                let mut k = e - 1;
+                while k > a && eff[k - 1].0 == tag && sorted[eff[k - 1].1 as usize].1 == phase {
+                    k -= 1;
+                }
+                if (phase & 7 == EDGE).then_some(phase >> 3) == edge {
+                    // Unread before any target is cleared: a parallel move.
+                    keep.clear();
+                    for &(_, j) in &eff[k..e] {
+                        let j = j as usize;
+                        let to = mloc[j].0;
+                        let unread = exact
+                            && !dead[j]
+                            && !sorted[j].2.to.is_stack()
+                            && to != NONE
+                            && !has(live, to as usize);
+                        if unread && mark {
+                            dead[j] = true;
+                            *marked += 1;
+                        }
+                        keep.push(!dead[j] && !unread);
+                    }
+                    for (n, &(_, j)) in eff[k..e].iter().enumerate() {
+                        if keep[n] && mloc[j as usize].0 != NONE {
+                            write(live, kill, mloc[j as usize].0 as usize);
+                        }
+                    }
+                    for (n, &(_, j)) in eff[k..e].iter().enumerate() {
+                        if keep[n] && mloc[j as usize].1 != NONE {
+                            set(live, mloc[j as usize].1 as usize);
+                        }
+                    }
+                }
+                e = k;
+                continue;
+            }
+            if edge.is_none() {
+                match tag {
+                    USE => set(live, j as usize),
+                    CLOBBER => {
+                        for k in bits(0, j as u64) {
+                            write(live, kill, k as usize);
+                        }
+                    }
+                    CLOBBER1 => {
+                        for k in bits(0, j as u64) {
+                            write(live, kill, n0 + k as usize);
+                        }
+                    }
+                    _ => write(live, kill, tag as usize),
+                }
+            }
+            e -= 1;
+        }
+    }
+
+    /// Backward: the locations read on some path from each point. Each
+    /// block's reads before any write (`reads`) and writes (`kill`) are
+    /// summarized once, the fixpoint from the end runs on the sets, and one
+    /// exact walk marks the unread moves. Whether any was.
+    fn unread<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve, width: usize) -> bool {
+        let Resolve {
+            sorted,
+            dead,
+            held,
+            now,
+            next,
+            work,
+            queued,
+            keep,
+            genkill,
+            mloc,
+            eff,
+            eoff,
+            ..
+        } = t;
+        let ms = &mut Marks {
+            sorted,
+            dead,
+            keep,
+            mloc,
+            eff,
+            marked: 0,
+        };
+        let nb = f.num_blocks();
+        let words = width.div_ceil(32);
+        // `held` holds each block's live-in set, `now`/`next` one set each.
+        held.clear();
+        held.resize(nb * words, 0);
+        now.clear();
+        now.resize(words, 0);
+        next.clear();
+        next.resize(words, 0);
+        queued.clear();
+        queued.resize(nb, true);
+        genkill.clear();
+        genkill.resize(2 * nb * words, 0);
+        // A block's summary: what it reads before writing (`reads`, the
+        // live-in of nothing live out) and what it writes (`kill`).
+        for b in 0..nb {
+            let (reads, kill) = genkill[2 * b * words..2 * (b + 1) * words].split_at_mut(words);
+            let (all, _) = self.effects(f, eoff, b);
+            self.read(ms, reads, kill, all, None, Mode::Summary);
+        }
+        work.extend(self.order.iter().rev().map(|b| b.index() as u32));
+        let mut mark = false;
+        loop {
+            let b = match work.pop_front() {
+                Some(b) => b as usize,
+                None if !mark => {
+                    mark = true;
+                    work.extend(0..nb as u32);
+                    continue;
+                }
+                None => break,
+            };
+            queued[b] = false;
+            let (all, last) = self.effects(f, eoff, b);
+            // Live out: what each successor needs after that edge's moves.
+            now.fill(0);
+            for (k, s) in f.block_succs(Block::new(b)).iter().enumerate() {
+                let si = s.index();
+                next.copy_from_slice(&held[si * words..(si + 1) * words]);
+                let mode = if mark { Mode::Mark } else { Mode::Exact };
+                self.read(ms, next, &mut [], last, Some(k as u8), mode);
+                for (o, &x) in now.iter_mut().zip(next.iter()) {
+                    *o |= x;
+                }
+            }
+            if mark {
+                self.read(ms, now, &mut [], all, None, Mode::Mark);
+                continue;
+            }
+            let (reads, kill) = genkill[2 * b * words..2 * (b + 1) * words].split_at(words);
+            for ((o, &g), &k) in now.iter_mut().zip(reads).zip(kill) {
+                *o = g | (*o & !k);
+            }
+            let into = &mut held[b * words..(b + 1) * words];
+            if into != &now[..] {
+                into.copy_from_slice(now);
+                for p in f.block_preds(Block::new(b)) {
+                    if !std::mem::replace(&mut queued[p.index()], true) {
+                        work.push_back(p.index() as u32);
+                    }
+                }
+            }
+        }
+        ms.marked != 0
     }
 
     fn slot(&self, g: u32) -> Allocation {
@@ -663,6 +1181,52 @@ impl Ra {
         }
         Ok(())
     }
+}
+
+/// `cleanup`'s moves and marks: the sorted moves, the ones dropped, and a
+/// parallel move's kept ones.
+struct Marks<'a> {
+    sorted: &'a [(u32, u8, Mv)],
+    dead: &'a mut [bool],
+    keep: &'a mut Vec<bool>,
+    /// Each move's locations (`NONE` for none), the effects, and how many
+    /// moves this pass marked.
+    mloc: &'a [(u32, u32)],
+    eff: &'a [(u32, u32)],
+    marked: u32,
+}
+
+/// How `read` treats moves: every one reads its source (a block summary,
+/// also collecting what the block writes), only those whose target is read
+/// after (exact), and marking the others dead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Summary,
+    Exact,
+    Mark,
+}
+
+/// Registers `mask` (indices from `base`) hold nothing known.
+fn clobber(st: &mut [u16], base: usize, mask: u32) {
+    for k in bits(0, mask as u64) {
+        st[base + k as usize] = UNKNOWN;
+    }
+}
+
+/// `cleanup`'s forward state: what a location holds, by vreg (so a region of
+/// more values than fit gets no cleanup).
+const UNKNOWN: u16 = u16::MAX;
+
+fn set(s: &mut [u32], l: usize) {
+    s[l / 32] |= 1 << (l % 32);
+}
+
+fn clr(s: &mut [u32], l: usize) {
+    s[l / 32] &= !(1 << (l % 32));
+}
+
+fn has(s: &[u32], l: usize) -> bool {
+    s[l / 32] >> (l % 32) & 1 != 0
 }
 
 fn mv(from: Allocation, to: Allocation, cls: u8, vreg: u32, remat: bool) -> Mv {
