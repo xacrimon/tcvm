@@ -1,10 +1,12 @@
 # LJR benchmark suite
 
 The 43 programs from luajit-remake's `luabench/` (commit a1275ae) used by
-`tools/ljr.py`; `life.lua` is left out because its source is Latin-1.
+`tools/ljr.py`; `life.lua` is left out because its source is Latin-1. Added
+here: `particles.lua`, a game-script-style particle simulation (method
+dispatch, per-call allocation, closures, string keys, library calls).
 
 Run them with `tools/ljr.py --suite bench/ljr`. Sizes (luajit-remake's
-`run_bench.sh`), as in `ARGS` in `tools/ljr.py`:
+`run_bench.sh`; particles' own), as in `ARGS` in `tools/ljr.py`:
 
 | program | arguments |
 |---|---|
@@ -25,6 +27,7 @@ Run them with `tools/ljr.py --suite bench/ljr`. Sizes (luajit-remake's
 | nbody | `5e6` |
 | nsieve | `12` |
 | partialsums | `3e7` |
+| particles | `10000` |
 | pidigits-nogmp | `5000` |
 | qt | `14` |
 | quadtree-2 | `14` |

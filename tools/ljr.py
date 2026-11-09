@@ -21,7 +21,7 @@ import sys
 import tempfile
 
 SKIP = {"life"}
-# The suite's own sizes (luajit-remake's run_bench.sh); k-nucleotide and
+# The suite's own sizes (luajit-remake's run_bench.sh, particles' own); k-nucleotide and
 # revcomp read the output of `fasta.lua 5000000` on stdin.
 ARGS = {
     "array3d": ["300", "packed"], "binary-trees-num": ["16"], "binary-trees-name": ["15"],
@@ -29,11 +29,11 @@ ARGS = {
     "fannkuch": ["11"], "fasta": ["5e6"], "fixpoint-fact": ["1000"],
     "heapsort": ["1", "3000000"], "k-nucleotide": ["5e6"], "linear-sieve": ["3e7"],
     "mandelbrot": ["3000"], "mandel-metatable": ["256"], "nbody": ["5e6"], "nsieve": ["12"],
-    "partialsums": ["3e7"], "pidigits-nogmp": ["5000"], "qt": ["14"], "quadtree-2": ["14"],
-    "queen": ["12"], "ray": ["9"], "ray-prop": ["9"], "recursive-fib-uv": ["40"],
-    "recursive-fib-gv": ["40"], "revcomp": ["5e6"], "scimark-fft": ["10"],
-    "scimark-lu": ["5"], "scimark-sor": ["5"], "scimark-sparse": ["300"], "series": ["5000"],
-    "spectral-norm": ["2000"], "table-sort": ["5e6"], "table-sort-cmp": ["1e6"],
+    "partialsums": ["3e7"], "particles": ["10000"], "pidigits-nogmp": ["5000"], "qt": ["14"],
+    "quadtree-2": ["14"], "queen": ["12"], "ray": ["9"], "ray-prop": ["9"],
+    "recursive-fib-uv": ["40"], "recursive-fib-gv": ["40"], "revcomp": ["5e6"],
+    "scimark-fft": ["10"], "scimark-lu": ["5"], "scimark-sor": ["5"], "scimark-sparse": ["300"],
+    "series": ["5000"], "spectral-norm": ["2000"], "table-sort": ["5e6"], "table-sort-cmp": ["1e6"],
 }
 STDIN = {"k-nucleotide", "revcomp"}
 
