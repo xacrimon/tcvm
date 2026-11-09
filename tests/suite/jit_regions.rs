@@ -2503,6 +2503,47 @@ fn tail_calls_in_bodies_replace_their_frames() {
     );
 }
 
+/// A metamethod inlined at `SUB` and at `GETFIELD` tail-calls a callee too
+/// polymorphic to inline, which replaces the metamethod and so invalidates
+/// the region: the lazy exit past the call resumes after the instruction
+/// with the result in `R[A]`, which still held the instruction's operand.
+#[test]
+fn metamethod_tail_calls_leave_with_the_result() {
+    for (set, use_) in [
+        (
+            "V.__sub = function(a, b) return mk(a.x - b.x) end",
+            "local d = P[i].v - b.v",
+        ),
+        (
+            "V.__index = function(t, k) return mk(t.x - 3) end",
+            "local d = P[i].v; d = d.y",
+        ),
+    ] {
+        agrees(&format!(
+            "local V = {{}}
+            local mk
+            local function new(x) return setmetatable({{x = x}}, V) end
+            local function new2(x) return setmetatable({{x = x + 0}}, V) end
+            local function new3(x)
+              if x == 1499 then {set} end
+              return setmetatable({{x = x}}, V)
+            end
+            {set}
+            local ks = {{new, new2, new3}}
+            local P = {{}}
+            for i = 1, 2000 do P[i] = {{v = new(i + 3)}} end
+            local b = {{v = new(3)}}
+            local s = 0
+            for i = 1, 2000 do
+              mk = ks[i % 3 + 1]
+              {use_}
+              s = s + d.x
+            end
+            return tostring(s)"
+        ));
+    }
+}
+
 /// A tail call in a region's own frame (W3 step 6b): `outer` (its region
 /// made through `pcall`, which no caller inlines) tail-calls `inner`, which
 /// takes over its frame. Level 3 from `inner` is the `pcall`, `outer`
