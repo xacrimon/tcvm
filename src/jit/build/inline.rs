@@ -491,6 +491,7 @@ fn inline_site(
             watch,
             returns: Vec::new(),
             closure,
+            window: 0,
         };
         let from = b.cur;
         let mut ib = Builder::new_inline(b, lf, proto, &code.cfg, inline);
@@ -569,7 +570,7 @@ fn inline_site(
         Err(_) => {}
     }
     let end = (base + proto.max_stack_size as usize) as u16;
-    b.ins_exit(Op::GuardWindow(end), &[], ExitTag::Slow);
+    b.need_window(end.max(inline.window));
     b.flush();
     let slots: Vec<SlotState> = (0..(a as usize).min(b.nregs))
         .map(|r| b.slot(b.cur, r))
@@ -892,12 +893,11 @@ fn producer(b: &Builder<'_, '_>, pc: u32) -> Option<u8> {
 
 /// `n` values of `R[r..top)` (`count` of them, an i32) for the instruction
 /// at `pc`: the registers before the call that set `top` as they are, its
-/// results from their slots where below `top` and nil past it. The window
-/// guard keeps the loads in the stack.
+/// results from their slots where below `top` and nil past it, which the
+/// region's window keeps in the stack.
 fn top_values(b: &mut Builder<'_, '_>, pc: u32, r: u8, n: u8, count: Val) -> Vec<Val> {
     let first = producer(b, pc).expect("a call returning to top");
-    let end = b.slot_of(r) as u16 + n as u16;
-    b.ins_exit(Op::GuardWindow(end), &[], ExitTag::Slow);
+    b.need_window(b.slot_of(r) as u16 + n as u16);
     let nil = b.konst(crate::env::value::Value::nil());
     (0..n)
         .map(|k| {

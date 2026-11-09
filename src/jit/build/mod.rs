@@ -327,6 +327,9 @@ pub(crate) struct Inline {
     /// The callee closure (a `Ptr`) when known by its prototype only, whose
     /// upvalues are loaded from it; else the builder's closure is it.
     pub(crate) closure: Option<Val>,
+    /// The window what is built in it needs, which counts toward the
+    /// region's once it is inlined (`Builder::need_window`).
+    pub(crate) window: u16,
 }
 
 /// How many values an inlined call left up to `top` (W3 §7).
@@ -554,8 +557,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             return;
         }
         let e = op.effects();
-        let frame = (e.reads | e.writes).intersects(Mem::SLOT | Mem::FRAME)
-            && !matches!(op, Op::GuardWindow(_));
+        let frame = (e.reads | e.writes).intersects(Mem::SLOT | Mem::FRAME);
         let bad = frame
             || match op {
                 Op::UpvalValue(_)
@@ -1597,6 +1599,15 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.push(Op::Resume { c }, &[]);
         self.bs[resume.idx()].root_at = 1;
         resume
+    }
+
+    /// The value stack holds `end` slots past the region's base for what is
+    /// built here (`Func::window`): a body's need counts once it inlines.
+    pub(crate) fn need_window(&mut self, end: u16) {
+        match &mut self.inline {
+            Some(i) => i.window = i.window.max(end),
+            None => self.f.window = self.f.window.max(end),
+        }
     }
 
     /// End an inlined body with a real call that replaces its frame (its

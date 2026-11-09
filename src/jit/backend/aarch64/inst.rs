@@ -400,11 +400,6 @@ pub(crate) enum MInst {
         nargs: u8,
         known: Option<(u64, u8)>,
     },
-    /// `[snap..]`: exit unless the header at `hdr` and `n` arguments fit.
-    GuardFits {
-        end: u16,
-        exit: u32,
-    },
     /// A resume block's first instruction, where a fast callee's `ret`
     /// lands: `[def x0, def x1]` up to `wanted` (1 or 2), or the landing
     /// helper.
@@ -465,8 +460,7 @@ impl MInst {
             | GuardShapeIn { exit, .. }
             | GuardProto { exit, .. }
             | GcCheck { exit }
-            | LazyExit { exit }
-            | GuardFits { exit, .. } => exit,
+            | LazyExit { exit } => exit,
             _ => return None,
         };
         (e != ENTRY_FAIL).then_some(e)

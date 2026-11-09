@@ -244,6 +244,25 @@ handler! {
         tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
     }
 
+    /// An interpreter entry whose inlined frames' window does not fit (from
+    /// its stub, `insn` the region, its frame not open): grow the stack and
+    /// enter again, else run the original instruction, which overflows only
+    /// where the frames do.
+    slow fn jit_window {
+        let region: &Region<'gc> = unsafe { &*(insn.raw() as *const Region<'gc>) };
+        let closure: LuaFn<'gc> = unsafe { frame::closure(base) };
+        let site = unsafe { closure.code.add(region.entry_pc as usize) };
+        let mut word = unsafe { *site };
+        let ts = thread!();
+        let end = ts.slot_index(base) + region.window as usize;
+        if word.is_jit_word() && !ts.ensure_frame_slots(end) {
+            word = original_of(closure, word);
+        }
+        pc = unsafe { site.add(1) };
+        let h = rt.handler(word.opcode());
+        tail!(h, insn = Slot::insn(word), closure = Slot::closure(closure))
+    }
+
     /// The entry of a region a broken dependency invalidated
     /// (`Region::invalidate`), from its stub with `insn` the region and its
     /// frame not open: retire the entry and run the original word.

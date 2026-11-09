@@ -827,9 +827,6 @@ pub(crate) enum Op {
         c: u8,
         hdr: u8,
     },
-    /// Exits unless the stack holds `end` slots past the region's base: an
-    /// inlined frame's window, which its exits write (E1).
-    GuardWindow(u16),
     /// Leave for the interpreter's handler of the instruction at `pc`, the
     /// frame in its slots (R1): a `TAILCALL` or a `RETURN` that leaves the
     /// frame, whose interpreter work is all there is left.
@@ -993,7 +990,7 @@ impl Op {
             | ISub | IMul | INeg | IShl | IShr | IDivFloor | IModFloor | IRem | LDivFloor
             | LModFloor | LRem | LToI | LToFExact | FToIExact | FToLExact | ToF64(_) | ToPos(_)
             | StrByteAt => Effects::flags(DEOPT),
-            GuardNoFlag(_) | GuardWindow(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
+            GuardNoFlag(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) | GuardShapeIn(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
             ShapeIs(_) | ShapeIn(_) | TabHasRoom(_) | NamedKey => Effects::reads(Mem::SHAPE),
@@ -1107,7 +1104,6 @@ impl Op {
             | CallMm { .. }
             | Dispatch { .. }
             | TailEnter { .. }
-            | GuardWindow(_)
             | Deopt
             | LazyExit => 0,
             Resume { c } => match c {

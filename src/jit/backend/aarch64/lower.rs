@@ -94,6 +94,9 @@ pub(crate) struct Lowered {
     /// them enter (W4 §2); none in the block's code.
     pub(crate) prefix_guards: bool,
     pub(crate) entry_tests: Vec<(u8, TypeSet)>,
+    /// `Func::window`, when past the frame's own window: every entry makes
+    /// sure of it, once, before the guards (W4).
+    pub(crate) window: Option<u16>,
 }
 
 struct Lower<'a, 'gc> {
@@ -176,11 +179,13 @@ pub(super) fn float_cond(cc: Cc) -> Cond {
     }
 }
 
-/// The address of `Code[pc]` of the prototype being compiled.
+/// The address of `Code[pc]` of the prototype being compiled; `frame` its
+/// frame's window, which every entry has.
 pub(crate) fn lower<'gc>(
     f: &Func<'gc>,
     code_base: usize,
     own: Option<u64>,
+    frame: u16,
 ) -> Result<Lowered, String> {
     let cfg = f.cfg();
     let crate::jit::backend::order::Layout {
@@ -336,6 +341,7 @@ pub(crate) fn lower<'gc>(
         ir_blocks: order.iter().map(|b| b.0).collect(),
         prefix_guards: lw.prefix_guards,
         entry_tests: lw.entry_tests,
+        window: (f.window > frame).then_some(f.window),
     })
 }
 
@@ -2094,9 +2100,6 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     },
                     ops,
                 );
-            }
-            Op::GuardWindow(end) => {
-                self.push_exit(i, |exit| MInst::GuardFits { end, exit }, vec![], none);
             }
             Op::Return { a, n } => match self.returned(i) {
                 Some(v) => {

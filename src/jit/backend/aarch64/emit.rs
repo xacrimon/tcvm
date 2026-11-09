@@ -279,7 +279,7 @@ struct Em<'a> {
     /// entry block, past the fast entry's tests), checking the window
     /// themselves.
     typed_entry: Option<Label>,
-    own_max_stack: u8,
+    own_max_stack: u16,
     /// A resume block whose `GuardLanding` follows its `Resume` (with the
     /// call's header slot): its slow resume is bound out of line, unless a
     /// move comes between.
@@ -318,6 +318,9 @@ pub(crate) const KNOWN_ENTRY: u64 = 24;
 pub(crate) struct Helpers {
     pub(crate) exit_common: usize,
     pub(crate) entry_fail: usize,
+    /// `jit::jit_window`, where an interpreter entry whose window does not
+    /// fit goes.
+    pub(crate) window: usize,
     pub(crate) enter: usize,
     /// `jit_box_i64`'s trampoline.
     pub(crate) box_i64: usize,
@@ -540,6 +543,7 @@ fn emit_with(
     let (fixup, budget) = (em.a.new_label(), em.a.new_label());
     let nreg = l.params;
     let param_miss = em.a.new_label();
+    let window = l.window;
     let fast_label = fast.map(|fe| {
         let l = em.a.new_label();
         em.a.bind(l);
@@ -567,9 +571,9 @@ fn emit_with(
             crate::jit::known_offset(true, fe.num_params)
         );
         em.own_entry = Some((fe.proto, known, regs));
-        em.own_max_stack = fe.max_stack;
+        em.own_max_stack = window.unwrap_or(fe.max_stack as u16);
         em.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
-        em.a.add_imm(Sz::X, X17, BASE, fe.max_stack as u64 * 8);
+        em.window_end(em.own_max_stack);
         em.a.cmp(Sz::X, X17, X16);
         // A miss from the register entry leaves the parameters in their
         // slots for the caller's slow path (from the slot one, again).
@@ -655,8 +659,27 @@ fn emit_with(
     for k in 0..l.params {
         em.a.ldr(Gpr(k), BASE, 8 * k as i32);
     }
-    em.a.adr(X16, guards);
-    em.a.b_far(em.helpers.level_enter);
+    // The interpreter made sure of the frame's window, not of the inlined
+    // frames' past it (`Lowered::window`): `jit_window` grows the stack.
+    match l.window {
+        Some(w) => {
+            let check = em.a.new_label();
+            em.a.adr(X16, check);
+            em.a.b_far(em.helpers.level_enter);
+            em.a.bind(check);
+            em.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
+            em.window_end(w);
+            em.a.cmp(Sz::X, X17, X16);
+            em.a.b_cond(Cond::Ls, guards);
+            em.a.ldr_label(INSN, em.region_word);
+            em.a.ldr_lit(X16, em.helpers.window as u64);
+            em.tail_level();
+        }
+        None => {
+            em.a.adr(X16, guards);
+            em.a.b_far(em.helpers.level_enter);
+        }
+    }
     // Cold section: one stub per exit, the trampoline, and the prologue's
     // entry-fail stub, which needs no register image (6.4).
     for (k, _) in l.exits.iter().enumerate() {
@@ -729,7 +752,7 @@ fn emit_with(
         // fits; then on to the checks past the arity one.
         em.a.bind(fixup);
         em.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
-        em.a.add_imm(Sz::X, X17, BASE, fe.max_stack as u64 * 8);
+        em.window_end(em.own_max_stack);
         em.a.cmp(Sz::X, X17, X16);
         em.a.b_cond(Cond::Hi, fast_miss);
         em.a.add_shift(Sz::X, X17, BASE, INSN, Shift::Lsl, 3);
@@ -869,6 +892,17 @@ impl<'a> Em<'a> {
 
     fn fr(&self, i: usize, k: usize) -> Fpr {
         fpr(self.allocs(i)[k].as_reg().expect("a register operand"))
+    }
+
+    /// `x17 = BASE + 8 * slots`, the end of a window to check.
+    fn window_end(&mut self, slots: u16) {
+        let off = slots as u64 * 8;
+        if Asm::addsub_imm(off).is_some() {
+            self.a.add_imm(Sz::X, X17, BASE, off);
+        } else {
+            self.a.mov_imm(X17, off);
+            self.a.add(Sz::X, X17, BASE, X17);
+        }
     }
 
     fn reg(&self, i: usize, k: usize) -> PReg {
@@ -1233,8 +1267,7 @@ impl<'a> Em<'a> {
         // The window check the typed entry leaves to its caller.
         if let Some(w) = window {
             self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
-            self.a
-                .add_imm(Sz::X, X17, BASE, self.own_max_stack as u64 * 8);
+            self.window_end(self.own_max_stack);
             self.a.cmp(Sz::X, X17, X16);
             self.a.b_cond(Cond::Hi, w);
         }
@@ -3028,13 +3061,6 @@ impl<'a> Em<'a> {
                     keys.extend([(fast, false), (back, true)]);
                     em.call_site(keys, i, block, hdr, pc_after);
                 }));
-            }
-            GuardFits { end, exit } => {
-                self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
-                self.a.add_imm(Sz::X, X17, BASE, end as u64 * 8);
-                self.a.cmp(Sz::X, X17, X16);
-                let l = self.exit(exit);
-                self.a.b_cond(Cond::Hi, l);
             }
             Return { a, n, x0 } => {
                 // To a compiled caller, or to `level_land` for a frame

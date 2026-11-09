@@ -445,7 +445,13 @@ pub(crate) fn compile<'gc>(
     // caller's `blr` can enter (5.4).
     let enterable = pc == 0 && !f.meta.loop_entry && !closure.proto.is_vararg;
     let own = enterable.then(|| closure.proto.ptr.as_ptr() as u64);
-    let lowered = lower::lower(&f, closure.code as usize, own).map_err(CompileError::Backend)?;
+    let lowered = lower::lower(
+        &f,
+        closure.code as usize,
+        own,
+        closure.proto.max_stack_size as u16,
+    )
+    .map_err(CompileError::Backend)?;
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Lower);
     let out = &(ctx.jit().ra.borrow_mut())
@@ -537,6 +543,7 @@ pub(crate) fn compile<'gc>(
     let helpers = emit::Helpers {
         exit_common: abi::exit_common as *const () as usize,
         entry_fail: crate::jit::jit_entry_fail as *const () as usize,
+        window: crate::jit::jit_window as *const () as usize,
         enter: crate::vm::ops::call::enter as *const () as usize,
         box_i64: tramp(
             crate::jit::helpers::jit_box_i64 as *const () as usize,
@@ -823,6 +830,7 @@ pub(crate) fn compile<'gc>(
             protos: f.protos.clone().into_boxed_slice(),
             site_protos: site_protos.into_boxed_slice(),
             entry_pc: pc,
+            window: lowered.window.unwrap_or(0),
             nest: nest.into_boxed_slice(),
             num_spills: em.num_spills,
             frame_size: em.frame_size,
