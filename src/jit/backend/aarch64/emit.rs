@@ -337,9 +337,10 @@ pub(crate) struct Helpers {
     pub(crate) native_act: usize,
     /// `jit::jit_dead_entry`, where an invalidated region's entry goes.
     pub(crate) dead_entry: usize,
-    /// `abi::level_enter` and `abi::call_miss`.
+    /// `abi::level_enter`, and `abi::direct_miss` for a fast entry's
+    /// failed checks.
     pub(crate) level_enter: usize,
-    pub(crate) call_miss: usize,
+    pub(crate) fast_miss: usize,
     /// The runtime (the handler ABI's x23), and what code reads through it
     /// that stays put for the runtime's life: the arena's `Metrics`, the
     /// type metatables' cells, and the level's return and landing.
@@ -538,8 +539,8 @@ fn emit_with(
     // A compiled caller has written the header, set base, closure and `insn`
     // (the argument count) as `enter` would, and its `blr` left the return
     // address in x30; what `enter` would check of a Lua callee is checked
-    // here, and a miss goes to the caller's slow path (`fast_miss`). Missing
-    // arguments are filled in (`arity_fixup`, I3).
+    // here, and a miss goes to the caller's slow path (`abi::direct_miss`).
+    // Missing arguments are filled in (`arity_fixup`, I3).
     let fast_miss = em.a.new_label();
     let (fixup, budget) = (em.a.new_label(), em.a.new_label());
     let nreg = l.params;
@@ -772,29 +773,10 @@ fn emit_with(
         for k in 0..nreg {
             em.a.str(Gpr(k), BASE, 8 * k as i32);
         }
-        em.a.b(fast_miss);
     }
     if fast_label.is_some() {
-        // Back to the caller's slow path, which its site names by the return
-        // address (`abi::call_miss`). A tail call from a frame dispatch
-        // entered has `level_land` for one instead: `enter` runs the call
-        // from the header the tail call wrote.
         em.a.bind(fast_miss);
-        let dispatched = em.a.new_label();
-        em.a.ldr_lit(X17, em.helpers.level_land);
-        em.a.cmp(Sz::X, LR, X17);
-        em.a.b_cond(Cond::Eq, dispatched);
-        em.a.b_far(em.helpers.call_miss);
-        em.a.bind(dispatched);
-        // The tail call left its callee in `CLOSURE`.
-        em.a.movz(Sz::X, X16, FUNCTION_TAG, 3);
-        em.a.orr(Sz::X, X16, X16, CLOSURE);
-        em.a.str(X16, BASE, -32);
-        em.a.sub_imm(Sz::X, PC, BASE, 32);
-        em.a.mov(BASE, ZR);
-        em.a.ldr_lit(RT, em.helpers.rt);
-        em.a.ldr_lit(LR, em.helpers.level_ret);
-        em.a.b_far(em.helpers.enter);
+        em.a.b_far(em.helpers.fast_miss);
     }
     em.level_tail_stub();
     let exits = l
