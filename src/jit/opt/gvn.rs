@@ -6,11 +6,19 @@
 //! the blocks an edge of a `br` on it dominates and after a guard on it, and
 //! a `br`, guard or `select` on a known one folds.
 
+use std::hash::BuildHasher;
+
+use foldhash::fast::FixedState;
+use hashbrown::hash_table::{Entry, HashTable};
+
 use crate::jit::FastMap;
 use crate::jit::ir::ops::{Flags, Mem, Op};
 use crate::jit::ir::{Block, Func, Inst, Val};
 
 const CLASSES: usize = 8;
+const NONE: Val = Val(u32::MAX);
+/// A known `B1`'s mark; its low bit is the outcome.
+const KNOWN: u8 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
@@ -62,14 +70,17 @@ impl Versions {
     }
 
     fn renew(&mut self, mask: Mem, fresh: &mut u32) {
+        if mask.is_empty() {
+            return;
+        }
         for c in 0..CLASSES {
             if mask.bits() >> c & 1 != 0 {
                 *fresh += 1;
                 self.class[c] = *fresh;
                 self.any[c] = *fresh;
-                self.keys.retain(|&(x, _), _| x as usize != c);
             }
         }
+        self.keys.retain(|&(x, _), _| mask.bits() >> x & 1 == 0);
     }
 
     fn renew_key(&mut self, m: Mem, key: u32, fresh: &mut u32) {
@@ -93,9 +104,15 @@ impl Versions {
 
 /// `i`'s number, if it has one. Equal argument-free values (constants,
 /// by-value upvalues) count as one argument, `consts` holding the first of
-/// each: they are made again after every call (`calls`), which keeps them
-/// apart as values.
-fn key_of(f: &Func<'_>, i: Inst, mem: &Versions, consts: &mut FastMap<Op, Val>) -> Option<Key> {
+/// each and `canon` each value's once looked up: they are made again after
+/// every call (`calls`), which keeps them apart as values.
+fn key_of(
+    f: &Func<'_>,
+    i: Inst,
+    mem: &Versions,
+    consts: &mut FastMap<Op, Val>,
+    canon: &mut [Val],
+) -> Option<Key> {
     let op = f.op(i);
     let a = f.args(i);
     if a.len() > 3 {
@@ -131,12 +148,15 @@ fn key_of(f: &Func<'_>, i: Inst, mem: &Versions, consts: &mut FastMap<Op, Val>) 
     }
     let mut args = [Val(0); 3];
     for (k, &v) in a.iter().enumerate() {
-        args[k] = match f.def_inst(v) {
-            Some(d) if f.insts[d.idx()].an == 0 && f.op(d).is_pure() => {
-                *consts.entry(f.op(d)).or_insert(v)
-            }
-            _ => v,
-        };
+        if canon[v.idx()] == NONE {
+            canon[v.idx()] = match f.def_inst(v) {
+                Some(d) if f.insts[d.idx()].an == 0 && f.op(d).is_pure() => {
+                    *consts.entry(f.op(d)).or_insert(v)
+                }
+                _ => v,
+            };
+        }
+        args[k] = canon[v.idx()];
     }
     Some(Key {
         op,
@@ -150,15 +170,74 @@ fn key_of(f: &Func<'_>, i: Inst, mem: &Versions, consts: &mut FastMap<Op, Val>) 
     })
 }
 
-/// The load a store makes redundant, and the value it would read.
-fn forwarded(f: &Func<'_>, i: Inst) -> Option<(Op, Vec<Val>, Val)> {
+/// The load a store makes redundant (its operation and operands), and the
+/// value it would read.
+fn forwarded<'a>(f: &'a Func<'_>, i: Inst) -> Option<(Op, &'a [Val], Val)> {
     let a = f.args(i);
     match f.op(i) {
-        Op::Store(r) => Some((Op::Load(r), vec![], a[0])),
-        Op::TabStore { loc, key } => Some((Op::TabLoad { loc, key }, vec![a[0]], a[1])),
-        Op::ArrStore => Some((Op::ArrLoad, vec![a[0], a[1]], a[2])),
-        Op::CellStore => Some((Op::CellLoad, vec![a[0]], a[1])),
+        Op::Store(r) => Some((Op::Load(r), &[], a[0])),
+        Op::TabStore { loc, key } => Some((Op::TabLoad { loc, key }, &a[..1], a[1])),
+        Op::ArrStore => Some((Op::ArrLoad, &a[..2], a[2])),
+        Op::CellStore => Some((Op::CellLoad, &a[..1], a[1])),
         _ => None,
+    }
+}
+
+/// A number's hash, key, and the number and scope it replaced.
+type Undo = (u64, Key, Option<(Val, u32)>);
+
+/// The value numbers in scope: entries with their hash and the scope that
+/// made them, and an undo log restoring the table when a scope closes.
+struct Numbers {
+    table: HashTable<(u64, Key, Val, u32)>,
+    undo: Vec<Undo>,
+    marks: Vec<usize>,
+    state: FixedState,
+}
+
+impl Numbers {
+    /// `key`'s number if it has one made by a scope `usable` admits; else
+    /// `key` is numbered `v` by scope `scope`.
+    fn number(
+        &mut self,
+        key: Key,
+        v: Val,
+        scope: u32,
+        usable: impl Fn(u32) -> bool,
+    ) -> Option<Val> {
+        let h = self.state.hash_one(key);
+        match self.table.entry(h, |e| e.1 == key, |e| e.0) {
+            Entry::Occupied(mut o) => {
+                let e = o.get_mut();
+                if usable(e.3) {
+                    return Some(e.2);
+                }
+                self.undo.push((h, key, Some((e.2, e.3))));
+                (e.2, e.3) = (v, scope);
+            }
+            Entry::Vacant(x) => {
+                x.insert((h, key, v, scope));
+                self.undo.push((h, key, None));
+            }
+        }
+        None
+    }
+
+    fn close(&mut self) {
+        let m = self.marks.pop().unwrap();
+        while self.undo.len() > m {
+            let (h, k, old) = self.undo.pop().unwrap();
+            let Ok(e) = self.table.find_entry(h, |e| e.1 == k) else {
+                unreachable!("an undone number not in the table")
+            };
+            match old {
+                Some((v, s)) => {
+                    let x = e.into_mut();
+                    (x.2, x.3) = (v, s);
+                }
+                None => drop(e.remove()),
+            }
+        }
     }
 }
 
@@ -167,62 +246,64 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
     let n = f.blocks.len();
     // The classes each block writes.
     let mut wmask = vec![Mem::empty(); n];
+    let mut live = 0;
     for &b in &cfg.rpo {
+        live += f.insts_of(b).len();
         for &i in f.insts_of(b) {
             wmask[b.idx()] |= f.op(i).effects().writes;
         }
     }
-    let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
+    let nv = f.vals.len();
+    let mut map: Vec<Val> = (0..nv as u32).map(Val).collect();
     let mut removed = vec![false; f.insts.len()];
     let mut changed = false;
-    // Each number with the scope that made it; an undo log restores the
-    // table when a scope closes.
-    let mut table: FastMap<Key, (Val, u32)> = FastMap::default();
+    let mut numbers = Numbers {
+        table: HashTable::with_capacity(live),
+        undo: Vec::with_capacity(live),
+        marks: Vec::new(),
+        state: FixedState::default(),
+    };
     let mut consts: FastMap<Op, Val> = FastMap::default();
-    let mut undo: Vec<(Key, Option<(Val, u32)>)> = Vec::new();
-    let mut marks: Vec<usize> = Vec::new();
+    let mut canon = vec![NONE; nv];
     // The versions at each block's end, for its dominator-tree children.
     let mut end: Vec<Option<Versions>> = vec![None; n];
     let mut fresh = 0u32;
-    // Known `B1`s, with their own undo log, marked per scope.
-    let mut known: FastMap<Val, bool> = FastMap::default();
-    let mut kundo: Vec<(Val, Option<bool>)> = Vec::new();
+    // Known `B1`s (`KNOWN | outcome`, 0 unknown), with their own undo log,
+    // marked per scope.
+    let mut known = vec![0u8; nv];
+    let mut kundo: Vec<(Val, u8)> = Vec::new();
     let mut kmarks: Vec<usize> = Vec::new();
     let mut folded = false;
-    let mut seen = vec![false; n];
+    // The walk that last reached each block, for the writes on paths from a
+    // dominator.
+    let mut seen = vec![0u32; n];
+    let mut walk = 0u32;
     let mut work: Vec<Block> = Vec::new();
     // (block, done, lowest visible scope)
     let mut stack: Vec<(Block, bool, usize)> = vec![(f.entry, false, 0)];
     while let Some((b, done, barrier)) = stack.pop() {
         if done {
-            let m = marks.pop().unwrap();
-            while undo.len() > m {
-                let (k, old) = undo.pop().unwrap();
-                match old {
-                    Some(o) => table.insert(k, o),
-                    None => table.remove(&k),
-                };
-            }
+            numbers.close();
             let m = kmarks.pop().unwrap();
             while kundo.len() > m {
                 let (c, old) = kundo.pop().unwrap();
-                match old {
-                    Some(o) => known.insert(c, o),
-                    None => known.remove(&c),
-                };
+                known[c.idx()] = old;
             }
             continue;
         }
-        marks.push(undo.len());
+        numbers.marks.push(numbers.undo.len());
         kmarks.push(kundo.len());
         // A fact crosses calls: folding on it adds no use.
         if let &[(t, k)] = cfg.incoming(b)
             && f.op(t) == Op::Br
         {
             let c = f.args(t)[0];
-            kundo.push((c, known.insert(c, k == 0)));
+            kundo.push((
+                c,
+                std::mem::replace(&mut known[c.idx()], KNOWN | (k == 0) as u8),
+            ));
         }
-        let scope = marks.len() - 1;
+        let scope = numbers.marks.len() - 1;
         // Scopes restart after a call: a value shared across one must then
         // stay in the frame or be computed again (C1).
         let lo = if f.blocks[b.idx()].resume {
@@ -234,20 +315,27 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
         // here writes (a loop header: its body).
         let mut mem = match cfg.idom[b.idx()].filter(|_| b != f.entry) {
             Some(d) => {
-                let mut m = end[d.idx()].clone().unwrap_or_default();
-                seen.fill(false);
-                seen[d.idx()] = true;
-                work.clear();
-                work.extend_from_slice(cfg.preds(b));
-                let mut w = Mem::empty();
-                while let Some(x) = work.pop() {
-                    if std::mem::replace(&mut seen[x.idx()], true) {
-                        continue;
+                // The last child to start takes the dominator's versions.
+                let mut m = if cfg.children(d).last() == Some(&b) {
+                    end[d.idx()].take().unwrap_or_default()
+                } else {
+                    end[d.idx()].clone().unwrap_or_default()
+                };
+                if cfg.preds(b) != [d] {
+                    walk += 1;
+                    seen[d.idx()] = walk;
+                    work.clear();
+                    work.extend_from_slice(cfg.preds(b));
+                    let mut w = Mem::empty();
+                    while let Some(x) = work.pop() {
+                        if std::mem::replace(&mut seen[x.idx()], walk) == walk {
+                            continue;
+                        }
+                        w |= wmask[x.idx()];
+                        work.extend_from_slice(cfg.preds(x));
                     }
-                    w |= wmask[x.idx()];
-                    work.extend_from_slice(cfg.preds(x));
+                    m.renew(w, &mut fresh);
                 }
-                m.renew(w, &mut fresh);
                 m
             }
             None => Versions::default(),
@@ -262,8 +350,10 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
             }
             let op = f.op(i);
             if let Op::Br | Op::GuardTrue | Op::GuardFalse | Op::Select = op
-                && let Some(&c) = known.get(&f.args(i)[0])
+                && let x = known[f.args(i)[0].idx()]
+                && x != 0
             {
+                let c = x == KNOWN | 1;
                 match op {
                     Op::Br => {
                         let e = f.edges(i)[!c as usize];
@@ -291,29 +381,22 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
             }
             if matches!(op, Op::GuardTrue | Op::GuardFalse) {
                 let c = f.args(i)[0];
-                kundo.push((c, known.insert(c, op == Op::GuardTrue)));
+                let x = KNOWN | (op == Op::GuardTrue) as u8;
+                kundo.push((c, std::mem::replace(&mut known[c.idx()], x)));
             }
-            if let Some(key) = key_of(f, i, &mem, &mut consts) {
-                match table.get(&key) {
-                    // A check without a result keeps nothing alive across
-                    // a call.
-                    Some(&(v, s)) if s as usize >= lo || f.insts[i.idx()].rn == 0 => {
-                        if f.insts[i.idx()].rn == 1 {
-                            map[f.result(i).idx()] = v;
-                        }
-                        removed[i.idx()] = true;
-                        changed = true;
-                        continue;
+            if let Some(key) = key_of(f, i, &mem, &mut consts, &mut canon) {
+                let rn = f.insts[i.idx()].rn;
+                let r = if rn == 1 { f.result(i) } else { NONE };
+                // A check without a result keeps nothing alive across a
+                // call.
+                let usable = |s| s >= lo as u32 || rn == 0;
+                if let Some(v) = numbers.number(key, r, scope as u32, usable) {
+                    if rn == 1 {
+                        map[f.result(i).idx()] = v;
                     }
-                    _ => {
-                        let r = if f.insts[i.idx()].rn == 1 {
-                            f.result(i)
-                        } else {
-                            Val(u32::MAX)
-                        };
-                        let old = table.insert(key, (r, scope as u32));
-                        undo.push((key, old));
-                    }
+                    removed[i.idx()] = true;
+                    changed = true;
+                    continue;
                 }
             }
             if !op.effects().writes() {
@@ -323,15 +406,14 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
             // A store answers the load of what it stored.
             if let Some((lop, largs, v)) = forwarded(f, i) {
                 let mut args = [Val(0); 3];
-                args[..largs.len()].copy_from_slice(&largs);
+                args[..largs.len()].copy_from_slice(largs);
                 let key = Key {
                     op: lop,
                     n: largs.len() as u8,
                     args,
                     mem: mem.version(lop.effects().reads, lop.mem_key()),
                 };
-                let old = table.insert(key, (v, scope as u32));
-                undo.push((key, old));
+                numbers.number(key, v, scope as u32, |_| false);
             }
         }
         end[b.idx()] = Some(mem);
