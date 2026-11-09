@@ -72,6 +72,27 @@ fn io_write_returns_handle_and_chains() {
 }
 
 #[test]
+fn write_goes_out_argument_by_argument() {
+    // As in g_write: the arguments before a bad one are written, and a handle
+    // not open for writing fails only once there is something to write.
+    let p = tmp_path("write_each");
+    assert_runs(&format!(
+        "local f = io.open({p:?}, \"w+\")\n\
+         local ok, msg = pcall(f.write, f, \"a\", 1, 2.5, {{}}, \"b\")\n\
+         assert(not ok and msg:find(\"bad argument #5\", 1, true), msg)\n\
+         f:seek(\"set\")\n\
+         assert(f:read(\"a\") == \"a12.5\", \"written before the bad argument\")\n\
+         f:close()\n\
+         local r = io.open({p:?})\n\
+         assert(r:write() == r, \"nothing to write\")\n\
+         local n, wmsg, code, count = r:write(\"x\")\n\
+         assert(n == nil and code == 9 and count == 0, wmsg)\n\
+         r:close()"
+    ));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
 fn file_write_chains_and_returns_self() {
     let p = tmp_path("chain");
     assert_ok(&format!(
