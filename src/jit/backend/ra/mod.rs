@@ -408,15 +408,14 @@ impl Ctx {
     }
 }
 
-/// `liveness`'s buffers: each block's gen values then its kill values
-/// (block `b`'s runs are `off[2b]..off[2b + 1]..off[2b + 2]` of
-/// `genkill`), a block's definitions as they are found, its live-out, the
-/// worklist and the blocks on it.
+/// `liveness`'s buffers: each block's gen set, its kill values (a run
+/// `koff[b]..koff[b + 1]` of `kill`), a block's live-out, the worklist and
+/// the blocks on it.
 #[derive(Default)]
 struct Live {
-    genkill: Vec<u32>,
-    off: Vec<u32>,
-    defs: Vec<u32>,
+    gen_: Vec<u64>,
+    kill: Vec<u32>,
+    koff: Vec<u32>,
     out: Vec<u64>,
     queued: Vec<bool>,
     work: std::collections::VecDeque<u32>,
@@ -424,7 +423,7 @@ struct Live {
 
 impl Live {
     fn clear(&mut self) {
-        clear!(self; genkill, off, defs, out, queued, work);
+        clear!(self; gen_, kill, koff, out, queued, work);
     }
 }
 
@@ -756,42 +755,39 @@ impl Ra {
         let w = f.num_vregs().div_ceil(64);
         self.words = w;
         let Live {
-            genkill,
-            off,
-            defs,
+            gen_,
+            kill,
+            koff,
             out,
             queued,
             work,
         } = t;
+        gen_.resize(nb * w, 0);
         let anyuse = &mut self.anyuse;
         anyuse.resize(w, 0);
         out.resize(w, 0);
-        off.reserve_exact(2 * nb + 1);
-        off.push(0);
+        koff.reserve_exact(nb + 1);
+        koff.push(0);
         let set = |s: &mut [u64], v: usize| s[v / 64] |= 1 << (v % 64);
         let has = |s: &[u64], v: usize| s[v / 64] >> (v % 64) & 1 != 0;
-        // Gen is the block's distinct uses of values it does not define (a
-        // value defined in it is never used before that); kill its
-        // parameters and definitions, each value's one. `out` marks the
-        // values seen so far.
+        // Kill is the block's parameters and definitions, each value's one,
+        // so a list; gen its uses of values not defined in it before
+        // (`out` marks those), a set.
         for b in 0..nb {
             out.fill(0);
-            let mut used = |out: &mut [u64], v: usize| {
-                if !has(out, v) {
-                    set(out, v);
-                    genkill.push(v as u32);
-                }
-            };
+            let g = &mut gen_[b * w..(b + 1) * w];
             for p in f.block_params(Block::new(b)) {
                 set(out, p.vreg());
-                defs.push(p.vreg() as u32);
+                kill.push(p.vreg() as u32);
             }
             for i in f.block_insns(Block::new(b)).iter() {
                 let ops = f.inst_operands(i);
                 for op in ops {
                     if op.kind() == OperandKind::Use {
                         let v = op.vreg().vreg();
-                        used(out, v);
+                        if !has(out, v) {
+                            set(g, v);
+                        }
                         if matches!(
                             op.constraint(),
                             OperandConstraint::Any | OperandConstraint::Stack
@@ -803,18 +799,18 @@ impl Ra {
                 for op in ops {
                     if op.kind() == OperandKind::Def {
                         set(out, op.vreg().vreg());
-                        defs.push(op.vreg().vreg() as u32);
+                        kill.push(op.vreg().vreg() as u32);
                     }
                 }
             }
             for s in 0..f.block_succs(Block::new(b)).len() {
                 for v in f.branch_blockparams(Block::new(b), s) {
-                    used(out, v.vreg());
+                    if !has(out, v.vreg()) {
+                        set(g, v.vreg());
+                    }
                 }
             }
-            off.push(genkill.len() as u32);
-            genkill.append(defs);
-            off.push(genkill.len() as u32);
+            koff.push(kill.len() as u32);
         }
         // A worklist from the last block: a block is done again only when
         // a successor's set grew.
@@ -838,20 +834,16 @@ impl Ra {
                     }
                 }
             }
-            let (g, k, e) = (
-                off[2 * b] as usize,
-                off[2 * b + 1] as usize,
-                off[2 * b + 2] as usize,
-            );
-            for &v in &genkill[k..e] {
+            for &v in &kill[koff[b] as usize..koff[b + 1] as usize] {
                 out[v as usize / 64] &= !(1 << (v % 64));
             }
-            for &v in &genkill[g..k] {
-                set(out, v as usize);
+            let mut changed = false;
+            for k in 0..w {
+                let n = gen_[b * w + k] | out[k];
+                changed |= n != live_in[b * w + k];
+                live_in[b * w + k] = n;
             }
-            let li = &mut live_in[b * w..(b + 1) * w];
-            if li != out {
-                li.copy_from_slice(out);
+            if changed {
                 for p in f.block_preds(Block::new(b)) {
                     if !std::mem::replace(&mut queued[p.index()], true) {
                         work.push_back(p.index() as u32);
