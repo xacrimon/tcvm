@@ -1508,12 +1508,15 @@ pub(super) fn emit_settable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
             newindex(b, recv, key, v, true);
             b.jump(join);
         });
+        let store = b.new_block();
         for blk in [plain, present] {
             b.switch_to(blk);
-            barrier_for(b, t, v);
-            b.push(Op::ArrStore, &[arr, i, v]);
-            b.jump(join);
+            b.jump(store);
         }
+        enter_join(b, store);
+        barrier_for(b, t, v);
+        b.push(Op::ArrStore, &[arr, i, v]);
+        b.jump(join);
         b.switch_to(outside);
         cold(b, |b| {
             newindex(b, recv, key, v, true);
