@@ -59,6 +59,7 @@ pub(crate) fn write<I: TargetInst>(
             Remat::Int(x) => (1, x, 0),
             Remat::Float(x) => (2, x, 0),
             Remat::AndImm { src, imm } => (3, src as u64, imm),
+            Remat::Slot(r) => (4, r as u64, 0),
         };
         w.u32(tag);
         w.u64(a);
@@ -158,10 +159,11 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
             0 => Remat::None,
             1 => Remat::Int(a),
             2 => Remat::Float(a),
-            _ => Remat::AndImm {
+            3 => Remat::AndImm {
                 src: a as u32,
                 imm: b,
             },
+            _ => Remat::Slot(a as u8),
         };
     }
     f.entry = Block::new(r.u32() as usize);

@@ -170,10 +170,12 @@ impl Gen {
         if self.rng.chance(15) {
             let c = self.class();
             let d = self.v.new_vreg(c);
-            self.v.remat[d.vreg()] = if c == RegClass::Int {
-                Remat::Int(self.rng.next())
-            } else {
+            self.v.remat[d.vreg()] = if c != RegClass::Int {
                 Remat::Float(self.rng.next())
+            } else if self.rng.chance(25) {
+                Remat::Slot(self.rng.below(16) as u8)
+            } else {
+                Remat::Int(self.rng.next())
             };
             self.blocks[b as usize].insts.push((
                 T::Op,

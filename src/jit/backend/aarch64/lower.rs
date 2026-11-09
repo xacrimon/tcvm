@@ -43,6 +43,8 @@ pub(crate) enum Src {
     Operand(u16),
     /// A raw word.
     Const(u64),
+    /// At an exit: the frame slot of this register (a home load's).
+    Slot(u8),
 }
 
 /// A call's site (C1): the values its snapshot names, which live in the
@@ -430,6 +432,16 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         v
     }
 
+    /// The slot of a home load (`Func::home_loads`) `v` shares a register
+    /// with.
+    fn home_load(&self, v: Val) -> Option<u8> {
+        let v = self.alias(v);
+        match self.f.def_op(v) {
+            Some(Op::Load(r)) if self.f.home_loads.get(v.idx()) == Some(&true) => Some(r),
+            _ => None,
+        }
+    }
+
     /// A constant: defined where the IR puts it, computed again by the
     /// allocator wherever that is cheaper than keeping it.
     fn constant(&mut self, r: Val, k: Remat) {
@@ -438,6 +450,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let inst = match k {
             Remat::Int(v) => MInst::MovImm(v),
             Remat::Float(b) => MInst::FImm(b),
+            Remat::Slot(r) => MInst::LoadSlot(r),
             Remat::None | Remat::AndImm { .. } => unreachable!(),
         };
         self.push(inst, &[d], PRegSet::empty());
@@ -836,6 +849,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 entries.push((r, SRep::Val, Src::Const(k)));
                 continue;
             }
+            // A home load's slot holds it here: nothing to write for its
+            // own register, a copy within the frame for another.
+            if let Some(s) = self.home_load(v) {
+                if s != r {
+                    entries.push((r, srep(rep), Src::Slot(s)));
+                }
+                continue;
+            }
             let vr = self.vr(v);
             let k = match seen.iter().find(|(x, _)| *x == vr) {
                 Some(&(_, k)) => k,
@@ -933,6 +954,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let mut entries = Vec::new();
         let mut seen: Vec<(VReg, u16)> = Vec::new();
         let base = ops.len();
+        let homes = self.f.call_homes.get(&d_snap).copied().unwrap_or_default();
         for &(r, v) in self.f.entries(d.snap) {
             let v = match self.f.def_op(v) {
                 Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
@@ -940,6 +962,11 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             };
             if let Some(k) = self.const_word(v) {
                 entries.push((r, SRep::Val, Src::Const(k)));
+                continue;
+            }
+            // The slot holds it, and the call keeps it there: a home entry.
+            if let Some(s) = self.home_load(v) {
+                debug_assert!(s == r && homes.contains(r as usize), "v{} spilled", v.0);
                 continue;
             }
             let vr = self.vr(v);
@@ -966,7 +993,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             self.block_of[resume.idx()] as usize,
             LSite {
                 entries,
-                homes: self.f.call_homes.get(&d_snap).copied().unwrap_or_default(),
+                homes,
                 frames,
             },
         ));
@@ -1014,6 +1041,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::KI64(n) => self.constant(res.unwrap(), Remat::Int(n as u64)),
             Op::KB1(c) => self.constant(res.unwrap(), Remat::Int(c as u64)),
             Op::KF64(b) => self.constant(res.unwrap(), Remat::Float(b)),
+            Op::Load(r) if self.home_load(res.unwrap()) == Some(r) => {
+                self.constant(res.unwrap(), Remat::Slot(r))
+            }
             Op::Load(r) => {
                 let d = self.def(res.unwrap());
                 self.push(MInst::LoadSlot(r), &[d], none);

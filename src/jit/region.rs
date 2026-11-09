@@ -35,6 +35,9 @@ pub(crate) enum Loc {
     True,
     /// At a call site: the register's home slot holds its value.
     Home,
+    /// At an exit: the frame slot of this register holds the value, as the
+    /// exit finds it (before any entry is written).
+    Slot(u8),
 }
 
 /// One home-slot write of an exit; `reg` counts from the region's base.
@@ -97,6 +100,7 @@ pub(crate) fn encode_snap(
             Loc::False => (4, 0),
             Loc::True => (5, 0),
             Loc::Home => (6, 0),
+            Loc::Slot(r) => (7, r as u32),
         };
         assert!(index < 1 << 18);
         out.push(e.reg as u32 | (e.rep as u32) << 8 | loc << 11 | index << 14);
@@ -162,7 +166,8 @@ impl<'a> SnapView<'a> {
                 3 => Loc::Nil,
                 4 => Loc::False,
                 5 => Loc::True,
-                _ => Loc::Home,
+                6 => Loc::Home,
+                _ => Loc::Slot(index as u8),
             };
             SnapEntry {
                 reg: w as u8,
@@ -374,6 +379,11 @@ mod tests {
                 reg: 1,
                 rep: SRep::Val,
                 loc: Loc::True,
+            },
+            SnapEntry {
+                reg: 2,
+                rep: SRep::I32,
+                loc: Loc::Slot(255),
             },
         ];
         let mut out = vec![0xdead];

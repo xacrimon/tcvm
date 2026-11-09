@@ -1065,6 +1065,9 @@ impl Ctx {
             let _ = write!(s, " {}", if gi.class == 0 { "int" } else { "float" });
             if f.remat[g] != crate::jit::backend::vcode::Remat::None {
                 let _ = write!(s, " {}", if gi.remat { "remat" } else { "remat-off" });
+                if let crate::jit::backend::vcode::Remat::Slot(r) = f.remat[g] {
+                    let _ = write!(s, "(slot {r})");
+                }
             }
             if gi.slot != NONE {
                 let _ = write!(

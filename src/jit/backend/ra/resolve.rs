@@ -844,10 +844,10 @@ impl Ra {
         }
     }
 
-    /// A value computed from one on the stack costs a load and the
-    /// computation where reloading it costs the load alone: one spilled
-    /// where its source is on the stack gets a slot, stored after its
-    /// definition, when that is in a register.
+    /// A value computed from one on the stack (or in its frame slot) costs
+    /// a load and the computation where reloading it costs the load alone:
+    /// one spilled where its source is on the stack gets a slot, stored
+    /// after its definition, when that is in a register.
     fn slot_derived<I: TargetInst>(&mut self, f: &VCode<I>) {
         for v in 0..self.vregs.len() {
             let Remat::AndImm { src, .. } = f.remat[v] else {
@@ -863,7 +863,7 @@ impl Ra {
                 self.pieces[x as usize].loc == Loc::Remat
                     && (0..iv.len()).any(|k| {
                         self.alloc_at(src, iv.get(k).0)
-                            .is_some_and(|l| l.is_stack())
+                            .is_some_and(|l| l.is_stack() || l.is_none())
                     })
             });
             if def_in_reg && src_on_stack {
@@ -962,6 +962,7 @@ impl Ra {
         cls: u8,
     ) -> Mv {
         match (from.is_none(), f.remat[v as usize]) {
+            // The source nowhere is in its frame slot (`Remat::Slot`).
             (true, Remat::AndImm { src, .. }) => {
                 let src = self.alloc_at(src, at).expect("the source live");
                 mv(src, to, cls, v, true)
@@ -1048,7 +1049,7 @@ impl Ra {
             once.clear();
             if preds.len() > 1 && !resume {
                 for &(v, x) in live.iter() {
-                    if !matches!(f.remat[v as usize], Remat::Int(_) | Remat::Float(_)) {
+                    if !f.remat[v as usize].is_free() {
                         continue;
                     }
                     let to = self.alloc_of(x);

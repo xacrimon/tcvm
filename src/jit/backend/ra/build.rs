@@ -286,8 +286,8 @@ impl Ra {
             }
         };
         // A value computed again from another only where that one is live
-        // (always holding it at the gap before a reload), not from a value
-        // itself computed again.
+        // (always holding it at the gap before a reload, or in its slot),
+        // not from a value itself computed again.
         for v in 0..nv {
             if let Remat::AndImm { src, .. } = f.remat[v]
                 && self.vregs[v].remat
@@ -299,7 +299,8 @@ impl Ra {
                     k < si.len() && si.raw[k].0 <= a
                 };
                 let mine = &self.ivs[span[v].0 as usize..span[v].1 as usize];
-                if self.vregs[src].remat || !mine.iter().all(within) {
+                let held = !self.vregs[src].remat || matches!(f.remat[src], Remat::Slot(_));
+                if !held || !mine.iter().all(within) {
                     self.vregs[v].remat = false;
                     need_reg_at_def(&mut self.uses, self.vregs[v].def, v);
                 }
@@ -327,9 +328,7 @@ impl Ra {
                     let (gq, ga) = (gq as usize, ga as usize);
                     // A constant stays out (it is made again on the edge); a
                     // derived value joins and is spilled as any value.
-                    let konst = |v: usize| {
-                        matches!(f.remat[v], Remat::Int(_) | Remat::Float(_)) && self.vregs[v].remat
-                    };
+                    let konst = |v: usize| f.remat[v].is_free() && self.vregs[v].remat;
                     if self.vregs[gq].class != self.vregs[ga].class
                         || konst(gq)
                         || konst(ga)

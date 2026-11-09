@@ -104,7 +104,7 @@ pub(crate) struct ExitOut {
 /// where used.
 fn emits_nothing(l: &Lowered, out: &Output, i: usize) -> bool {
     match l.vcode.insts[i] {
-        MInst::MovImm(_) | MInst::FImm(_) | MInst::AluImm(..) => {
+        MInst::MovImm(_) | MInst::FImm(_) | MInst::AluImm(..) | MInst::LoadSlot(_) => {
             out.inst_allocs(&l.vcode, crate::jit::backend::reg::Inst::new(i))[0].is_none()
         }
         _ => false,
@@ -819,6 +819,7 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
                 consts.push(w);
                 Loc::Const(consts.len() as u32 - 1)
             }
+            Src::Slot(r) => Loc::Slot(r),
             Src::Operand(k) => {
                 let al = allocs[base + k as usize];
                 if let Some(p) = al.as_reg() {
@@ -1027,11 +1028,16 @@ impl<'a> Em<'a> {
         match self.v.remat[vreg] {
             Remat::Int(v) => self.a.mov_imm(gpr(r), v),
             Remat::Float(bits) => self.fimm(fpr(r), bits),
-            Remat::AndImm { imm, .. } => {
-                let s = match (src.as_reg(), src.as_stack()) {
-                    (Some(s), _) => gpr(s),
-                    (None, Some(slot)) => {
+            Remat::Slot(slot) => self.a.ldr(gpr(r), BASE, slot as i32 * 8),
+            Remat::AndImm { src: sv, imm } => {
+                let s = match (src.as_reg(), src.as_stack(), self.v.remat[sv as usize]) {
+                    (Some(s), _, _) => gpr(s),
+                    (None, Some(slot), _) => {
                         self.a.ldr(gpr(r), FP, spill_off(slot.index()));
+                        gpr(r)
+                    }
+                    (None, None, Remat::Slot(slot)) => {
+                        self.a.ldr(gpr(r), BASE, slot as i32 * 8);
                         gpr(r)
                     }
                     _ => panic!("v{vreg} computed again from nowhere"),
@@ -1511,6 +1517,7 @@ impl<'a> Em<'a> {
                         .expect("a kept value outside the frame")
                         .index() as u16,
                 ),
+                Src::Slot(_) => unreachable!("a call's entry in a frame slot"),
             };
             entries.push(SnapEntry { reg, rep, loc });
         }
@@ -1695,7 +1702,7 @@ impl<'a> Em<'a> {
             Prologue => self.open_frame(),
             Params => {}
             // A value the allocator computes again where used.
-            MovImm(_) | FImm(_) | AluImm(..) if self.allocs(i)[0].is_none() => {}
+            MovImm(_) | FImm(_) | AluImm(..) | LoadSlot(_) if self.allocs(i)[0].is_none() => {}
             MovImm(v) => {
                 let d = self.r(i, 0);
                 self.a.mov_imm(d, v);

@@ -136,10 +136,19 @@ handler! {
                 }
             }
         }
+        // A slot one entry reads another may write: those are read first.
+        let mut held = [const { std::mem::MaybeUninit::<u64>::uninit() }; 256];
+        for s in snap.entries() {
+            if let Loc::Slot(r) = s.loc {
+                held[s.reg as usize].write(unsafe { *(base.add(r as usize) as *const u64) });
+            }
+        }
         for s in snap.entries() {
             let w = match s.loc {
                 Loc::Reg(i) => img[i as usize].get(),
                 Loc::Spill(i) => img[crate::jit::state::IMAGE_SPILLS + i as usize].get(),
+                // SAFETY: written by the loop above.
+                Loc::Slot(_) => unsafe { held[s.reg as usize].assume_init() },
                 loc => const_word(region, loc),
             };
             unsafe { base.add(s.reg as usize).write(entry_value(mc, s.rep, w)) };
@@ -280,7 +289,9 @@ pub(crate) fn const_word(region: &Region<'_>, loc: Loc) -> u64 {
         Loc::Nil => Value::nil().to_raw(),
         Loc::False => Value::boolean(false).to_raw(),
         Loc::True => Value::boolean(true).to_raw(),
-        Loc::Reg(_) | Loc::Spill(_) | Loc::Home => unreachable!("not a constant location"),
+        Loc::Reg(_) | Loc::Spill(_) | Loc::Home | Loc::Slot(_) => {
+            unreachable!("not a constant location")
+        }
     }
 }
 

@@ -62,6 +62,17 @@ pub(crate) enum Remat {
         src: u32,
         imm: u64,
     },
+    /// The value of frame slot `r`, which holds it wherever the value is
+    /// live (`Func::home_loads`).
+    Slot(u8),
+}
+
+impl Remat {
+    /// Made from nothing: where a register first serves it, once at a
+    /// join, on an edge rather than in a parameter's group.
+    pub(crate) fn is_free(self) -> bool {
+        matches!(self, Remat::Int(_) | Remat::Float(_) | Remat::Slot(_))
+    }
 }
 
 fn run<T: Copy>(pool: &mut Vec<T>, xs: impl IntoIterator<Item = T>) -> (u32, u32) {
