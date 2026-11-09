@@ -4,11 +4,13 @@
 //! (`emit_instance` emits the two as one), any other iterator called,
 //! `TFORLOOP` a nil test.
 
+use crate::env::MetamethodBits;
 use crate::env::table::POS_PART_SHIFT;
 use crate::env::value::Value;
 use crate::instruction::{Instruction, Op as BcOp, TFOR_VARS};
 use crate::jit::build::Builder;
-use crate::jit::build::emit::{branch_arm, enter_join, staged_call};
+use crate::jit::build::emit::{branch_arm, cold, enter_join, staged_call};
+use crate::jit::build::tables::class_bit;
 use crate::jit::ir::ops::{Cc, ExitTag, HELPER_FAIL_VAL, HelperId, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{Block, Val};
@@ -132,8 +134,9 @@ pub(super) fn emit_tforcall_next(
 }
 
 /// `TFORCALL_IPAIRS a count` and its `TFORLOOP`, to `exit` or `body`: the
-/// array part inline, past it the helper, whose failure (`__index` may
-/// answer) exits.
+/// array part inline, a nil there the end unless the class has `__index`,
+/// which exits; past it the helper, whose failure (`__index` may answer)
+/// exits.
 pub(super) fn emit_tforcall_ipairs(
     b: &mut Builder<'_, '_>,
     a: u8,
@@ -162,11 +165,18 @@ pub(super) fn emit_tforcall_ipairs(
     let v = b.ins(Op::ArrLoad, &[arr, k]);
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
     let found = branch_arm(b, nil);
-    past_array(b, exit, body, vars, count, g, kv);
+    // Inside the array part a nil is the raw value (`get_int`).
+    let has = class_bit(b, t, MetamethodBits::INDEX);
+    let s = b.snap_before();
+    b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Slow);
+    let none = b.konst(Value::nil());
+    step_to(b, exit, vars, count, none, none);
     b.switch_to(found);
     step_to(b, body, vars, count, kv, v);
+    // Past the array part: the end of a list a constructor sized, or keys
+    // the hash part holds.
     b.switch_to(outside);
-    past_array(b, exit, body, vars, count, g, kv);
+    cold(b, |b| past_array(b, exit, body, vars, count, g, kv));
 }
 
 /// The `ipairs` step at key `kv` past the array part: the value, or the
