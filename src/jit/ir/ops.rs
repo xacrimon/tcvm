@@ -1049,8 +1049,9 @@ impl Op {
     }
 
     /// What lowering may compute where it is used instead: a test a
-    /// branch, guard or select takes, a product a sum takes, a tested bit.
-    /// Its operands are read there (`Op::Home` counts on the set).
+    /// branch, guard or select takes, a product a sum takes, a tested bit
+    /// and the class bits it is of. Its operands are read there (`Op::Home`
+    /// counts on the set).
     pub(crate) fn folds(self) -> bool {
         use Op::*;
         matches!(
@@ -1073,6 +1074,7 @@ impl Op {
                 | IMulNo
                 | LMul
                 | IAnd
+                | TabMmBits
         )
     }
 

@@ -943,11 +943,22 @@ impl<'a> Em<'a> {
             }
             return;
         }
-        if let Test::Bit(b) = test
+        if let Test::Bit(b) | Test::MmBit(b) = test
             && self.bit_branches
         {
-            let x = self.r(i, 0);
             let (set, clear) = if cond == Cond::Ne { (lt, lf) } else { (lf, lt) };
+            let after = self.a.new_label();
+            let x = match test {
+                Test::MmBit(_) => {
+                    let t = self.r(i, 0);
+                    // `next` is reached by falling through, its edge's moves
+                    // in between.
+                    let none = if Some(clear) == next { after } else { clear };
+                    self.class_bits(X16, t, none);
+                    X16
+                }
+                _ => self.r(i, 0),
+            };
             if Some(set) == next {
                 self.a.tbz(x, b as u32, clear);
             } else {
@@ -956,6 +967,7 @@ impl<'a> Em<'a> {
                     self.a.b(clear);
                 }
             }
+            self.a.bind(after);
             return;
         }
         if let Some(sz) = zero_test(test, cond) {
@@ -1576,6 +1588,15 @@ impl<'a> Em<'a> {
         (entries, consts)
     }
 
+    /// `d` = the metamethod bits of table `t`'s class, or on to `none`
+    /// without a class, `d` zero there.
+    fn class_bits(&mut self, d: Gpr, t: Gpr, none: Label) {
+        self.a.ldr(d, t, layout::T_SHAPE as i32);
+        self.a.ldr(d, d, Shape::MT_CACHE_OFFSET as i32);
+        self.a.cbz(Sz::X, d, none);
+        self.a.ldr_w(d, d, MtCache::BITS_OFFSET as i32);
+    }
+
     /// Flags `Eq` when table `t`'s shape is one of `shape_sets[set]`: one
     /// load, then a compare per shape, each after the first only while none
     /// matched (`ccmp`, `Z` set otherwise).
@@ -1649,6 +1670,14 @@ impl<'a> Em<'a> {
             Test::Bit(b) => {
                 let x = self.r(i, k);
                 self.a.tst_imm(Sz::W, x, 1 << b);
+                cond
+            }
+            Test::MmBit(b) => {
+                let t = self.r(i, k);
+                let done = self.a.new_label();
+                self.class_bits(X16, t, done);
+                self.a.bind(done);
+                self.a.tst_imm(Sz::W, X16, 1 << b);
                 cond
             }
             Test::HasFlag(mask) => {
@@ -2222,16 +2251,25 @@ impl<'a> Em<'a> {
             }
             Guard { test, cond, exit } => {
                 let l = self.exit(exit);
-                if let Test::Bit(b) = test
+                if let Test::Bit(b) | Test::MmBit(b) = test
                     && self.bit_branches
                 {
                     // Passes where `cond` holds (`Ne`: the bit set).
-                    let x = self.r(i, 0);
+                    let pass = self.a.new_label();
+                    let x = match test {
+                        Test::MmBit(_) => {
+                            let t = self.r(i, 0);
+                            self.class_bits(X16, t, if cond == Cond::Ne { l } else { pass });
+                            X16
+                        }
+                        _ => self.r(i, 0),
+                    };
                     if cond == Cond::Ne {
                         self.a.tbz(x, b as u32, l);
                     } else {
                         self.a.tbnz(x, b as u32, l);
                     }
+                    self.a.bind(pass);
                 } else if let Some(sz) = zero_test(test, cond) {
                     // Passes where `cond` holds: out where it does not.
                     let c = self.r(i, 0);
@@ -2475,12 +2513,8 @@ impl<'a> Em<'a> {
             }
             TabMmBits => {
                 let (d, t) = (self.r(i, 0), self.r(i, 1));
-                // A null class is the result: no bits.
                 let done = self.a.new_label();
-                self.a.ldr(d, t, layout::T_SHAPE as i32);
-                self.a.ldr(d, d, crate::env::Shape::MT_CACHE_OFFSET as i32);
-                self.a.cbz(Sz::X, d, done);
-                self.a.ldr_w(d, d, MtCache::BITS_OFFSET as i32);
+                self.class_bits(d, t, done);
                 self.a.bind(done);
             }
             LoadCell => {

@@ -752,8 +752,11 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     /// computing the compare itself: flags feed a branch directly (`cmp`
     /// and `b.cond` fuse), where a boolean costs a `cset` and a test of it.
     fn find_fusions(&mut self, order: &[Block]) {
+        use crate::jit::ir::ops::Mem;
         let f = self.f;
         let mut tested = vec![0u32; f.vals.len()];
+        // One of those tests.
+        let mut tested_at = vec![None; f.vals.len()];
         for &b in order {
             for &i in f.insts_of(b) {
                 let op = f.op(i);
@@ -788,6 +791,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 f.for_each_use(i, |v| n += (v == c) as u32);
                 if fusable && n == 1 {
                     tested[c.idx()] += 1;
+                    tested_at[c.idx()] = Some(i);
                 }
             }
         }
@@ -813,6 +817,37 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         for (v, &n) in bit_tests.iter().enumerate() {
             if n > 0 && n == self.uses[v] {
                 self.fused[v] = true;
+            }
+        }
+        // A class's bits that only such a bit uses, tested once, in their
+        // block with no write to a class between: the test reads them
+        // itself (`Test::MmBit`).
+        for v in 0..f.vals.len() {
+            let c = Val(v as u32);
+            if !self.fused[v] || tested[v] != 1 || !matches!(f.def_op(c), Some(Op::ICmp(_))) {
+                continue;
+            }
+            let bit = f.args(f.def_inst(c).unwrap())[0];
+            if !self.fused[bit.idx()] || self.uses[bit.idx()] != 1 {
+                continue;
+            }
+            let Some((x, _)) = self.bit_of(bit) else {
+                continue;
+            };
+            let (Some(d), Some(test)) = (f.def_inst(x), tested_at[v]) else {
+                continue;
+            };
+            let b = f.insts[d.idx()].block;
+            if f.op(d) == Op::TabMmBits
+                && self.uses[x.idx()] == 1
+                && f.insts[test.idx()].block == b
+                && f.insts_of(b)
+                    .iter()
+                    .skip_while(|&&j| j != d)
+                    .take_while(|&&j| j != test)
+                    .all(|&j| !f.op(j).effects().writes.intersects(Mem::META))
+            {
+                self.fused[x.idx()] = true;
             }
         }
     }
@@ -884,7 +919,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     && self.bit_of(args[0]).is_some() =>
             {
                 let (x, k) = self.bit_of(args[0]).expect("a fused bit");
-                (Test::Bit(k), int_cond(cc), vec![x])
+                if self.fused[x.idx()]
+                    && let Some(d) = self.f.def_inst(x)
+                    && self.f.op(d) == Op::TabMmBits
+                {
+                    (Test::MmBit(k), int_cond(cc), vec![self.f.args(d)[0]])
+                } else {
+                    (Test::Bit(k), int_cond(cc), vec![x])
+                }
             }
             Op::ICmp(cc) => {
                 if let Some(k) = self.imm12(args[1]) {

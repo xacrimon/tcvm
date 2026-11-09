@@ -61,6 +61,9 @@ pub(crate) enum Test {
     B1,
     /// Bit `k` of a w register is set (`Ne`) or clear (`Eq`): `[x]`.
     Bit(u8),
+    /// Bit `k` of the table's class's metamethod bits is set (`Ne`) or
+    /// clear (`Eq`), clear without a class: `[t]`.
+    MmBit(u8),
     /// The frame's header has the flag (`Ne`): `[]`.
     HasFlag(u8),
     /// Numbers have a metatable (`Ne`): `[]`.
