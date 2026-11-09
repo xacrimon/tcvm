@@ -26,11 +26,13 @@ pub(crate) const X16: Gpr = Gpr(16);
 pub(crate) const X17: Gpr = Gpr(17);
 pub(crate) const D31: Fpr = Fpr(31);
 
-/// Allocatable integer registers, caller-saved first.
-pub(crate) const INT_PREFERRED: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// Allocatable integer registers, caller-saved first; the argument registers
+/// last among those, from the top: calls and helpers fix them, so a value
+/// with no hint taking one would stand in the way of a fixed operand.
+pub(crate) const INT_PREFERRED: [u8; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 4, 3, 2, 1, 0];
 pub(crate) const INT_OTHER: [u8; 8] = [19, 20, 21, 23, 24, 26, 27, 28];
 pub(crate) const FLOAT_PREFERRED: [u8; 23] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 7, 6, 5, 4, 3, 2, 1, 0,
 ];
 pub(crate) const FLOAT_OTHER: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 
