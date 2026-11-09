@@ -14,7 +14,7 @@ use crate::dmm::Gc;
 use crate::env::MetamethodBits;
 use crate::env::function::{LuaFn, Prototype};
 use crate::env::value::Value;
-use crate::instruction::Instruction;
+use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::cfg::{Cfg, RegSet};
 use crate::jit::ir::ops::{ExitTag, HelperId, Op};
 use crate::jit::ir::types::{Refine, Rep, Ty, TypeSet};
@@ -2181,7 +2181,14 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             self.cur_snap = None;
             self.pc_refines.clear();
             let last = pc + 1 == end;
-            let succs = if last { &sb[..ns] } else { &[][..] };
+            // A `next` or `ipairs` step branches as its TFORLOOP would.
+            let fused = pc + 2 == end
+                && matches!(
+                    self.code(pc).op(),
+                    BcOp::TFORCALL_NEXT | BcOp::TFORCALL_IPAIRS
+                )
+                && self.code(pc + 1).op() == BcOp::TFORLOOP;
+            let succs = if last || fused { &sb[..ns] } else { &[][..] };
             emit::emit(self, pc, succs);
             self.flush();
             if self.terminated() {

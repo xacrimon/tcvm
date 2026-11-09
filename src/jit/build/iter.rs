@@ -1,6 +1,8 @@
 //! Generic `for` loops (`jit-design.md` 7.6): `TFORPREP` as the form it
 //! wrote at its `TFORCALL` says, the `next` and `ipairs` steps without
-//! calling the iterator, any other iterator called, `TFORLOOP` a nil test.
+//! calling the iterator, each arm going where the `TFORLOOP` after it would
+//! (`emit_instance` emits the two as one), any other iterator called,
+//! `TFORLOOP` a nil test.
 
 use crate::env::table::POS_PART_SHIFT;
 use crate::env::value::Value;
@@ -53,11 +55,17 @@ pub(super) fn emit_tforprep(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction,
     b.jump(succs[0]);
 }
 
-/// `TFORCALL_NEXT a count`: `next`'s walk at the position in `R[a+3]`,
-/// the array part and named slots inline, the other parts and the step
-/// from one part to the next by helper through the slots;
-/// `TFORLOOP` then tests the first variable.
-pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
+/// `TFORCALL_NEXT a count` and its `TFORLOOP`, to `exit` or `body`:
+/// `next`'s walk at the position in `R[a+3]`, the array part and named
+/// slots inline, the other parts and the step from one part to the next by
+/// helper through the slots, its first variable then tested.
+pub(super) fn emit_tforcall_next(
+    b: &mut Builder<'_, '_>,
+    a: u8,
+    count: u8,
+    exit: Block,
+    body: Block,
+) {
     let vars = a + TFOR_VARS;
     // Not a table, or no position: the interpreter calls the iterator.
     // Tested before the step, which moves the position.
@@ -70,7 +78,6 @@ pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     let ok = b.ins(Op::ICmp(Cc::Ge), &[p, zero]);
     let s = b.snap_before();
     b.ins_snap(Op::GuardTrue, &[ok], s, ExitTag::Slow);
-    let join = b.new_block();
     let slow = b.new_block();
     // A position in the array part is its index.
     let part = b.ki32(1 << POS_PART_SHIFT);
@@ -87,7 +94,7 @@ pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     let after = b.ins(Op::IAddNo, &[i, one]);
     let after = b.ins(Op::Box, &[after]);
     b.set(a + 3, after);
-    step_to(b, join, vars, count, k, v);
+    step_to(b, body, vars, count, k, v);
     // The named slots, part 2, at the index after the position's part.
     b.switch_to(rest);
     let named = b.ki32(2 << POS_PART_SHIFT);
@@ -104,7 +111,7 @@ pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     let after = b.ins(Op::IAddNo, &[j, next]);
     let after = b.ins(Op::Box, &[after]);
     b.set(a + 3, after);
-    step_to(b, join, vars, count, k, v);
+    step_to(b, body, vars, count, k, v);
     for blk in [past, other, gone] {
         b.switch_to(blk);
         b.jump(slow);
@@ -118,13 +125,22 @@ pub(super) fn emit_tforcall_next(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     }
     b.reload(a + 3);
     b.flush();
-    b.jump(join);
-    enter_join(b, join);
+    let k = b.reg(vars);
+    let k = b.boxed(k);
+    let end = b.ins(Op::IsType(TypeSet::NIL), &[k]);
+    b.br(end, exit, body);
 }
 
-/// `TFORCALL_IPAIRS a count`: the array part inline, past it the helper,
-/// whose failure (`__index` may answer) exits.
-pub(super) fn emit_tforcall_ipairs(b: &mut Builder<'_, '_>, a: u8, count: u8) {
+/// `TFORCALL_IPAIRS a count` and its `TFORLOOP`, to `exit` or `body`: the
+/// array part inline, past it the helper, whose failure (`__index` may
+/// answer) exits.
+pub(super) fn emit_tforcall_ipairs(
+    b: &mut Builder<'_, '_>,
+    a: u8,
+    count: u8,
+    exit: Block,
+    body: Block,
+) {
     let vars = a + TFOR_VARS;
     let state = b.reg(a + 1);
     let g = b.guard(state, TypeSet::TAB);
@@ -139,7 +155,6 @@ pub(super) fn emit_tforcall_ipairs(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     let k = b.ins_exit(Op::IAdd, &[i, one], ExitTag::Slow);
     let k = b.f.result(k);
     let kv = b.ins(Op::Box, &[k]);
-    let join = b.new_block();
     let n = b.ins(Op::TabASize, &[t]);
     let inside = b.ins(Op::ICmp(Cc::Lo), &[k, n]);
     let outside = branch_arm(b, inside);
@@ -147,34 +162,39 @@ pub(super) fn emit_tforcall_ipairs(b: &mut Builder<'_, '_>, a: u8, count: u8) {
     let v = b.ins(Op::ArrLoad, &[arr, k]);
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
     let found = branch_arm(b, nil);
-    past_array(b, join, vars, count, g, kv);
+    past_array(b, exit, body, vars, count, g, kv);
     b.switch_to(found);
-    step_to(b, join, vars, count, kv, v);
+    step_to(b, body, vars, count, kv, v);
     b.switch_to(outside);
-    past_array(b, join, vars, count, g, kv);
-    enter_join(b, join);
+    past_array(b, exit, body, vars, count, g, kv);
 }
 
 /// The `ipairs` step at key `kv` past the array part: the value, or the
 /// end with the variables nil.
-fn past_array(b: &mut Builder<'_, '_>, join: Block, vars: u8, count: u8, t: Val, kv: Val) {
+fn past_array(
+    b: &mut Builder<'_, '_>,
+    exit: Block,
+    body: Block,
+    vars: u8,
+    count: u8,
+    t: Val,
+    kv: Val,
+) {
     let w = b.ins(Op::Helper(HelperId::TforIpairs), &[t, kv]);
     let fail = b.ins(Op::KVal(HELPER_FAIL_VAL), &[]);
     let failed = b.ins(Op::SameBits, &[w, fail]);
     let s = b.snap_before();
     b.ins_snap(Op::GuardFalse, &[failed], s, ExitTag::Slow);
-    // A branch, not a select: the end comes once, and the key then waits
-    // on nothing (a `csel` would wait for the helper's result).
     let end = b.ins(Op::IsType(TypeSet::NIL), &[w]);
     let more = branch_arm(b, end);
     let nil = b.konst(Value::nil());
-    step_to(b, join, vars, count, nil, w);
+    step_to(b, exit, vars, count, nil, w);
     b.switch_to(more);
-    step_to(b, join, vars, count, kv, w);
+    step_to(b, body, vars, count, kv, w);
 }
 
-/// The loop variables `(k, v, nil...)`, then the join.
-fn step_to(b: &mut Builder<'_, '_>, join: Block, vars: u8, count: u8, k: Val, v: Val) {
+/// The loop variables `(k, v, nil...)`, then `to`.
+fn step_to(b: &mut Builder<'_, '_>, to: Block, vars: u8, count: u8, k: Val, v: Val) {
     b.set(vars, k);
     if count > 1 {
         b.set(vars + 1, v);
@@ -184,7 +204,7 @@ fn step_to(b: &mut Builder<'_, '_>, join: Block, vars: u8, count: u8, k: Val, v:
         b.set(vars + i, nil);
     }
     b.flush();
-    b.jump(join);
+    b.jump(to);
 }
 
 /// `TFORCALL a count` with another iterator: `R[a](R[a+1], R[a+4])`, its

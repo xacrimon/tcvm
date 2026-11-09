@@ -206,8 +206,9 @@ fn any_f64(b: &mut Builder<'_, '_>, v: Val) -> Val {
 }
 
 /// Emit the instruction at `pc`. `succs` are the IR blocks of its bytecode
-/// block's successors when it is the block's last instruction:
-/// `[fallthrough, target]` for a branch, `[target]` for a jump.
+/// block's successors when it is the block's last instruction, or a `next`
+/// or `ipairs` step before its `TFORLOOP`: `[fallthrough, target]` for a
+/// branch, `[target]` for a jump.
 pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
     let mut insn = b.code(pc);
     // An inlined call before it left values up to `top`: a fixed number
@@ -551,8 +552,9 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1 => emit_call(b, pc, insn),
         TFORPREP => iter::emit_tforprep(b, pc, insn, succs),
         TFORCALL => iter::emit_tforcall(b, a, rb),
-        TFORCALL_NEXT => iter::emit_tforcall_next(b, a, rb),
-        TFORCALL_IPAIRS => iter::emit_tforcall_ipairs(b, a, rb),
+        TFORCALL_NEXT | TFORCALL_IPAIRS if succs.is_empty() => b.deopt(ExitTag::Unsupported),
+        TFORCALL_NEXT => iter::emit_tforcall_next(b, a, rb, succs[0], succs[1]),
+        TFORCALL_IPAIRS => iter::emit_tforcall_ipairs(b, a, rb, succs[0], succs[1]),
         TFORLOOP => {
             let v = b.reg(a + TFOR_VARS);
             let v = b.boxed(v);
