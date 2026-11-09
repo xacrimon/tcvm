@@ -114,7 +114,8 @@ enum Stage {
 pub(crate) struct Times {
     last: std::time::Instant,
     stages: [u128; 5],
-    /// Each pass's share of `Passes`, summed over its runs (F1).
+    /// Each pass's share of `Passes` in nanoseconds, summed over its runs
+    /// (F1).
     pass: Vec<(&'static str, u128)>,
 }
 
@@ -142,10 +143,10 @@ impl Times {
     fn timed<T>(&mut self, name: &'static str, f: impl FnOnce() -> T) -> T {
         let t = std::time::Instant::now();
         let r = f();
-        let us = t.elapsed().as_micros();
+        let ns = t.elapsed().as_nanos();
         match self.pass.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, x)) => *x += us,
-            None => self.pass.push((name, us)),
+            Some((_, x)) => *x += ns,
+            None => self.pass.push((name, ns)),
         }
         r
     }
@@ -702,7 +703,7 @@ pub(crate) fn compile<'gc>(
             times
                 .pass
                 .iter()
-                .map(|(n, us)| format!("{n} {us}"))
+                .map(|(n, ns)| format!("{n} {:.1}", *ns as f64 / 1000.0))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
