@@ -363,17 +363,30 @@ enum Target {
     Reg,
 }
 
+/// What a trampoline's call hands back: a result in x0 or d0, or nothing
+/// from a call whose first `args` integer registers the caller set up (and
+/// keeps itself).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tramp {
+    Int,
+    Float,
+    Args(u8),
+}
+
 /// A trampoline (A5): a C call of `target` that keeps x0-x15, d0-d7 and
-/// d16-d30 but the result's register, behind a frame record that keeps the
-/// frame chain walkable; and its frame's size.
-pub(crate) fn trampoline(target: usize, ret_float: bool) -> (Asm, u32) {
-    let ints: Vec<Gpr> = (0..16u8)
-        .filter(|&r| ret_float || r != 0)
-        .map(Gpr)
-        .collect();
+/// d16-d30 but the result's register and the caller's argument registers,
+/// behind a frame record that keeps the frame chain walkable; and its
+/// frame's size.
+pub(crate) fn trampoline(target: usize, kind: Tramp) -> (Asm, u32) {
+    let first = match kind {
+        Tramp::Int => 1,
+        Tramp::Float => 0,
+        Tramp::Args(n) => n,
+    };
+    let ints: Vec<Gpr> = (first..16u8).map(Gpr).collect();
     let floats: Vec<Fpr> = (0..8u8)
         .chain(16..31)
-        .filter(|&r| !ret_float || r != 0)
+        .filter(|&r| kind != Tramp::Float || r != 0)
         .map(Fpr)
         .collect();
     let frame = (16 + 8 * (ints.len() + floats.len()) as u64).next_multiple_of(16);
@@ -2563,14 +2576,30 @@ impl<'a> Em<'a> {
                 self.a.b(top);
                 self.a.bind(done);
             }
+            // The slow path, out of line, keeps every register itself: x0
+            // and x1 across its own argument setup, the rest in the
+            // trampoline.
             Barrier => {
-                let skip = self.a.new_label();
-                self.a.ldr(X16, Gpr(1), layout::T_HEADER);
-                self.a.tbnz(X16, 0, skip);
-                self.a.ldr_lit(Gpr(0), self.helpers.rt);
-                self.a
-                    .bl_far(crate::jit::helpers::jit_barrier as *const () as usize);
-                self.a.bind(skip);
+                let t = self.r(i, 0);
+                let (slow, back) = (self.a.new_label(), self.a.new_label());
+                self.a.ldr(X16, t, layout::T_HEADER);
+                self.a.tbz(X16, 0, slow);
+                self.a.bind(back);
+                let target = crate::jit::helpers::jit_barrier as *const () as usize;
+                let tramp = self.helpers.trampolines.iter().find(|(x, _)| *x == target);
+                let tramp = tramp.expect("the barrier's trampoline").1;
+                let rt = self.helpers.rt;
+                self.ool.push(Box::new(move |em: &mut Em<'_>| {
+                    em.a.bind(slow);
+                    em.a.stp_pre(Gpr(0), Gpr(1), SP, -16);
+                    if t != Gpr(1) {
+                        em.a.mov(Gpr(1), t);
+                    }
+                    em.a.ldr_lit(Gpr(0), rt);
+                    em.a.bl_far(tramp);
+                    em.a.ldp_post(Gpr(0), Gpr(1), SP, 16);
+                    em.a.b(back);
+                }));
             }
             NumVarargs => {
                 let d = self.r(i, 0);

@@ -498,31 +498,40 @@ pub(crate) fn compile<'gc>(
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Regalloc);
     let jit = ctx.jit();
-    let tramp = |h: usize, f: bool| jit.trampoline(h, f);
+    use crate::jit::backend::aarch64::emit::Tramp;
+    let tramp = |h: usize, k: Tramp| jit.trampoline(h, k);
     let mut trampolines: Vec<(usize, usize)> = Vec::new();
     for inst in &lowered.vcode.insts {
         use crate::jit::backend::aarch64::inst::MInst;
-        let (a, float) = match inst {
+        let (a, kind) = match inst {
             MInst::HelperCold(h) => (
                 crate::jit::helpers::address(*h),
-                h.sig().ret == Some(crate::jit::ir::types::Rep::F64),
+                if h.sig().ret == Some(crate::jit::ir::types::Rep::F64) {
+                    Tramp::Float
+                } else {
+                    Tramp::Int
+                },
             ),
             MInst::FMod => (
                 crate::jit::helpers::address(crate::jit::ir::ops::HelperId::FMod),
-                true,
+                Tramp::Float,
             ),
             MInst::ToF64 { kinds, .. } if kinds.contains(crate::jit::ir::types::TypeSet::STR) => (
                 crate::jit::helpers::jit_str_to_f64 as *const () as usize,
-                false,
+                Tramp::Int,
             ),
             MInst::ToPos { kinds, .. } if kinds.contains(crate::jit::ir::types::TypeSet::STR) => (
                 crate::jit::helpers::jit_str_to_i64 as *const () as usize,
-                false,
+                Tramp::Int,
+            ),
+            MInst::Barrier => (
+                crate::jit::helpers::jit_barrier as *const () as usize,
+                Tramp::Args(2),
             ),
             _ => continue,
         };
         if !trampolines.iter().any(|&(x, _)| x == a) {
-            trampolines.push((a, tramp(a, float)?));
+            trampolines.push((a, tramp(a, kind)?));
         }
     }
     let helpers = emit::Helpers {
@@ -531,7 +540,7 @@ pub(crate) fn compile<'gc>(
         enter: crate::vm::ops::call::enter as *const () as usize,
         box_i64: tramp(
             crate::jit::helpers::jit_box_i64 as *const () as usize,
-            false,
+            Tramp::Int,
         )?,
         land: crate::jit::helpers::jit_land as *const () as usize,
         level: abi::jit_level as *const () as usize,

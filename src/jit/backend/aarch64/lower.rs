@@ -1368,8 +1368,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::ArrNext, &ops, none);
             }
             Op::Barrier => {
-                let t = Operand::reg_fixed_use(self.vr(args[0]), preg_int(1));
-                self.push(MInst::Barrier, &[t], caller_saved());
+                let t = self.use_(args[0]);
+                self.push(MInst::Barrier, &[t], none);
             }
             Op::NumVarargs => {
                 let d = self.def(res.unwrap());
