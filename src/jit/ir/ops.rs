@@ -979,6 +979,11 @@ impl Op {
     pub(crate) fn effects(self) -> Effects {
         use Op::*;
         const DEOPT: Flags = Flags::MAY_DEOPT;
+        // Apart, so that the match below is all constants: a table lookup,
+        // not a jump table.
+        if let Helper(h) = self {
+            return h.sig().effects;
+        }
         let e = Effects::new;
         match self {
             Load(_) | Home(_) => Effects::reads(Mem::SLOT),
@@ -1011,7 +1016,6 @@ impl Op {
             SetTop(_) => e(Flags::empty(), Mem::empty(), Mem::FRAME),
             CellLoad => Effects::reads(Mem::UPVAL | Mem::SLOT),
             CellStore => e(Flags::empty(), Mem::empty(), Mem::UPVAL | Mem::SLOT),
-            Helper(h) => h.sig().effects,
             Resume { .. } => e(Flags::SIDE_EFFECT, Mem::SLOT, Mem::empty()),
             Jump | Br => Effects::flags(Flags::TERMINATOR),
             Return { .. } => e(Flags::TERMINATOR | Flags::TAILOUT, Mem::SLOT, Mem::empty()),
