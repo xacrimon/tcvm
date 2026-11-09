@@ -904,7 +904,21 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     (Test::X { imm: None }, int_cond(cc), args)
                 }
             }
-            Op::FCmp(cc) => (Test::F64, float_cond(cc), args),
+            Op::FCmp(cc) => {
+                // `#0.0` compares as -0.0 does.
+                let zero = |v: Val| matches!(self.f.def_op(v), Some(Op::KF64(b)) if f64::from_bits(b) == 0.0);
+                if zero(args[1]) {
+                    (Test::F64 { zero: true }, float_cond(cc), vec![args[0]])
+                } else if zero(args[0]) {
+                    (
+                        Test::F64 { zero: true },
+                        float_cond(cc.swap()),
+                        vec![args[1]],
+                    )
+                } else {
+                    (Test::F64 { zero: false }, float_cond(cc), args)
+                }
+            }
             Op::SameBits => (Test::X { imm: None }, Cond::Eq, args),
             Op::IsType(set) => (Test::Type(set, args.len() > 1), Cond::Eq, args),
             Op::IsFalsy => (Test::Falsy(args.len() > 1), Cond::Lo, args),

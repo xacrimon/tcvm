@@ -1607,7 +1607,12 @@ impl<'a> Em<'a> {
                 self.a.cmp(Sz::X, x, y);
                 cond
             }
-            Test::F64 => {
+            Test::F64 { zero: true } => {
+                let x = self.fr(i, k);
+                self.a.fcmp_zero(x);
+                cond
+            }
+            Test::F64 { zero: false } => {
                 let (x, y) = (self.fr(i, k), self.fr(i, k + 1));
                 self.a.fcmp(x, y);
                 cond
