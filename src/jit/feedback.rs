@@ -41,18 +41,16 @@ pub(crate) const KINDS: Bits = SMALL | BIGINT | FLOAT | STR | TAB | OTHER;
 /// The kind bit of `v`.
 #[inline(always)]
 pub(crate) fn kind(v: Value<'_>) -> Bits {
-    if v.is_float() {
+    // By the box's tag: none, userdata, boxed integers, strings, tables,
+    // functions, threads, the immediates.
+    const BY_TAG: [Bits; 8] = [OTHER, OTHER, BIGINT, STR, TAB, OTHER, OTHER, OTHER];
+    let b = v.to_raw();
+    if b < crate::env::value::BOX {
         FLOAT
     } else if v.get_small().is_some() {
         SMALL
-    } else if v.get_integer().is_some() {
-        BIGINT
-    } else if v.get_string().is_some() {
-        STR
-    } else if v.get_table().is_some() {
-        TAB
     } else {
-        OTHER
+        BY_TAG[(b >> 48 & 7) as usize]
     }
 }
 
