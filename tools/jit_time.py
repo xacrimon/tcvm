@@ -37,6 +37,7 @@ def main():
         args = ["200000"] if n == "partialsums" else []
         t = time.time()
         p = subprocess.run([a.bin, "-f", w] + args, cwd=a.suite, capture_output=True, text=True,
+                           errors="replace",
                            env=dict(os.environ, TCVM_JIT_TIME="1"), stdin=subprocess.DEVNULL)
         wall = (time.time() - t) * 1000
         stages = collections.Counter()
