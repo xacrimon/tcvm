@@ -1600,15 +1600,23 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     }
 
     /// End an inlined body with a real call that replaces its frame (its
-    /// `TAILCALL`, W3 §5): made from the body's header slot, as its caller
-    /// made the call the body was inlined at, so its site is the caller's
-    /// frame there, keeping what the caller kept. Continues in the resume
-    /// block, where the body's registers are dead.
-    pub(crate) fn tail_call(&mut self, op: Op, args: &[Val], c: u8) -> Block {
+    /// `TAILCALL` at `pc`, W3 §5): made from the body's header slot, as its
+    /// caller made the call the body was inlined at, so its site is the
+    /// caller's frame there, keeping what the caller kept, and the body's
+    /// at `pc` for a native callee (`Func::tail_sites`). Continues in the
+    /// resume block, where the body's registers are dead.
+    pub(crate) fn tail_call(&mut self, op: Op, args: &[Val], c: u8, pc: u32) -> Block {
         let i = self.inline.as_mut().expect("an inlined body");
         i.called = true;
-        let x = self.f.inline_frames[i.frame as usize];
+        let frame = i.frame;
+        let x = self.f.inline_frames[frame as usize];
         let homes = i.outer_homes;
+        let hdr = i.base.checked_sub(4);
+        let closure = i
+            .outer
+            .iter()
+            .copied()
+            .find(|&(r, _)| Some(r as usize) == hdr);
         let from = self.f.snap_pool.len();
         let outer = self.inline.as_ref().unwrap().outer_entries();
         self.f.snap_pool.extend_from_slice(&outer);
@@ -1617,6 +1625,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             .f
             .finish_snap(x.parent, x.caller_pc, ExitKind::After, from);
         self.f.call_homes.entry(snap.0).or_default().union(&homes);
+        let site = crate::jit::ir::TailSite { frame, pc, closure };
+        self.f.tail_sites.insert(snap.0, site);
         let before = self.cur;
         let resume = self.new_block();
         self.f.blocks[resume.idx()].resume = true;

@@ -977,7 +977,7 @@ pub(super) fn tail_call(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8, call
         pc: x.caller_pc,
         proto,
     };
-    let resume = b.tail_call(op, &vals[..in_regs], x.c);
+    let resume = b.tail_call(op, &vals[..in_regs], x.c, pc);
     let res: Vec<Val> = if x.c == 2 || x.c == 3 {
         let first = b.f.insts_of(resume)[0];
         b.f.results(first).collect()

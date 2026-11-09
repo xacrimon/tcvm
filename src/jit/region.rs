@@ -288,6 +288,11 @@ pub(crate) struct Site {
     /// words a fast call does not write (D4).
     pub(crate) hdr: u16,
     pub(crate) pc_after: u64,
+    /// For the call an inlined body's `TAILCALL` made in its place (W3
+    /// §5), past that instruction, else 0: the snapshot's last frame is the
+    /// body's, which a native callee is called from as in the interpreter,
+    /// and which a Lua callee replaced.
+    pub(crate) tail_pc: u64,
     /// The return address is a level's (`jit_level`): `BASE` there is this
     /// frame's. Otherwise it is a fast callee's, and `BASE` the callee's.
     pub(crate) level: bool,

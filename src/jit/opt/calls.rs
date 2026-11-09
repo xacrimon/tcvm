@@ -630,8 +630,12 @@ fn keep_unnamed(f: &mut Func<'_>, cfg: &CfgInfo, b: Block, v: Val) -> Result<(),
         .extend_from_within(d.entries.start as usize..(d.entries.start + d.entries.len) as usize);
     f.snap_pool.push((crate::jit::ir::KEPT, v));
     let s = f.finish_snap(d.frame, d.pc, d.kind, from);
-    if let Some(&homes) = f.call_homes.get(&f.insts[t.idx()].snap) {
+    let old = f.insts[t.idx()].snap;
+    if let Some(&homes) = f.call_homes.get(&old) {
         f.call_homes.insert(s.0, homes);
+    }
+    if let Some(&tail) = f.tail_sites.get(&old) {
+        f.tail_sites.insert(s.0, tail);
     }
     f.insts[t.idx()].snap = s.0;
     Ok(())

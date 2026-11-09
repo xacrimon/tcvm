@@ -415,6 +415,7 @@ pub(crate) fn frames<'gc>(ts: &ThreadState<'gc>) -> Walk<'gc> {
         elided: None,
         queue: [None; 3],
         queued: 0,
+        native: false,
     }
 }
 
@@ -440,12 +441,23 @@ pub(crate) struct Walk<'gc> {
     /// last first.
     queue: [Option<Frame<'gc>>; 3],
     queued: usize,
+    /// The frame just walked is a native's: a compiled frame reached next
+    /// called it (`Site::tail_pc`).
+    native: bool,
 }
 
 impl<'gc> Iterator for Walk<'gc> {
     type Item = Frame<'gc>;
 
     fn next(&mut self) -> Option<Frame<'gc>> {
+        let f = self.step();
+        self.native = f.is_some_and(|f| f.is_native());
+        f
+    }
+}
+
+impl<'gc> Walk<'gc> {
+    fn step(&mut self) -> Option<Frame<'gc>> {
         if let Some(f) = self.elided.take() {
             return Some(f);
         }
@@ -526,9 +538,7 @@ impl<'gc> Iterator for Walk<'gc> {
             return Some(f);
         }
     }
-}
 
-impl<'gc> Walk<'gc> {
     /// Go on to the caller of `f`, whose header names it: through its
     /// caller words, or below its level for a level's first frame, whose
     /// caller is compiled, as is a native's that `jit_call_native` runs.
@@ -574,7 +584,11 @@ impl<'gc> Walk<'gc> {
         let snap = crate::jit::region::SnapView::decode(&region.snaps[site.snap as usize..]);
         let mut cur = f0;
         let mut code = f0.closure().code;
-        for fr in snap.frames() {
+        // A native the body's `TAILCALL` called runs above the body, which
+        // a Lua callee replaced.
+        let tail = site.tail_pc != 0 && self.native;
+        let n = snap.frames().count() - (site.tail_pc != 0 && !tail) as usize;
+        for fr in snap.frames().take(n) {
             // A tail callee in the compiled frame's place (W3 §5).
             if fr.delta == 0 {
                 let callee = region.pool[fr.func as usize]
@@ -617,7 +631,7 @@ impl<'gc> Walk<'gc> {
             };
             code = callee.code;
         }
-        cur.pc = site.pc_after as usize as *const Instruction;
+        cur.pc = if tail { site.tail_pc } else { site.pc_after } as usize as *const Instruction;
         cur
     }
 }

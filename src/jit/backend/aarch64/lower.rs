@@ -57,6 +57,10 @@ pub(crate) struct LSite {
     /// The inlined frames the call is made from, outermost first, which the
     /// frame walk shows (W3 §4).
     pub(crate) frames: Vec<crate::jit::region::SnapFrame>,
+    /// For the call an inlined body's `TAILCALL` makes in its place: past
+    /// that instruction, in the body's code, which `frames` ends with (the
+    /// walk shows the body above a native callee only, `Func::tail_sites`).
+    pub(crate) tail_pc: Option<usize>,
 }
 
 pub(crate) struct Lowered {
@@ -1090,12 +1094,25 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     fn push_call(&mut self, i: Inst, mk: MInst, mut ops: Vec<Operand>) {
         let d = &self.f.insts[i.idx()];
         let d_snap = d.snap;
-        let frames = self.snap_frames(self.f.snaps[d_snap as usize].frame);
+        let tail = self.f.tail_sites.get(&d_snap).copied();
+        let (frames, tail_pc) = match tail {
+            Some(t) => {
+                let code = self.f.inline_frames[t.frame as usize].code;
+                (
+                    self.snap_frames(t.frame),
+                    Some(code + (t.pc as usize + 1) * 8),
+                )
+            }
+            None => (self.snap_frames(self.f.snaps[d_snap as usize].frame), None),
+        };
+        // The closure of a body a native callee runs above, which the walk
+        // reads at its header slot.
+        let closure = tail.and_then(|t| t.closure);
         let mut entries = Vec::new();
         let mut seen: Vec<(VReg, u16)> = Vec::new();
         let base = ops.len();
         let homes = self.f.call_homes.get(&d_snap).copied().unwrap_or_default();
-        for &(r, v) in self.f.entries(d.snap) {
+        for &(r, v) in self.f.entries(d.snap).iter().chain(&closure) {
             let v = match self.f.def_op(v) {
                 Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
                 _ => v,
@@ -1106,7 +1123,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
             // The slot holds it, and the call keeps it there: a home entry.
             if let Some(s) = self.home_load(v) {
-                debug_assert!(s == r && homes.contains(r as usize), "v{} spilled", v.0);
+                if s != r {
+                    entries.push((r, SRep::Val, Src::Slot(s)));
+                }
+                debug_assert!(s != r || homes.contains(r as usize), "v{} spilled", v.0);
                 continue;
             }
             let vr = self.vr(v);
@@ -1135,6 +1155,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 entries,
                 homes,
                 frames,
+                tail_pc,
             },
         ));
     }

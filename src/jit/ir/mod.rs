@@ -211,6 +211,17 @@ pub(crate) struct InlineFrame {
     pub(crate) replaces: bool,
 }
 
+/// A call an inlined body's `TAILCALL` makes in its place, which a native
+/// callee runs above the body as the interpreter runs it: the body's frame,
+/// the `TAILCALL`'s pc, and for a body known by its prototype its header
+/// slot and closure, which the callee's header took.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TailSite {
+    pub(crate) frame: u32,
+    pub(crate) pc: u32,
+    pub(crate) closure: Option<(u8, Val)>,
+}
+
 /// What a region was compiled from.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RegionMeta {
@@ -288,6 +299,9 @@ pub(crate) struct Func<'gc> {
     /// hold what they will be read as after it, which the collector traces
     /// while the call runs (H11); it clears the frame's other slots there.
     pub(crate) call_homes: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
+    /// Calls an inlined body's `TAILCALL` makes in its place (W3 §5), by
+    /// snapshot.
+    pub(crate) tail_sites: crate::jit::FastMap<u32, TailSite>,
     /// The region slots closures capture, of every frame the region inlines,
     /// which a call may write through their cells.
     pub(crate) captured: crate::jit::build::cfg::RegSet,
@@ -381,6 +395,7 @@ impl<'gc> Func<'gc> {
             landings: Vec::new(),
             boundaries: false,
             call_homes: Default::default(),
+            tail_sites: Default::default(),
             captured: Default::default(),
             exit_sites: Default::default(),
             inline_frames: Vec::new(),
@@ -818,6 +833,9 @@ impl<'gc> Func<'gc> {
         let ns = Snap(self.snaps.len() as u32 - 1);
         if let Some(&homes) = self.call_homes.get(&s.0) {
             self.call_homes.insert(ns.0, homes);
+        }
+        if let Some(&tail) = self.tail_sites.get(&s.0) {
+            self.tail_sites.insert(ns.0, tail);
         }
         ns
     }

@@ -798,6 +798,7 @@ pub(crate) fn compile<'gc>(
             snap: at,
             hdr: site.hdr,
             pc_after: site.pc_after,
+            tail_pc: site.tail_pc.unwrap_or(0) as u64,
             level,
             miss: *miss,
         }));

@@ -87,6 +87,7 @@ pub(crate) struct SiteOut {
     pub(crate) pc_after: u64,
     /// The inlined frames it is made from (`LSite::frames`).
     pub(crate) frames: Vec<crate::jit::region::SnapFrame>,
+    pub(crate) tail_pc: Option<usize>,
 }
 
 pub(crate) struct ExitOut {
@@ -1507,8 +1508,8 @@ impl<'a> Em<'a> {
     ) {
         let (entries, consts) = self.site_entries(i, block, hdr);
         let resume = self.v.succs(block)[0].index();
-        let frames = (self.sites_of.iter().find(|(b, _)| *b == resume))
-            .map_or(Vec::new(), |(_, s)| s.frames.clone());
+        let (frames, tail_pc) = (self.sites_of.iter().find(|(b, _)| *b == resume))
+            .map_or((Vec::new(), None), |(_, s)| (s.frames.clone(), s.tail_pc));
         let miss = self.miss[resume];
         self.sites.push(SiteOut {
             keys,
@@ -1518,6 +1519,7 @@ impl<'a> Em<'a> {
             hdr,
             pc_after: pc_after as u64,
             frames,
+            tail_pc,
         });
     }
 
@@ -1545,7 +1547,7 @@ impl<'a> Em<'a> {
                         .expect("a kept value outside the frame")
                         .index() as u16,
                 ),
-                Src::Slot(_) => unreachable!("a call's entry in a frame slot"),
+                Src::Slot(s) => Loc::Slot(s),
             };
             entries.push(SnapEntry { reg, rep, loc });
         }
