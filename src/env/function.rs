@@ -776,6 +776,26 @@ impl<'gc> Function<'gc> {
         proto: Gc<'gc, Prototype<'gc>>,
         init: impl FnOnce(*mut UpvalueSlot<'gc>),
     ) -> Self {
+        // SAFETY: `init` writes every upvalue, and nothing collects first.
+        unsafe {
+            let f = Self::new_lua_unwritten(mc, proto);
+            init(LuaFn::from_function_unchecked(f).upvalue_ptr());
+            f
+        }
+    }
+
+    /// [`new_lua`](Self::new_lua) leaving the upvalues to the caller: a
+    /// capturing `init` shared by several callers stays out of line, its
+    /// environment in memory.
+    ///
+    /// # Safety
+    /// Every upvalue is written, as `new_lua`'s `init` would, before the next
+    /// collection.
+    #[inline(always)]
+    pub(crate) unsafe fn new_lua_unwritten(
+        mc: &Mutation<'gc>,
+        proto: Gc<'gc, Prototype<'gc>>,
+    ) -> Self {
         let closure = LuaClosure {
             proto,
             code: proto.code.as_ptr(),
@@ -795,10 +815,8 @@ impl<'gc> Function<'gc> {
         if made < 2 {
             proto.closures.set(made + 1);
         }
-        // SAFETY: `init` writes every upvalue.
-        Function(unsafe {
-            Gc::new_with_trailing(mc, FunctionKind::Lua(closure), |p| init(p.cast().as_ptr()))
-        })
+        // SAFETY: the caller writes every upvalue before anything reads them.
+        Function(unsafe { Gc::new_with_trailing(mc, FunctionKind::Lua(closure), |_| ()) })
     }
 
     pub fn new_native(mc: &Mutation<'gc>, function: NativeFn, upvalues: &[Value<'gc>]) -> Self {
