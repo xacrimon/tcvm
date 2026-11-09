@@ -4,7 +4,7 @@
 
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Rep, Ty, TypeSet};
-use crate::jit::ir::{Block, Func, Val};
+use crate::jit::ir::{Block, Func, Val, ValDef};
 
 /// Whether the builder fixed the result type of `op` from knowledge the
 /// operands do not carry.
@@ -113,6 +113,7 @@ fn narrow_rep(t: Ty, i64_arg: bool) -> Option<Rep> {
 pub(crate) fn narrow(f: &mut Func<'_>) -> bool {
     let cfg = f.cfg();
     let mut changed = false;
+    let mut users: Option<Vec<(Val, Block)>> = None;
     for &block in &cfg.rpo {
         for k in 0..f.blocks[block.idx()].params.len() {
             let p = f.params(block)[k];
@@ -129,6 +130,7 @@ pub(crate) fn narrow(f: &mut Func<'_>) -> bool {
                 continue;
             };
             changed = true;
+            let users = users.get_or_insert_with(|| param_users(f));
             // The parameter becomes `rep`; its old uses see it boxed.
             let set = f.vals[p.idx()].ty.set;
             f.vals[p.idx()].ty = Ty {
@@ -136,7 +138,7 @@ pub(crate) fn narrow(f: &mut Func<'_>) -> bool {
                 set,
                 refine: crate::jit::ir::types::Refine::None,
             };
-            box_uses(f, p);
+            box_uses(f, p, users);
             for &(term, e) in cfg.incoming(block) {
                 let a = f.edge_args(term, e as usize)[k];
                 let na = convert(f, a, rep, f.insts[term.idx()].block);
@@ -147,15 +149,44 @@ pub(crate) fn narrow(f: &mut Func<'_>) -> bool {
     changed
 }
 
-/// Give each operand and edge use of the now unboxed `p` a box of its own
-/// just before it; GVN merges the dominated ones. Snapshots take `p` as is.
-fn box_uses(f: &mut Func<'_>, p: Val) {
-    let set = f.vals[p.idx()].ty.set;
+/// Each boxed parameter with the blocks that have it as an operand or edge
+/// argument, sorted. Narrowing adds such a use of a parameter still boxed
+/// only where there is one already: a conversion of an edge's argument, in
+/// the edge's block.
+fn param_users(f: &Func<'_>) -> Vec<(Val, Block)> {
+    let mut users = Vec::new();
     for b in 0..f.blocks.len() {
         if f.blocks[b].dead {
             continue;
         }
         let b = Block(b as u32);
+        for &i in f.insts_of(b) {
+            let edges = f.edges(i).iter().flat_map(|e| f.vl(e.args));
+            for &a in f.args(i).iter().chain(edges) {
+                let d = &f.vals[a.idx()];
+                if matches!(d.def, ValDef::Param(..))
+                    && d.ty.rep == Rep::Val
+                    && users.last() != Some(&(a, b))
+                {
+                    users.push((a, b));
+                }
+            }
+        }
+    }
+    users.sort_unstable();
+    users.dedup();
+    users
+}
+
+/// Give each operand and edge use of the now unboxed `p` a box of its own
+/// just before it; GVN merges the dominated ones. Snapshots take `p` as is.
+fn box_uses(f: &mut Func<'_>, p: Val, users: &[(Val, Block)]) {
+    let set = f.vals[p.idx()].ty.set;
+    let from = users.partition_point(|&(v, _)| v < p);
+    for &(v, b) in &users[from..] {
+        if v != p {
+            break;
+        }
         let mut k = 0;
         while k < f.blocks[b.idx()].insts.len() {
             let i = f.insts_of(b)[k];
