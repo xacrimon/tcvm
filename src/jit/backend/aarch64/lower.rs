@@ -733,15 +733,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     }
 
     /// Whether a value stored as a result can be returned in x0: a boxed
-    /// value a register holds (a float's box exists only in its store).
+    /// value (a float's box is then computed there, not stored and loaded).
     fn in_x0(&self, v: Val) -> bool {
         self.f.ty(v).rep == Rep::Val
-            && match self.f.def_op(v) {
-                Some(Op::Box) => {
-                    self.f.ty(self.f.args(self.f.def_inst(v).unwrap())[0]).rep != Rep::F64
-                }
-                _ => true,
-            }
     }
 
     /// Mark compares that only branches, guards and selects use, each
