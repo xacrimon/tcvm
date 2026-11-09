@@ -4,7 +4,7 @@
 
 use std::cmp::Reverse;
 
-use super::{Held, Loc, MAX_REGS, NONE, Piece, Pos, Ra, Want, Why, intersect};
+use super::{FIXED, Held, Loc, MAX_REGS, NONE, Piece, Pos, Ra, Want, Why, intersect};
 use crate::jit::backend::reg::PReg;
 use crate::jit::backend::vcode::{TargetInst, VCode};
 
@@ -275,7 +275,7 @@ impl Ra {
     }
 
     /// The register `c` would like: that of its first fixed use, else its
-    /// previous piece's.
+    /// previous piece's, else that of the fixed definition right after it.
     fn hint(&self, c: u32) -> Option<usize> {
         let p = &self.pieces[c as usize];
         let fixed = (self.want_from(p.ulo, p.uhi, Want::Fixed)).map(|j| {
@@ -285,7 +285,12 @@ impl Ra {
             }
         });
         let prev = || (p.prev != NONE).then(|| self.reg_of(p.prev)).flatten();
-        let r = fixed.or_else(prev)?;
+        let next = || {
+            (p.next != NONE && self.pieces[p.next as usize].flags & FIXED != 0)
+                .then(|| self.reg_of(p.next))
+                .flatten()
+        };
+        let r = fixed.or_else(prev).or_else(next)?;
         let k = self.reg_idx[r.index()];
         (k != NONE && r.class() == self.env.regs[self.class_of(c)][k as usize].class())
             .then_some(k as usize)
@@ -372,13 +377,20 @@ impl Ra {
             self.activate(c);
             return Ok(());
         }
-        // The hinted register held by pieces that want no register again:
-        // take it from them (they would be spilled by the next clobber).
+        // The hinted register held by pieces that want no register again,
+        // or that are made again where they next want one less often than
+        // `c` starts: take it from them (they would be spilled by the next
+        // clobber; making one there costs less than moving `c` here).
         if let Some(h) = hint {
+            let here = self.freq_at(s);
             let idle = |x: &Held| {
                 x.cls as usize != cls
                     || x.k as usize != h
-                    || self.next_use(x.x, s, Want::Beneficial).is_none()
+                    || self.next_use(x.x, s, Want::Beneficial).is_none_or(|u| {
+                        self.vregs[self.pieces[x.x as usize].g as usize].remat
+                            && u.pos > s
+                            && self.freq_at(u.pos) < here
+                    })
             };
             if a.free[h] < e
                 && a.fixed[h] >= e
