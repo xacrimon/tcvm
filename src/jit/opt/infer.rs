@@ -15,6 +15,7 @@ fn keeps_type(op: Op) -> bool {
             | Op::Param(_)
             | Op::TabLoad { .. }
             | Op::KObj(_)
+            | Op::KPtr(_)
             | Op::Resume { .. }
             | Op::UpvalValue(_)
             | Op::UpvalValueOf(_)

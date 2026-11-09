@@ -3,7 +3,7 @@
 
 use crate::env::value::Value;
 use crate::jit::ir::ops::{Cc, ExitTag, Op};
-use crate::jit::ir::types::{Rep, TypeSet};
+use crate::jit::ir::types::{Refine, Rep, TypeSet};
 use crate::jit::ir::{Block, BlockCall, Func, Inst, Val};
 use crate::vm::num::shift_left;
 
@@ -228,6 +228,18 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                     let x = args[0];
                     if f.ty(x).rep == rep {
                         map[res(f).idx()] = x;
+                        changed = true;
+                        continue;
+                    }
+                    // A constant object's pointer, by its definition or a
+                    // guard's refinement.
+                    if rep == Rep::Ptr
+                        && let (Some(Op::KObj(p)), _) | (_, Refine::Const(p)) =
+                            (f.def_op(x), f.ty(x).refine)
+                    {
+                        f.insts[i.idx()].op = Op::KPtr(p);
+                        f.insts[i.idx()].an = 0;
+                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
                         changed = true;
                         continue;
                     }

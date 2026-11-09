@@ -669,7 +669,15 @@ pub(crate) fn rooted(f: &Func<'_>, kept: &[Val], t: Val) -> bool {
 pub(crate) fn is_const(f: &Func<'_>, v: Val) -> bool {
     matches!(
         f.def_op(v),
-        Some(Op::KVal(_) | Op::KObj(_) | Op::KI32(_) | Op::KI64(_) | Op::KB1(_) | Op::KF64(_))
+        Some(
+            Op::KVal(_)
+                | Op::KObj(_)
+                | Op::KPtr(_)
+                | Op::KI32(_)
+                | Op::KI64(_)
+                | Op::KB1(_)
+                | Op::KF64(_)
+        )
     )
 }
 

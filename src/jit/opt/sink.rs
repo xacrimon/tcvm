@@ -24,7 +24,15 @@ pub(crate) fn sink(f: &mut Func<'_>) -> bool {
     let konst = |f: &Func<'_>, v| {
         matches!(
             f.def_op(v),
-            Some(Op::KI32(_) | Op::KI64(_) | Op::KF64(_) | Op::KVal(_) | Op::KObj(_) | Op::KB1(_))
+            Some(
+                Op::KI32(_)
+                    | Op::KI64(_)
+                    | Op::KF64(_)
+                    | Op::KVal(_)
+                    | Op::KObj(_)
+                    | Op::KPtr(_)
+                    | Op::KB1(_)
+            )
         )
     };
     let mut changed = false;

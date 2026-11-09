@@ -1006,6 +1006,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         match op {
             Op::KVal(b) => self.constant(res.unwrap(), Remat::Int(b)),
             Op::KObj(p) => self.constant(res.unwrap(), Remat::Int(f.pool[p as usize].to_raw())),
+            Op::KPtr(p) => self.constant(
+                res.unwrap(),
+                Remat::Int(f.pool[p as usize].to_raw() & crate::env::value::PAYLOAD_MASK),
+            ),
             Op::KI32(n) => self.constant(res.unwrap(), Remat::Int(n as u32 as u64)),
             Op::KI64(n) => self.constant(res.unwrap(), Remat::Int(n as u64)),
             Op::KB1(c) => self.constant(res.unwrap(), Remat::Int(c as u64)),

@@ -521,6 +521,8 @@ pub(crate) enum Op {
     KVal(u64),
     /// A heap `Value`, its pool index.
     KObj(u32),
+    /// A heap object's pointer (`unbox.ptr` of a `KObj`), its pool index.
+    KPtr(u32),
     KI32(i32),
     KI64(i64),
     KB1(bool),
@@ -1081,6 +1083,10 @@ impl Op {
         match self {
             KVal(bits) => Ty::val(crate::jit::ir::const_set(bits)),
             KObj(_) => Ty::ANY,
+            KPtr(p) => Ty {
+                refine: crate::jit::ir::types::Refine::Const(p),
+                ..Ty::PTR
+            },
             KI32(_) => Ty::I32,
             KB1(_) => Ty::B1,
             KI64(_) => Ty::I64,
@@ -1151,6 +1157,7 @@ impl Op {
         match self {
             KVal(b) => format!("kval {:#x}", b),
             KObj(p) => format!("kobj k{p}"),
+            KPtr(p) => format!("kptr k{p}"),
             KI32(v) => format!("ki32 {v}"),
             KI64(v) => format!("ki64 {v}"),
             KB1(v) => format!("kb1 {v}"),
