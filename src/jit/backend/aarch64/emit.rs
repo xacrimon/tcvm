@@ -2475,15 +2475,12 @@ impl<'a> Em<'a> {
             }
             TabMmBits => {
                 let (d, t) = (self.r(i, 0), self.r(i, 1));
-                let (none, done) = (self.a.new_label(), self.a.new_label());
-                self.a.ldr(X16, t, layout::T_SHAPE as i32);
-                self.a
-                    .ldr(X16, X16, crate::env::Shape::MT_CACHE_OFFSET as i32);
-                self.a.cbz(Sz::X, X16, none);
-                self.a.ldr_w(d, X16, MtCache::BITS_OFFSET as i32);
-                self.a.b(done);
-                self.a.bind(none);
-                self.a.movz(Sz::W, d, 0, 0);
+                // A null class is the result: no bits.
+                let done = self.a.new_label();
+                self.a.ldr(d, t, layout::T_SHAPE as i32);
+                self.a.ldr(d, d, crate::env::Shape::MT_CACHE_OFFSET as i32);
+                self.a.cbz(Sz::X, d, done);
+                self.a.ldr_w(d, d, MtCache::BITS_OFFSET as i32);
                 self.a.bind(done);
             }
             LoadCell => {
