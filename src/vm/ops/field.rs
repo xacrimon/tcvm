@@ -500,6 +500,7 @@ macro_rules! newindex_chain {
             NewIndexChain::RawSet(target) => {
                 check_index_key!(k);
                 target.$raw_set($rt, k, v);
+                gc_check!();
                 next!()
             }
             NewIndexChain::Invoke { func, receiver } => {
@@ -666,6 +667,7 @@ handler! {
         if let Some(t) = recv.get_table()
             && set_own_fill_ic(rt, closure, insn.d(), unsafe { pc.sub(1) }, t, k, v)
         {
+            gc_check!();
             next!()
         }
         newindex_chain!(pc, base, rt, recv, k, v, raw_set)

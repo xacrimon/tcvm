@@ -28,6 +28,7 @@ mod executor_isolation;
 mod fast_entry_gc;
 mod feedback_gc;
 mod field_ic;
+mod gc_pacing;
 mod gc_stack_trace;
 mod generational;
 mod generic_for;

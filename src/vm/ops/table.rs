@@ -114,6 +114,8 @@ handler! {
         check_index_key!(k);
         let mut state = t.inner().borrow_mut(rt.mutation());
         state.raw_set_keyed(rt, k, v);
+        drop(state);
+        gc_check!();
         next!()
     }
 
@@ -141,6 +143,7 @@ handler! {
         barrier!(t.inner());
         let items = &ts.stack[start..start + n];
         unsafe { t.borrow_mut_barriered() }.set_list(rt.mutation(), offset as usize, items);
+        gc_check!();
         next!()
     }
 
