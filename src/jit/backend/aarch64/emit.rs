@@ -870,6 +870,31 @@ impl<'a> Em<'a> {
         fpr(self.allocs(i)[k].as_reg().expect("a register operand"))
     }
 
+    fn reg(&self, i: usize, k: usize) -> PReg {
+        self.allocs(i)[k].as_reg().expect("a register operand")
+    }
+
+    /// A value word loaded or stored at `[n, #off]`: from an x register, or
+    /// from a d register holding a float's (`Lower::in_d`).
+    fn word_at(&mut self, store: bool, t: PReg, n: Gpr, off: i32) {
+        match (t.class(), store) {
+            (RegClass::Int, false) => self.a.ldr(gpr(t), n, off),
+            (RegClass::Int, true) => self.a.str(gpr(t), n, off),
+            (_, false) => self.a.ldr_d(fpr(t), n, off),
+            (_, true) => self.a.str_d(fpr(t), n, off),
+        }
+    }
+
+    /// The same at `[n, wm, uxtw #3]`.
+    fn word_idx(&mut self, store: bool, t: PReg, n: Gpr, m: Gpr) {
+        match (t.class(), store) {
+            (RegClass::Int, false) => self.a.ldr_idx(gpr(t), n, m, Extend::Uxtw, true),
+            (RegClass::Int, true) => self.a.str_idx(gpr(t), n, m, Extend::Uxtw, true),
+            (_, false) => self.a.ldr_d_idx(fpr(t), n, m, Extend::Uxtw, true),
+            (_, true) => self.a.str_d_idx(fpr(t), n, m, Extend::Uxtw, true),
+        }
+    }
+
     /// The branch `i` to `lt` where its test holds, else `lf`.
     fn br(&mut self, i: usize, test: Test, cond: Cond, lt: Label, lf: Label, next: Option<Label>) {
         let multi = matches!(test, Test::Type(set, _) if !is_single_test(set));
@@ -1028,7 +1053,7 @@ impl<'a> Em<'a> {
         match self.v.remat[vreg] {
             Remat::Int(v) => self.a.mov_imm(gpr(r), v),
             Remat::Float(bits) => self.fimm(fpr(r), bits),
-            Remat::Slot(slot) => self.a.ldr(gpr(r), BASE, slot as i32 * 8),
+            Remat::Slot(slot) => self.word_at(false, r, BASE, slot as i32 * 8),
             Remat::AndImm { src: sv, imm } => {
                 let s = match (src.as_reg(), src.as_stack(), self.v.remat[sv as usize]) {
                     (Some(s), _, _) => gpr(s),
@@ -1740,16 +1765,12 @@ impl<'a> Em<'a> {
                 self.fimm(d, bits);
             }
             LoadSlot(r) => {
-                let d = self.r(i, 0);
-                self.a.ldr(d, BASE, r as i32 * 8);
+                let d = self.reg(i, 0);
+                self.word_at(false, d, BASE, r as i32 * 8);
             }
             StoreSlot(r) => {
-                let v = self.r(i, 0);
-                self.a.str(v, BASE, r as i32 * 8);
-            }
-            StoreSlotF(r) => {
-                let v = self.fr(i, 0);
-                self.a.str_d(v, BASE, r as i32 * 8);
+                let v = self.reg(i, 0);
+                self.word_at(true, v, BASE, r as i32 * 8);
             }
             FrameClosure => {
                 let d = self.r(i, 0);
@@ -1757,9 +1778,9 @@ impl<'a> Em<'a> {
                 self.a.and_imm(Sz::X, d, d, PTR_MASK);
             }
             LoadUpvalOf(k) => {
-                let (d, c) = (self.r(i, 0), self.r(i, 1));
+                let (d, c) = (self.reg(i, 0), self.r(i, 1));
                 let off = crate::jit::compile::upvalues_offset() + k as usize * 8;
-                self.a.ldr(d, c, off as i32);
+                self.word_at(false, d, c, off as i32);
             }
             Alu(op, sz) => {
                 let (d, n, m) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
@@ -2441,10 +2462,10 @@ impl<'a> Em<'a> {
                 self.a.bind(done);
             }
             LoadCell => {
-                let (d, c) = (self.r(i, 0), self.r(i, 1));
+                let (d, c) = (self.reg(i, 0), self.r(i, 1));
                 self.a
                     .ldr(X16, c, crate::env::function::UpvalueCell::V_OFFSET as i32);
-                self.a.ldr(d, X16, 0);
+                self.word_at(false, d, X16, 0);
             }
             GuardShape { shape, exit } => {
                 let t = self.r(i, 0);
@@ -2489,24 +2510,15 @@ impl<'a> Em<'a> {
                 self.a.ldr_lit(X16, class);
                 self.a.ldr(d, X16, MtCache::INDEX_OFFSET as i32);
             }
-            TabLoad(loc) => {
-                let (d, t) = (self.r(i, 0), self.r(i, 1));
+            TabLoad(loc) | TabStore(loc) => {
+                let store = matches!(inst, TabStore(_));
+                let (t, v) = (self.r(i, !store as usize), self.reg(i, store as usize));
                 let loc = SlotLoc::from_raw(loc);
                 if loc.spilled() {
                     self.a.ldr(X16, t, layout::T_SPILL as i32);
-                    self.a.ldr(d, X16, loc.offset() as i32);
+                    self.word_at(store, v, X16, loc.offset() as i32);
                 } else {
-                    self.a.ldr(d, t, loc.offset() as i32);
-                }
-            }
-            TabStore(loc) => {
-                let (t, v) = (self.r(i, 0), self.r(i, 1));
-                let loc = SlotLoc::from_raw(loc);
-                if loc.spilled() {
-                    self.a.ldr(X16, t, layout::T_SPILL as i32);
-                    self.a.str(v, X16, loc.offset() as i32);
-                } else {
-                    self.a.str(v, t, loc.offset() as i32);
+                    self.word_at(store, v, t, loc.offset() as i32);
                 }
             }
             TabSetShape(shape) => {
@@ -2523,12 +2535,12 @@ impl<'a> Em<'a> {
                 self.a.ldr(d, t, layout::T_ARRAY as i32);
             }
             ArrLoad => {
-                let (d, a, k) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
-                self.a.ldr_idx(d, a, k, Extend::Uxtw, true);
+                let (d, a, k) = (self.reg(i, 0), self.r(i, 1), self.r(i, 2));
+                self.word_idx(false, d, a, k);
             }
             ArrStore => {
-                let (a, k, v) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
-                self.a.str_idx(v, a, k, Extend::Uxtw, true);
+                let (a, k, v) = (self.r(i, 0), self.r(i, 1), self.reg(i, 2));
+                self.word_idx(true, v, a, k);
             }
             NamedNext => {
                 let (d, t, from) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
@@ -2667,10 +2679,10 @@ impl<'a> Em<'a> {
                 self.a.csel(Sz::X, d, d, X16, Cond::Lo);
             }
             StoreCell => {
-                let (c, v) = (self.r(i, 0), self.r(i, 1));
+                let (c, v) = (self.r(i, 0), self.reg(i, 1));
                 self.a
                     .ldr(X16, c, crate::env::function::UpvalueCell::V_OFFSET as i32);
-                self.a.str(v, X16, 0);
+                self.word_at(true, v, X16, 0);
             }
             GcCheck { exit } => self.gc_check(exit),
             Helper(h) | HelperCold(h) => {
