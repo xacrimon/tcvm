@@ -1,7 +1,8 @@
 //! The aarch64 machine instructions, before register allocation. Each
 //! variant's operands (in its `VCode` operand pool, in the order its doc
 //! gives) are allocated by `ra`; x16 and x17 are scratch inside one
-//! instruction, never allocated.
+//! instruction, never allocated. A value word a load or store moves may
+//! be in a d register: a float's, which lowering keeps there (`Lower::in_d`).
 
 use crate::jit::backend::aarch64::asm::{Cond, Shift, Sz};
 use crate::jit::backend::vcode::TargetInst;
@@ -105,10 +106,8 @@ pub(crate) enum MInst {
     FImm(u64),
     /// `[def d]`: `R[r]`.
     LoadSlot(u8),
-    /// `[use v]` (int): `R[r] = v`.
+    /// `[use v]`: `R[r] = v`.
     StoreSlot(u8),
-    /// `[use v]` (float): `R[r] = v` as a float `Value`.
-    StoreSlotF(u8),
     /// `[def d]`: the frame's closure, from its header (W4 §3: no register
     /// holds it), for its upvalues.
     FrameClosure,

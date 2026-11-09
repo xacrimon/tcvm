@@ -98,6 +98,9 @@ struct Lower<'a, 'gc> {
     vreg: Vec<Option<VReg>>,
     /// Values computed by their single user instead of at their definition.
     fused: Vec<bool>,
+    /// Values lowering keeps in a d register as their float's word
+    /// (`find_float_words`).
+    in_d: Vec<bool>,
     uses: Vec<u32>,
     exits: Vec<LExit>,
     sites: Vec<(usize, LSite)>,
@@ -195,6 +198,7 @@ pub(crate) fn lower<'gc>(
         v: VCode::new(),
         vreg: vec![None; f.vals.len()],
         fused: vec![false; f.vals.len()],
+        in_d: vec![false; f.vals.len()],
         uses,
         exits: Vec::new(),
         sites: Vec::new(),
@@ -244,6 +248,7 @@ pub(crate) fn lower<'gc>(
     lw.find_multiply_adds(order);
     lw.find_known_callees(order);
     lw.find_register_returns(order);
+    lw.find_float_words(order);
     let mut params: Vec<VReg> = Vec::new();
     let mut succs: Vec<RBlock> = Vec::new();
     let mut args: Vec<VReg> = Vec::new();
@@ -357,18 +362,21 @@ fn closure_block(f: &Func<'_>, cfg: &crate::jit::ir::CfgInfo, order: &[Block]) -
 }
 
 impl<'a, 'gc> Lower<'a, 'gc> {
-    /// `R[r] = v`; a float stores straight from its d register.
+    /// `R[r] = v`.
     fn store_slot(&mut self, r: u8, v: Val) {
+        let u = self.stored(v);
+        self.push(MInst::StoreSlot(r), &[u], PRegSet::empty());
+    }
+
+    /// A stored value's operand: a float box stores its float's d register,
+    /// whether or not other uses compute the box.
+    fn stored(&mut self, v: Val) -> Operand {
         let f = self.f;
-        if let Some(Op::Box) = f.def_op(v)
-            && let x = f.args(f.def_inst(v).unwrap())[0]
-            && f.ty(x).rep == Rep::F64
-        {
-            let u = self.use_(x);
-            self.push(MInst::StoreSlotF(r), &[u], PRegSet::empty());
-        } else {
-            let u = self.use_(v);
-            self.push(MInst::StoreSlot(r), &[u], PRegSet::empty());
+        match f.def_inst(v) {
+            Some(i) if f.op(i) == Op::Box && f.ty(f.args(i)[0]).rep == Rep::F64 => {
+                self.use_(f.args(i)[0])
+            }
+            _ => self.use_(v),
         }
     }
 
@@ -413,19 +421,46 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         if let Some(r) = self.vreg[v.idx()] {
             return r;
         }
-        let r = self.v.new_vreg(rep_class(self.f.ty(v).rep));
+        let r = self.v.new_vreg(self.class(v));
         self.vreg[v.idx()] = Some(r);
         r
     }
 
+    /// The register class of a value `alias` returns.
+    fn class(&self, v: Val) -> RegClass {
+        if self.in_d[v.idx()] {
+            RegClass::Float
+        } else {
+            rep_class(self.f.ty(v).rep)
+        }
+    }
+
+    /// The rep of `v` as its register holds it: `F64` for a word in a d
+    /// register.
+    fn reg_rep(&self, v: Val) -> Rep {
+        match self.class(self.alias(v)) {
+            RegClass::Float => Rep::F64,
+            _ => self.f.ty(v).rep,
+        }
+    }
+
     /// The value whose register `v` shares: refining guards and i32
-    /// unboxes/narrowings change no bits.
+    /// unboxes/narrowings change no bits, nor do f64 boxes and unboxes of a
+    /// word in a d register (`in_d`).
     fn alias(&self, mut v: Val) -> Val {
         while let Some(i) = self.f.def_inst(v) {
             match self.f.op(i) {
                 Op::Guard(_) | Op::Refine(_) => v = self.f.args(i)[0],
                 Op::Unbox(Rep::I32) => v = self.f.args(i)[0],
                 Op::LToI => v = self.f.args(i)[0],
+                Op::Box if self.in_d[v.idx()] => v = self.f.args(i)[0],
+                Op::Unbox(Rep::F64) => {
+                    let x = self.alias(self.f.args(i)[0]);
+                    if self.class(x) != RegClass::Float {
+                        break;
+                    }
+                    v = x;
+                }
                 _ => break,
             }
         }
@@ -598,6 +633,102 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// The value return `i` passes in x0: what its block stored to `R[a]`,
+    /// if a register has it.
+    fn returned(&self, i: Inst) -> Option<Val> {
+        let f = self.f;
+        let Op::Return { a, n } = f.op(i) else {
+            return None;
+        };
+        let b = f.insts[i.idx()].block;
+        let mut stored = None;
+        for &j in f.insts_of(b).iter().rev().skip(1) {
+            match f.op(j) {
+                Op::Store(r) if r == a => {
+                    stored = Some(f.args(j)[0]);
+                    break;
+                }
+                op if op.effects().writes.contains(crate::jit::ir::ops::Mem::SLOT) => break,
+                _ => {}
+            }
+        }
+        stored.filter(|&v| n > 0 && self.in_x0(v))
+    }
+
+    /// The values whose float's word lowering keeps in a d register
+    /// (`in_d`): f64 boxes and loads of floats that only stores, snapshots
+    /// and f64 unboxes use. Such a load loads into the d register, its
+    /// unboxes and a box's share the register (`alias`), and stores store
+    /// it, all where the IR has them (`opt::snaps` follows reads through
+    /// boxes and unboxes).
+    fn find_float_words(&mut self, order: &[Block]) {
+        let f = self.f;
+        // Per alias root: the uses that need the word in an x register,
+        // and whether an f64 unbox reads it.
+        let mut gpr = vec![0u32; f.vals.len()];
+        let mut unboxed = vec![false; f.vals.len()];
+        for &b in order {
+            for &i in f.insts_of(b) {
+                let op = f.op(i);
+                if self.absorbed[i.idx()]
+                    || (f.insts[i.idx()].rn == 1
+                        && op.is_pure()
+                        && self.uses[f.result(i).idx()] == 0
+                        && !self.fused[f.result(i).idx()])
+                {
+                    continue;
+                }
+                let args = f.args(i);
+                // The operands only an x register serves; the others are
+                // stored values, and snapshot entries take either too.
+                let xs = match op {
+                    Op::Unbox(Rep::F64) => {
+                        unboxed[self.alias(args[0]).idx()] = true;
+                        &[][..]
+                    }
+                    Op::Refine(_) | Op::Store(_) => &[],
+                    Op::TabStore { .. } | Op::CellStore => &args[..1],
+                    Op::ArrStore => &args[..2],
+                    Op::Call { nargs, .. }
+                        if nargs != u8::MAX
+                            && !matches!(self.known.get(&i), Some(Known::Lua { .. })) =>
+                    {
+                        &[]
+                    }
+                    _ => args,
+                };
+                for &a in xs {
+                    gpr[self.alias(a).idx()] += 1;
+                }
+                if let Some(v) = self.returned(i) {
+                    gpr[self.alias(v).idx()] += 1;
+                }
+                for e in f.edges(i) {
+                    for &a in f.vl(e.args) {
+                        gpr[self.alias(a).idx()] += 1;
+                    }
+                }
+            }
+        }
+        for (k, d) in f.vals.iter().enumerate() {
+            let Some(i) = f.def_inst(Val(k as u32)) else {
+                continue;
+            };
+            self.in_d[k] = gpr[k] == 0
+                && match f.op(i) {
+                    Op::Box => f.ty(f.args(i)[0]).rep == Rep::F64,
+                    Op::Load(_)
+                    | Op::Home(_)
+                    | Op::TabLoad { .. }
+                    | Op::ArrLoad
+                    | Op::CellLoad
+                    | Op::UpvalValue(_)
+                    | Op::UpvalValueOf(_) => unboxed[k] && d.ty.set == TypeSet::FLOAT,
+                    _ => false,
+                };
         }
     }
 
@@ -845,7 +976,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
                 _ => v,
             };
-            let rep = self.f.ty(v).rep;
+            let rep = self.reg_rep(v);
             if let Some(k) = self.const_word(v) {
                 entries.push((r, SRep::Val, Src::Const(k)));
                 continue;
@@ -985,7 +1116,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     k
                 }
             };
-            entries.push((r, srep(self.f.ty(v).rep), Src::Operand(k)));
+            entries.push((r, srep(self.reg_rep(v)), Src::Operand(k)));
         }
         self.v.push(mk, &ops, allocatable());
         self.snap_ops.push(base as u32);
@@ -1088,6 +1219,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         let (d, u) = (self.def(r), self.use_(x));
                         self.push(MInst::BoxI32, &[d, u], none);
                     }
+                    Rep::F64 if self.in_d[r.idx()] => {}
                     Rep::F64 => {
                         let (d, u) = (self.def(r), self.use_(x));
                         self.push(MInst::FmovToGpr, &[d, u], none);
@@ -1118,6 +1250,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let r = res.unwrap();
                 match rep {
                     Rep::I32 => {}
+                    Rep::F64 if self.alias(r) != r => {}
                     Rep::F64 => {
                         let (d, u) = (self.def(r), self.use_(x));
                         self.push(MInst::FmovFromGpr, &[d, u], none);
@@ -1330,7 +1463,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::TabLoad(loc), &[d, t], none);
             }
             Op::TabStore { loc, .. } => {
-                let (t, v) = (self.use_(args[0]), self.use_(args[1]));
+                let (t, v) = (self.use_(args[0]), self.stored(args[1]));
                 self.push(MInst::TabStore(loc), &[t, v], none);
             }
             Op::TabSetShape(k) => {
@@ -1356,7 +1489,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::ArrLoad, &[d, a, k], none);
             }
             Op::ArrStore => {
-                let ops = [self.use_(args[0]), self.use_(args[1]), self.use_(args[2])];
+                let ops = [self.use_(args[0]), self.use_(args[1]), self.stored(args[2])];
                 self.push(MInst::ArrStore, &ops, none);
             }
             Op::NamedNext => {
@@ -1415,7 +1548,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(MInst::VarargIdx, &[d, nv, k], none);
             }
             Op::CellStore => {
-                let (c, v) = (self.use_(args[0]), self.use_(args[1]));
+                let (c, v) = (self.use_(args[0]), self.stored(args[1]));
                 self.push(MInst::StoreCell, &[c, v], none);
             }
             Op::GcCheck => self.push_exit(i, |exit| MInst::GcCheck { exit }, vec![], none),
@@ -1936,31 +2069,15 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::GuardWindow(end) => {
                 self.push_exit(i, |exit| MInst::GuardFits { end, exit }, vec![], none);
             }
-            Op::Return { a, n } => {
-                // The value this block stored to `R[a]`, if a register has it.
-                let b = f.insts[i.idx()].block;
-                let mut stored = None;
-                for &j in f.insts_of(b).iter().rev().skip(1) {
-                    match f.op(j) {
-                        Op::Store(r) if r == a => {
-                            stored = Some(f.args(j)[0]);
-                            break;
-                        }
-                        op if op.effects().writes.contains(crate::jit::ir::ops::Mem::SLOT) => break,
-                        _ => {}
-                    }
+            Op::Return { a, n } => match self.returned(i) {
+                Some(v) => {
+                    let u = Operand::reg_fixed_use(self.vr(v), preg_int(0));
+                    self.push(MInst::Return { a, n, x0: true }, &[u], none);
                 }
-                let v = stored.filter(|&v| n > 0 && self.in_x0(v));
-                match v {
-                    Some(v) => {
-                        let u = Operand::reg_fixed_use(self.vr(v), preg_int(0));
-                        self.push(MInst::Return { a, n, x0: true }, &[u], none);
-                    }
-                    None => {
-                        self.push(MInst::Return { a, n, x0: false }, &[], none);
-                    }
+                None => {
+                    self.push(MInst::Return { a, n, x0: false }, &[], none);
                 }
-            }
+            },
             Op::Deopt => self.push_exit(i, |exit| MInst::Deopt { exit }, vec![], none),
             Op::LazyExit => self.push_exit(i, |exit| MInst::LazyExit { exit }, vec![], none),
         }
