@@ -281,7 +281,10 @@ pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
     for _ in 0..4 {
         t.timed("infer", || opt::infer::infer(f));
         let mut changed = t.timed("narrow", || opt::infer::narrow(f));
-        t.timed("infer", || opt::infer::infer(f));
+        // Inference again on unchanged IR finds what it found.
+        if changed {
+            t.timed("infer", || opt::infer::infer(f));
+        }
         changed |= t.timed("stable", || opt::stable::fold(f));
         changed |= t.timed("simplify", || opt::simplify::simplify(f));
         t.timed("params", || remove_trivial_params(f));
@@ -301,8 +304,9 @@ pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
     }
     t.timed("one destination", || opt::simplify::fold_one_destination(f));
     t.timed("infer", || opt::infer::infer(f));
-    t.timed("legalize", || opt::infer::legalize(f));
-    t.timed("infer", || opt::infer::infer(f));
+    if t.timed("legalize", || opt::infer::legalize(f)) {
+        t.timed("infer", || opt::infer::infer(f));
+    }
     t.timed("dce", || opt::dce(f));
 }
 
