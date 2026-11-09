@@ -47,8 +47,8 @@ pub(crate) enum Test {
     I32 { imm: Option<i32> },
     /// `cmp` of two x registers (i64 or raw `Value` words), or one against `imm`.
     X { imm: Option<i64> },
-    /// `fcmp` of two d registers: `[a, b]`.
-    F64,
+    /// `fcmp` of two d registers, or one against zero: `[a, b]` or `[a]`.
+    F64 { zero: bool },
     /// A `Val` in a type set: `[v]`, then its `test_words` where `true`.
     Type(TypeSet, bool),
     /// A `Val` is nil or false: `[v]`, then nil's word where `true`.
