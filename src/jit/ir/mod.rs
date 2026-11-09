@@ -957,13 +957,14 @@ impl<'gc> Func<'gc> {
             }
             r
         }
+        // Most values map to themselves: a load and a compare for those.
         for v in &mut self.vpool {
-            if v.idx() < map.len() {
+            if map.get(v.idx()).is_some_and(|m| m != v) {
                 *v = find(map, *v);
             }
         }
         for e in &mut self.snap_pool {
-            if e.1.idx() < map.len() {
+            if map.get(e.1.idx()).is_some_and(|&m| m != e.1) {
                 e.1 = find(map, e.1);
             }
         }
