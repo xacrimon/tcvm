@@ -439,7 +439,8 @@ struct Ra {
     live_in: Vec<u64>,
     /// The values some use takes from wherever they are (`Any`, `Stack`).
     anyuse: Vec<u64>,
-    /// Intervals and uses, a run per group (`Piece`).
+    /// Intervals, a run per group, and uses, a run per value with a merged
+    /// group's after them (`Piece`).
     ivs: Vec<(Pos, Pos)>,
     uses: Vec<Use>,
     /// Per value (a run `snap_off[v]..snap_off[v + 1]`, by point) the
