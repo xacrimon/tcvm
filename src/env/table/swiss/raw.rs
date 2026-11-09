@@ -214,6 +214,9 @@ struct RawTableInner {
 
 impl<T: Copy, A: Allocator> RawTable<T, A> {
     const TABLE_LAYOUT: TableLayout = TableLayout::new::<T>();
+    /// The live item count, for compiled code.
+    pub(crate) const ITEMS_OFFSET: usize =
+        core::mem::offset_of!(Self, table) + core::mem::offset_of!(RawTableInner, items);
 
     /// Creates a new empty hash table without allocating any memory, using the
     /// given allocator.

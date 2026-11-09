@@ -1650,6 +1650,17 @@ impl<'a> Em<'a> {
                 }
                 cond
             }
+            // No cell, or none of its integer part's items: zero.
+            Test::TabNoInts => {
+                let t = self.r(i, k);
+                let done = self.a.new_label();
+                self.a.ldr(X16, t, layout::T_AUX as i32);
+                self.a.cbz(Sz::X, X16, done);
+                self.a.ldr(X16, X16, layout::AUX_INTS as i32);
+                self.a.bind(done);
+                self.a.cmp_imm(Sz::X, X16, 0);
+                cond
+            }
             Test::Shape(word) => {
                 let t = self.r(i, k);
                 self.a.ldr(X16, t, layout::T_SHAPE as i32);

@@ -76,6 +76,10 @@ pub(crate) const T_SPILL: usize = T_STATE + TableState::SPILL_OFFSET;
 pub(crate) const T_SPILL_CAP: usize = T_STATE + TableState::SPILL_CAP_OFFSET;
 pub(crate) const T_ARRAY: usize = T_STATE + TableState::ARRAY_OFFSET;
 pub(crate) const T_ASIZE: usize = T_STATE + TableState::ASIZE_OFFSET;
+/// A table's `aux` cell (null without one), and from it how many integer
+/// keys the hash part holds.
+pub(crate) const T_AUX: usize = T_STATE + TableState::AUX_OFFSET;
+pub(crate) const AUX_INTS: usize = TableState::AUX_INTS_OFFSET;
 /// A table's inline named slots, the values trailing its state.
 pub(crate) const T_INLINE: usize = RefLock::<TableState<'static>>::TRAILING_FROM_LOCK;
 /// A table's GC header (bit 0: gray, no barrier needed) before its lock.
@@ -189,6 +193,39 @@ mod tests {
             assert!(add.get_function().is_some());
             let header = unsafe { ((lock as isize + T_HEADER as isize) as *const u64).read() };
             assert_eq!(header & 1 != 0, Gc::is_gray(t.inner()));
+        });
+    }
+
+    #[test]
+    fn table_int_keys_count() {
+        use crate::env::value::Value;
+        let mut lua = Lua::new();
+        lua.load_all();
+        let ex = lua
+            .try_enter(|ctx| {
+                let src = "local a = {1, 2, 3} local b = {1, 2, 3} b[100] = 5 b[1000] = 7 \
+                           local c = {1, [true] = 1} return {a, b, c}";
+                Ok::<_, crate::LoadError>(ctx.stash(crate::Executor::start(
+                    ctx,
+                    ctx.load(src, None)?,
+                    (),
+                )))
+            })
+            .unwrap();
+        lua.finish(&ex).unwrap();
+        lua.enter(|ctx| {
+            let v: Value = ctx.fetch(&ex).take_result(ctx).unwrap();
+            let all = v.get_table().unwrap();
+            // Null without a cell, else the integer part's count from it.
+            let ints = |i: i32| {
+                let t = all.raw_get(Value::small(i));
+                let lock = (t.to_raw() & crate::env::value::PAYLOAD_MASK) as usize;
+                let aux = unsafe { ((lock + T_AUX) as *const usize).read() };
+                (aux != 0).then(|| unsafe { ((aux + AUX_INTS) as *const usize).read() })
+            };
+            assert_eq!(ints(1), None);
+            assert_eq!(ints(2), Some(2));
+            assert_eq!(ints(3), Some(0));
         });
     }
 

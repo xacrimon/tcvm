@@ -744,6 +744,8 @@ pub(crate) enum Op {
     ClassMm(u8),
     /// The live metamethod bits (`I32`) of the table's class, 0 without one.
     TabMmBits,
+    /// Whether the table's hash part holds no integer key, a `B1`.
+    TabNoInts,
     /// A string's length (`I32`: strings are capped below 2^31), the operand
     /// its value's payload (`Ptr`).
     StrLenOf,
@@ -992,7 +994,7 @@ impl Op {
             ClassBits(_) | ClassIndex(_) | ClassMm(_) | TabMmBits | NumMtSet | TypeMtIs { .. } => {
                 Effects::reads(Mem::META)
             }
-            TabLoad { .. } => Effects::reads(Mem::TAB),
+            TabLoad { .. } | TabNoInts => Effects::reads(Mem::TAB),
             TabStore { .. } => e(Flags::empty(), Mem::empty(), Mem::TAB),
             TabASize | TabArray | ArrLoad | ArrNext => Effects::reads(Mem::ARR),
             ArrStore => e(Flags::empty(), Mem::empty(), Mem::ARR),
@@ -1063,6 +1065,7 @@ impl Op {
                 | FnFixedLua
                 | FnFits
                 | TabHasRoom(_)
+                | TabNoInts
                 | IMulNo
                 | LMul
                 | IAnd
@@ -1137,7 +1140,7 @@ impl Op {
             NamedKey => Ty::val(TypeSet::STR),
             ClassIndex(_) | TabLoad { .. } | ArrLoad => Ty::ANY,
             TabArray => Ty::PTR,
-            TabHasRoom(_) | ShapeIs(_) | ShapeIn(_) => Ty::B1,
+            TabHasRoom(_) | TabNoInts | ShapeIs(_) | ShapeIn(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
             HasFlag(_) | FnFixedLua | FnFits | NumMtSet | TypeMtIs { .. } => Ty::B1,
             ClassMm(_) => Ty::ANY,

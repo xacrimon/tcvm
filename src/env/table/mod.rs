@@ -762,6 +762,13 @@ impl<'gc> TableState<'gc> {
         core::mem::offset_of!(TableState<'static>, spill_cap);
     pub(crate) const ARRAY_OFFSET: usize = core::mem::offset_of!(TableState<'static>, array);
     pub(crate) const ASIZE_OFFSET: usize = core::mem::offset_of!(TableState<'static>, asize);
+    /// The `aux` cell, null when there is none, and in it the count of the
+    /// integer keys its hash part holds.
+    pub(crate) const AUX_OFFSET: usize = core::mem::offset_of!(TableState<'static>, aux);
+    pub(crate) const AUX_INTS_OFFSET: usize = Gc::<'static, Owned<Aux<'static>>>::VALUE_OFFSET
+        + Owned::<Aux<'static>>::VALUE_OFFSET
+        + core::mem::offset_of!(Aux<'static>, ints)
+        + hash_part::Part::<'static, i64, GcAlloc<'static>>::ITEMS_OFFSET;
 
     #[inline]
     pub fn shape(&self) -> Shape<'gc> {
