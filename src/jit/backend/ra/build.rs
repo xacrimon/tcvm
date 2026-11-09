@@ -256,14 +256,9 @@ impl Ra {
     /// Each value's intervals ascending, runs of `ivs` (`span`).
     fn interval_runs(&mut self, w: &mut Build) {
         let nv = self.vregs.len();
-        let Build {
-            ivr,
-            ioff,
-            at,
-            span,
-            ..
-        } = w;
+        let Build { ivr, at, span, .. } = w;
         let ivr = &ivr.recs;
+        let ioff = &mut self.own;
         runs(ioff, nv, ivr.iter().map(|r| r.0));
         self.ivs.resize(ivr.len(), (0, 0));
         at.clear();
@@ -605,10 +600,9 @@ pub(super) struct Build {
     out: Vec<u64>,
     defined: Vec<u64>,
     defs: Vec<u32>,
-    /// Each value's run of intervals (`span`, by `ioff`) and of uses
-    /// (`Ra::uses`, by `uoff`), and the cursors filling the runs (`sat`
-    /// the snapshot operands').
-    ioff: Vec<u32>,
+    /// Each value's run of intervals (`span`, at first `Ra::own`) and of
+    /// uses (`Ra::uses`, by `uoff`), and the cursors filling the runs
+    /// (`sat` the snapshot operands').
     uoff: Vec<u32>,
     at: Vec<u32>,
     sat: Vec<u32>,
@@ -623,7 +617,7 @@ pub(super) struct Build {
 impl Build {
     pub(super) fn clear(&mut self) {
         clear!(self; fixtmp, fixed_def, stack_use, open, touched, out, defined, defs,
-            ioff, uoff, at, sat, span, keys, fx, seen);
+            uoff, at, sat, span, keys, fx, seen);
         clear!(self.ivr; recs, last);
     }
 }

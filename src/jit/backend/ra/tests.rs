@@ -704,6 +704,35 @@ fn random_functions_allocate_correctly() {
     }
 }
 
+/// Functions whose allocation once failed the checker (`regress/*.ra`,
+/// recorded with `TCVM_RA_RECORD`) pass it.
+#[test]
+fn recorded_regressions_allocate_correctly() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/jit/backend/ra/regress");
+    let mut n = 0;
+    for e in std::fs::read_dir(dir).expect("the regressions") {
+        let p = e.expect("an entry").path();
+        if p.extension().is_none_or(|x| x != "ra") {
+            continue;
+        }
+        let d = std::fs::read(&p).expect("a record");
+        let mk = |b: bool| if b { T::Br } else { T::Op };
+        let c = super::corpus::read(&d, mk).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let mut ctx = Ctx::new(c.env.clone());
+        let out =
+            (ctx.run(&c.f, &c.order, c.hot)).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let mut checker = super::checker::Checker::new(&c.f);
+        let (remat, src) = super::remat_table(&c.f);
+        checker.allow_unmaterialized(remat, src);
+        checker.prepare(&out);
+        if let Err(e) = checker.run() {
+            panic!("{}: {e:?}\n{}", p.display(), c.f.print(&out, &c.order));
+        }
+        n += 1;
+    }
+    assert!(n > 0, "no regressions in {dir}");
+}
+
 /// Every allocation recorded in `TCVM_RA_CORPUS` (`corpus`) comes out the
 /// same and passes the checker; then all of them are allocated
 /// `TCVM_RA_ROUNDS` times (default 0), timed. In a release build:

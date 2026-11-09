@@ -488,6 +488,8 @@ struct Ra {
     /// Intervals, a run per group, and uses, a run per value with a merged
     /// group's after them (`Piece`).
     ivs: Vec<(Pos, Pos)>,
+    /// Each value's own run of `ivs`, as before grouping (`member_at`).
+    own: Vec<u32>,
     uses: Vec<Use>,
     /// Per value (a run `snap_off[v]..snap_off[v + 1]`, by point) the
     /// operands taking it from wherever it is, as `operand << 1 | from its
@@ -625,6 +627,7 @@ impl Ra {
             live_in: Vec::new(),
             anyuse: Vec::new(),
             ivs: Vec::new(),
+            own: Vec::new(),
             uses: Vec::new(),
             snaps: Vec::new(),
             snap_off: Vec::new(),
@@ -662,7 +665,7 @@ impl Ra {
     /// Ready for another function.
     fn clear(&mut self) {
         clear!(self; order, rank, first, last, lin_block, at_lin, freq, inner, outer, hot_end,
-            live_in, anyuse, ivs, uses, snaps, snap_off, next_of, defs, defs_off, members,
+            live_in, anyuse, ivs, own, uses, snaps, snap_off, next_of, defs, defs_off, members,
             members_off, pieces, flat, flat_off, flat_start, vregs, rep, deferred, clobs, initial,
             unhandled, active, inactive, scratch);
         for l in &mut self.fixres {

@@ -188,12 +188,8 @@ impl Ra {
                     return Err(format!("v{g} reloaded inside instruction {}", at / 2));
                 }
                 let phase = if at & 1 != 0 { LATE_STORE } else { CONNECT };
-                let v = self.member_at(g, at - 1);
-                moves.push((
-                    at / 2,
-                    phase,
-                    self.mv(f, v, at - 1, self.alloc_of(w[1]), cls),
-                ));
+                let m = self.mv_member(f, g, at - 1, at - 1, self.alloc_of(w[1]), cls);
+                moves.push((at / 2, phase, m));
             }
             // Into fixed registers, from wherever the value is when the
             // instruction starts.
@@ -206,7 +202,7 @@ impl Ra {
                         unreachable!("a fixed use")
                     };
                     let n = u.pos / 2;
-                    let m = self.mv(f, self.member_at(g, u.pos), 2 * n, Allocation::reg(r), cls);
+                    let m = self.mv_member(f, g, u.pos, 2 * n, Allocation::reg(r), cls);
                     if m.remat || m.from != m.to {
                         moves.push((n, FIXED_COPY, m));
                     }
@@ -291,23 +287,38 @@ impl Ra {
         self.flat_off.push(self.flat.len() as u32);
     }
 
-    /// The member of group `g` live at `p`: the last defined by there.
-    fn member_at(&self, g: u32, p: Pos) -> u32 {
+    /// The member of group `g` live at `p`, whose own intervals cover it
+    /// (members' ranges are disjoint); none where no member is.
+    fn member_at(&self, g: u32, p: Pos) -> Option<u32> {
         let ms = self.members_of(g);
         if ms.len() == 1 {
-            return g;
+            return Some(g);
         }
-        let def = |m: u32| {
-            let vi = &self.vregs[m as usize];
-            if vi.def != NONE {
-                vi.def
-            } else {
-                self.block_start(vi.param_of)
-            }
-        };
-        (ms.iter().copied().filter(|&m| def(m) <= p))
-            .max_by_key(|&m| def(m))
-            .unwrap_or(g)
+        ms.iter().copied().find(|&m| {
+            let run = &self.ivs[self.own[m as usize] as usize..self.own[m as usize + 1] as usize];
+            let k = run.partition_point(|iv| iv.1 <= p);
+            k < run.len() && run[k].0 <= p
+        })
+    }
+
+    /// A move of group `g`'s value at `p` (`mv`), named for the member live
+    /// there; for none, it names no value.
+    fn mv_member<I: TargetInst>(
+        &self,
+        f: &VCode<I>,
+        g: u32,
+        p: Pos,
+        at: Pos,
+        to: Allocation,
+        cls: u8,
+    ) -> Mv {
+        let v = self.member_at(g, p);
+        let mut m = self.mv(f, v.unwrap_or(g), at, to, cls);
+        if v.is_none() {
+            debug_assert!(!m.remat);
+            m.vreg = UNKNOWN as u32;
+        }
+        m
     }
 
     /// The location index of an allocation: allocatable registers by class,
@@ -334,19 +345,18 @@ impl Ra {
     /// repeat while the backward one finds more.
     #[inline(never)]
     fn cleanup<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve) {
+        t.dead.resize(t.sorted.len(), false);
         if f.num_vregs() >= UNKNOWN as usize {
             return;
         }
         let width = self.env.regs[0].len() + self.env.regs[1].len() + self.num_slots as usize;
         let Resolve {
             sorted,
-            dead,
             mloc,
             eff,
             eoff,
             ..
         } = t;
-        dead.resize(sorted.len(), false);
         let loc = |a: Allocation| self.loc_index(a).map_or(NONE, |l| l as u32);
         mloc.extend(sorted.iter().map(|m| (loc(m.2.to), loc(m.2.from))));
         // Each instruction's effects in order (`eoff`): the moves before it
@@ -421,7 +431,7 @@ impl Ra {
     }
 
     /// Forward over effects `a..e`, `edge`'s moves if any else a block's:
-    /// what each location holds after them. A run of moves of one phase is a
+    /// what each location holds after them. A gap's run of moves of one phase is a
     /// parallel move, read before written; those changing nothing are marked
     /// when `mark`, dead ones skipped.
     #[inline(never)]
@@ -446,17 +456,21 @@ impl Ra {
         while k < e {
             let (tag, j) = eff[k];
             if tag == MOVE || tag == EDGE_MOVE {
-                let phase = sorted[j as usize].1;
+                // One gap's: an instruction between two may have no effects.
+                let (l, phase) = (sorted[j as usize].0, sorted[j as usize].1);
+                let same = |x: (u32, u32)| {
+                    x.0 == tag && (sorted[x.1 as usize].0, sorted[x.1 as usize].1) == (l, phase)
+                };
                 let mut e2 = k + 1;
-                while e2 < e && eff[e2].0 == tag && sorted[eff[e2].1 as usize].1 == phase {
+                while e2 < e && same(eff[e2]) {
                     e2 += 1;
                 }
                 let mine = (phase & 7 == EDGE).then_some(phase >> 3) == edge;
                 if mine && mark {
                     for &(_, j) in &eff[k..e2] {
                         let j = j as usize;
-                        let l = mloc[j].0;
-                        if !dead[j] && l != NONE && st[l as usize] == sorted[j].2.vreg as u16 {
+                        let (l, v) = (mloc[j].0, sorted[j].2.vreg as u16);
+                        if !dead[j] && l != NONE && v != UNKNOWN && st[l as usize] == v {
                             dead[j] = true;
                             *marked += 1;
                         }
@@ -619,9 +633,12 @@ impl Ra {
         while e > a {
             let (tag, j) = eff[e - 1];
             if tag == MOVE || tag == EDGE_MOVE {
-                let phase = sorted[j as usize].1;
+                let (l, phase) = (sorted[j as usize].0, sorted[j as usize].1);
+                let same = |x: (u32, u32)| {
+                    x.0 == tag && (sorted[x.1 as usize].0, sorted[x.1 as usize].1) == (l, phase)
+                };
                 let mut k = e - 1;
-                while k > a && eff[k - 1].0 == tag && sorted[eff[k - 1].1 as usize].1 == phase {
+                while k > a && same(eff[k - 1]) {
                     k -= 1;
                 }
                 if (phase & 7 == EDGE).then_some(phase >> 3) == edge {
