@@ -17,7 +17,7 @@ use crate::env::function::Template;
 use crate::env::shape::{self, MAX_KEYED_PROPERTIES, MAX_PROPERTIES_FAST, MtHome, Shape, WeakMode};
 use crate::env::string::LuaString;
 use crate::env::symbols::Symbols;
-use crate::env::value::{Value, ValueKind, value_hash};
+use crate::env::value::{Value, ValueKind, trace_values, value_hash};
 
 #[derive(Clone, Copy, Collect)]
 #[collect(internal, no_drop)]
@@ -682,7 +682,7 @@ unsafe impl<'gc> Collect<'gc> for TableState<'gc> {
         if mode.is_empty() {
             cc.trace(inline);
             cc.trace(spilled);
-            cc.trace(self.array());
+            trace_values(cc, self.array());
             // Each part's trace marks its memory too.
             if let Some(h) = aux {
                 cc.trace(&h.ints);
