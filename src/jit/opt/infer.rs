@@ -235,9 +235,10 @@ pub(crate) fn convert(f: &mut Func<'_>, a: Val, rep: Rep, at: Block) -> Val {
 }
 
 /// Make every edge argument the representation of its parameter, boxing or
-/// unboxing in the predecessor.
-pub(crate) fn legalize(f: &mut Func<'_>) {
+/// unboxing in the predecessor; returns whether any changed.
+pub(crate) fn legalize(f: &mut Func<'_>) -> bool {
     let cfg = f.cfg();
+    let mut changed = false;
     for &b in &cfg.rpo {
         for k in 0..f.blocks[b.idx()].params.len() {
             let rep = f.vals[f.params(b)[k].idx()].ty.rep;
@@ -246,8 +247,10 @@ pub(crate) fn legalize(f: &mut Func<'_>) {
                 if f.vals[a.idx()].ty.rep != rep {
                     let na = convert(f, a, rep, f.insts[term.idx()].block);
                     f.edge_args_mut(term, e as usize)[k] = na;
+                    changed = true;
                 }
             }
         }
     }
+    changed
 }

@@ -245,7 +245,11 @@ pub(crate) fn build_ir<'gc>(
         times.timed("params", || remove_trivial_params(&mut f));
         times.timed("verify", || check(&f, "peel"))?;
     }
-    optimize(&mut f, times);
+    #[cfg(feature = "tcvm-dev")]
+    let settled = opts.check;
+    #[cfg(not(feature = "tcvm-dev"))]
+    let settled = false;
+    optimize(&mut f, times, settled).map_err(CompileError::Verify)?;
     if times.timed("jumps", || opt::jumps::thread(&mut f)) {
         times.timed("verify", || check(&f, "jumps"))?;
     }
@@ -277,11 +281,29 @@ pub(crate) fn build_ir<'gc>(
     Ok((f, cfg))
 }
 
-pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
+/// `check`: make sure of what skipping an inference assumes.
+pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times, check: bool) -> Result<(), String> {
+    // Inference again on unchanged IR finds what it found: it starts from
+    // the types it left, so nothing but this check says so.
+    let settled = |f: &mut Func<'_>| {
+        if !check {
+            return Ok(());
+        }
+        let before: Vec<_> = f.vals.iter().map(|v| v.ty).collect();
+        opt::infer::infer(f);
+        match (0..before.len()).find(|&k| f.vals[k].ty != before[k]) {
+            Some(k) => Err(format!("inference changed v{k} on unchanged IR")),
+            None => Ok(()),
+        }
+    };
     for _ in 0..4 {
         t.timed("infer", || opt::infer::infer(f));
         let mut changed = t.timed("narrow", || opt::infer::narrow(f));
-        t.timed("infer", || opt::infer::infer(f));
+        if changed {
+            t.timed("infer", || opt::infer::infer(f));
+        } else {
+            settled(f)?;
+        }
         changed |= t.timed("stable", || opt::stable::fold(f));
         changed |= t.timed("simplify", || opt::simplify::simplify(f));
         t.timed("params", || remove_trivial_params(f));
@@ -301,9 +323,13 @@ pub(crate) fn optimize(f: &mut Func<'_>, t: &mut Times) {
     }
     t.timed("one destination", || opt::simplify::fold_one_destination(f));
     t.timed("infer", || opt::infer::infer(f));
-    t.timed("legalize", || opt::infer::legalize(f));
-    t.timed("infer", || opt::infer::infer(f));
+    if t.timed("legalize", || opt::infer::legalize(f)) {
+        t.timed("infer", || opt::infer::infer(f));
+    } else {
+        settled(f)?;
+    }
     t.timed("dce", || opt::dce(f));
+    Ok(())
 }
 
 /// The word a JIT entry replaced, for an instruction that is one.
