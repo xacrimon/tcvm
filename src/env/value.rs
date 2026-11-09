@@ -566,6 +566,19 @@ pub(crate) fn value_hash(v: Value<'_>) -> u64 {
     foldhash::fast::FixedState::default().hash_one(v)
 }
 
+/// Trace the objects among `values`. Big runs, arrays, mostly hold none: they are tested eight at
+/// a time, in a fold (`any` stops early, which does not vectorize).
+#[inline]
+pub(crate) fn trace_values<'gc, T: Trace<'gc>>(cc: &mut T, values: &[Value<'gc>]) {
+    let (chunks, rest) = values.as_chunks::<8>();
+    for c in chunks {
+        if c.iter().fold(false, |any, v| any | v.is_object()) {
+            cc.trace(c);
+        }
+    }
+    cc.trace(rest);
+}
+
 unsafe impl<'gc> Collect<'gc> for Value<'gc> {
     #[inline(always)]
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
