@@ -535,7 +535,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         CLOSE => {
             // A `__close` runs Lua: the interpreter does it. An inlined body
             // has no to-be-closed variable (`inline::needs_frame`).
-            if b.inline.is_none() {
+            if b.inline.is_none() && frame_flags(b, flag::HAS_TBC) != 0 {
                 let s = b.snap_before();
                 b.ins_snap(
                     Op::GuardNoFlag(flag::HAS_TBC as u8),
@@ -698,11 +698,14 @@ fn emit_tailcall(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8) {
     if proto == NO_PROTO {
         others.push(arm(b, Op::FnFixedLua, p));
     }
-    let closes = b.ins(Op::HasFlag((HAS_OPEN | HAS_TBC) as u8), &[]);
-    let (closing, fast) = (b.new_sealed_succ(), b.new_sealed_succ());
-    b.br(closes, closing, fast);
-    b.switch_to(fast);
-    others.push(closing);
+    let mask = frame_flags(b, HAS_OPEN | HAS_TBC);
+    if mask != 0 {
+        let closes = b.ins(Op::HasFlag(mask as u8), &[]);
+        let (closing, fast) = (b.new_sealed_succ(), b.new_sealed_succ());
+        b.br(closes, closing, fast);
+        b.switch_to(fast);
+        others.push(closing);
+    }
     if proto == NO_PROTO {
         others.push(arm(b, Op::FnFits, p));
     }
@@ -742,7 +745,24 @@ fn return_guard(b: &mut Builder<'_, '_>, s: crate::jit::ir::Snap) {
     } else {
         flag::HAS_OPEN | flag::HAS_TBC
     };
-    b.ins_snap(Op::GuardNoFlag(mask as u8), &[], s, ExitTag::Unsupported);
+    let mask = frame_flags(b, mask);
+    if mask != 0 {
+        b.ins_snap(Op::GuardNoFlag(mask as u8), &[], s, ExitTag::Unsupported);
+    }
+}
+
+/// Of the frame flags in `mask`, those the region's frame may have. A
+/// function region's starts with none: only the interpreter sets `HAS_TBC`
+/// (compiled code exits before `TBC` and a closing `TFORPREP`), and only
+/// the region prototype's own closures set `HAS_OPEN` (an inlined body's
+/// mark nothing and close what they open at its returns). A loop region's
+/// frame may arrive with any.
+fn frame_flags(b: &Builder<'_, '_>, mask: u64) -> u64 {
+    if b.f.meta.loop_entry {
+        return mask;
+    }
+    let opens = b.cfg.captured != super::cfg::RegSet::EMPTY;
+    mask & if opens { flag::HAS_OPEN } else { 0 }
 }
 
 /// The return of `R[a..a+n]` once [`return_guard`] passed.
