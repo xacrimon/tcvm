@@ -1,8 +1,9 @@
 //! Feedback holds what it caches weakly: a collection that frees a cached
 //! shape, `__index` holder or callee empties the entry, so memory reused for
-//! another object never matches it. Each test churns allocation after the
-//! collection to reuse what it freed. Expected strings come from `lua` 5.5.1
-//! running the chunks with `collectgarbage()` for each `--full`/`--minor`.
+//! another object never matches it; nor does a metatable class one of whose
+//! metamethods it freed. Each test churns allocation after the collection to
+//! reuse what it freed. Expected strings come from `lua` 5.5.1 running the
+//! chunks with `collectgarbage()` for each `--full`/`--minor`.
 
 use tcvm::Lua;
 
@@ -61,6 +62,50 @@ for i = 1, 3000 do junk[i] = {m = -i} end
 return get(mk(77)) .. " " .. get(mk(78))
 "#;
     assert_eq!(run(src), "77 78");
+}
+
+/// Compiled reads baked in what `__index` holders held, the holders died, and
+/// tables took their addresses: a metatable naming one of those is of
+/// another class than the dead holder's, whose compiled read it must not
+/// take. Each holder's class has two metatables, so its tables are in the
+/// shape a later member's tables would get.
+#[test]
+fn dead_holder_address_reused() {
+    let src = r#"
+gets, at = {}, {}
+do
+  local pad = {}
+  for k = 1, 8 do
+    for _ = 1, 100 do pad[#pad + 1] = {m = 0} end
+    local h = {m = k}
+    at[tostring(h)] = k
+    local m1, m2 = {__index = h}, {__index = h}
+    setmetatable({}, m1) setmetatable({}, m2)
+    local a, b = setmetatable({}, m1), setmetatable({}, m2)
+    local get = load("return function(o) return o.m end")()
+    gets[k] = get
+    for _ = 1, 300 do get(a) get(b) end
+  end
+end
+--full
+junk = {}
+for i = 1, 6000 do junk[i] = {m = -i} end
+local reused, wrong = 0, 0
+for i = 1, 6000 do
+  local k = at[tostring(junk[i])]
+  if k then
+    reused = reused + 1
+    if gets[k](setmetatable({}, {__index = junk[i]})) ~= -i then wrong = wrong + 1 end
+  end
+end
+return (reused > 0 and "reused" or "none") .. " " .. wrong
+"#;
+    let mut lua = Lua::new();
+    // The collections and each `get`'s region as written: the holders die at `--full`.
+    lua.stop_gc_stress();
+    lua.set_jit_inline(false);
+    lua.load_all();
+    assert_eq!(run_steps(&mut lua, src).0, "reused 0");
 }
 
 /// A call site's callee died: one closure, then a prototype whose closures

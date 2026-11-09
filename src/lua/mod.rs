@@ -195,6 +195,7 @@ impl Lua {
         while self.marked().finalize(|fc, _| Table::converge_weak(fc)) {}
         self.marked().finalize(|fc, root| {
             Table::clear_weak(fc);
+            crate::env::shape::MtCache::retire_dead(fc);
             crate::env::Prototype::clear_dead_feedback(fc);
             fc.clear_deferred();
             root.interner.prune(fc);

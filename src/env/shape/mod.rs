@@ -27,7 +27,7 @@ use hashbrown::{HashTable, hash_table};
 
 use crate::dmm::allocator_api::MetricsAlloc;
 use crate::dmm::barrier::unlock;
-use crate::dmm::{Collect, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
+use crate::dmm::{Collect, Finalization, Gc, GcWeak, Lock, Mutation, RefLock, Trace};
 use crate::env::for_each_metamethod;
 use crate::env::string::LuaString;
 use crate::env::symbols::METAMETHOD_COUNT;
@@ -547,35 +547,28 @@ impl WeakMode {
     }
 }
 
-#[derive(Collect)]
-#[collect(internal, no_drop)]
 pub struct MtCacheData<'gc> {
     /// The metatable that made this class, the metatable of every table in a
     /// mono shape of it. Untraced so that a shape held by an IC doesn't keep
     /// it alive: only those tables read it, and each of them marks it. Once
     /// dead only its address is compared, and a metatable reusing the address
-    /// with these metamethods may as well be the owner.
-    #[collect(require_static)]
+    /// with these metamethods may as well be the owner: the metamethods are
+    /// alive, or the class was retired ([`MtCache::retire_dead`]).
     owner: NonNull<()>,
     /// Metatables that joined, the owner included; never decremented, so
     /// more than one means members other than the owner may be alive.
-    #[collect(require_static)]
     members: Cell<u32>,
-    /// Retired by a member's write (see [`MtCache::make_stale`]).
-    #[collect(require_static)]
+    /// Retired, by a member's write (see [`MtCache::make_stale`]) or by the
+    /// collector ([`MtCache::retire_dead`]).
     stale: Cell<bool>,
     /// The address of the `TableState` of the member whose write retired
-    /// this class, 0 before. Every member was alive at that write, so no
+    /// this class, else 0. Every member was alive at that write, so no
     /// other member shares the address.
-    #[collect(require_static)]
     retired_by: Cell<usize>,
     /// Not in `MtClasses`: no other metatable joins it.
-    #[collect(require_static)]
     private: bool,
-    #[collect(require_static)]
     pub bits: Cell<MetamethodBits>,
     /// Read by the collector when it traces a table with this metatable.
-    #[collect(require_static)]
     pub weak: Cell<WeakMode>,
     /// `__index` and `__newindex`, kept like `bits` (weak clears included),
     /// inline as every table access may need them.
@@ -594,13 +587,32 @@ pub struct MtCacheData<'gc> {
     pub dict_sentinel_poly: Lock<Option<Shape<'gc>>>,
     /// The regions assuming the bits stay (ws2 §5.3), by the bits.
     deps: DepSlot<'gc>,
-    #[collect(require_static)]
     volatile: Cell<bool>,
 }
 
-/// A metamethod in [`MtCacheData`]. Untraced: every member metatable holds
-/// it, and a shape carrying the class is only read through a table that
-/// keeps its own member alive. A stale class holds nil.
+// SAFETY: the metamethods are weak (see `MmValue`): a class that has any
+// defers itself, and `MtCache::retire_dead` empties it before the sweep if
+// one died. A class a minor collection does not trace is old, and so are its
+// metamethods, but for one its only member stored since (`MtCache::mirror`):
+// that member is older than the class and took the store's barrier, so the
+// collection keeps the value.
+unsafe impl<'gc> Collect<'gc> for MtCacheData<'gc> {
+    fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+        cc.trace(&self.rest);
+        cc.trace(&self.dict_sentinel);
+        cc.trace(&self.dict_sentinel_poly);
+        cc.trace(&self.deps);
+        if !self.stale.get() && !self.bits.get().is_empty() {
+            cc.defer(crate::env::DEFER_CLASSES);
+        }
+    }
+}
+
+/// A metamethod in [`MtCacheData`]. Weak, so that a shape kept by a memo or
+/// by compiled code doesn't keep it alive: every member metatable holds it,
+/// and the collection that finds it dead retires the class
+/// ([`MtCache::retire_dead`]), so a class that is not stale names live
+/// objects. A stale class holds nil.
 pub struct MmValue<'gc>(Cell<Value<'gc>>);
 
 unsafe impl<'gc> Collect<'gc> for MmValue<'gc> {
@@ -814,6 +826,29 @@ impl<'gc> MtCache<'gc> {
         self.0.newindex.0.set(Value::nil());
         // SAFETY: storing `None` adopts nothing.
         unsafe { self.0.rest.as_cell() }.set(None);
+    }
+
+    /// Retire the deferred classes with a metamethod this collection found
+    /// dead, once the weak tables' clears have reached their classes. No
+    /// member of such a class is alive, so no table of it is, and none joins
+    /// a stale class: code compiled for its shapes never sees them again and
+    /// needs no invalidation. Left as it was, the class would be joined by a
+    /// metatable naming a new object at the dead one's address, whose tables
+    /// would take what was compiled for the dead object's.
+    pub(crate) fn retire_dead(fc: &Finalization<'gc>) {
+        for c in fc.deferred(crate::env::DEFER_CLASSES) {
+            // SAFETY: only `MtCacheData::trace` defers to `DEFER_CLASSES`.
+            let c = MtCache(unsafe { Gc::cast::<MtCacheData<'gc>>(c) });
+            let d = c.0;
+            let dead = d.index.0.get().is_dead(fc)
+                || d.newindex.0.get().is_dead(fc)
+                || d.rest
+                    .get()
+                    .is_some_and(|r| r.0.iter().any(|v| v.get().is_dead(fc)));
+            if dead {
+                c.make_stale(0);
+            }
+        }
     }
 
     /// Apply the write of `key` by the member whose `TableState` is at
