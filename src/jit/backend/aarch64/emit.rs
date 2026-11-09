@@ -1052,6 +1052,9 @@ impl<'a> Em<'a> {
         let r = to.as_reg().expect("a register to compute into");
         match self.v.remat[vreg] {
             Remat::Int(v) => self.a.mov_imm(gpr(r), v),
+            // The transport register on the way to a stack slot
+            // (`ra::resolve`): the word.
+            Remat::Float(bits) if r.class() == RegClass::Int => self.a.mov_imm(gpr(r), bits),
             Remat::Float(bits) => self.fimm(fpr(r), bits),
             Remat::Slot(slot) => self.word_at(false, r, BASE, slot as i32 * 8),
             Remat::AndImm { src: sv, imm } => {

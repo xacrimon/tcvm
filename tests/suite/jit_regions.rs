@@ -2112,6 +2112,35 @@ fn register_arguments_and_results() {
     );
 }
 
+/// Float constants reaching loop-carried floats that live in stack slots
+/// across a call: the allocator computes each in the transport register,
+/// as its word, and stores that (a float register took it, unstored).
+#[test]
+fn float_constants_into_stack_slots() {
+    compiles_cleanly(
+        "local n = 0
+        local function h() n = n + 1 end
+        local function f(m)
+          local a, b, c, d, e, g = 0.5, 1.5, 2.5, 3.5, 4.5, 5.5
+          local p, q, r, s, t, u = 6.5, 7.5, 8.5, 9.5, 10.5, 11.5
+          for i = 1, m do
+            h()
+            if i % 3 == 0 then
+              a, b, c, d, e, g = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            else
+              a, b, c, d, e, g = a + 1.0, b + 2.0, c + 3.0, d + 4.0, e + 5.0, g + 6.0
+            end
+            p, q, r, s, t, u = p + a, q + b, r + c, s + d, t + e, u + g
+          end
+          return a + b + c + d + e + g + p + q + r + s + t + u
+        end
+        local z = 0.0
+        for k = 1, 300 do z = z + f(300) end
+        return tostring(z) .. ' ' .. n",
+        false,
+    );
+}
+
 /// A tail call in a callee a call passed its arguments in registers, to a
 /// function that never compiles (an irreducible loop): its miss runs the
 /// caller's slow path with the tail call's arguments in the slots, where
