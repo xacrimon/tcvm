@@ -50,7 +50,10 @@ pub(crate) fn dominators(f: &Func<'_>, cfg: &CfgInfo) -> Vec<Option<Block>> {
     idom
 }
 
-pub(crate) fn dominates(idom: &[Option<Block>], a: Block, mut b: Block) -> bool {
+/// The walk up the dominator tree `CfgInfo::dominates` answers by numbers,
+/// kept for the verifier to check with.
+#[cfg(feature = "tcvm-dev")]
+fn dominates(idom: &[Option<Block>], a: Block, mut b: Block) -> bool {
     loop {
         if a == b {
             return true;

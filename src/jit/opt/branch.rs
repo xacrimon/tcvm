@@ -9,7 +9,6 @@ use crate::jit::FastMap;
 use crate::jit::ir::ops::Op;
 use crate::jit::ir::types::TypeSet;
 use crate::jit::ir::{Block, BlockCall, Func, Inst, NO_SNAP, Snap, Val};
-use crate::jit::opt::DomTree;
 
 /// Merge blocks of more instructions than this (the terminator counted,
 /// parameters not: the copies drop them) stay: Turboshaft's
@@ -106,7 +105,6 @@ fn eliminate_merges(f: &mut Func<'_>) -> bool {
     if !cfg.rpo.iter().any(|&m| shaped(f, m)) {
         return false;
     }
-    let tree = DomTree::new(f, &cfg);
     let mut header = vec![false; f.blocks.len()];
     for &t in &cfg.rpo {
         for h in f.succs(t) {
@@ -169,7 +167,7 @@ fn eliminate_merges(f: &mut Func<'_>) -> bool {
             }
         }
         stack.push((b, true));
-        for &c in tree.children(b).iter().rev() {
+        for &c in cfg.children(b).iter().rev() {
             stack.push((c, false));
         }
     }

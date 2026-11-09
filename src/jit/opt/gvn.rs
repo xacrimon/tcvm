@@ -9,7 +9,6 @@
 use crate::jit::FastMap;
 use crate::jit::ir::ops::{Flags, Mem, Op};
 use crate::jit::ir::{Block, Func, Inst, Val};
-use crate::jit::opt::DomTree;
 
 const CLASSES: usize = 8;
 
@@ -166,7 +165,6 @@ fn forwarded(f: &Func<'_>, i: Inst) -> Option<(Op, Vec<Val>, Val)> {
 pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
     let cfg = f.cfg();
     let n = f.blocks.len();
-    let tree = DomTree::new(f, &cfg);
     // The classes each block writes.
     let mut wmask = vec![Mem::empty(); n];
     for &b in &cfg.rpo {
@@ -338,7 +336,7 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
         }
         end[b.idx()] = Some(mem);
         stack.push((b, true, lo));
-        for &c in tree.children(b).iter().rev() {
+        for &c in cfg.children(b).iter().rev() {
             stack.push((c, false, lo));
         }
     }

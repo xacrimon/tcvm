@@ -19,45 +19,7 @@ pub(crate) mod stable;
 pub(crate) mod words;
 
 use crate::jit::ir::ops::Op;
-use crate::jit::ir::{Block, CfgInfo, Func, Inst};
-
-/// The dominator tree's children of each reachable block.
-pub(crate) struct DomTree {
-    at: Vec<u32>,
-    children: Vec<Block>,
-}
-
-impl DomTree {
-    pub(crate) fn new(f: &Func<'_>, cfg: &CfgInfo) -> Self {
-        let n = f.blocks.len();
-        let mut at = vec![0u32; n + 1];
-        for &b in &cfg.rpo {
-            if b != f.entry
-                && let Some(p) = cfg.idom[b.idx()]
-            {
-                at[p.idx() + 1] += 1;
-            }
-        }
-        for k in 0..n {
-            at[k + 1] += at[k];
-        }
-        let mut fill = at.clone();
-        let mut children = vec![Block(0); at[n] as usize];
-        for &b in &cfg.rpo {
-            if b != f.entry
-                && let Some(p) = cfg.idom[b.idx()]
-            {
-                children[fill[p.idx()] as usize] = b;
-                fill[p.idx()] += 1;
-            }
-        }
-        DomTree { at, children }
-    }
-
-    pub(crate) fn children(&self, b: Block) -> &[Block] {
-        &self.children[self.at[b.idx()] as usize..self.at[b.idx() + 1] as usize]
-    }
-}
+use crate::jit::ir::{Block, Func, Inst};
 
 /// Whether some path from the entry does work in compiled code before it
 /// leaves: a loop's back edge, a return from a function entry, or an exit a
