@@ -123,7 +123,19 @@ impl WBuf {
 
     /// Buffer `buf`, or write it through to `w` once it no longer fits. The
     /// count is the bytes of `buf` accepted before an error.
+    #[inline]
     fn write(&mut self, w: &mut impl Write, buf: &[u8]) -> (std::io::Result<()>, u64) {
+        if let BufMode::Full(cap) = self.mode
+            && self.buf.len() + buf.len() <= cap
+        {
+            self.buf.extend_from_slice(buf);
+            return (Ok(()), buf.len() as u64);
+        }
+        self.write_through(w, buf)
+    }
+
+    #[inline(never)]
+    fn write_through(&mut self, w: &mut impl Write, buf: &[u8]) -> (std::io::Result<()>, u64) {
         let (cap, line) = match self.mode {
             BufMode::No => (0, false),
             BufMode::Line(cap) => (cap, true),
