@@ -332,14 +332,14 @@ pub fn load<'gc>(ctx: Context<'gc>) {
     let gc = Value::function(native(lua_file_gc));
     mt.raw_set(ctx, str_val(ctx, b"__gc"), gc);
     mt.raw_set(ctx, str_val(ctx, b"__close"), gc);
-    io_state.raw_set(ctx, str_val(ctx, b"mt"), Value::table(mt));
+    io_state.raw_set_index(ctx, MT, Value::table(mt));
 
     // Predefined handles.
     let stdin = new_handle(ctx, mt, LuaFile::open(Stream::Stdin, true, false));
     let stdout = new_handle(ctx, mt, LuaFile::open(Stream::Stdout, false, true));
     let stderr = new_handle(ctx, mt, LuaFile::open(Stream::Stderr, false, true));
-    io_state.raw_set(ctx, str_val(ctx, b"input"), Value::userdata(stdin));
-    io_state.raw_set(ctx, str_val(ctx, b"output"), Value::userdata(stdout));
+    io_state.raw_set_index(ctx, INPUT, Value::userdata(stdin));
+    io_state.raw_set_index(ctx, OUTPUT, Value::userdata(stdout));
 
     // The public `io` table.
     let lib = Table::new(ctx);
@@ -390,29 +390,30 @@ fn io_state<'gc>(closure: &NativeClosure<'gc>) -> Table<'gc> {
         .expect("io native upvalue 0 must be the io-state table")
 }
 
+// io-state's slots, in its array part.
+const MT: usize = 1;
+const INPUT: usize = 2;
+const OUTPUT: usize = 3;
+
 #[inline]
-fn state_get<'gc>(ctx: Context<'gc>, st: Table<'gc>, key: &[u8]) -> Value<'gc> {
-    st.raw_get(str_val(ctx, key))
+fn state_get(st: Table<'_>, slot: usize) -> Value<'_> {
+    st.raw_get_index(slot)
 }
 
 /// The shared file metatable held in io-state.
 #[inline]
-fn file_metatable<'gc>(ctx: Context<'gc>, closure: &NativeClosure<'gc>) -> Table<'gc> {
-    state_get(ctx, io_state(closure), b"mt")
+fn file_metatable<'gc>(closure: &NativeClosure<'gc>) -> Table<'gc> {
+    state_get(io_state(closure), MT)
         .get_table()
         .expect("io-state must hold the file metatable")
 }
 
 /// `v` as a file handle iff it is userdata carrying the file metatable
 /// (`luaL_testudata` by metatable identity).
-fn as_file<'gc>(
-    ctx: Context<'gc>,
-    closure: &NativeClosure<'gc>,
-    v: Value<'gc>,
-) -> Option<Userdata<'gc>> {
+fn as_file<'gc>(closure: &NativeClosure<'gc>, v: Value<'gc>) -> Option<Userdata<'gc>> {
     let u = v.get_userdata()?;
     let umt = u.metatable()?;
-    let fmt = file_metatable(ctx, closure);
+    let fmt = file_metatable(closure);
     (Gc::as_ptr(umt.inner()) == Gc::as_ptr(fmt.inner())).then_some(u)
 }
 
@@ -423,7 +424,7 @@ fn check_file<'gc>(
     fname: &str,
     n: usize,
 ) -> Result<Userdata<'gc>, Error<'gc>> {
-    as_file(ctx, closure, v).ok_or_else(|| util::type_error(ctx, fname, n, "FILE*", Some(v)))
+    as_file(closure, v).ok_or_else(|| util::type_error(ctx, fname, n, "FILE*", Some(v)))
 }
 
 fn closed_file_error<'gc>(ctx: Context<'gc>) -> Error<'gc> {
@@ -445,15 +446,16 @@ fn is_closed(u: Userdata<'_>) -> bool {
 fn io_file<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
-    slot: &str,
+    slot: usize,
+    name: &str,
 ) -> Result<Userdata<'gc>, Error<'gc>> {
-    let u = state_get(ctx, io_state(closure), slot.as_bytes())
+    let u = state_get(io_state(closure), slot)
         .get_userdata()
         .expect("io-state default file must be a file handle");
     if is_closed(u) {
         return Err(Error::from_str(
             ctx,
-            &format!("default {slot} file is closed"),
+            &format!("default {name} file is closed"),
         ));
     }
     Ok(u)
@@ -837,7 +839,7 @@ fn open_file<'gc>(
     let writable = base != b'r' || plus;
     Ok(new_handle(
         ctx,
-        file_metatable(ctx, closure),
+        file_metatable(closure),
         LuaFile::open(Stream::File(FileStream::new(file)), readable, writable),
     ))
 }
@@ -920,7 +922,7 @@ fn lua_write<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
-    let out = io_file(ctx, closure, "output")?;
+    let out = io_file(ctx, closure, OUTPUT, "output")?;
     let vals: Vec<Value<'gc>> = stack.as_slice().to_vec();
     match do_write(ctx, out, &vals, "write", 1)? {
         WriteOutcome::Ok => stack.replace(&[Value::userdata(out)]),
@@ -936,7 +938,7 @@ fn lua_read<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
-    let inp = io_file(ctx, closure, "input")?;
+    let inp = io_file(ctx, closure, INPUT, "input")?;
     let vals = do_read(ctx, inp, stack.as_slice(), "read", 1)?;
     stack.replace(&vals);
     Ok(())
@@ -950,7 +952,7 @@ fn lua_close<'gc>(
 ) -> Result<(), Error<'gc>> {
     let arg = stack.get(0);
     let file = if arg.is_nil() {
-        state_get(ctx, io_state(closure), b"output")
+        state_get(io_state(closure), OUTPUT)
             .get_userdata()
             .expect("io-state output must be a file handle")
     } else {
@@ -965,7 +967,7 @@ fn lua_flush<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
-    let out = io_file(ctx, closure, "output")?;
+    let out = io_file(ctx, closure, OUTPUT, "output")?;
     match with_state(out, flush_stream) {
         WriteOutcome::Closed => return Err(closed_file_error(ctx)),
         WriteOutcome::Io(e, _) => stack.replace(&io_fail(ctx, None, &e)),
@@ -981,7 +983,7 @@ fn lua_input<'gc>(
     closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
-    default_file(ctx, closure, stack, b"input", b"r", "input")
+    default_file(ctx, closure, stack, INPUT, b"r", "input")
 }
 
 /// `io.output([file])` — get/set the default output (string opens in `w`).
@@ -990,14 +992,14 @@ fn lua_output<'gc>(
     closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
-    default_file(ctx, closure, stack, b"output", b"w", "output")
+    default_file(ctx, closure, stack, OUTPUT, b"w", "output")
 }
 
 fn default_file<'gc>(
     ctx: Context<'gc>,
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
-    slot: &[u8],
+    slot: usize,
     mode: &[u8],
     fname: &str,
 ) -> Result<(), Error<'gc>> {
@@ -1014,9 +1016,9 @@ fn default_file<'gc>(
         } else {
             check_file(ctx, closure, arg, fname, 1)?
         };
-        io_state(closure).raw_set(ctx, str_val(ctx, slot), Value::userdata(handle));
+        io_state(closure).raw_set_index(ctx, slot, Value::userdata(handle));
     }
-    let cur = state_get(ctx, io_state(closure), slot);
+    let cur = state_get(io_state(closure), slot);
     stack.ret1(cur);
     Ok(())
 }
@@ -1032,7 +1034,7 @@ fn lua_lines<'gc>(
 ) -> Result<(), Error<'gc>> {
     let fmt_args = stack.as_slice().get(1..).unwrap_or_default();
     let (handle, close_eof) = if stack.get(0).is_nil() {
-        let inp = state_get(ctx, io_state(closure), b"input");
+        let inp = state_get(io_state(closure), INPUT);
         if is_closed(
             inp.get_userdata()
                 .expect("io-state input must be a file handle"),
@@ -1067,7 +1069,7 @@ fn lua_type<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<(), Error<'gc>> {
     util::check_any(ctx, &stack, "type", 1)?;
-    let result = match as_file(ctx, closure, stack.get(0)) {
+    let result = match as_file(closure, stack.get(0)) {
         Some(u) if is_closed(u) => str_val(ctx, b"closed file"),
         Some(_) => str_val(ctx, b"file"),
         None => Value::nil(),
@@ -1099,7 +1101,7 @@ fn lua_tmpfile<'gc>(
             let _ = std::fs::remove_file(&path); // unlink; fd remains valid
             let u = new_handle(
                 ctx,
-                file_metatable(ctx, closure),
+                file_metatable(closure),
                 LuaFile::open(Stream::File(FileStream::new(file)), true, true),
             );
             stack.ret1(Value::userdata(u));
