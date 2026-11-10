@@ -531,7 +531,7 @@ struct Ra {
     deferred: Vec<bool>,
     /// Points fixed operands reserve allocatable registers over, per class
     /// by `from`: `(from, to, owner, k)` for `env.regs[c][k]`; the owner
-    /// vreg may sit there (a fixed operand of its own).
+    /// vreg's group may sit there (a fixed operand of its own).
     fixres: [Vec<(Pos, Pos, u32, u8)>; 2],
     /// Per class, the registers (as `env.regs` bits) with any, and the ones
     /// any clobber names.

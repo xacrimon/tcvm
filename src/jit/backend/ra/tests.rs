@@ -934,3 +934,16 @@ fn reused_input_twice_is_read_where_it_is() {
     let al = out.inst_allocs(&v, Inst::new(1));
     assert!(out.edits.is_empty() && al[0] == al[1] && al[1] == al[2]);
 }
+
+#[test]
+fn reused_input_is_made_where_the_definition_is_wanted() {
+    let (v, [_, _, d], mut insts) = two_address(None, false);
+    insts.push((
+        vec![Operand::reg_fixed_use(d, int(INTS[3]))],
+        PRegSet::empty(),
+    ));
+    let (v, out) = straight(v, insts, &[]);
+    assert!(out.edits.is_empty(), "{}", v.print(&out, &[0]));
+    let made = out.inst_allocs(&v, Inst::new(0))[0];
+    assert_eq!(made.as_reg(), Some(int(INTS[3])));
+}

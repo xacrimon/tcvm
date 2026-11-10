@@ -199,7 +199,7 @@ impl Ra {
             let k = k as usize;
             if a >= out[k] {
                 pending &= !(1 << k);
-            } else if o != p.g
+            } else if self.rep[o as usize] != p.g
                 && let Some(x) = iv.first_in(a.max(s), b)
             {
                 out[k] = out[k].min(x);
