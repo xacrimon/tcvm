@@ -454,6 +454,18 @@ impl Ra {
             // before it is taken.
             let gap = until & !1;
             if gap > s {
+                // A reload nothing reads before a clobber takes every
+                // register (one placed at a loop's header, the loop calling
+                // before its use): out of a register until that use.
+                let p = &self.pieces[c as usize];
+                if a.fixed[..n].iter().all(|&x| x <= until)
+                    && p.prev != NONE
+                    && self.pieces[p.prev as usize].loc.spilled()
+                    && !self.is_def(p.g, s)
+                    && (self.next_use(c, s, Want::Beneficial)).is_none_or(|u| u.pos >= gap)
+                {
+                    return self.spill_tail(c);
+                }
                 let tail = self
                     .split_at(c, gap, Why::Gap)
                     .expect("a split inside the piece");
