@@ -278,12 +278,16 @@ impl Ra {
     /// previous piece's, else that of the fixed definition right after it.
     fn hint(&self, c: u32) -> Option<usize> {
         let p = &self.pieces[c as usize];
-        let fixed = (self.want_from(p.ulo, p.uhi, Want::Fixed)).map(|j| {
-            match self.uses[j as usize].need() {
-                super::Need::Fixed(r) => r,
-                _ => unreachable!("a fixed use"),
+        let mut k = p.ulo;
+        let fixed = loop {
+            let Some(j) = self.want_from(k, p.uhi, Want::Fixed) else {
+                break None;
+            };
+            if let super::Need::Fixed(r) = self.uses[j as usize].need() {
+                break Some(r);
             }
-        });
+            k = j + 1;
+        };
         let prev = || (p.prev != NONE).then(|| self.reg_of(p.prev)).flatten();
         let next = || {
             (p.next != NONE && self.pieces[p.next as usize].flags & FIXED != 0)

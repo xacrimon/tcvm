@@ -3,7 +3,7 @@
 
 use super::{FIXED, Ivs, Loc, NONE, Need, Piece, Pos, Ra, Use, VInfo, Why, class_index, intersect};
 use crate::jit::backend::reg::{
-    Allocation, Block, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
+    Allocation, Block, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
 };
 use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
 
@@ -43,7 +43,7 @@ impl Ra {
         self.interval_runs(w);
         self.group(f, &mut w.span, &w.uoff);
         self.members_and_defs(w);
-        self.make_pieces(w);
+        self.make_pieces(f, w);
         Ok(())
     }
 
@@ -51,7 +51,13 @@ impl Ra {
     /// (`snap_off`), counted ahead for the walk to fill from the end.
     fn count<I: TargetInst>(&mut self, f: &VCode<I>, w: &mut Build) {
         let nv = self.vregs.len();
-        let Build { uoff, at, sat, .. } = w;
+        let Build {
+            uoff,
+            at,
+            sat,
+            reuse,
+            ..
+        } = w;
         uoff.resize(nv + 1, 0);
         self.snap_off.resize(nv + 1, 0);
         for op in &f.operands {
@@ -61,6 +67,10 @@ impl Ra {
                     self.snap_off[v + 1] += 1;
                 }
                 (OperandKind::Def, OperandConstraint::FixedReg(_)) => {}
+                (OperandKind::Def, OperandConstraint::Reuse(_)) => {
+                    *reuse = true;
+                    uoff[v + 1] += 1;
+                }
                 // An early register definition is also a use at the late point.
                 (OperandKind::Def, _)
                     if op.pos() == OperandPos::Early
@@ -104,6 +114,7 @@ impl Ra {
             uoff,
             at: uat,
             sat,
+            reuse,
             ..
         } = w;
         ivr.recs.reserve(n as usize);
@@ -137,11 +148,25 @@ impl Ra {
                 let base = f.ops[i.index()].0;
                 let ops = f.inst_operands(i);
                 let (early, late) = (2 * l, 2 * l + 1);
+                let tie = if *reuse { tie_of(ops)? } else { None };
+                // The definition may sit where the reused input was, so the
+                // other inputs are read at the late point to stay clear of
+                // it (regalloc2's rule, from IonMonkey). The reused value's
+                // other uses read it where it still is, but a fixed one,
+                // which is copied.
+                let after_tie = |k: usize, op: &Operand| {
+                    tie.is_some_and(|(_, t)| {
+                        op.kind() == OperandKind::Use
+                            && k != t
+                            && (op.vreg() != ops[t].vreg()
+                                || matches!(op.constraint(), OperandConstraint::FixedReg(_)))
+                    })
+                };
                 for pos in [late, early] {
                     for (k, op) in ops.iter().enumerate().rev() {
                         let v = op.vreg().vreg();
                         let alloc = base + k as u32;
-                        let at = if op.pos() == OperandPos::Late {
+                        let at = if op.pos() == OperandPos::Late || after_tie(k, op) {
                             late
                         } else {
                             early
@@ -171,6 +196,9 @@ impl Ra {
                                 open[v] = open[v].max(pos + 1);
                             }
                             let need = match op.constraint() {
+                                OperandConstraint::Reg if tie.is_some_and(|(_, t)| t == k) => {
+                                    Need::Tied
+                                }
                                 OperandConstraint::Reg => Need::Reg,
                                 OperandConstraint::Any | OperandConstraint::Stack => {
                                     let stack = op.constraint() == OperandConstraint::Stack;
@@ -214,6 +242,13 @@ impl Ra {
                             OperandConstraint::Reg | OperandConstraint::Any => {
                                 let need = def_need(&self.vregs[v], f.remat[v]);
                                 put(&mut self.uses, uat, v, Use::new(pos, alloc, need));
+                            }
+                            OperandConstraint::Reuse(t) => {
+                                if def_need(&self.vregs[v], f.remat[v]) != Need::Reg {
+                                    return Err(format!("v{v} reuses an input and is a constant"));
+                                }
+                                self.ties.push((base + t as u32, alloc, early));
+                                put(&mut self.uses, uat, v, Use::new(pos, alloc, Need::Reg));
                             }
                             c => return Err(format!("unsupported def constraint {c:?}")),
                         }
@@ -277,14 +312,6 @@ impl Ra {
     /// Values computed again, and the groups of parameters and arguments.
     fn group<I: TargetInst>(&mut self, f: &VCode<I>, span: &mut [(u32, u32)], uoff: &[u32]) {
         let nv = self.vregs.len();
-        // The definition of a value that loses its remat needs a register.
-        let need_reg_at_def = |uses: &mut [Use], def: Pos, v: usize| {
-            for u in &mut uses[uoff[v] as usize..uoff[v + 1] as usize] {
-                if u.pos == def {
-                    u.set_need(Need::Reg);
-                }
-            }
-        };
         // A value computed again from another only where that one is live
         // (always holding it at the gap before a reload, or in its slot),
         // not from a value itself computed again.
@@ -302,16 +329,23 @@ impl Ra {
                 let held = !self.vregs[src].remat || matches!(f.remat[src], Remat::Slot(_));
                 if !held || !mine.iter().all(within) {
                     self.vregs[v].remat = false;
-                    need_reg_at_def(&mut self.uses, self.vregs[v].def, v);
+                    need_reg_at_def(&mut self.uses, uoff, self.vregs[v].def, v);
                 }
             }
         }
         // Groups: a block parameter shares one allocation unit with each
         // argument passed to it whose range stays clear of the group's
         // (V8's `BundleBuilder`, allocated as one range), so the edge needs
-        // no move unless a split moves one of them. A merged group's
-        // intervals are written after the rest of `ivs`.
+        // no move unless a split moves one of them; and a definition with
+        // the input it reuses when that one ends there, first (regalloc2's
+        // order). A merged group's intervals are written after the rest of
+        // `ivs`.
         self.rep.extend(0..nv as u32);
+        for k in 0..self.ties.len() {
+            let (t, d, _) = self.ties[k];
+            let v = |o: u32| f.operands[o as usize].vreg().vreg() as u32;
+            self.join(f, span, uoff, v(t), v(d));
+        }
         for bi in 0..self.order.len() {
             let b = self.order[bi];
             for (k, q) in f.block_params(b).iter().enumerate() {
@@ -321,41 +355,7 @@ impl Ra {
                         .position(|&x| x == b)
                         .expect("an edge");
                     let a = f.branch_blockparams(p, pk)[k];
-                    let (gq, ga) = (self.find(q.vreg() as u32), self.find(a.vreg() as u32));
-                    if gq == ga {
-                        continue;
-                    }
-                    let (gq, ga) = (gq as usize, ga as usize);
-                    // A constant stays out (it is made again on the edge); a
-                    // derived value joins and is spilled as any value.
-                    let konst = |v: usize| f.remat[v].is_free() && self.vregs[v].remat;
-                    if self.vregs[gq].class != self.vregs[ga].class
-                        || konst(gq)
-                        || konst(ga)
-                        || span[gq].0 == span[gq].1
-                        || span[ga].0 == span[ga].1
-                        || intersect(
-                            run_ivs(&self.ivs, span[gq]),
-                            run_ivs(&self.ivs, span[ga]),
-                            0,
-                        )
-                        .is_some()
-                    {
-                        all = false;
-                        continue;
-                    }
-                    self.rep[ga] = gq as u32;
-                    for x in [gq, ga] {
-                        if self.vregs[x].remat {
-                            self.vregs[x].remat = false;
-                            need_reg_at_def(&mut self.uses, self.vregs[x].def, x);
-                        }
-                    }
-                    let s = self.ivs.len();
-                    let (a, b) = (span[gq], span[ga]);
-                    merge(&mut self.ivs, s, a, b, |x| x.0, push_coalesced);
-                    span[gq] = (s as u32, self.ivs.len() as u32);
-                    span[ga] = (s as u32, s as u32);
+                    all &= self.join(f, span, uoff, q.vreg() as u32, a.vreg() as u32);
                 }
                 self.vregs[q.vreg()].args_in_group = all;
             }
@@ -364,6 +364,53 @@ impl Ra {
             let r = self.find(v);
             self.rep[v as usize] = r;
         }
+    }
+
+    /// Make the groups of `q` and `a` one, `q`'s its representative, when
+    /// their ranges stay clear of each other; whether they are one.
+    fn join<I: TargetInst>(
+        &mut self,
+        f: &VCode<I>,
+        span: &mut [(u32, u32)],
+        uoff: &[u32],
+        q: u32,
+        a: u32,
+    ) -> bool {
+        let (gq, ga) = (self.find(q), self.find(a));
+        if gq == ga {
+            return true;
+        }
+        let (gq, ga) = (gq as usize, ga as usize);
+        // A constant stays out (it is made again on the edge); a
+        // derived value joins and is spilled as any value.
+        let konst = |v: usize| f.remat[v].is_free() && self.vregs[v].remat;
+        if self.vregs[gq].class != self.vregs[ga].class
+            || konst(gq)
+            || konst(ga)
+            || span[gq].0 == span[gq].1
+            || span[ga].0 == span[ga].1
+            || intersect(
+                run_ivs(&self.ivs, span[gq]),
+                run_ivs(&self.ivs, span[ga]),
+                0,
+            )
+            .is_some()
+        {
+            return false;
+        }
+        self.rep[ga] = gq as u32;
+        for x in [gq, ga] {
+            if self.vregs[x].remat {
+                self.vregs[x].remat = false;
+                need_reg_at_def(&mut self.uses, uoff, self.vregs[x].def, x);
+            }
+        }
+        let s = self.ivs.len();
+        let (a, b) = (span[gq], span[ga]);
+        merge(&mut self.ivs, s, a, b, |x| x.0, push_coalesced);
+        span[gq] = (s as u32, self.ivs.len() as u32);
+        span[ga] = (s as u32, s as u32);
+        true
     }
 
     /// Each group's members, then their definitions.
@@ -397,7 +444,7 @@ impl Ra {
 
     /// Each group's uses and first piece, its fixed definitions' pieces,
     /// and the queue.
-    fn make_pieces(&mut self, w: &mut Build) {
+    fn make_pieces<I: TargetInst>(&mut self, f: &VCode<I>, w: &mut Build) {
         let nv = self.vregs.len();
         let Build {
             fixed_def,
@@ -460,11 +507,13 @@ impl Ra {
             self.next_of.resize(self.uses.len(), [0; 2]);
             let uhi = uhi as u32;
             let mut next = [uhi; 2];
+            let konst = self.vregs[v].remat && f.remat[v].is_free();
             for k in (ulo as u32..uhi).rev() {
                 match self.uses[k as usize].need() {
                     Need::Reg => next[0] = k,
                     Need::Fixed(_) => next[1] = k,
-                    Need::Any => {}
+                    Need::Tied if !konst => next[1] = k,
+                    Need::Tied | Need::Any => {}
                 }
                 self.next_of[k as usize] = next;
             }
@@ -611,6 +660,8 @@ pub(super) struct Build {
     keys: Vec<u64>,
     fx: Vec<u64>,
     seen: Vec<(PRegSet, [u32; 2])>,
+    /// Some definition reuses an input.
+    reuse: bool,
 }
 
 impl Build {
@@ -618,6 +669,7 @@ impl Build {
         clear!(self; fixtmp, fixed_def, stack_use, open, touched, out, defined, defs,
             uoff, at, sat, span, keys, fx, seen);
         clear!(self.ivr; recs, last);
+        self.reuse = false;
     }
 }
 
@@ -630,6 +682,40 @@ fn def_need(vi: &VInfo, r: Remat) -> Need {
     } else {
         Need::Reg
     }
+}
+
+/// The definition of a value that loses its remat needs a register.
+fn need_reg_at_def(uses: &mut [Use], uoff: &[u32], def: Pos, v: usize) {
+    for u in &mut uses[uoff[v] as usize..uoff[v + 1] as usize] {
+        if u.pos == def {
+            u.set_need(Need::Reg);
+        }
+    }
+}
+
+/// The definition of `ops` reusing an input and that input, by operand: one
+/// at most, a late register definition of an early register use.
+fn tie_of(ops: &[Operand]) -> Result<Option<(usize, usize)>, String> {
+    let mut tie = None;
+    for (d, op) in ops.iter().enumerate() {
+        let OperandConstraint::Reuse(t) = op.constraint() else {
+            continue;
+        };
+        let fits = tie.is_none()
+            && op.kind() == OperandKind::Def
+            && op.pos() == OperandPos::Late
+            && ops.get(t).is_some_and(|i| {
+                i.kind() == OperandKind::Use
+                    && i.pos() == OperandPos::Early
+                    && i.constraint() == OperandConstraint::Reg
+                    && i.class() == op.class()
+            });
+        if !fits {
+            return Err(format!("unsupported reuse {op:?}"));
+        }
+        tie = Some((d, t));
+    }
+    Ok(tie)
 }
 
 /// `x` into `v`'s run, filled from its end (`at`).

@@ -130,6 +130,7 @@ impl Ra {
                     },
                     Need::Any => self.alloc_of(x),
                     Need::Fixed(r) => Allocation::reg(r),
+                    Need::Tied => continue,
                 };
                 self.allocs[u.alloc() as usize] = a;
             }
@@ -198,17 +199,29 @@ impl Ra {
                 let mut k = p.ulo;
                 while let Some(j) = self.want_from(k, p.uhi, Want::Fixed) {
                     let u = self.uses[j as usize];
+                    k = j + 1;
                     let Need::Fixed(r) = u.need() else {
-                        unreachable!("a fixed use")
+                        continue;
                     };
                     let n = u.pos / 2;
                     let m = self.mv_member(f, g, u.pos, 2 * n, Allocation::reg(r), cls);
                     if m.remat || m.from != m.to {
                         moves.push((n, FIXED_COPY, m));
                     }
-                    k = j + 1;
                 }
             }
+        }
+        // A reused input takes the definition's register: copied there with
+        // the instruction's fixed copies.
+        for k in 0..self.ties.len() {
+            let (t, d, at) = self.ties[k];
+            let to = self.allocs[d as usize];
+            let v = f.operands[t as usize].vreg().vreg() as u32;
+            let m = self.mv(f, v, at, to, self.vregs[v as usize].class);
+            if m.remat || m.from != m.to {
+                moves.push((at / 2, FIXED_COPY, m));
+            }
+            self.allocs[t as usize] = to;
         }
         self.edge_moves(f, t)?;
         // By instruction and phase, in the order pushed.

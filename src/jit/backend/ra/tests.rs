@@ -268,6 +268,23 @@ impl Gen {
                         ops.push(Operand::reg_temp(self.v.new_vreg(c)));
                     }
                 }
+                // A definition reusing an input (a two-address instruction):
+                // the other inputs are then held to the late point too.
+                let tied = (0..ops.len()).find(|&d| {
+                    ops[d].kind() == OperandKind::Def && ops[d].pos() == OperandPos::Late
+                });
+                let input = (0..ops.len()).find(|&t| {
+                    ops[t].kind() == OperandKind::Use
+                        && ops[t].pos() == OperandPos::Early
+                        && ops[t].constraint() == OperandConstraint::Reg
+                        && tied.is_some_and(|d| ops[d].class() == ops[t].class())
+                });
+                if let (Some(d), Some(t)) = (tied, input)
+                    && need.iter().all(|n| n[0] + n[1] <= 4)
+                    && self.rng.chance(40)
+                {
+                    ops[d] = Operand::reg_reuse_def(ops[d].vreg(), t);
+                }
             }
             6..=7 => {
                 // A helper: arguments in x0.. and d0.., the result in x0 or d0.
@@ -776,4 +793,144 @@ fn recorded_allocations_stay_the_same() {
         );
     }
     assert_eq!(differ, 0, "{differ} of {} allocations differ", cases.len());
+}
+
+/// Instructions as their operands and clobbers.
+type Insts = Vec<(Vec<Operand>, PRegSet)>;
+
+/// One block of `insts` and a return of `ret`, allocated and checked.
+fn straight(v: VCode<T>, insts: Insts, ret: &[VReg]) -> (VCode<T>, Output) {
+    let mut g = Gen {
+        rng: Rng(1),
+        v,
+        blocks: Vec::new(),
+        cold: Vec::new(),
+        in_cold: false,
+    };
+    let b = g.block() as usize;
+    for (ops, clob) in insts {
+        g.blocks[b].insts.push((T::Op, ops, clob));
+    }
+    let ret = ret.iter().map(|&r| Operand::reg_use(r)).collect();
+    g.blocks[b].insts.push((T::Ret, ret, PRegSet::empty()));
+    let mut v = g.finish();
+    (v.loop_of, v.loop_parent) = loops(&v);
+    let out = Ctx::new(env()).run(&v, &[0], 1).expect("allocated");
+    let mut checker = super::checker::Checker::new(&v);
+    let (remat, src) = super::remat_table(&v);
+    checker.allow_unmaterialized(remat, src);
+    checker.prepare(&out);
+    if let Err(e) = checker.run() {
+        panic!("{e:?}\n{}", v.print(&out, &[0]));
+    }
+    check_operands(&v, &out).expect("operands apart");
+    (v, out)
+}
+
+/// `a`, `b`, then `d = op a, b` reusing `a` as instruction 2 (`mid` between).
+fn two_address(mid: Option<PRegSet>, konst: bool) -> (VCode<T>, [VReg; 3], Insts) {
+    let mut v = VCode::new();
+    let [a, b, d] = [(); 3].map(|_| v.new_vreg(RegClass::Int));
+    if konst {
+        v.remat[a.vreg()] = Remat::Int(7);
+    }
+    let none = PRegSet::empty();
+    let mut insts = vec![
+        (vec![Operand::reg_def(a)], none),
+        (vec![Operand::reg_def(b)], none),
+    ];
+    if let Some(clob) = mid {
+        insts.push((vec![], clob));
+    }
+    insts.push((
+        vec![
+            Operand::reg_reuse_def(d, 1),
+            Operand::reg_use(a),
+            Operand::reg_use(b),
+        ],
+        none,
+    ));
+    (v, [a, b, d], insts)
+}
+
+fn edits_before(out: &Output, i: usize) -> Vec<super::Edit> {
+    (out.edits.iter())
+        .filter(|e| e.0 == ProgPoint::before(Inst::new(i)))
+        .map(|e| e.1)
+        .collect()
+}
+
+#[test]
+fn reused_input_ending_there_gives_its_register() {
+    let (v, [_, _, d], insts) = two_address(None, false);
+    let (v, out) = straight(v, insts, &[d]);
+    let al = out.inst_allocs(&v, Inst::new(2));
+    assert!(out.edits.is_empty(), "{:?}", out.edits);
+    assert!(al[0].is_reg() && al[0] == al[1] && al[2] != al[0]);
+    assert_eq!(al[1], out.inst_allocs(&v, Inst::new(0))[0]);
+}
+
+#[test]
+fn reused_input_live_after_is_copied() {
+    let (v, [a, _, d], insts) = two_address(None, false);
+    let (v, out) = straight(v, insts, &[d, a]);
+    let al = out.inst_allocs(&v, Inst::new(2));
+    let from = out.inst_allocs(&v, Inst::new(0))[0];
+    assert!(al[0] == al[1] && al[2] != al[0] && from != al[0]);
+    assert_eq!(
+        edits_before(&out, 2),
+        [super::Edit::Move { from, to: al[0] }]
+    );
+    assert_eq!(out.inst_allocs(&v, Inst::new(3))[1], from);
+}
+
+#[test]
+fn reused_input_on_the_stack_is_loaded_into_the_definition() {
+    let (v, [_, b, d], insts) = two_address(Some(all_regs()), false);
+    let (v, out) = straight(v, insts, &[d, b]);
+    let al = out.inst_allocs(&v, Inst::new(3));
+    assert!(al[0].is_reg() && al[0] == al[1] && al[2].is_reg() && al[2] != al[0]);
+    let loads: Vec<_> = (edits_before(&out, 3).into_iter())
+        .filter(|e| matches!(e, super::Edit::Move { to, .. } if *to == al[0]))
+        .collect();
+    assert!(
+        matches!(loads[..], [super::Edit::Move { from, .. }] if from.is_stack()),
+        "{}",
+        v.print(&out, &[0])
+    );
+}
+
+#[test]
+fn reused_constant_is_made_in_the_definition() {
+    let (v, [a, _, d], insts) = two_address(None, true);
+    let (v, out) = straight(v, insts, &[d]);
+    let al = out.inst_allocs(&v, Inst::new(2));
+    assert!(al[0].is_reg() && al[0] == al[1] && al[2] != al[0]);
+    assert!(
+        matches!(out.edits[..], [(p, super::Edit::Remat { to, vreg, .. })]
+            if p == ProgPoint::before(Inst::new(2)) && to == al[0] && vreg == a),
+        "{}",
+        v.print(&out, &[0])
+    );
+}
+
+#[test]
+fn reused_input_twice_is_read_where_it_is() {
+    let mut v = VCode::new();
+    let [a, d] = [(); 2].map(|_| v.new_vreg(RegClass::Int));
+    let none = PRegSet::empty();
+    let insts = vec![
+        (vec![Operand::reg_def(a)], none),
+        (
+            vec![
+                Operand::reg_reuse_def(d, 1),
+                Operand::reg_use(a),
+                Operand::reg_use(a),
+            ],
+            none,
+        ),
+    ];
+    let (v, out) = straight(v, insts, &[d]);
+    let al = out.inst_allocs(&v, Inst::new(1));
+    assert!(out.edits.is_empty() && al[0] == al[1] && al[1] == al[2]);
 }

@@ -157,6 +157,10 @@ enum Need {
     /// Copied into the register before the instruction; being there
     /// already saves the copy.
     Fixed(PReg),
+    /// The input a definition reuses (`OperandConstraint::Reuse`): copied
+    /// into the definition's register before the instruction, from wherever
+    /// it is.
+    Tied,
 }
 
 /// A use: its point, and in one word the operand's index in
@@ -182,7 +186,8 @@ impl Use {
         match self.bits >> 22 & 3 {
             0 => Need::Reg,
             1 => Need::Any,
-            _ => Need::Fixed(PReg::from_index((self.bits >> 24) as usize)),
+            2 => Need::Fixed(PReg::from_index((self.bits >> 24) as usize)),
+            _ => Need::Tied,
         }
     }
 
@@ -191,6 +196,7 @@ impl Use {
             Need::Reg => (0, 0),
             Need::Any => (1, 0),
             Need::Fixed(r) => (2, r.index() as u32),
+            Need::Tied => (3, 0),
         };
         self.bits = self.bits & 0x3f_ffff | tag << 22 | r << 24;
     }
@@ -320,7 +326,7 @@ impl<'a> Ivs<'a> {
 }
 
 /// The uses `next_use` looks for: needing a register, served by one (any
-/// but a constant's definition), wanting a fixed one.
+/// but a constant's definition), wanting a fixed one or tied.
 #[derive(Clone, Copy)]
 enum Want {
     Reg,
@@ -497,7 +503,9 @@ struct Ra {
     snaps: Vec<(Pos, u32)>,
     snap_off: Vec<u32>,
     /// Per use: the index of the first use from it on (in its group) that
-    /// needs a register and that is fixed; past the group's last otherwise.
+    /// needs a register and that is fixed or tied (a constant's tied use is
+    /// neither: it is made in the definition's register); past the group's
+    /// last otherwise.
     next_of: Vec<[u32; 2]>,
     /// Per group (runs by `_off`): its members' definition points, sorted
     /// (a piece may start at one without a move); its members, ascending;
@@ -512,8 +520,12 @@ struct Ra {
     flat_start: Vec<Pos>,
     /// Per value; a group's pieces and slot are its representative's.
     vregs: Vec<VInfo>,
-    /// Each value's group (`build`): itself, or the parameter it joined.
+    /// Each value's group (`build`): itself, or the parameter or the reused
+    /// input it joined.
     rep: Vec<u32>,
+    /// Reused inputs, as (the input's operand, the definition's, the
+    /// instruction's early point).
+    ties: Vec<(u32, u32, Pos)>,
     /// Per group: stored where it goes from a register to the stack, not
     /// after its definitions.
     deferred: Vec<bool>,
@@ -642,6 +654,7 @@ impl Ra {
             flat_start: Vec::new(),
             vregs: Vec::new(),
             rep: Vec::new(),
+            ties: Vec::new(),
             deferred: Vec::new(),
             fixres: [Vec::new(), Vec::new()],
             fixregs: [0; 2],
@@ -666,7 +679,8 @@ impl Ra {
     fn clear(&mut self) {
         clear!(self; order, rank, first, last, lin_block, at_lin, freq, inner, outer, hot_end,
             live_in, anyuse, ivs, own, uses, snaps, snap_off, next_of, defs, defs_off, members,
-            members_off, pieces, flat, flat_off, flat_start, vregs, rep, deferred, clobs, initial,
+            members_off, pieces, flat, flat_off, flat_start, vregs, rep, ties, deferred, clobs,
+            initial,
             unhandled, active, inactive, scratch);
         for l in &mut self.fixres {
             l.clear();
@@ -1102,6 +1116,7 @@ impl Ctx {
                     Need::Reg => "R".to_string(),
                     Need::Any => "A".to_string(),
                     Need::Fixed(r) => format!("F{}", r.hw_enc()),
+                    Need::Tied => "T".to_string(),
                 };
                 let _ = write!(s, " {}{need}", pos(u.pos));
                 k += 1;
