@@ -19,12 +19,21 @@ pub(crate) const THREAD: Gpr = Gpr(25);
 /// (`abi::jit_level`), where stubs without it find it (`RT_OF_LEVEL`).
 pub(crate) const RT: Gpr = Gpr(23);
 pub(crate) const CLOSURE: Gpr = Gpr(24);
-/// Where a level's record keeps the runtime (its x23), from the record.
-pub(crate) const RT_OF_LEVEL: usize = crate::vm::stack::rec::X + 32;
+/// Where a level's record keeps the runtime, from the record.
+pub(crate) const RT_OF_LEVEL: usize = crate::vm::stack::rec::RT;
 const PTR_MASK: u64 = (1 << 48) - 1;
 /// The handler slots loaded at every tail-out.
 pub(crate) const INSN: Gpr = Gpr(20);
 pub(crate) const PC: Gpr = Gpr(21);
+/// A call's argument count, and `insn` for the handler `jit_level` starts;
+/// `pc` for that handler. Not the handler ABI's registers, which hold a
+/// compiled caller's values (`call-protocol.md`).
+pub(crate) const COUNT: Gpr = Gpr(15);
+pub(crate) const LEVEL_PC: Gpr = Gpr(14);
+/// A return's result count and the values' address (the first is in x0
+/// too): read where the return lands, before anything else.
+pub(crate) const NRET: Gpr = Gpr(16);
+pub(crate) const RETS: Gpr = Gpr(17);
 /// Scratch inside one instruction; never allocated.
 pub(crate) const X16: Gpr = Gpr(16);
 pub(crate) const X17: Gpr = Gpr(17);
@@ -196,18 +205,20 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "add x10, x29, x10",
         "ldp x29, x30, [x29]",
         "mov sp, x10",
-        "mov x20, x16",
-        "ldr x23, [x25, #{record}]",
-        "ldr x23, [x23, #{rt_of_level}]",
-        "ldr x24, [x22, #-32]",
-        "and x24, x24, #{ptr_mask}",
-        "ldr x11, [x23, #{level_land}]",
+        "mov x15, x16",
+        "ldr x13, [x25, #{record}]",
+        "ldr x13, [x13, #{rt_of_level}]",
+        "ldr x11, [x13, #{level_land}]",
         "cmp x30, x11",
         "b.eq 3f",
         "adr x16, 4f",
         "mov x17, x22",
         "b {jit_level}",
         "3:",
+        "mov x20, x15",
+        "mov x23, x13",
+        "ldr x24, [x22, #-32]",
+        "and x24, x24, #{ptr_mask}",
         "ldr x30, [x23, #{level_ret}]",
         "4:",
         "b {jit_exit}",
@@ -235,11 +246,12 @@ pub(crate) const RAS_STACK: usize = 1536;
 
 /// Start a level (H6) for compiled code: entered by `bl` or `b` with the
 /// return address in x30, the handler to run in x16, the base of the
-/// level's first frame in x17 and the handler's arguments in x20-x25.
-/// Pushes an entry record keeping x22-x25 (`BASE`, `RT`, `CLOSURE`,
-/// `THREAD`), as the call clobbers every allocatable register, makes it the
-/// thread's, and branches to the handler with x30 = `level_return`. The
-/// level ends in `ret_to_native`.
+/// level's first frame in x17, the handler's `insn` in x15 and `pc` in x14;
+/// its runtime is the level's below, its closure the frame's at x22. Pushes
+/// an entry record keeping x19-x28 and d8-d15 as the compiled code left
+/// them, makes it the thread's, and branches to the handler with x30 =
+/// `level_return`. The level ends in `ret_to_native`, which gives them
+/// back.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn jit_level() {
     core::arch::naked_asm!(
@@ -248,10 +260,22 @@ pub(crate) unsafe extern "C" fn jit_level() {
         "ldr x9, [x25, #{record}]",
         "ldr x10, [x25, #{deep}]",
         "stp x9, x17, [sp, #{prev}]",
-        "str x10, [sp, #{deep_saved}]",
-        "str x22, [sp, #{x} + 24]",
+        "ldr x13, [x9, #{rt}]",
+        "stp x10, x13, [sp, #{deep_saved}]",
+        "stp x19, x20, [sp, #{x}]",
+        "stp x21, x22, [sp, #{x} + 16]",
         "stp x23, x24, [sp, #{x} + 32]",
-        "str x25, [sp, #{x} + 48]",
+        "stp x25, x26, [sp, #{x} + 48]",
+        "stp x27, x28, [sp, #{x} + 64]",
+        "stp d8, d9, [sp, #{d}]",
+        "stp d10, d11, [sp, #{d} + 16]",
+        "stp d12, d13, [sp, #{d} + 32]",
+        "stp d14, d15, [sp, #{d} + 48]",
+        "mov x20, x15",
+        "mov x21, x14",
+        "mov x23, x13",
+        "ldr x24, [x22, #-32]",
+        "and x24, x24, #{ptr_mask}",
         "mov x29, sp",
         "str x29, [x25, #{record}]",
         "sub x9, x29, #{ras}",
@@ -261,7 +285,10 @@ pub(crate) unsafe extern "C" fn jit_level() {
         size = const crate::vm::stack::rec::SIZE,
         prev = const crate::vm::stack::rec::PREV,
         deep_saved = const crate::vm::stack::rec::DEEP,
+        rt = const crate::vm::stack::rec::RT,
         x = const crate::vm::stack::rec::X,
+        d = const crate::vm::stack::rec::D,
+        ptr_mask = const PTR_MASK,
         record = const crate::jit::layout::RECORD,
         deep = const crate::jit::layout::NATIVE_DEEP,
         level_ret = const crate::jit::layout::LEVEL_RET,
@@ -280,7 +307,7 @@ unsafe extern "C" fn jit_level_full() {
         "ldr x9, [x25, #{record}]",
         "ldr x10, [x25, #{deep}]",
         "stp x9, x17, [sp, #{prev}]",
-        "str x10, [sp, #{deep_saved}]",
+        "stp x10, x23, [sp, #{deep_saved}]",
         "stp x19, x20, [sp, #{x}]",
         "stp x21, x22, [sp, #{x} + 16]",
         "stp x23, x24, [sp, #{x} + 32]",
@@ -367,7 +394,8 @@ pub(crate) unsafe extern "C" fn level_return() {
 /// Where a fast entry's failed checks go, and a direct call while its
 /// callee's prototype has no fast entry (`jit::direct_target`). A tail call
 /// from a frame dispatch entered has its landing for a return address:
-/// `enter` runs the call from the header the tail call wrote, in the level.
+/// `enter` runs the call from the header the tail call wrote (the callee in
+/// word 0, the argument count in x15), in the level.
 /// Otherwise on to the caller's slow path.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn direct_miss() {
@@ -379,9 +407,12 @@ pub(crate) unsafe extern "C" fn direct_miss() {
         "b.eq 1f",
         "b {call_miss}",
         "1:",
+        "ldr x24, [x22, #-32]",
+        "and x24, x24, #{ptr_mask}",
         "movz x16, #{tag}, lsl #48",
         "orr x16, x16, x24",
         "str x16, [x22, #-32]",
+        "mov x20, x15",
         "sub x21, x22, #32",
         "mov x22, xzr",
         "ldr x23, [x25, #{record}]",
@@ -393,39 +424,40 @@ pub(crate) unsafe extern "C" fn direct_miss() {
         level_land = const crate::jit::layout::LEVEL_LAND,
         level_ret = const crate::jit::layout::LEVEL_RET,
         tag = const crate::jit::layout::FUNCTION_TAG,
+        ptr_mask = const PTR_MASK,
         call_miss = sym call_miss,
         enter = sym crate::vm::ops::call::enter,
     )
 }
 
 /// `direct_miss` for a call passing its arguments in registers (W4 §2):
-/// the slow path finds them in the callee's slots (x22 its base, x20 their
+/// the slow path finds them in the callee's slots (x22 its base, x15 their
 /// count). A tail call's own branch goes to `direct_miss`, its arguments in
 /// the slots already.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn direct_miss_regs() {
     core::arch::naked_asm!(
-        "cbz x20, 1f",
+        "cbz x15, 1f",
         "str x0, [x22]",
-        "cmp x20, #1",
+        "cmp x15, #1",
         "b.ls 1f",
         "str x1, [x22, #8]",
-        "cmp x20, #2",
+        "cmp x15, #2",
         "b.ls 1f",
         "str x2, [x22, #16]",
-        "cmp x20, #3",
+        "cmp x15, #3",
         "b.ls 1f",
         "str x3, [x22, #24]",
-        "cmp x20, #4",
+        "cmp x15, #4",
         "b.ls 1f",
         "str x4, [x22, #32]",
-        "cmp x20, #5",
+        "cmp x15, #5",
         "b.ls 1f",
         "str x5, [x22, #40]",
-        "cmp x20, #6",
+        "cmp x15, #6",
         "b.ls 1f",
         "str x6, [x22, #48]",
-        "cmp x20, #7",
+        "cmp x15, #7",
         "b.ls 1f",
         "str x7, [x22, #56]",
         "1:",
@@ -437,24 +469,26 @@ pub(crate) unsafe extern "C" fn direct_miss_regs() {
 /// A fast callee's entry checks failed: on to its caller's slow path, which
 /// the caller's site table names by the return address in x30 (tagged or
 /// not), the arguments a register call passed in x0-x7 kept for it to
-/// store (W4 §2). The pinned registers and `insn` are callee-saved.
+/// store (W4 §2), and the argument count in x15.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn call_miss() {
     core::arch::naked_asm!(
-        "stp x0, x1, [sp, #-80]!",
+        "stp x0, x1, [sp, #-96]!",
         "stp x2, x3, [sp, #16]",
         "stp x4, x5, [sp, #32]",
         "stp x6, x7, [sp, #48]",
-        "stp x29, x30, [sp, #64]",
-        "add x29, sp, #64",
+        "str x15, [sp, #64]",
+        "stp x29, x30, [sp, #80]",
+        "add x29, sp, #80",
         "and x0, x30, #~1",
         "bl {target}",
         "mov x16, x0",
-        "ldp x29, x30, [sp, #64]",
+        "ldp x29, x30, [sp, #80]",
+        "ldr x15, [sp, #64]",
         "ldp x6, x7, [sp, #48]",
         "ldp x4, x5, [sp, #32]",
         "ldp x2, x3, [sp, #16]",
-        "ldp x0, x1, [sp], #80",
+        "ldp x0, x1, [sp], #96",
         "br x16",
         target = sym crate::jit::jit_call_miss,
     )
@@ -489,10 +523,12 @@ pub(crate) unsafe extern "C" fn level_enter() {
         ".cfi_offset x28, -{size} + {x} + 72",
         "blr x16",
         // A compiled callee returns its one result in x0 alone.
-        "cbz x20, 1f",
-        "str x0, [x21]",
+        "cbz x16, 1f",
+        "str x0, [x17]",
         "1:",
-        "ldr x23, [sp, #{x} + 32]",
+        "mov x20, x16",
+        "mov x21, x17",
+        "ldr x23, [sp, #{rt}]",
         "ldr x24, [x22, #-32]",
         "and x24, x24, #{ptr_mask}",
         "ldr x30, [x23, #{level_ret}]",
@@ -502,6 +538,7 @@ pub(crate) unsafe extern "C" fn level_enter() {
         ".cfi_endproc",
         size = const crate::vm::stack::rec::SIZE,
         x = const crate::vm::stack::rec::X,
+        rt = const crate::vm::stack::rec::RT,
         ptr_mask = const PTR_MASK,
         level_ret = const crate::jit::layout::LEVEL_RET,
     )
@@ -517,8 +554,8 @@ pub(crate) fn level_land() -> usize {
 
 /// The continuation of a level's first frame: its results go back to the
 /// compiled code that started the level, as a fast callee leaves them (the
-/// first or nil in x0, the count in `insn`, the values in `pc`), with that
-/// code's pinned registers and the level below back.
+/// first or nil in x0, the count in x16, the values' address in x17), with
+/// that code's x19-x28 and d8-d15 and the level below back.
 #[unsafe(naked)]
 #[rustc_align(32)]
 pub(crate) extern "rust-preserve-none" fn ret_to_native<'gc>(
@@ -537,12 +574,21 @@ pub(crate) extern "rust-preserve-none" fn ret_to_native<'gc>(
         "cbz x20, 1f",
         "ldr x0, [x21]",
         "1:",
+        "mov x16, x20",
+        "mov x17, x21",
         "ldr x10, [x9, #{prev}]",
         "ldr x11, [x9, #{deep_saved}]",
         "str x10, [x25, #{record}]",
         "str x11, [x25, #{deep}]",
-        "ldp x22, x23, [x9, #{x} + 24]",
-        "ldp x24, x25, [x9, #{x} + 40]",
+        "ldp x19, x20, [x9, #{x}]",
+        "ldp x21, x22, [x9, #{x} + 16]",
+        "ldp x23, x24, [x9, #{x} + 32]",
+        "ldp x25, x26, [x9, #{x} + 48]",
+        "ldp x27, x28, [x9, #{x} + 64]",
+        "ldp d8, d9, [x9, #{d}]",
+        "ldp d10, d11, [x9, #{d} + 16]",
+        "ldp d12, d13, [x9, #{d} + 32]",
+        "ldp d14, d15, [x9, #{d} + 48]",
         "ldp x29, x30, [x9, #0]",
         "add sp, x9, #{size}",
         "tbnz x30, #0, 2f",
@@ -554,6 +600,7 @@ pub(crate) extern "rust-preserve-none" fn ret_to_native<'gc>(
         prev = const crate::vm::stack::rec::PREV,
         deep_saved = const crate::vm::stack::rec::DEEP,
         x = const crate::vm::stack::rec::X,
+        d = const crate::vm::stack::rec::D,
         record = const crate::jit::layout::RECORD,
         deep = const crate::jit::layout::NATIVE_DEEP,
     )
@@ -594,7 +641,8 @@ pub(crate) unsafe extern "C" fn native_entry() {
 /// `jit_call_native`'s arguments, recording the caller as `native_entry`
 /// does. The switch function either ran the native, whose result goes back,
 /// or names the thread to switch to (H5): this one then waits at its switch
-/// point, `BASE` and `CLOSURE` in the frame, and when switched back to
+/// point, `BASE` and the caller's x19-x28 and d8-d15 in the frame (the
+/// other thread's code leaves its own there), and when switched back to
 /// returns what the landing function makes of it. Switches are branches,
 /// and the stub is entered and returns with branches too (`native_path`),
 /// so the return address stack sees only the Rust calls' pairs: a return
@@ -608,19 +656,19 @@ macro_rules! coro_stub {
             core::arch::naked_asm!(
                 ".cfi_startproc",
                 "stp x29, x30, [x25, #{shim}]",
-                "sub x9, sp, #32",
+                "sub x9, sp, #160",
                 "stp x29, x30, [x9]",
                 "stp x22, x0, [x9, #16]",
                 "mov sp, x9",
-                ".cfi_def_cfa_offset 32",
-                ".cfi_offset x29, -32",
-                ".cfi_offset x30, -24",
-                ".cfi_offset x22, -16",
+                ".cfi_def_cfa_offset 160",
+                ".cfi_offset x29, -160",
+                ".cfi_offset x30, -152",
+                ".cfi_offset x22, -144",
                 "bl {switch}",
                 "cmn x1, #2",
                 "b.eq 1f",
                 ".cfi_remember_state",
-                "ldp x29, x30, [sp], #32",
+                "ldp x29, x30, [sp], #160",
                 ".cfi_def_cfa_offset 0",
                 ".cfi_restore x29",
                 ".cfi_restore x30",
@@ -632,6 +680,14 @@ macro_rules! coro_stub {
                 // (`thread_entry`).
                 "1:",
                 "mov x9, sp",
+                "stp x19, x20, [x9, #32]",
+                "stp x21, x23, [x9, #48]",
+                "stp x24, x26, [x9, #64]",
+                "stp x27, x28, [x9, #80]",
+                "stp d8, d9, [x9, #96]",
+                "stp d10, d11, [x9, #112]",
+                "stp d12, d13, [x9, #128]",
+                "stp d14, d15, [x9, #144]",
                 "ldr x23, [x9, #24]",
                 "add x10, x25, #{tsw}",
                 "adr x11, 2f",
@@ -649,9 +705,17 @@ macro_rules! coro_stub {
                 "ldr x0, [sp, #24]",
                 "bl {landed}",
                 "mov x9, sp",
+                "ldp x19, x20, [x9, #32]",
+                "ldp x21, x23, [x9, #48]",
+                "ldp x24, x26, [x9, #64]",
+                "ldp x27, x28, [x9, #80]",
+                "ldp d8, d9, [x9, #96]",
+                "ldp d10, d11, [x9, #112]",
+                "ldp d12, d13, [x9, #128]",
+                "ldp d14, d15, [x9, #144]",
                 "ldr x22, [x9, #16]",
                 "ldp x29, x30, [x9]",
-                "add sp, x9, #32",
+                "add sp, x9, #160",
                 "br x30",
                 ".cfi_endproc",
                 shim = const crate::jit::layout::SHIM,

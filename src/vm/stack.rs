@@ -188,10 +188,10 @@ pub(crate) struct EntryRecord {
     pub(crate) first: usize,
     /// `ThreadState::native_deep` of the level below.
     pub(crate) deep: usize,
-    _pad: usize,
-    /// x19 to x28 and d8 to d15 of the Rust code that started the bottom
-    /// level; a level compiled code starts keeps only x22 to x25, x22 its
-    /// `BASE` (`abi::jit_level`).
+    /// The runtime, which the level's handlers run with.
+    pub(crate) rt: usize,
+    /// x19 to x28 and d8 to d15 of the code that started the level; x22 is
+    /// compiled code's `BASE` (`abi::jit_level`).
     pub(crate) x: [usize; 10],
     pub(crate) d: [u64; 8],
 }
@@ -204,9 +204,10 @@ pub(crate) mod rec {
     pub(crate) const SIZE: usize = size_of::<EntryRecord>();
     pub(crate) const PREV: usize = offset_of!(EntryRecord, prev);
     pub(crate) const DEEP: usize = offset_of!(EntryRecord, deep);
+    pub(crate) const RT: usize = offset_of!(EntryRecord, rt);
     pub(crate) const X: usize = offset_of!(EntryRecord, x);
     pub(crate) const D: usize = offset_of!(EntryRecord, d);
-    const _: () = assert!(SIZE == 192 && PREV == 16 && X == 48 && D == 128);
+    const _: () = assert!(SIZE == 192 && PREV == 16 && RT == DEEP + 8 && X == 48 && D == 128);
 }
 
 /// The return address of a compiled frame dispatch entered

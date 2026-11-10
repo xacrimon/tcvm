@@ -11,7 +11,8 @@ use crate::env::value::{
 };
 use crate::env::{MtCache, Shape};
 use crate::jit::backend::aarch64::abi::{
-    BASE, CLOSURE, D31, IMAGE_SPILLS, INSN, MAX_SPILLS, PC, RT, THREAD, X16, X17, image_index,
+    BASE, CLOSURE, COUNT, D31, IMAGE_SPILLS, INSN, LEVEL_PC, MAX_SPILLS, NRET, PC, RETS, RT,
+    THREAD, X16, X17, image_index,
 };
 use crate::jit::backend::aarch64::asm::{
     Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
@@ -537,8 +538,8 @@ fn emit_with(
     em.a.bind(em.region_word);
     em.a.emit(0);
     em.a.emit(0);
-    // A compiled caller has written the header, set base, closure and `insn`
-    // (the argument count) as `enter` would, and its `blr` left the return
+    // A compiled caller has written the header, set base and the argument
+    // count (`COUNT`), and its `blr` left the return
     // address in x30; what `enter` would check of a Lua callee is checked
     // here, and a miss goes to the caller's slow path (`abi::direct_miss`).
     // Missing arguments are filled in (`arity_fixup`, I3).
@@ -550,7 +551,7 @@ fn emit_with(
     let fast_label = fast.map(|fe| {
         let l = em.a.new_label();
         em.a.bind(l);
-        em.a.cmp_imm(Sz::X, INSN, fe.num_params as u64);
+        em.a.cmp_imm(Sz::X, COUNT, fe.num_params as u64);
         em.a.b_cond(Cond::Lo, fixup);
         em.a.bind(budget);
         em.a.mov_sp(X16, SP);
@@ -674,7 +675,7 @@ fn emit_with(
             em.window_end(w);
             em.a.cmp(Sz::X, X17, X16);
             em.a.b_cond(Cond::Ls, guards);
-            em.a.ldr_label(INSN, em.region_word);
+            em.a.ldr_label(COUNT, em.region_word);
             em.a.ldr_lit(X16, em.helpers.window as u64);
             em.tail_level();
         }
@@ -731,7 +732,7 @@ fn emit_with(
         for k in 0..l.params {
             em.a.str(Gpr(k), BASE, 8 * k as i32);
         }
-        em.a.ldr_label(INSN, region_word);
+        em.a.ldr_label(COUNT, region_word);
         em.a.ldr_lit(X16, em.helpers.dead_entry as u64);
         em.tail_level();
         em.lazy.insert(0, (em.labels[0], dead));
@@ -746,7 +747,7 @@ fn emit_with(
         if !l.prefix_guards {
             em.close_frame();
         }
-        em.a.ldr_label(INSN, region_word);
+        em.a.ldr_label(COUNT, region_word);
         em.a.ldr_lit(X16, em.helpers.entry_fail as u64);
         em.tail_level();
     }
@@ -758,7 +759,7 @@ fn emit_with(
         em.window_end(em.own_window);
         em.a.cmp(Sz::X, X17, X16);
         em.a.b_cond(Cond::Hi, fast_miss);
-        em.a.add_shift(Sz::X, X17, BASE, INSN, Shift::Lsl, 3);
+        em.a.add_shift(Sz::X, X17, BASE, COUNT, Shift::Lsl, 3);
         em.a.add_imm(Sz::X, Gpr(9), BASE, fe.num_params as u64 * 8);
         em.a.mov_imm(X16, NIL);
         let fill = em.a.new_label();
@@ -1120,7 +1121,7 @@ impl<'a> Em<'a> {
         self.a.add_imm(Sz::X, SP, SP, self.frame as u64);
     }
 
-    /// The fast path of a call whose header is at `base + hdr`, `insn` the
+    /// The fast path of a call whose header is at `base + hdr`, `COUNT` the
     /// argument count: a Lua callee without varargs whose prototype has a
     /// fast entry is called with `blr`, this frame kept, and its `ret` lands
     /// past the resume block's frame push (5.4); a native goes to `native`
@@ -1306,7 +1307,7 @@ impl<'a> Em<'a> {
     /// `check`, `fast_call`'s test with the function in x16 and its
     /// `FN_IS_VARARG` byte in w17 (1 for a vararg Lua callee, which goes to
     /// `slow`, the enum's tag above that), or the constant closure `nc`,
-    /// whose argument count is in x2 already (else in `INSN`). A
+    /// whose argument count is in x2 already (else in `COUNT`). A
     /// plain return lands as a fast callee's; anything else goes on in a
     /// level running `native_act` on the frame, which returns through
     /// `ret_to_native`. Returns the return addresses for `call_site`.
@@ -1341,7 +1342,7 @@ impl<'a> Em<'a> {
         self.a.ldr_lit(Gpr(0), self.helpers.rt);
         self.a.add_imm(Sz::X, Gpr(1), BASE, win);
         if from.is_ok() {
-            self.a.mov(Gpr(2), INSN);
+            self.a.mov(Gpr(2), COUNT);
         }
         let ret = self.a.new_label();
         if switches {
@@ -1358,8 +1359,8 @@ impl<'a> Em<'a> {
         self.a.cmn_imm(Sz::X, Gpr(1), 1);
         if self.resume_reads_count(block) {
             self.a.b_cond(Cond::Eq, outcome);
-            self.a.mov(INSN, Gpr(1));
-            self.a.add_imm(Sz::X, PC, BASE, win);
+            self.a.mov(NRET, Gpr(1));
+            self.a.add_imm(Sz::X, RETS, BASE, win);
             self.a.b(resume);
         } else {
             self.a.b_cond(Cond::Ne, resume);
@@ -1371,10 +1372,9 @@ impl<'a> Em<'a> {
         self.a.ldr_lit(Gpr(10), self.helpers.ret_to_native as u64);
         self.a.orr(Sz::X, Gpr(9), Gpr(9), Gpr(10));
         self.a.str(Gpr(9), BASE, hdr + 8);
-        self.a.mov(INSN, Gpr(0));
-        self.a.add_imm(Sz::X, PC, BASE, hdr as u64);
+        self.a.mov(COUNT, Gpr(0));
+        self.a.add_imm(Sz::X, LEVEL_PC, BASE, hdr as u64);
         self.a.add_imm(Sz::X, X17, BASE, win);
-        self.handler_regs();
         self.a.ldr_lit(X16, self.helpers.native_act as u64);
         self.a.bl_far(self.helpers.level);
         let back = self.a.new_label();
@@ -1384,7 +1384,7 @@ impl<'a> Em<'a> {
     }
 
     /// Whether the resume block after `block` reads the result count and
-    /// the values (`INSN`, `PC`), not just the first result in x0.
+    /// the values (`NRET`, `RETS`), not just the first result in x0.
     fn resume_reads_count(&self, block: usize) -> bool {
         let r = self.v.succs(block)[0].index();
         !matches!(
@@ -1456,7 +1456,8 @@ impl<'a> Em<'a> {
     }
 
     /// The slow path of a call whose header at `hdr` holds the callee's
-    /// value: a level runs it through `enter` (H6.2), with `ret_to_native`
+    /// value: a level runs it through `enter` (H6.2), `COUNT` its `insn` as
+    /// the call left it, with `ret_to_native`
     /// to come back. Returns the address the level returns to, from where
     /// the resume block goes on past its `BASE` (a level's return restores
     /// this frame's).
@@ -1466,9 +1467,8 @@ impl<'a> Em<'a> {
         self.a.str(BASE, BASE, hdr + 16);
         self.a.ldr_lit(X16, pc_after as u64);
         self.a.str(X16, BASE, hdr + 24);
-        self.a.add_imm(Sz::X, PC, BASE, hdr as u64);
+        self.a.add_imm(Sz::X, LEVEL_PC, BASE, hdr as u64);
         self.a.add_imm(Sz::X, X17, BASE, hdr as u64 + 32);
-        self.handler_regs();
         self.a.ldr_lit(X16, self.helpers.enter as u64);
         self.a.bl_far(self.helpers.level);
         let back = self.a.new_label();
@@ -1477,14 +1477,18 @@ impl<'a> Em<'a> {
         back
     }
 
-    /// The frame is closed and `x16` holds the handler that goes on: one
-    /// dispatch entered goes on in its level; a fast-called one starts a
-    /// level returning to its caller, its header made to return through it.
+    /// The frame is closed and `x16` holds the handler that goes on, its
+    /// `insn` in `COUNT` and `pc` in `LEVEL_PC`: one dispatch entered goes
+    /// on in its level, no compiled caller's values in the handler ABI's
+    /// registers; a fast-called one starts a level returning to its caller,
+    /// its header made to return through it.
     fn tail_level(&mut self) {
-        self.handler_regs();
         self.a.ldr_lit(X17, self.helpers.level_land);
         self.a.cmp(Sz::X, LR, X17);
         self.a.b_cond(Cond::Ne, self.level_tail);
+        self.a.mov(INSN, COUNT);
+        self.a.mov(PC, LEVEL_PC);
+        self.handler_regs();
         self.a.ldr_lit(LR, self.helpers.level_ret);
         self.a.br(X16);
     }
@@ -1520,7 +1524,7 @@ impl<'a> Em<'a> {
     }
 
     /// The handler ABI's runtime and closure registers, for code going on
-    /// into a handler or a level: the frame's closure from its header.
+    /// into a handler: the frame's closure from its header.
     fn handler_regs(&mut self) {
         self.a.ldr_lit(RT, self.helpers.rt);
         self.a.ldr(CLOSURE, BASE, -32);
@@ -2784,7 +2788,7 @@ impl<'a> Em<'a> {
                 let count = if matches!(known, Some(Known::Native(_))) {
                     Gpr(2)
                 } else {
-                    INSN
+                    COUNT
                 };
                 if nargs == u8::MAX {
                     let n = self.r(i, 0);
@@ -2860,17 +2864,17 @@ impl<'a> Em<'a> {
             }
             Dispatch { op, word, pc_after } => {
                 self.close_frame();
-                self.a.ldr_lit(INSN, word);
-                self.a.ldr_lit(PC, pc_after as u64);
+                self.a.ldr_lit(COUNT, word);
+                self.a.ldr_lit(LEVEL_PC, pc_after as u64);
                 self.a.ldr_lit(X16, self.helpers.rt);
                 self.a.ldr(X16, X16, op as i32 * 8);
                 self.tail_level();
             }
             TailEnter { nargs, known } => {
-                // The callee is the frame's closure from here, which frees
-                // `insn` and `pc` (allocatable in the body) as scratch.
+                // The callee goes in the frame's header: the handler ABI's
+                // registers hold the caller's values at a tail-out.
                 let f = self.r(i, 0);
-                self.a.mov(CLOSURE, f);
+                let nil = if f == Gpr(9) { Gpr(10) } else { Gpr(9) };
                 let target = known.and_then(|(proto, nparams)| {
                     Some((self.direct_target(proto, nparams, false)?, nparams))
                 });
@@ -2886,21 +2890,21 @@ impl<'a> Em<'a> {
                     }
                     self.a.ldr(X16, BASE, -32);
                     self.a.and_imm(Sz::X, X16, X16, !crate::vm::frame::PTR_MASK);
-                    self.a.orr(Sz::X, X16, X16, CLOSURE);
+                    self.a.orr(Sz::X, X16, X16, f);
                     self.a.str(X16, BASE, -32);
-                    self.a.movz(Sz::X, INSN, nargs.max(nparams) as u16, 0);
+                    self.a.movz(Sz::X, COUNT, nargs.max(nparams) as u16, 0);
                     self.close_frame();
                     self.branch_to(target, false);
                     return Ok(());
                 }
                 let (top, done) = (self.a.new_label(), self.a.new_label());
-                self.a.ldrb(X16, CLOSURE, layout::FN_NUM_PARAMS as i32);
+                self.a.ldrb(X16, f, layout::FN_NUM_PARAMS as i32);
                 self.a.movz(Sz::X, X17, nargs as u16, 0);
-                self.a.mov_imm(INSN, NIL);
+                self.a.mov_imm(nil, NIL);
                 self.a.bind(top);
                 self.a.cmp(Sz::X, X17, X16);
                 self.a.b_cond(Cond::Hs, done);
-                self.a.str_idx(INSN, BASE, X17, Extend::Lsl, true);
+                self.a.str_idx(nil, BASE, X17, Extend::Lsl, true);
                 self.a.add_imm(Sz::X, X17, X17, 1);
                 self.a.b(top);
                 self.a.bind(done);
@@ -2908,24 +2912,24 @@ impl<'a> Em<'a> {
                 // where its caller expects.
                 self.a.ldr(X16, BASE, -32);
                 self.a.and_imm(Sz::X, X16, X16, !crate::vm::frame::PTR_MASK);
-                self.a.orr(Sz::X, X16, X16, CLOSURE);
+                self.a.orr(Sz::X, X16, X16, f);
                 self.a.str(X16, BASE, -32);
                 // A callee with a fast entry is entered there with this
                 // frame popped, so it returns where this one would have: to a
                 // compiled caller's `ret` or through the header (5.5).
                 let dispatch = self.a.new_label();
-                self.a.ldr(X16, CLOSURE, layout::FN_PROTO as i32);
+                self.a.ldr(X16, f, layout::FN_PROTO as i32);
                 self.a.ldr(X16, X16, layout::PROTO_FAST as i32);
                 self.a.cbz(Sz::X, X16, dispatch);
-                self.a.mov(INSN, X17);
+                self.a.mov(COUNT, X17);
                 self.close_frame();
                 self.a.br(X16);
                 self.a.bind(dispatch);
                 self.close_frame();
-                self.a.ldr(X16, CLOSURE, layout::FN_CODE as i32);
-                self.a.ldr(INSN, X16, 0);
-                self.a.add_imm(Sz::X, PC, X16, 8);
-                self.a.and_imm(Sz::X, X17, INSN, 0xff);
+                self.a.ldr(X16, f, layout::FN_CODE as i32);
+                self.a.ldr(COUNT, X16, 0);
+                self.a.add_imm(Sz::X, LEVEL_PC, X16, 8);
+                self.a.and_imm(Sz::X, X17, COUNT, 0xff);
                 self.a.ldr_lit(X16, self.helpers.rt);
                 self.a.ldr_idx(X16, X16, X17, Extend::Lsl, true);
                 self.tail_level();
@@ -2956,7 +2960,8 @@ impl<'a> Em<'a> {
                     0 => {
                         // The results to `R[a..]` (I5): all of them, `top`
                         // past them, or `c - 1` filled out with nil. Up to
-                        // three here, more through the helper. They come from
+                        // three here, more through the helper (x9 and x10
+                        // are free: nothing is in a register). They come from
                         // at least a header above `R[a]`, so copying up is
                         // safe, and reading past them stays in the stack.
                         // The first is in x0: a compiled callee returning one
@@ -2965,53 +2970,54 @@ impl<'a> Em<'a> {
                             (self.a.new_label(), self.a.new_label(), self.a.new_label());
                         let at = a as i32 * 8;
                         if c == 0 {
-                            self.a.cmp_imm(Sz::X, INSN, 3);
+                            self.a.cmp_imm(Sz::X, NRET, 3);
                             self.a.b_cond(Cond::Hi, helper);
                             for k in 0..3 {
-                                self.a.cmp_imm(Sz::X, INSN, k);
+                                self.a.cmp_imm(Sz::X, NRET, k);
                                 self.a.b_cond(Cond::Eq, top);
                                 if k == 0 {
                                     self.a.str(Gpr(0), BASE, at);
                                 } else {
-                                    self.a.ldr(X16, PC, 8 * k as i32);
-                                    self.a.str(X16, BASE, at + 8 * k as i32);
+                                    self.a.ldr(Gpr(9), RETS, 8 * k as i32);
+                                    self.a.str(Gpr(9), BASE, at + 8 * k as i32);
                                 }
                             }
                             self.a.bind(top);
-                            self.a.ldr(X16, THREAD, layout::THREAD_STACK as i32);
-                            self.a.add_imm(Sz::X, X17, BASE, at as u64);
-                            self.a.sub(Sz::X, X17, X17, X16);
-                            self.a.add_shift(Sz::X, X17, INSN, X17, Shift::Lsr, 3);
-                            self.a.str(X17, THREAD, layout::THREAD_TOP as i32);
+                            self.a.ldr(Gpr(9), THREAD, layout::THREAD_STACK as i32);
+                            self.a.add_imm(Sz::X, Gpr(10), BASE, at as u64);
+                            self.a.sub(Sz::X, Gpr(10), Gpr(10), Gpr(9));
+                            self.a
+                                .add_shift(Sz::X, Gpr(10), NRET, Gpr(10), Shift::Lsr, 3);
+                            self.a.str(Gpr(10), THREAD, layout::THREAD_TOP as i32);
                             self.a.b(done);
                         } else if c <= 4 {
                             // All `c - 1` there (a callee's count rarely
                             // varies): copied; else filled out of line.
                             let n = (c - 1) as u64;
                             let fill = self.a.new_label();
-                            self.a.cmp_imm(Sz::X, INSN, n);
+                            self.a.cmp_imm(Sz::X, NRET, n);
                             self.a.b_cond(Cond::Lo, fill);
                             for k in 0..n {
                                 if k == 0 {
                                     self.a.str(Gpr(0), BASE, at);
                                 } else {
-                                    self.a.ldr(X16, PC, 8 * k as i32);
-                                    self.a.str(X16, BASE, at + 8 * k as i32);
+                                    self.a.ldr(Gpr(9), RETS, 8 * k as i32);
+                                    self.a.str(Gpr(9), BASE, at + 8 * k as i32);
                                 }
                             }
                             self.a.b(done);
                             self.ool.push(Box::new(move |em: &mut Em<'_>| {
                                 em.a.bind(fill);
-                                em.a.mov_imm(X17, NIL);
+                                em.a.mov_imm(Gpr(10), NIL);
                                 for k in 0..n {
                                     if k == 0 {
-                                        em.a.mov(X16, Gpr(0));
+                                        em.a.mov(Gpr(9), Gpr(0));
                                     } else {
-                                        em.a.ldr(X16, PC, 8 * k as i32);
+                                        em.a.ldr(Gpr(9), RETS, 8 * k as i32);
                                     }
-                                    em.a.cmp_imm(Sz::X, INSN, k);
-                                    em.a.csel(Sz::X, X16, X16, X17, Cond::Hi);
-                                    em.a.str(X16, BASE, at + 8 * k as i32);
+                                    em.a.cmp_imm(Sz::X, NRET, k);
+                                    em.a.csel(Sz::X, Gpr(9), Gpr(9), Gpr(10), Cond::Hi);
+                                    em.a.str(Gpr(9), BASE, at + 8 * k as i32);
                                 }
                                 em.a.b(done);
                             }));
@@ -3019,14 +3025,14 @@ impl<'a> Em<'a> {
                         self.a.bind(helper);
                         // The helper reads the first result from memory too.
                         let first = self.a.new_label();
-                        self.a.cbz(Sz::X, INSN, first);
-                        self.a.str(Gpr(0), PC, 0);
+                        self.a.cbz(Sz::X, NRET, first);
+                        self.a.str(Gpr(0), RETS, 0);
                         self.a.bind(first);
                         // Land through the helper: (rt, thread, base, a, values, nret, c).
                         self.a.ldr_lit(Gpr(0), self.helpers.rt);
                         self.a.mov(Gpr(1), THREAD);
-                        self.a.mov(Gpr(4), PC);
-                        self.a.mov(Gpr(5), INSN);
+                        self.a.mov(Gpr(4), RETS);
+                        self.a.mov(Gpr(5), NRET);
                         self.a.mov(Gpr(2), BASE);
                         self.a.movz(Sz::X, Gpr(3), a as u16, 0);
                         self.a.movz(Sz::X, Gpr(6), c as u16, 0);
@@ -3039,9 +3045,9 @@ impl<'a> Em<'a> {
                         let done = self.a.new_label();
                         let d1 = self.r(i, 1);
                         self.a.mov_imm(d1, NIL);
-                        self.a.cmp_imm(Sz::X, INSN, 2);
+                        self.a.cmp_imm(Sz::X, NRET, 2);
                         self.a.b_cond(Cond::Lo, done);
-                        self.a.ldr(d1, PC, 8);
+                        self.a.ldr(d1, RETS, 8);
                         self.a.bind(done);
                     }
                 }
@@ -3057,7 +3063,7 @@ impl<'a> Em<'a> {
                     let at = if k == 0 { h } else { h + 24 + 8 * k as i32 };
                     self.a.str(v, BASE, at);
                 }
-                self.a.movz(Sz::X, INSN, nargs as u16, 0);
+                self.a.movz(Sz::X, COUNT, nargs as u16, 0);
                 let (slow, native) = (self.a.new_label(), self.a.new_label());
                 let (ret, deep) = self.fast_call(h, slow, native);
                 self.fall_into_resume(block, next);
@@ -3083,8 +3089,8 @@ impl<'a> Em<'a> {
                     self.a.ldr(Gpr(0), BASE, a as i32 * 8);
                 }
                 self.close_frame();
-                self.a.movz(Sz::X, INSN, n as u16, 0);
-                self.a.add_imm(Sz::X, PC, BASE, a as u64 * 8);
+                self.a.movz(Sz::X, NRET, n as u16, 0);
+                self.a.add_imm(Sz::X, RETS, BASE, a as u64 * 8);
                 let deep = self.a.new_label();
                 self.a.tbnz(LR, 0, deep);
                 self.a.ret();
