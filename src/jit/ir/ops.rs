@@ -495,6 +495,22 @@ pub(crate) enum ExitTag {
 }
 
 impl ExitTag {
+    /// Whether an exit's feedback reads its site's operands (their kinds, a
+    /// receiver's shape, a callee), which a moved exit's blame carries. The
+    /// others' operands were guarded already or tell nothing.
+    pub(crate) fn blames_operands(self) -> bool {
+        matches!(
+            self,
+            ExitTag::Type
+                | ExitTag::Shape
+                | ExitTag::Const
+                | ExitTag::Mm
+                | ExitTag::NeverRan
+                | ExitTag::Arg
+                | ExitTag::ArgCmp
+        )
+    }
+
     pub(crate) fn widenable(self) -> bool {
         matches!(
             self,
@@ -1044,6 +1060,17 @@ impl Op {
             Op::TabASize | Op::TabArray => Some(ARR_SIZE),
             _ => None,
         }
+    }
+
+    /// Whether running the instruction twice differs from running it once:
+    /// a write, a call, a leave. An allocation is none, nothing seeing the
+    /// object before a write; `SIDE_EFFECT` only pins a parameter, a resume
+    /// and a lazy exit. A checkpoint ends with one (`Builder::snap_before`).
+    pub(crate) fn side_effect(self) -> bool {
+        let e = self.effects();
+        !matches!(self, Op::Param(_) | Op::Resume { .. } | Op::LazyExit)
+            && (!e.writes.difference(Mem::GC).is_empty()
+                || e.flags.intersects(Flags::SIDE_EFFECT | Flags::TAILOUT))
     }
 
     pub(crate) fn is_terminator(self) -> bool {

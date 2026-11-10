@@ -29,6 +29,8 @@ pub(crate) struct LExit {
     pub(crate) tag: ExitTag,
     /// `(register, rep, source)`.
     pub(crate) entries: Vec<(u8, SRep, Src)>,
+    /// A moved exit's blame entries, by the blamed instruction's registers.
+    pub(crate) blame: Vec<(u8, SRep, Src)>,
     /// The VCode instruction that exits, once lowered.
     pub(crate) inst: Option<usize>,
     /// Whether `TCVM_JIT_DEOPT_ALL` may take it where it is first reached:
@@ -37,7 +39,7 @@ pub(crate) struct LExit {
     pub(crate) forced: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Src {
     /// The `k`th snapshot operand of the exiting instruction.
     Operand(u16),
@@ -981,56 +983,30 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let d = &self.f.insts[i.idx()];
         debug_assert!(d.snap != NO_SNAP, "{:?} exits without a snapshot", d.op);
         let s = self.f.snaps[d.snap as usize];
+        let f = self.f;
         let mut ops: Vec<Operand> = Vec::new();
         let mut seen: Vec<(VReg, u16)> = Vec::new();
         let mut entries = Vec::new();
-        for &(r, v) in self.f.entries(d.snap) {
+        for &(r, v) in f.entries(d.snap) {
             // A call's kept value, in a snapshot an exit shares.
             if r == crate::jit::ir::KEPT {
                 continue;
             }
-            // Boxes in snapshots are the exit's work.
-            let v = match self.f.def_op(v) {
-                Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
-                _ => v,
-            };
-            let rep = self.reg_rep(v);
-            if let Some(k) = self.const_word(v) {
-                entries.push((r, SRep::Val, Src::Const(k)));
-                continue;
+            let (rep, src) = self.exit_src(v, &mut ops, &mut seen);
+            // A home load's slot holds its own register already.
+            if src != Src::Slot(r) {
+                entries.push((r, rep, src));
             }
-            // A home load's slot holds it here: nothing to write for its
-            // own register, a copy within the frame for another.
-            if let Some(s) = self.home_load(v) {
-                if s != r {
-                    entries.push((r, srep(rep), Src::Slot(s)));
-                }
-                continue;
-            }
-            let vr = self.vr(v);
-            let k = match seen.iter().find(|(x, _)| *x == vr) {
-                Some(&(_, k)) => k,
-                None => {
-                    let k = ops.len() as u16;
-                    // Late: the instruction may write its result or call
-                    // before it exits, and the value must survive that.
-                    ops.push(Operand::new(
-                        vr,
-                        crate::jit::backend::reg::OperandConstraint::Any,
-                        crate::jit::backend::reg::OperandKind::Use,
-                        crate::jit::backend::reg::OperandPos::Late,
-                    ));
-                    seen.push((vr, k));
-                    k
-                }
-            };
-            entries.push((r, srep(rep), Src::Operand(k)));
+        }
+        let mut blame = Vec::new();
+        for &(r, v) in f.blame_entries(i) {
+            let (rep, src) = self.exit_src(v, &mut ops, &mut seen);
+            blame.push((r, rep, src));
         }
         let pc = s.pc;
         let kind = s.kind;
         let tag = d.tag;
         let frames = self.snap_frames(s.frame);
-        let f = self.f;
         let store_failed = d.op == Op::GuardFalse
             && f.def_inst(f.args(i)[0]).is_some_and(|c| {
                 f.op(c) == Op::SameBits
@@ -1041,22 +1017,64 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         self.exits.push(LExit {
             pc,
             frames,
-            site: self.f.exit_sites.get(&i).copied(),
+            site: (d.blame != NO_SNAP).then(|| self.f.exit_site(i)),
             frame: s.frame,
             kind,
             tag,
             entries,
+            blame,
             inst: None,
             forced: !store_failed,
         });
         (self.exits.len() as u32 - 1, ops)
     }
 
+    /// Where an exit finds `v`: a constant, a home load's slot, or `v`'s
+    /// register as one of the exit's operands `ops` (`seen`: those in).
+    fn exit_src(
+        &mut self,
+        v: Val,
+        ops: &mut Vec<Operand>,
+        seen: &mut Vec<(VReg, u16)>,
+    ) -> (SRep, Src) {
+        // Boxes in snapshots are the exit's work.
+        let v = match self.f.def_op(v) {
+            Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
+            _ => v,
+        };
+        if let Some(k) = self.const_word(v) {
+            return (SRep::Val, Src::Const(k));
+        }
+        let rep = srep(self.reg_rep(v));
+        if let Some(s) = self.home_load(v) {
+            return (rep, Src::Slot(s));
+        }
+        let vr = self.vr(v);
+        let k = match seen.iter().find(|(x, _)| *x == vr) {
+            Some(&(_, k)) => k,
+            None => {
+                let k = ops.len() as u16;
+                // Late: the instruction may write its result or call
+                // before it exits, and the value must survive that.
+                ops.push(Operand::new(
+                    vr,
+                    crate::jit::backend::reg::OperandConstraint::Any,
+                    crate::jit::backend::reg::OperandKind::Use,
+                    crate::jit::backend::reg::OperandPos::Late,
+                ));
+                seen.push((vr, k));
+                k
+            }
+        };
+        (rep, Src::Operand(k))
+    }
+
     /// The boxed word of a constant value.
     fn const_word(&self, v: Val) -> Option<u64> {
         match self.f.def_op(v)? {
             Op::KVal(b) => Some(b),
-            Op::KObj(p) => Some(self.f.pool[p as usize].to_raw()),
+            // A pointer constant in a blame stands for the object.
+            Op::KObj(p) | Op::KPtr(p) => Some(self.f.pool[p as usize].to_raw()),
             Op::KI32(n) => Some(Value::small(n).to_raw()),
             Op::KF64(b) => Some(Value::float(f64::from_bits(b)).to_raw()),
             Op::KB1(c) => Some(Value::boolean(c).to_raw()),

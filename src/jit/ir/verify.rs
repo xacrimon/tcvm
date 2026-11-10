@@ -139,6 +139,12 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
             for &(_, v) in f.snap_entries(i) {
                 check_use(v, b, k, "snapshot", i)?;
             }
+            for &(_, v) in f.blame_entries(i) {
+                check_use(v, b, k, "blame", i)?;
+            }
+            if d.blame != NO_SNAP && d.snap == NO_SNAP {
+                return Err(format!("i{} has a blame but no snapshot", i.0));
+            }
             for e in f.edges(i) {
                 let tb = &f.blocks[e.target.idx()];
                 if tb.dead {
@@ -269,7 +275,7 @@ pub(crate) fn live_in(f: &Func<'_>, rpo: &[Block]) -> Vec<ValSet> {
                 for &a in f.args(i) {
                     cur.insert(a.idx());
                 }
-                for &(_, v) in f.snap_entries(i) {
+                for &(_, v) in f.snap_entries(i).iter().chain(f.blame_entries(i)) {
                     cur.insert(v.idx());
                 }
             }

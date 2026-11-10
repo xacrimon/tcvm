@@ -122,6 +122,11 @@ pub(crate) struct InstData {
     pub(crate) e0: u32,
     pub(crate) en: u8,
     pub(crate) snap: u32,
+    /// A moved exit's blame: the pc and frame of the
+    /// instruction it failed for, with the values of the registers that
+    /// instruction reads by its own numbering, or constants of their kinds
+    /// (`Builder::blame`); `NO_SNAP` for an exit at its snapshot's pc.
+    pub(crate) blame: u32,
     pub(crate) tag: ExitTag,
     pub(crate) block: Block,
 }
@@ -185,6 +190,10 @@ pub(crate) struct ExitSite {
     pub(crate) pc: u32,
     pub(crate) frame: u32,
 }
+
+/// A blame entry's register for the value the exit's guard tested: a shape
+/// guard's table (an upvalue's is in no register).
+pub(crate) const BLAME_TESTED: u8 = u8::MAX;
 
 /// The register of a call snapshot's entry for a value no register holds,
 /// which the call keeps in the frame (C1): past every region slot (the
@@ -304,9 +313,6 @@ pub(crate) struct Func<'gc> {
     /// The region slots closures capture, of every frame the region inlines,
     /// which a call may write through their cells.
     pub(crate) captured: crate::jit::build::cfg::RegSet,
-    /// Exits whose miss belongs to another pc than their snapshot's: a
-    /// guard hoisted out of a loop (E2), and the access it stands for.
-    pub(crate) exit_sites: crate::jit::FastMap<Inst, ExitSite>,
     pub(crate) inline_frames: Vec<InlineFrame>,
     /// The slots past the region's base its inlined frames, staged calls
     /// and reads up to `top` take, which every entry makes sure of once
@@ -400,7 +406,6 @@ impl<'gc> Func<'gc> {
             boundaries: false,
             call_homes: Default::default(),
             captured: Default::default(),
-            exit_sites: Default::default(),
             inline_frames: Vec::new(),
             window: 0,
             protos: Vec::new(),
@@ -705,6 +710,7 @@ impl<'gc> Func<'gc> {
             e0: 0,
             en: 0,
             snap: snap.map_or(NO_SNAP, |s| s.0),
+            blame: NO_SNAP,
             tag,
             block: Block(u32::MAX),
         });
@@ -840,7 +846,6 @@ impl<'gc> Func<'gc> {
         Snap(self.snaps.len() as u32 - 1)
     }
 
-    /// A new snapshot with `s`'s frame and its values mapped by `map`.
     /// The site of an exit with snapshot `s` that stays where it is.
     pub(crate) fn snap_site(&self, s: Snap) -> ExitSite {
         let d = self.snaps[s.0 as usize];
@@ -850,6 +855,7 @@ impl<'gc> Func<'gc> {
         }
     }
 
+    /// A new snapshot with `s`'s frame and its values mapped by `map`.
     pub(crate) fn map_snap(&mut self, s: Snap, mut map: impl FnMut(Val) -> Val) -> Snap {
         let d = self.snaps[s.idx()];
         let start = self.snap_pool.len();
@@ -887,10 +893,48 @@ impl<'gc> Func<'gc> {
         }
     }
 
+    /// The blame entries of `inst`, if it is a moved exit.
+    #[inline]
+    pub(crate) fn blame_entries(&self, inst: Inst) -> &[(u8, Val)] {
+        match self.insts[inst.idx()].blame {
+            NO_SNAP => &[],
+            s => self.entries(s),
+        }
+    }
+
+    /// The site whose feedback an exit of `inst` records: its blame's, else
+    /// its snapshot's.
+    pub(crate) fn exit_site(&self, inst: Inst) -> ExitSite {
+        let d = &self.insts[inst.idx()];
+        self.snap_site(Snap(if d.blame != NO_SNAP { d.blame } else { d.snap }))
+    }
+
+    /// The blame of `inst`'s exit taken elsewhere (a guard moved out of a
+    /// loop, or made from it): its site, with the entries `keep` admits
+    /// there.
+    pub(crate) fn moved_blame(&mut self, inst: Inst, keep: impl Fn(&Self, Val) -> bool) -> u32 {
+        let site = self.exit_site(inst);
+        let operands = self.insts[inst.idx()].tag.blames_operands();
+        let kept: Vec<(u8, Val)> = (self.blame_entries(inst).iter())
+            .copied()
+            .filter(|&(_, v)| operands && keep(self, v))
+            .collect();
+        let from = self.snap_pool.len();
+        self.snap_pool.extend_from_slice(&kept);
+        let s = self.finish_snap(site.frame, site.pc, ExitKind::Before, from);
+        s.0
+    }
+
+    /// `inst` exits no more: its snapshot and blame go.
+    pub(crate) fn drop_exit(&mut self, inst: Inst) {
+        let d = &mut self.insts[inst.idx()];
+        (d.snap, d.blame) = (NO_SNAP, NO_SNAP);
+    }
+
     // --- uses -------------------------------------------------------------------
 
-    /// Make `inst` use `r` where it uses `v`; a snapshot it may share is
-    /// copied first.
+    /// Make `inst` use `r` where it uses `v`; a snapshot or blame it may
+    /// share is copied first.
     pub(crate) fn replace_uses(&mut self, inst: Inst, v: Val, r: Val) {
         for a in self.args_mut(inst) {
             if *a == v {
@@ -909,9 +953,15 @@ impl<'gc> Func<'gc> {
             let ns = self.map_snap(Snap(s), |x| if x == v { r } else { x });
             self.insts[inst.idx()].snap = ns.0;
         }
+        if self.blame_entries(inst).iter().any(|e| e.1 == v) {
+            let s = self.insts[inst.idx()].blame;
+            let ns = self.map_snap(Snap(s), |x| if x == v { r } else { x });
+            self.insts[inst.idx()].blame = ns.0;
+        }
     }
 
-    /// Every value `inst` uses: operands, edge arguments, snapshot entries.
+    /// Every value `inst` uses: operands, edge arguments, snapshot and blame
+    /// entries.
     pub(crate) fn for_each_use(&self, inst: Inst, mut f: impl FnMut(Val)) {
         for &a in self.args(inst) {
             f(a);
@@ -922,6 +972,9 @@ impl<'gc> Func<'gc> {
             }
         }
         for &(_, v) in self.snap_entries(inst) {
+            f(v);
+        }
+        for &(_, v) in self.blame_entries(inst) {
             f(v);
         }
     }

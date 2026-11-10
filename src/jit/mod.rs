@@ -16,7 +16,7 @@ pub(crate) mod state;
 mod tests;
 
 use crate::dmm::Gc;
-use crate::env::function::LuaFn;
+use crate::env::function::{LuaFn, Prototype};
 use crate::env::value::Value;
 use crate::instruction::{Instruction, Op};
 use crate::jit::ir::ExitKind;
@@ -57,7 +57,7 @@ handler! {
     /// budget.
     op fn op_jit_loop {
         if std::hint::unlikely(below_budget(thread!())) {
-            let word = original_of(closure, insn);
+            let word = original_of(closure.proto, insn);
             let h = rt.handler(word.opcode());
             tail!(h, insn = Slot::insn(word))
         }
@@ -136,6 +136,21 @@ handler! {
                 }
             }
         }
+        // A moved exit's blame, from the frame as the exit finds it.
+        let blame: Vec<(u8, Value<'gc>)> = region.blame(e).map_or_else(Vec::new, |b| {
+            (b.entries())
+                .map(|s| {
+                    let w = match s.loc {
+                        Loc::Reg(i) => img[i as usize].get(),
+                        Loc::Spill(i) => img[crate::jit::state::IMAGE_SPILLS + i as usize].get(),
+                        // SAFETY: a slot of the region's window.
+                        Loc::Slot(r) => unsafe { *(base.add(r as usize) as *const u64) },
+                        loc => const_word(region, loc),
+                    };
+                    (s.reg, entry_value(mc, s.rep, w))
+                })
+                .collect()
+        });
         // A slot one entry reads another may write: those are read first.
         let mut held = [const { std::mem::MaybeUninit::<u64>::uninit() }; 256];
         for s in snap.entries() {
@@ -212,7 +227,7 @@ handler! {
         if region.invalidated.get() {
             retire_invalidated(rt, region_closure, region);
         }
-        on_exit(rt, region_closure, closure, base, region, e, snap.kind, snap.pc);
+        on_exit(rt, region_closure, closure, base, region, e, snap.kind, snap.pc, &blame);
         let at = if snap.kind == ExitKind::Before { snap.pc } else { snap.pc + 1 };
         let resume = unsafe { closure.code.add(at as usize) };
         if e.tag == crate::jit::ir::ops::ExitTag::Gc {
@@ -220,7 +235,7 @@ handler! {
         }
         let mut word = unsafe { *resume };
         if word.is_jit_word() {
-            word = original_of(closure, word);
+            word = original_of(closure.proto, word);
         }
         pc = unsafe { resume.add(1) };
         let h = rt.handler(word.opcode());
@@ -361,7 +376,9 @@ fn entry_site(closure: LuaFn<'_>, site: u32, word: Instruction) -> Option<u32> {
             let t = (site as i64 + 1 + word.branch_offset() as i64) as u32;
             match code(t - 1) {
                 h if h.op() == Op::LOOP => t - 1,
-                h if h.is_jit_word() && original_of(closure, h).op() == Op::LOOP => return None,
+                h if h.is_jit_word() && original_of(closure.proto, h).op() == Op::LOOP => {
+                    return None;
+                }
                 _ => site,
             }
         }
@@ -381,19 +398,15 @@ fn entry_word<'gc>(
     let site = unsafe { closure.code.add(region.entry_pc as usize) };
     let word = unsafe { *site };
     if word.is_jit_word() && !enter {
-        (site, original_of(closure, word))
+        (site, original_of(closure.proto, word))
     } else {
         (site, word)
     }
 }
 
 /// The word a JIT word replaced.
-fn original_of(closure: LuaFn<'_>, word: Instruction) -> Instruction {
-    let state = closure
-        .proto
-        .jit
-        .get()
-        .expect("a JIT word without a JIT state");
+fn original_of(proto: Gc<'_, Prototype<'_>>, word: Instruction) -> Instruction {
+    let state = proto.jit.get().expect("a JIT word without a JIT state");
     let st = state.borrow();
     st.entries
         .iter()
@@ -599,12 +612,7 @@ fn install<'gc>(
 
 /// Set the prototype's fast entry (0 for none) and point the direct calls
 /// of it there (`direct_target`); `st` is its state.
-fn set_fast<'gc>(
-    ctx: Context<'gc>,
-    proto: &crate::env::function::Prototype<'gc>,
-    st: &mut JitState<'gc>,
-    entry: usize,
-) {
+fn set_fast<'gc>(ctx: Context<'gc>, proto: &Prototype<'gc>, st: &mut JitState<'gc>, entry: usize) {
     proto.jit_fast.set(entry);
     st.callers
         .retain(|&(r, off, regs)| match r.upgrade(ctx.mutation()) {
@@ -715,7 +723,8 @@ fn retire_invalidated<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, region: &Regi
 /// What an exit leaves behind: the operand kinds the guard saw, the count,
 /// and a recompile request when the exit is hot. `closure` and `base` are
 /// the innermost frame's, an inlined callee's when the exit is in its body
-/// (E1), whose sites the feedback is for; `region_closure` the region's.
+/// (E1); `region_closure` the region's. The feedback is for the exit's site,
+/// whose operands a moved exit's `blame` holds.
 #[allow(clippy::too_many_arguments)]
 fn on_exit<'gc>(
     ctx: Context<'gc>,
@@ -726,18 +735,24 @@ fn on_exit<'gc>(
     e: &ExitInfo,
     kind: ExitKind,
     pc: u32,
+    blame: &[(u8, Value<'gc>)],
 ) {
     use crate::jit::ir::ops::ExitTag;
+    let (proto, at) = (site_proto(region, e, closure), e.site().unwrap_or(pc));
+    let ops = match e.site() {
+        None => Operands::Frame(closure, base),
+        Some(_) => Operands::Blame(blame),
+    };
     // The interpreter raises on such arguments: the code is as it should be.
     if matches!(e.tag, ExitTag::Arg | ExitTag::ArgCmp)
         && kind == ExitKind::Before
-        && call_arg_raises(closure, base, pc, e.tag == ExitTag::ArgCmp)
+        && call_arg_raises(proto, at, ops, e.tag == ExitTag::ArgCmp)
     {
         return;
     }
-    // A `Before` exit's operands are in their home slots; the other kinds
-    // follow a completed instruction and have no failed guard, as a lazy
-    // exit has none.
+    // A `Before` exit's operands are in their home slots or its blame; the
+    // other kinds follow a completed instruction and have no failed guard,
+    // as a lazy exit has none.
     if kind == ExitKind::Before && e.tag != ExitTag::Lazy {
         let extra = match e.tag {
             ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
@@ -746,11 +761,11 @@ fn on_exit<'gc>(
             ExitTag::OtherResult => crate::jit::feedback::OTHER_RESULT,
             // A closure of the prototype a guard took one closure of: the
             // next compile guards the prototype.
-            ExitTag::Const if callee_of_proto(ctx, closure, base, pc) => 0,
-            ExitTag::Const => match upvalue_of(closure, pc) {
+            ExitTag::Const if callee_of_proto(ctx, proto, at, ops) => 0,
+            ExitTag::Const => match upvalue_of(proto, at) {
                 // Every site of the upvalue loads it from now on.
                 Some(k) => {
-                    closure.proto.feedback.set_upvalue_varies(k);
+                    proto.feedback.set_upvalue_varies(k);
                     0
                 }
                 None => crate::jit::feedback::CONST_MISS,
@@ -763,15 +778,9 @@ fn on_exit<'gc>(
             } else {
                 0
             };
-        match e.site {
-            // The frame is the loop header's: only the miss is the access's.
-            Some(s) => site_proto(region, e, closure)
-                .feedback
-                .add_bits(s as usize, extra),
-            None => record_site(closure, base, pc, extra),
-        }
+        record_site(proto, at, ops, extra);
         if e.tag == ExitTag::Shape {
-            record_shape(ctx, closure, base, pc);
+            record_shape(ctx, proto, at, ops);
         }
     }
     let n = e.count.get() + 1;
@@ -779,9 +788,10 @@ fn on_exit<'gc>(
     if n == 1 {
         log(ctx, || {
             format!(
-                "first exit {} pc{} ({:?}) of the region at pc{}",
-                crate::jit::compile::chunk_name(closure),
-                pc,
+                "first exit {}:{} pc{} ({:?}) of the region at pc{}",
+                String::from_utf8_lossy(proto.source.as_bytes()),
+                proto.line_defined,
+                at,
                 e.tag,
                 region.entry_pc
             )
@@ -795,9 +805,10 @@ fn on_exit<'gc>(
     } else if e.tag.widenable() && n == region.exit_hot.get() {
         log(ctx, || {
             format!(
-                "hot exit {} pc{} ({:?}) of the region at pc{}",
-                crate::jit::compile::chunk_name(closure),
-                pc,
+                "hot exit {}:{} pc{} ({:?}) of the region at pc{}",
+                String::from_utf8_lossy(proto.source.as_bytes()),
+                proto.line_defined,
+                at,
                 e.tag,
                 region.entry_pc
             )
@@ -805,7 +816,7 @@ fn on_exit<'gc>(
         // Feedback only grows (kinds, the overflow, misses and metamethod
         // bits, shapes up to `MAX_SHAPES + 1`), so a recompile that learns
         // some is outside the budget, as the never-executed rule's are.
-        let learned = exit_seen(site_proto(region, e, closure), e.site.unwrap_or(pc)) != e.seen;
+        let learned = exit_seen(site_proto(region, e, closure), e.site().unwrap_or(pc)) != e.seen;
         request_recompile(ctx, region_closure, region, learned);
     }
 }
@@ -816,7 +827,7 @@ fn site_proto<'gc>(
     region: &Region<'gc>,
     e: &ExitInfo,
     closure: LuaFn<'gc>,
-) -> Gc<'gc, crate::env::function::Prototype<'gc>> {
+) -> Gc<'gc, Prototype<'gc>> {
     match e.site_proto {
         u16::MAX => closure.proto,
         k => region.site_protos[k as usize],
@@ -824,15 +835,16 @@ fn site_proto<'gc>(
 }
 
 /// The by-value upvalue `GETUPVAL` at `pc` reads.
-fn upvalue_of(closure: LuaFn<'_>, pc: u32) -> Option<usize> {
-    let i = unsafe { *closure.code.add(pc as usize) };
+fn upvalue_of(proto: Gc<'_, Prototype<'_>>, pc: u32) -> Option<usize> {
+    // SAFETY: `pc` is an instruction of `proto`.
+    let i = unsafe { *proto.code.as_ptr().add(pc as usize) };
     (i.op() == Op::GETUPVAL).then(|| i.b() as usize)
 }
 
 /// What a hot exit at `pc` compares with its copy from the compile
 /// (`ExitInfo::seen`) to tell whether a recompile learns something: the
 /// site's feedback, or for a `GETUPVAL` whether its upvalue varies.
-pub(crate) fn exit_seen(proto: Gc<'_, crate::env::function::Prototype<'_>>, pc: u32) -> u64 {
+pub(crate) fn exit_seen(proto: Gc<'_, Prototype<'_>>, pc: u32) -> u64 {
     // SAFETY: `pc` is an instruction of `proto`.
     let i = unsafe { *proto.code.as_ptr().add(pc as usize) };
     if i.op() == Op::GETUPVAL {
@@ -847,26 +859,27 @@ pub(crate) fn exit_seen(proto: Gc<'_, crate::env::function::Prototype<'_>>, pc: 
 /// the prototype (`call_note`), which the next compile guards instead.
 fn callee_of_proto<'gc>(
     ctx: Context<'gc>,
-    closure: LuaFn<'gc>,
-    base: *mut Value<'gc>,
+    proto: Gc<'gc, Prototype<'gc>>,
     pc: u32,
+    ops: Operands<'_, 'gc>,
 ) -> bool {
     use crate::env::feedback::{MEGAMORPHIC, proto_slot, slot_proto};
-    let mut i = unsafe { *closure.code.add(pc as usize) };
+    let mut i = unsafe { *proto.code.as_ptr().add(pc as usize) };
     if i.is_jit_word() {
-        i = original_of(closure, i);
+        i = original_of(proto, i);
     }
     let r = match i.op() {
         Op::CALL | Op::CALL_R0 | Op::CALL_R1 | Op::TAILCALL => i.a(),
         Op::CALLS | Op::CALLS_R0 | Op::CALLS_R1 => i.e() as u8,
         _ => return false,
     };
-    // SAFETY: the callee is a register of the frame's window.
-    let fv = unsafe { *base.add(r as usize) };
+    let Some(fv) = ops.reg(r) else {
+        return false;
+    };
     let Some(lf) = fv.get_function().and_then(|f| f.as_lua()) else {
         return false;
     };
-    let Some(slot) = closure.proto.feedback.callee(pc as usize) else {
+    let Some(slot) = proto.feedback.callee(pc as usize) else {
         return false;
     };
     let seen = slot.get();
@@ -882,8 +895,7 @@ fn callee_of_proto<'gc>(
     };
     if same {
         slot.set(proto_slot(lf.proto));
-        ctx.mutation()
-            .backward_barrier(Gc::erase(closure.proto), None);
+        ctx.mutation().backward_barrier(Gc::erase(proto), None);
     }
     same
 }
@@ -893,19 +905,23 @@ pub(crate) const MAX_SHAPES: usize = 4;
 
 /// A shape exit at a field site: its receiver's shape, for a chain in the
 /// next compile.
-fn record_shape<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32) {
-    let mut i = unsafe { *closure.code.add(pc as usize) };
+fn record_shape<'gc>(
+    ctx: Context<'gc>,
+    proto: Gc<'gc, Prototype<'gc>>,
+    pc: u32,
+    ops: Operands<'_, 'gc>,
+) {
+    let mut i = unsafe { *proto.code.as_ptr().add(pc as usize) };
     if i.is_jit_word() {
-        i = original_of(closure, i);
+        i = original_of(proto, i);
     }
-    let upval = |k: u8| unsafe { *closure.upvalue_ptr().add(k as usize) };
     let recv = match i.op().unquickened() {
-        Op::GETTABUP | Op::SETTABUP => unsafe { upval(i.b()).value },
-        Op::GETTABUP_REF | Op::SETTABUP_REF => unsafe { upval(i.b()).cell }.get(),
-        Op::GETFIELD | Op::SELF | Op::SETFIELD => unsafe { *base.add(i.b() as usize) },
+        Op::GETTABUP | Op::SETTABUP => ops.upval_table(i.b(), false),
+        Op::GETTABUP_REF | Op::SETTABUP_REF => ops.upval_table(i.b(), true),
+        Op::GETFIELD | Op::SELF | Op::SETFIELD => ops.reg(i.b()),
         _ => return,
     };
-    let Some(t) = recv.get_table() else {
+    let Some(t) = recv.and_then(|v| v.get_table()) else {
         return;
     };
     // A table on a deprecated shape moves now: the interpreter's entry may
@@ -913,18 +929,22 @@ fn record_shape<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, base: *mut Value<'g
     if t.shape().is_deprecated() {
         t.refresh_meta(ctx);
     }
-    closure.proto.feedback.add_shape(pc as usize, t.shape());
-    ctx.mutation()
-        .backward_barrier(Gc::erase(closure.proto), None);
+    proto.feedback.add_shape(pc as usize, t.shape());
+    ctx.mutation().backward_barrier(Gc::erase(proto), None);
 }
 
 /// Whether the instruction at `pc` is a call whose arguments a builtin's
 /// `ExitTag::Arg` guard raises on: one that is no number and no string, or
 /// (`cmp`: `min`, `max`, which compare them) strings mixed with numbers.
-fn call_arg_raises<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, cmp: bool) -> bool {
-    let mut i = unsafe { *closure.code.add(pc as usize) };
+fn call_arg_raises<'gc>(
+    proto: Gc<'gc, Prototype<'gc>>,
+    pc: u32,
+    ops: Operands<'_, 'gc>,
+    cmp: bool,
+) -> bool {
+    let mut i = unsafe { *proto.code.as_ptr().add(pc as usize) };
     if i.is_jit_word() {
-        i = original_of(closure, i);
+        i = original_of(proto, i);
     }
     let call = matches!(
         i.op(),
@@ -941,8 +961,9 @@ fn call_arg_raises<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, cmp
     }
     let (mut num, mut str) = (false, false);
     for r in 4..i.b().saturating_add(3) {
-        // SAFETY: the arguments are registers of the frame's window.
-        let v = unsafe { *base.add((i.a() + r) as usize) };
+        let Some(v) = ops.reg(i.a() + r) else {
+            return false;
+        };
         if v.is_float() || v.get_integer().is_some() {
             num = true;
         } else if v.get_string().is_some() {
@@ -954,39 +975,36 @@ fn call_arg_raises<'gc>(closure: LuaFn<'gc>, base: *mut Value<'gc>, pc: u32, cmp
     cmp && num && str
 }
 
-/// Record the kinds of the operands of the site at `pc`, from the frame just
-/// rebuilt, into its feedback.
+/// Record the kinds of the operands of the site at `pc` into its feedback;
+/// an operand `ops` lacks records none.
 fn record_site<'gc>(
-    closure: LuaFn<'gc>,
-    base: *mut Value<'gc>,
+    proto: Gc<'gc, Prototype<'gc>>,
     pc: u32,
+    ops: Operands<'_, 'gc>,
     extra: crate::jit::feedback::Bits,
 ) {
     use crate::instruction::Family;
     use crate::jit::feedback as fb;
-    let site = unsafe { closure.code.add(pc as usize) };
-    let mut i = unsafe { *site };
+    let mut i = unsafe { *proto.code.as_ptr().add(pc as usize) };
     if i.is_jit_word() {
-        i = original_of(closure, i);
+        i = original_of(proto, i);
     }
-    // SAFETY: the operands are registers of the frame's window.
-    let reg = |r: u8| unsafe { *base.add(r as usize) };
-    let kind = |r: u8| fb::kind(reg(r));
+    let reg = |r: u8| ops.reg(r);
+    let kind = |r: u8| reg(r).map_or(0, fb::kind);
     let imm = |i: Instruction| if i.imm_is_int() { fb::SMALL } else { fb::FLOAT };
     let num = |v: Value<'_>| v.is_float() || v.get_integer().is_some();
     let mut bits = match i.op() {
         // The loop's kind: integer (and whether it is big) or float.
-        Op::FORPREP => {
-            let (init, limit, step) = (reg(i.a()), reg(i.a() + 1), reg(i.a() + 2));
-            if init.get_integer().is_some() && step.get_integer().is_some() {
+        Op::FORPREP => match (reg(i.a()), reg(i.a() + 1), reg(i.a() + 2)) {
+            (Some(init), Some(limit), Some(step))
+                if init.get_integer().is_some() && step.get_integer().is_some() =>
+            {
                 let float_limit = if limit.is_float() { fb::FLOAT_LIMIT } else { 0 };
                 fb::kind(init) | fb::kind(step) | (fb::kind(limit) & fb::BIGINT) | float_limit
-            } else if num(init) && num(step) {
-                fb::FLOAT
-            } else {
-                0
             }
-        }
+            (Some(init), Some(_), Some(step)) if num(init) && num(step) => fb::FLOAT,
+            _ => 0,
+        },
         Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => kind(i.a() + 1) | kind(i.a() + 2),
         // An intrinsic's arguments (12): kinds it did not cover make the next
         // compile take them. A variable count records only the first.
@@ -1001,10 +1019,9 @@ fn record_site<'gc>(
             kind(i.a() + 4) | rest << fb::ARGS_SHIFT
         }
         Op::GETTABLE | Op::SETTABLE => {
-            let recv = if reg(i.b()).get_table().is_some() {
-                0
-            } else {
-                fb::OTHER
+            let recv = match reg(i.b()) {
+                Some(v) if v.get_table().is_none() => fb::OTHER,
+                _ => 0,
             };
             recv | kind(i.c())
         }
@@ -1026,7 +1043,43 @@ fn record_site<'gc>(
     };
     bits |= extra;
     if bits != 0 {
-        fb::record(closure, site, bits);
+        proto.feedback.add_bits(pc as usize, bits);
+    }
+}
+
+/// The operands of the instruction an exit failed at: the rebuilt frame's
+/// registers and its closure's upvalues for an exit at its own pc, a moved
+/// exit's blame (`ir::InstData::blame`), which has none past its entries.
+#[derive(Clone, Copy)]
+enum Operands<'a, 'gc> {
+    Frame(LuaFn<'gc>, *mut Value<'gc>),
+    Blame(&'a [(u8, Value<'gc>)]),
+}
+
+impl<'gc> Operands<'_, 'gc> {
+    fn reg(self, r: u8) -> Option<Value<'gc>> {
+        match self {
+            // SAFETY: the instruction's registers are in the frame's window.
+            Operands::Frame(_, base) => Some(unsafe { *base.add(r as usize) }),
+            Operands::Blame(b) => b.iter().find(|e| e.0 == r).map(|e| e.1),
+        }
+    }
+
+    /// The table a `GETTABUP` or `SETTABUP` of upvalue `k` indexes.
+    fn upval_table(self, k: u8, by_ref: bool) -> Option<Value<'gc>> {
+        match self {
+            Operands::Frame(c, _) => {
+                let u = unsafe { *c.upvalue_ptr().add(k as usize) };
+                Some(if by_ref {
+                    unsafe { u.cell }.get()
+                } else {
+                    unsafe { u.value }
+                })
+            }
+            Operands::Blame(b) => (b.iter())
+                .find(|e| e.0 == crate::jit::ir::BLAME_TESTED)
+                .map(|e| e.1),
+        }
     }
 }
 
@@ -1039,7 +1092,12 @@ fn on_entry_fail<'gc>(
     base: *mut Value<'gc>,
     region: &Region<'gc>,
 ) {
-    record_site(closure, base, region.entry_pc, 0);
+    record_site(
+        closure.proto,
+        region.entry_pc,
+        Operands::Frame(closure, base),
+        0,
+    );
     if let Some(state) = closure.proto.jit.get() {
         let mut st = state.borrow_mut(ctx.mutation());
         let me = region as *const Region<'gc>;

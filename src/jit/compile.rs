@@ -740,7 +740,7 @@ pub(crate) fn compile<'gc>(
     let mut consts: Vec<u64> = Vec::new();
     let mut last: Option<(usize, usize)> = None;
     for e in &mut em.exits {
-        for s in &mut e.entries {
+        for s in e.entries.iter_mut().chain(&mut e.blame) {
             if let crate::jit::region::Loc::Const(c) = s.loc {
                 let w = e.consts[c as usize];
                 let k = consts.iter().position(|&x| x == w).unwrap_or_else(|| {
@@ -779,32 +779,49 @@ pub(crate) fn compile<'gc>(
             .frames
             .last()
             .map_or(closure.proto, |fr| func_proto(fr.func));
-        let (site_proto, seen_proto) = match e.site {
-            Some(s) if s.frame != e.frame => {
-                let p = match s.frame {
-                    crate::jit::ir::NO_FRAME => closure.proto,
-                    fr => func_proto(f.inline_frames[fr as usize].func),
-                };
-                let k = site_protos
-                    .iter()
-                    .position(|&q| crate::dmm::Gc::ptr_eq(q, p))
-                    .unwrap_or_else(|| {
-                        site_protos.push(p);
-                        site_protos.len() - 1
-                    });
-                (k as u16, p)
+        // The function a site of inlined frame `fr` is in, by its index in
+        // `site_protos` unless it is the snapshot's.
+        let mut proto_of = |fr: u32| {
+            if fr == e.frame {
+                return (u16::MAX, proto);
             }
-            _ => (u16::MAX, proto),
+            let p = match fr {
+                crate::jit::ir::NO_FRAME => closure.proto,
+                fr => func_proto(f.inline_frames[fr as usize].func),
+            };
+            let k = site_protos
+                .iter()
+                .position(|&q| crate::dmm::Gc::ptr_eq(q, p))
+                .unwrap_or_else(|| {
+                    site_protos.push(p);
+                    site_protos.len() - 1
+                });
+            (k as u16, p)
         };
+        let (site_proto, seen_proto) = e.site.map_or((u16::MAX, proto), |s| proto_of(s.frame));
         let site = e.site.map(|s| s.pc);
-        exits.push(ExitInfo {
-            snap: at as u32,
-            tag: e.tag,
-            count: std::cell::Cell::new(0),
+        let blame = match (site, e.blame.is_empty()) {
+            (Some(pc), false) => {
+                let at = snaps.len() as u32;
+                encode_snap(
+                    &mut snaps,
+                    crate::jit::ir::ExitKind::Before,
+                    pc,
+                    &[],
+                    &e.blame,
+                );
+                at
+            }
+            _ => crate::jit::region::NO_BLAME,
+        };
+        exits.push(ExitInfo::new(
+            at as u32,
+            e.tag,
+            crate::jit::exit_seen(seen_proto, site.unwrap_or(e.pc)),
             site,
             site_proto,
-            seen: crate::jit::exit_seen(seen_proto, site.unwrap_or(e.pc)),
-        });
+            blame,
+        ));
     }
     // The sites, their snapshots after the exits'.
     let mut sites: Vec<crate::jit::region::Site> = Vec::new();

@@ -199,7 +199,14 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
     });
     for &i in &moves {
         if f.op(i).may_deopt() {
-            f.insts[i.idx()].snap = snap.unwrap().0;
+            // Its miss stays the access's, with what of its operands the
+            // preheader has.
+            let blame = f.moved_blame(i, |f, v| {
+                f.def_inst(v).is_some_and(|d| moved[d.idx()])
+                    || f.def_block(v).is_none_or(|d| !in_body[d.idx()])
+            });
+            let d = &mut f.insts[i.idx()];
+            (d.snap, d.blame) = (snap.unwrap().0, blame);
         }
     }
     for &b in body {

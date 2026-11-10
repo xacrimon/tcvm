@@ -97,6 +97,7 @@ pub(crate) struct ExitOut {
     pub(crate) kind: crate::jit::ir::ExitKind,
     pub(crate) tag: crate::jit::ir::ops::ExitTag,
     pub(crate) entries: Vec<SnapEntry>,
+    pub(crate) blame: Vec<SnapEntry>,
     pub(crate) consts: Vec<u64>,
 }
 
@@ -808,7 +809,6 @@ fn emit_with(
 /// The runtime record of an exit: each entry's location after allocation.
 fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
     let mut consts = Vec::new();
-    let mut entries = Vec::new();
     let inst = e.inst.expect("an exit without an instruction");
     let allocs = out.inst_allocs(&l.vcode, crate::jit::backend::reg::Inst::new(inst));
     let base = l.snap_ops[inst] as usize;
@@ -817,7 +817,7 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
         Value::boolean(false).to_raw(),
         Value::boolean(true).to_raw(),
     );
-    for &(reg, rep, src) in &e.entries {
+    let mut placed = |&(reg, rep, src): &(u8, SRep, Src)| {
         let loc = match src {
             Src::Const(w) if w == nil => Loc::Nil,
             Src::Const(w) if w == f => Loc::False,
@@ -838,8 +838,10 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
                 }
             }
         };
-        entries.push(SnapEntry { reg, rep, loc });
-    }
+        SnapEntry { reg, rep, loc }
+    };
+    let entries = e.entries.iter().map(&mut placed).collect();
+    let blame = e.blame.iter().map(&mut placed).collect();
     ExitOut {
         pc: e.pc,
         frames: e.frames.clone(),
@@ -848,6 +850,7 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
         kind: e.kind,
         tag: e.tag,
         entries,
+        blame,
         consts,
     }
 }

@@ -148,7 +148,7 @@ impl<'a, 'gc> Slots<'a, 'gc> {
                 }
                 // An exit reads its snapshot after what it wrote itself.
                 if evs.len() > written {
-                    for &(_, v) in f.snap_entries(i) {
+                    for &(_, v) in f.snap_entries(i).iter().chain(f.blame_entries(i)) {
                         reads(f, &load_of, v, &mut evs);
                     }
                 }
