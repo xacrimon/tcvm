@@ -2596,6 +2596,14 @@ impl<'a> Em<'a> {
                 let (a, k, v) = (self.r(i, 0), self.r(i, 1), self.reg(i, 2));
                 self.word_idx(true, v, a, k);
             }
+            ArrLoadAt(k) => {
+                let (d, a) = (self.reg(i, 0), self.r(i, 1));
+                self.word_at(false, d, a, k as i32 * 8);
+            }
+            ArrStoreAt(k) => {
+                let (a, v) = (self.r(i, 0), self.reg(i, 1));
+                self.word_at(true, v, a, k as i32 * 8);
+            }
             NamedNext => {
                 let (d, t, from) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
                 let (n, cap, mt) = (self.r(i, 3), self.r(i, 4), self.r(i, 5));

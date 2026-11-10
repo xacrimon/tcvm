@@ -1517,13 +1517,27 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push(m, &[d, t], none);
             }
             Op::ArrLoad => {
-                let d = self.def(res.unwrap());
-                let (a, k) = (self.use_(args[0]), self.use_(args[1]));
-                self.push(MInst::ArrLoad, &[d, a, k], none);
+                let (d, a) = (self.def(res.unwrap()), self.use_(args[0]));
+                match self.konst_int(args[1]) {
+                    Some(k @ 0..4096) => self.push(MInst::ArrLoadAt(k as u16), &[d, a], none),
+                    _ => {
+                        let k = self.use_(args[1]);
+                        self.push(MInst::ArrLoad, &[d, a, k], none)
+                    }
+                };
             }
             Op::ArrStore => {
-                let ops = [self.use_(args[0]), self.use_(args[1]), self.stored(args[2])];
-                self.push(MInst::ArrStore, &ops, none);
+                let a = self.use_(args[0]);
+                match self.konst_int(args[1]) {
+                    Some(k @ 0..4096) => {
+                        let v = self.stored(args[2]);
+                        self.push(MInst::ArrStoreAt(k as u16), &[a, v], none)
+                    }
+                    _ => {
+                        let ops = [a, self.use_(args[1]), self.stored(args[2])];
+                        self.push(MInst::ArrStore, &ops, none)
+                    }
+                };
             }
             Op::NamedNext => {
                 let d = Operand::new(

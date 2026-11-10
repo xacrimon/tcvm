@@ -338,6 +338,9 @@ pub(crate) enum MInst {
     /// `[def d, use arr, use i]` / `[use arr, use i, use v]`.
     ArrLoad,
     ArrStore,
+    /// `[def d, use arr]` / `[use arr, use v]`: at a constant index.
+    ArrLoadAt(u16),
+    ArrStoreAt(u16),
     /// `[early def d, use t, use from, temp v]`.
     ArrNext,
     /// `[early def d, use t, use from, temp n, temp cap, temp mt]`.
