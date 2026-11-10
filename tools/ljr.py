@@ -3,7 +3,10 @@
 instructions per benchmark and mode, from `/usr/bin/time -l`.
 
 Modes: `jit` (tcvm-cli), `interp` (tcvm-cli with TCVM_JIT=off), `lua`, `luajit`,
-`luajit-joff`, and per `--tcvm NAME=PATH` the modes `NAME` and `NAME-off`. The suite
+`luajit-joff`, and per `--tcvm NAME=PATH` the modes `NAME` and `NAME-off`. Every mode but
+LuaJIT's has a `-lualua` variant (`jit-lualua`, `lua-lualua`, ...): that VM runs the program
+under bench/lualua, a Lua 5.5 interpreter written in Lua, at the sizes in LUALUA_ARGS, and its
+ratio is to the first `-lualua` mode instead of the first mode. The suite
 defaults to bench/ljr. A benchmark NAME runs as NAME-5.5.lua under the Lua 5.5 modes (tcvm,
 lua) when the suite has that file, and as NAME.lua otherwise and under LuaJIT. Every mode
 but LuaJIT runs it through a wrapper that defines `unpack` and `loadstring` first; the cwd
@@ -11,7 +14,7 @@ is the suite. life.lua is skipped: its source is Latin-1, which tcvm-cli rejects
 
     tools/ljr.py [--suite DIR] [--bin PATH] [--modes jit,interp,luajit]
                  [--rounds N] [--only a,b] [--json OUT] [--timeout S]
-                 [--tcvm NAME=PATH ...] [--lua PATH] [--luajit PATH]
+                 [--tcvm NAME=PATH ...] [--lua PATH] [--luajit PATH] [--lualua PATH]
 """
 import argparse
 import json
@@ -38,8 +41,27 @@ ARGS = {
     "series": ["5000"], "spectral-norm": ["2000"], "table-sort": ["5000000"],
     "table-sort-cmp": ["1000000"],
 }
+# Sizes for the -lualua modes, ~5 s each under lua-lualua; havlak, cd and scimark-fft/lu/sor
+# are at their smallest verified or nonzero size. k-nucleotide and revcomp read FASTA of that size.
+LUALUA_ARGS = {
+    "array3d": ["87", "packed"], "binary-trees-name": ["12"], "binary-trees-num": ["12"],
+    "bounce": ["246"], "cd": ["10"], "chameneos": ["393220"], "coroutine-ring": ["2440097"],
+    "deltablue": ["4663"], "fannkuch": ["9"], "fasta": ["287029"], "fixpoint-fact": ["161"],
+    "havlak": ["1"], "heapsort": ["1", "178937"], "json": ["23"], "k-nucleotide": [],
+    "linear-sieve": ["2003934"], "list": ["263"], "mandel-metatable": ["92"],
+    "mandelbrot": ["442"], "nbody": ["77606"], "nsieve": ["8"], "partialsums": ["1045802"],
+    "particles": ["500"], "permute": ["153"], "pidigits-nogmp": ["622"], "qt": ["9"],
+    "quadtree-2": ["9"], "queen": ["11"], "ray": ["9", "23"], "ray-prop": ["9", "23"],
+    "recursive-fib-gv": ["32"], "recursive-fib-uv": ["31"], "revcomp": [], "richard": ["5"],
+    "scimark-fft": ["1"], "scimark-lu": ["1"], "scimark-sor": ["1"], "scimark-sparse": ["20"],
+    "series": ["2954"], "spectral-norm": ["271"], "storage": ["229"], "table-sort": ["591874"],
+    "table-sort-cmp": ["143717"], "towers": ["83"],
+}
+LUALUA_FASTA = {"k-nucleotide": 108770, "revcomp": 1648045}
 STDIN = {"k-nucleotide", "revcomp"}
-SUITE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bench", "ljr")
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+SUITE = os.path.join(TOOLS, "..", "bench", "ljr")
+LL = "-lualua"
 VARIANT = "-5.5"
 
 
@@ -85,6 +107,8 @@ def main():
                                                   "target", "release", "tcvm-cli"))
     ap.add_argument("--luajit", default="luajit")
     ap.add_argument("--lua", default="lua", help="Lua 5.5, for the `lua` mode")
+    ap.add_argument("--lualua", default=os.path.join(TOOLS, "..", "bench", "lualua", "lualua.lua"),
+                    help="lualua.lua, for the -lualua modes (the bench/lualua submodule)")
     ap.add_argument("--modes", default="jit,interp,luajit")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--only", default="")
@@ -104,22 +128,44 @@ def main():
         bins[name] = os.path.abspath(path)
     modes = [m for m in a.modes.split(",") if m]
     tcvm = {m: m for m in bins} | {m + "-off": m for m in bins} | {"interp": "jit"}
-    bad = [m for m in modes if m not in tcvm and m not in ("lua", "luajit", "luajit-joff")]
+    base = {m: m.removesuffix(LL) for m in modes}
+    bad = [m for m in modes if base[m] not in tcvm and base[m] != "lua"
+           and (m.endswith(LL) or m not in ("luajit", "luajit-joff"))]
     if bad:
         sys.exit(f"ljr.py: unknown modes {','.join(bad)}")
+    a.lualua = os.path.abspath(a.lualua)
+    shim = os.path.join(TOOLS, "lualua-shim.lua")
     names = programs(a.suite)
     if a.only:
         want = set(a.only.split(","))
         names = [n for n in names if n in want]
+    lualua = any(m.endswith(LL) for m in modes)
+    if lualua:
+        if not os.path.exists(a.lualua):
+            sys.exit(f"ljr.py: no {a.lualua} (git submodule update --init bench/lualua)")
+        missing = [n for n in names if n not in LUALUA_ARGS]
+        if missing:
+            sys.exit(f"ljr.py: no LUALUA_ARGS for {','.join(missing)}")
     wrapdir = tempfile.mkdtemp(prefix="ljr-")
-    if STDIN & set(names) and not os.path.exists(a.fasta) and not a.dry_run:
-        with open(a.fasta, "w") as fh:
-            subprocess.run([a.luajit, os.path.join(a.suite, "fasta.lua"), "5000000"],
+    # stdin of k-nucleotide and revcomp per size group, made with luajit when missing.
+    fastas = {n: a.fasta for n in STDIN}
+    fastas |= {n + LL: os.path.join(tempfile.gettempdir(), f"FASTA_{LUALUA_FASTA[n]}")
+               for n in STDIN}
+    sizes = {a.fasta: 5000000} | {fastas[n + LL]: LUALUA_FASTA[n] for n in STDIN}
+    used = {fastas[n + LL if m.endswith(LL) else n] for n in STDIN & set(names) for m in modes}
+    for path in sorted(used):
+        if os.path.exists(path) or a.dry_run:
+            continue
+        with open(path + ".tmp", "w") as fh:
+            subprocess.run([a.luajit, os.path.join(a.suite, "fasta.lua"), str(sizes[path])],
                            stdout=fh, check=True)
+        os.rename(path + ".tmp", path)
     results = {n: {m: [] for m in modes} for n in names}
 
     def command(name, mode):
-        args = ARGS.get(name, [])
+        nested = mode.endswith(LL)
+        args = LUALUA_ARGS[name] if nested else ARGS.get(name, [])
+        mode = base[mode]
         env = dict(os.environ)
         if mode.startswith("luajit"):
             flags = ["-joff"] if mode == "luajit-joff" else []
@@ -130,10 +176,10 @@ def main():
                      "loadstring = loadstring or load\n"
                      f"return assert(loadfile({source(a.suite, name, True)!r}))(...)\n")
         if mode == "lua":
-            return [a.lua, w] + args, env
+            return [a.lua] + ([a.lualua] if nested else []) + [w] + args, env
         if mode == "interp" or mode.endswith("-off"):
             env["TCVM_JIT"] = "off"
-        return [bins[tcvm[mode]], "-f", w] + args, env
+        return [bins[tcvm[mode]], "-f"] + ([shim, a.lualua] if nested else []) + [w] + args, env
 
     for r in range(a.rounds):
         for n in names:
@@ -142,7 +188,8 @@ def main():
                 if a.dry_run:
                     print(" ".join(cmd))
                     continue
-                res = measure(cmd, a.suite, env, a.timeout, a.fasta if n in STDIN else None)
+                stdin = fastas[n + LL if m.endswith(LL) else n] if n in STDIN else None
+                res = measure(cmd, a.suite, env, a.timeout, stdin)
                 results[n][m].append(res)
                 if res is None:
                     tag = "timeout"
@@ -158,28 +205,33 @@ def main():
         xs = [x[key] for x in runs if x and x.get("status") == 0 and key in x]
         return statistics.median(xs) if xs else None
 
-    # Ratios of each mode to the first, by median cycles, and their geomean.
-    head = f"{'benchmark':24}" + "".join(f"{m + ' Mcyc':>16}" for m in modes)
-    head += "".join(f"{m + '/' + modes[0]:>16}" for m in modes[1:])
+    # Ratios of each mode to the first of its size group (-lualua or not), by median cycles,
+    # and their geomean.
+    ref = {m: next(x for x in modes if x.endswith(LL) == m.endswith(LL)) for m in modes}
+    rest = [m for m in modes if ref[m] != m]
+    cw = {m: max(16, len(m) + 7) for m in modes}
+    rw = {m: max(16, len(m + ref[m]) + 3) for m in rest}
+    head = f"{'benchmark':24}" + "".join(f"{m + ' Mcyc':>{cw[m]}}" for m in modes)
+    head += "".join(f"{m + '/' + ref[m]:>{rw[m]}}" for m in rest)
     print(head)
-    logs = {m: [] for m in modes[1:]}
+    logs = {m: [] for m in rest}
     for n in names:
         cyc = {m: med(results[n][m], "cycles") for m in modes}
         row = f"{n:24}" + "".join(
-            f"{(c / 1e6 if c else float('nan')):>16.1f}" for c in cyc.values())
-        for m in modes[1:]:
-            if cyc[m] and cyc[modes[0]]:
-                q = cyc[m] / cyc[modes[0]]
+            f"{(c / 1e6 if c else float('nan')):>{cw[m]}.1f}" for m, c in cyc.items())
+        for m in rest:
+            if cyc[m] and cyc[ref[m]]:
+                q = cyc[m] / cyc[ref[m]]
                 logs[m].append(q)
-                row += f"{q:>16.2f}"
+                row += f"{q:>{rw[m]}.2f}"
             else:
-                row += f"{'-':>16}"
+                row += f"{'-':>{rw[m]}}"
         print(row)
-    geo = f"{'geomean':24}" + " " * 16 * len(modes)
-    for m in modes[1:]:
+    geo = f"{'geomean':24}" + " " * sum(cw.values())
+    for m in rest:
         xs = logs[m]
         g = statistics.geometric_mean(xs) if xs else float("nan")
-        geo += f"{g:>16.2f}"
+        geo += f"{g:>{rw[m]}.2f}"
     print(geo)
     if a.json:
         with open(a.json, "w") as fh:

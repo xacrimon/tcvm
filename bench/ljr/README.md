@@ -54,3 +54,7 @@ Run them with `tools/ljr.py` (this directory is its default suite). Sizes (luaji
 
 `k-nucleotide` and `revcomp` read the output of `fasta.lua 5000000` on
 stdin. Programs without an entry run with no arguments.
+
+The `-lualua` modes of `tools/ljr.py` (`jit-lualua`, `lua-lualua`, ...) run each program under
+`bench/lualua`, a Lua interpreter written in Lua, at smaller sizes (`LUALUA_ARGS`) that take
+about 5 s under `lua-lualua`.
