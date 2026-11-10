@@ -331,7 +331,7 @@ macro_rules! count_hot {
     ($rt:ident, $word:expr, $byte:ident) => {{
         let w: $crate::instruction::Instruction = $word;
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => {
+            jit => {
                 let c = $rt.hot_counter(w.$byte() as usize % $crate::instruction::HOT_COUNTERS);
                 let n = c.get().wrapping_sub(1);
                 c.set(n);

@@ -43,7 +43,7 @@ pub struct State<'gc> {
     #[collect(require_static)]
     pub(crate) rets: [Handler; 256],
     pub(crate) rt: Runtime<'gc>,
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[collect(require_static)]
     pub(crate) jit: crate::jit::state::JitRuntime,
     /// Root shapes by inline capacity (`INLINE_CAPS`). Each anchors a
@@ -132,7 +132,7 @@ impl Lua {
                 dispatch: crate::vm::dispatch::TABLE,
                 rets: crate::vm::dispatch::RETS,
                 rt: Runtime::new(mc.metrics()),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 jit: crate::jit::state::JitRuntime::new(),
                 root_shapes,
                 empty_dict_sentinel,
@@ -221,7 +221,7 @@ impl Lua {
     /// stay. A no-op in a build without the JIT.
     pub fn set_jit(&mut self, on: bool) {
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => self
+            jit => self
                 .arena
                 .mutate_root(|_, root| root.jit.config.enabled = on),
             _ => {
@@ -242,9 +242,7 @@ impl Lua {
     #[cfg(feature = "tcvm-dev")]
     pub fn jit_internal_errors(&mut self) -> u32 {
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => {
-                self.arena.mutate(|_, root| root.jit.internal_errors.get())
-            }
+            jit => self.arena.mutate(|_, root| root.jit.internal_errors.get()),
             _ => 0,
         }
     }
@@ -254,7 +252,7 @@ impl Lua {
     #[cfg(feature = "tcvm-dev")]
     pub fn set_jit_inline(&mut self, on: bool) {
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => self
+            jit => self
                 .arena
                 .mutate_root(|_, root| root.jit.config.dev.inline = on),
             _ => {

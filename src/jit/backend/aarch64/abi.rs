@@ -3,8 +3,12 @@
 
 use crate::jit::backend::aarch64::asm::{Fpr, Gpr};
 use crate::jit::backend::reg::{PReg, PRegSet, RegClass};
-use crate::jit::state::EXIT_REGS;
-pub(crate) use crate::jit::state::IMAGE_SPILLS;
+
+/// Words of the register image `exit_common` writes: x0-x15, x19-x21,
+/// x26-x28, d0-d31, then the region's spill slots from word `IMAGE_SPILLS`.
+pub(crate) const EXIT_REGS: usize = 320;
+/// Image word of the first spill slot.
+pub(crate) const IMAGE_SPILLS: usize = 64;
 
 /// Pinned for a region's whole body.
 pub(crate) const BASE: Gpr = Gpr(22);
@@ -723,6 +727,16 @@ pub(crate) unsafe extern "rust-preserve-none" fn dispatch_entry<'gc>(
         "b {jit_level_full}",
         jit_level_full = sym jit_level_full,
     )
+}
+
+/// The native stack pointer.
+#[inline(always)]
+pub(crate) fn stack_pointer() -> usize {
+    let sp: usize;
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
+    };
+    sp
 }
 
 #[cfg(test)]

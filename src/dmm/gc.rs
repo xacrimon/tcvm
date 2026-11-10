@@ -87,10 +87,10 @@ impl<'gc, T: ?Sized + 'gc> Borrow<T> for Gc<'gc, T> {
 
 impl<'gc, T: 'gc> Gc<'gc, T> {
     /// The value's offset from the box a `Gc` points at, for compiled code.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const VALUE_OFFSET: usize = core::mem::offset_of!(GcBoxInner<T>, value);
     /// A `TrailingBytes` value's bytes from the value, for compiled code.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const TRAILING_FROM_VALUE: usize = GcBoxInner::<T>::TRAILING_FROM_VALUE;
 }
 

@@ -238,7 +238,7 @@ impl<'gc> FeedbackVector<'gc> {
     }
 
     /// The slot of the instruction at `pc`, with its kind.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[inline]
     pub(crate) fn slot(&self, pc: usize) -> Option<(usize, SlotKind)> {
         let w = *self.slot_of_pc.get(pc)?;
@@ -262,7 +262,7 @@ impl<'gc> FeedbackVector<'gc> {
     }
 
     /// The callee word of the call at `pc`.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[inline]
     pub(crate) fn callee(&self, pc: usize) -> Option<&Cell<u64>> {
         match self.slot(pc)? {
@@ -273,7 +273,7 @@ impl<'gc> FeedbackVector<'gc> {
 
     /// The calls the interpreter made at `pc` (W1's count; 0 for a site of
     /// another kind).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[inline]
     pub(crate) fn call_count(&self, pc: usize) -> u64 {
         match self.slot(pc) {
@@ -283,7 +283,7 @@ impl<'gc> FeedbackVector<'gc> {
     }
 
     /// The function's invocations (`FUNC`), the word before slot 0.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[inline]
     pub(crate) fn invocations(&self) -> u64 {
         self.words[self.head as usize - 1].get()
@@ -349,14 +349,14 @@ impl<'gc> FeedbackVector<'gc> {
 
     /// Whether closures gave upvalue `k` different values (`note_closure`),
     /// or a region's constant guard on it failed (`set_upvalue_varies`).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn upvalue_varies(&self, k: usize) -> bool {
         let (m, sh) = self.upvalue_mask(k);
         m.get() >> sh & VARIES != 0
     }
 
     /// Mark upvalue `k` as varying; whether it was not already.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn set_upvalue_varies(&self, k: usize) -> bool {
         let (m, sh) = self.upvalue_mask(k);
         let old = m.get();
@@ -365,7 +365,7 @@ impl<'gc> FeedbackVector<'gc> {
     }
 
     /// The site word of the instruction at `pc`: its slot's first word.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[inline(always)]
     fn site(&self, pc: usize) -> Option<&Cell<u64>> {
         let w = *self.slot_of_pc.get(pc)?;
@@ -378,7 +378,7 @@ impl<'gc> FeedbackVector<'gc> {
     }
 
     /// The bits of the site at `pc`; none for one without a slot.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[inline]
     pub(crate) fn bits(&self, pc: usize) -> Bits {
         let Some(s) = self.site(pc) else { return 0 };
@@ -428,7 +428,7 @@ impl<'gc> FeedbackVector<'gc> {
 
     /// OR `bits` into the site at `pc`'s, stored only on a change: slow paths
     /// record on every run.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[inline]
     pub(crate) fn add_bits(&self, pc: usize, bits: Bits) {
         let Some(s) = self.site(pc) else { return };
@@ -445,7 +445,7 @@ impl<'gc> FeedbackVector<'gc> {
     }
 
     /// The shapes recorded at the field site at `pc`.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn shapes(&self, pc: usize) -> impl Iterator<Item = Shape<'gc>> + '_ {
         let r = self.site(pc).and_then(|s| self.record(s.get()));
         r.into_iter().flat_map(|r| {
@@ -457,7 +457,7 @@ impl<'gc> FeedbackVector<'gc> {
 
     /// Record `shape` at the field site at `pc`, up to `MAX_SHAPES + 1`. The
     /// caller runs the prototype's barrier.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn add_shape(&self, pc: usize, shape: Shape<'gc>) {
         if let Some((w, SlotKind::Field)) = self.slot(pc) {
             self.add_shape_at(w, shape);
@@ -465,7 +465,7 @@ impl<'gc> FeedbackVector<'gc> {
     }
 
     /// [`Self::add_shape`] for the field slot at word `w`.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn add_shape_at(&self, w: usize, shape: Shape<'gc>) {
         debug_assert!(self.is_field(w));
         if shape.is_deprecated() {
@@ -516,7 +516,7 @@ impl<'gc> FeedbackVector<'gc> {
 
     /// What exits compare to tell whether a recompile learns something: the
     /// site's bits and its shape count.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn seen(&self, pc: usize) -> u64 {
         let n = self
             .site(pc)

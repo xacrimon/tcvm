@@ -152,7 +152,7 @@ pub(crate) const TABLE: [Handler; 256] = {
 };
 
 cfg_select! {
-    all(feature = "jit", target_arch = "aarch64") => {
+    jit => {
         const JIT_ROWS: &[(Op, Handler)] = &[
             (Op::JIT_ENTRY, crate::jit::op_jit_entry),
             (Op::JIT_LOOP, crate::jit::op_jit_loop),
@@ -243,10 +243,8 @@ fn call_handler<'gc>(
     cfg_select! {
         // SAFETY: `dispatch_entry` starts the bottom level and branches to
         // `h` with these arguments.
-        all(feature = "jit", target_arch = "aarch64") => unsafe {
-            crate::jit::backend::aarch64::abi::dispatch_entry(
-                insn, pc, base, rt, closure, thread, h,
-            )
+        jit => unsafe {
+            crate::jit::backend::target::abi::dispatch_entry(insn, pc, base, rt, closure, thread, h)
         },
         target_arch = "aarch64" => h(insn, pc, base, rt, closure, thread),
         _ => {

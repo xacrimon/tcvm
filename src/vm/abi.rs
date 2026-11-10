@@ -518,9 +518,9 @@ macro_rules! handler_impl {
 
     (@jump $h:ident, $i:ident, $p:ident, $b:ident, $rt:ident, [$th:ident], $c:expr) => {{
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => {
+            jit => {
                 $rt.jit().jump_target.set($h as usize);
-                become $crate::jit::backend::aarch64::abi::level_jump($i, $p, $b, $rt, $c, $th)
+                become $crate::jit::backend::target::abi::level_jump($i, $p, $b, $rt, $c, $th)
             }
             _ => {
                 become $h($i, $p, $b, $rt, $c, $th)

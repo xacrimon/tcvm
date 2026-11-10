@@ -21,10 +21,10 @@ use crate::env::function::{FunctionKind, LuaFn, NativeClosure};
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::Instruction;
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 use crate::jit::region::{Region, Site};
 use crate::vm::abi::{Handler, handler_from_bits};
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 use crate::vm::stack::EntryRecord;
 
 /// Header words below a frame's base.
@@ -329,16 +329,16 @@ pub(crate) struct Frame<'gc> {
     pub(crate) pc: *const Instruction,
     /// The entry record of the level the frame runs in (`vm::stack`), 0
     /// where there are none.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) level: usize,
     /// For a compiled frame below a level: its native frame pointer and the
     /// call it is in, whose snapshot names what it keeps in spill slots.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) compiled: Option<(usize, *const Site, *const Region<'static>)>,
     /// A frame inlined into the compiled frame below it, which a call from
     /// its body is made in (W3 §4): no header of its own (`ret` is 0), its
     /// slots part of the compiled frame's window.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) inlined: bool,
 }
 
@@ -361,7 +361,7 @@ impl<'gc> Frame<'gc> {
     /// holding whatever was there.
     pub(crate) fn caller_words_dead(&self) -> bool {
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => {
+            jit => {
                 let ret = self.ret & !flag::MASK;
                 ret == crate::vm::stack::ret_to_native_bits()
                     || ret == crate::vm::stack::ret_shim_bits()
@@ -417,20 +417,20 @@ pub(crate) fn frames<'gc>(ts: &ThreadState<'gc>) -> Walk<'gc> {
     Walk {
         base: ts.top_base,
         pc: ts.top_pc,
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         rec: ts.record,
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         level: ts.record,
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         shim: ts.shim,
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         cross: false,
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         compiled: None,
         elided: None,
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         queue: [None; 3],
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         queued: 0,
     }
 }
@@ -441,28 +441,28 @@ pub(crate) struct Walk<'gc> {
     base: *mut Value<'gc>,
     pc: *const Instruction,
     /// The innermost entry record not crossed yet.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     rec: usize,
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     level: usize,
     /// `ThreadState::shim`.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     shim: [usize; 2],
     /// The frame just walked was a level's first: its caller is compiled.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     cross: bool,
     /// Walking compiled frames: the next one's frame pointer, return
     /// address, and its callee's base; for the first, whether that may be
     /// `BASE` from a record, the frame's own where its site is a level's.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     compiled: Option<(usize, usize, *mut Value<'gc>, bool)>,
     elided: Option<Frame<'gc>>,
     /// The frames of the compiled frame just reached that come after its
     /// innermost inlined one: its other inlined frames, then itself, the
     /// last first.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     queue: [Option<Frame<'gc>>; 3],
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     queued: usize,
 }
 
@@ -473,7 +473,7 @@ impl<'gc> Iterator for Walk<'gc> {
         if let Some(f) = self.elided.take() {
             return Some(f);
         }
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         if let Some(f) = self.next_compiled() {
             return Some(f);
         }
@@ -487,11 +487,11 @@ impl<'gc> Iterator for Walk<'gc> {
                 func: func_word(base),
                 ret: ret_word(base),
                 pc: self.pc,
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 level: self.level,
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 compiled: None,
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 inlined: false,
             }
         };
@@ -504,7 +504,7 @@ impl<'gc> Iterator for Walk<'gc> {
 impl<'gc> Walk<'gc> {
     /// The next frame if it is compiled or inlined into one: queued, past a
     /// level's first frame, or below the bottom of a level's run.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     fn next_compiled(&mut self) -> Option<Frame<'gc>> {
         if self.queued > 0 {
             self.queued -= 1;
@@ -566,7 +566,7 @@ impl<'gc> Walk<'gc> {
     /// caller words, or below its level for a level's first frame, whose
     /// caller is compiled, as is a native's that `jit_call_native` runs.
     fn header_caller(&mut self, f: &Frame<'gc>) {
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         {
             let ret = f.ret & !flag::MASK;
             if ret == crate::vm::stack::ret_to_native_bits() {
@@ -589,11 +589,11 @@ impl<'gc> Walk<'gc> {
                 func: 0,
                 ret: flag::NATIVE,
                 pc: std::ptr::null(),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 level: f.level,
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 compiled: None,
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 inlined: false,
             });
         }
@@ -607,7 +607,7 @@ impl<'gc> Walk<'gc> {
     ///
     /// # Safety
     /// `f0` is a compiled frame from the walk.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     unsafe fn expand(&mut self, f0: Frame<'gc>) -> Frame<'gc> {
         use crate::jit::region::{DYNAMIC, Loc};
         let (fp, site, region) = f0.compiled.expect("a compiled frame");

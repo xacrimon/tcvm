@@ -411,12 +411,12 @@ impl<'gc> Chunk<'gc> {
                 upvalue_names: self.upvalue_names.into_boxed_slice(),
                 feedback,
                 templates: self.templates.into_boxed_slice(),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 jit: crate::dmm::Lock::new(None),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 jit_fast: std::cell::Cell::new(0),
                 closures: std::cell::Cell::new(0),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 ir_size: std::cell::Cell::new(0),
             },
         ))

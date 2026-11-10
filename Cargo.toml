@@ -62,3 +62,6 @@ libc = "0.2.186"
 tcvm = { path = ".", default-features = false, features = ["tcvm-dev"] }
 paste = "1.0.15"
 insta = "1.47.2"
+
+[build-dependencies]
+cfg_aliases = "0.2.2"

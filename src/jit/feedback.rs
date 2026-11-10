@@ -21,7 +21,7 @@ pub(crate) const OVERFLOW: Bits = 64;
 /// A metamethod ran.
 pub(crate) const MM: Bits = 128;
 /// At a `FORPREP`: an integer loop's limit was a float.
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 pub(crate) const FLOAT_LIMIT: Bits = OTHER;
 /// At a `GETTABLE` or `SETTABLE`, whose kinds are the key's (`OTHER` also
 /// for a receiver that is no table): a small key was outside the array part,
@@ -30,10 +30,10 @@ pub(crate) const ARR_MISS: Bits = BIGINT;
 /// At a call (whose kinds are its first argument's, `ARGS_SHIFT` above them
 /// the later ones'): a callee a region took as constant differed
 /// (`ExitTag::Const`). `OVERFLOW` there: a builtin's integer result left i32.
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 pub(crate) const CONST_MISS: Bits = MM;
 /// Compiled code exited on operand kinds the site's form does not cover.
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 pub(crate) const KIND_EXIT: Bits = 256;
 /// At a call, the kinds of the arguments after the first, shifted by this.
 pub(crate) const ARGS_SHIFT: u32 = 9;
@@ -41,9 +41,9 @@ pub(crate) const ARGS_SHIFT: u32 = 9;
 /// without an integer representation, `string.byte` out of range.
 pub(crate) const OTHER_RESULT: Bits = 1 << 15;
 
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 pub(crate) const INT: Bits = SMALL | BIGINT;
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 pub(crate) const KINDS: Bits = SMALL | BIGINT | FLOAT | STR | TAB | OTHER;
 
 /// The kind bit of `v`.

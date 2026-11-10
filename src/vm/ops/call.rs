@@ -117,7 +117,7 @@ macro_rules! start {
 macro_rules! count_invocation {
     ($rt:ident, $f:expr, $word:expr) => {{
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => {
+            jit => {
                 // SAFETY: the word before slot 0 is the invocation count.
                 let n = unsafe { &*$f.feedback.sub(1) };
                 let c = n.get().wrapping_add(1);

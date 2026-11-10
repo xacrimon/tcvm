@@ -18,7 +18,8 @@ use std::io;
 use std::ptr::NonNull;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::jit::backend::code::{map_in, reserve as reserve_space, sync_icache, unmap_out};
+use crate::jit::backend::code::{map_in, reserve as reserve_space, unmap_out};
+use crate::jit::backend::target::code::sync_icache;
 
 pub(crate) const SEG_SIZE: usize = 64 * 1024;
 const UNIT: usize = 64;
@@ -237,7 +238,7 @@ impl Range {
             self.island_slot = Some((rx, rw.as_ptr() as usize, 0));
         }
         let (rx, rw, next) = self.island_slot.as_mut().expect("an island slot");
-        let words = crate::jit::backend::aarch64::abi::island(target);
+        let words = crate::jit::backend::target::abi::island(target);
         let (at_rx, at_rw) = (*rx + *next, *rw + *next);
         unsafe {
             std::ptr::copy_nonoverlapping(words.as_ptr(), at_rw as *mut u32, words.len());
@@ -282,7 +283,7 @@ pub(crate) struct CodeBlock {
     rx: NonNull<u8>,
     rw: NonNull<u8>,
     len_units: u16,
-    unwind: Option<crate::jit::backend::aarch64::unwind::Fde>,
+    unwind: Option<crate::jit::backend::target::unwind::Fde>,
 }
 
 impl CodeBlock {
@@ -313,7 +314,7 @@ impl CodeBlock {
     /// Tell the unwinder the block's calls are made with a frame of
     /// `frame` bytes open (`unwind::Fde`).
     pub(crate) fn describe_frame(&mut self, frame: u32) {
-        self.unwind = Some(crate::jit::backend::aarch64::unwind::Fde::register(
+        self.unwind = Some(crate::jit::backend::target::unwind::Fde::register(
             self.rx() as usize,
             self.len(),
             frame,

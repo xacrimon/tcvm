@@ -128,7 +128,7 @@ handler! {
                 .map(|s| {
                     let w = match s.loc {
                         Loc::Reg(i) => img[i as usize].get(),
-                        Loc::Spill(i) => img[crate::jit::state::IMAGE_SPILLS + i as usize].get(),
+                        Loc::Spill(i) => img[crate::jit::backend::target::abi::IMAGE_SPILLS + i as usize].get(),
                         // SAFETY: a slot of the region's window.
                         Loc::Slot(r) => unsafe { *(base.add(r as usize) as *const u64) },
                         loc => const_word(region, loc),
@@ -147,7 +147,7 @@ handler! {
         for s in snap.entries() {
             let w = match s.loc {
                 Loc::Reg(i) => img[i as usize].get(),
-                Loc::Spill(i) => img[crate::jit::state::IMAGE_SPILLS + i as usize].get(),
+                Loc::Spill(i) => img[crate::jit::backend::target::abi::IMAGE_SPILLS + i as usize].get(),
                 // SAFETY: written by the loop above.
                 Loc::Slot(_) => unsafe { held[s.reg as usize].assume_init() },
                 loc => const_word(region, loc),
@@ -203,7 +203,7 @@ handler! {
         unsafe {
             let w = frame::ret_word(base);
             if w & !frame::flag::MASK == 0 {
-                let r = crate::jit::backend::aarch64::abi::ret_to_native;
+                let r = crate::jit::backend::target::abi::ret_to_native;
                 frame::set_ret_word(base, w | crate::vm::abi::handler_bits(r));
             }
         }
@@ -317,11 +317,7 @@ fn entry_value<'gc>(mc: &crate::dmm::Mutation<'gc>, rep: SRep, w: u64) -> Value<
 /// compiled code refuses entry.
 #[inline(always)]
 fn below_budget(ts: &crate::env::thread::ThreadState<'_>) -> bool {
-    let sp: usize;
-    unsafe {
-        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
-    };
-    sp < ts.native_limit
+    crate::jit::backend::target::abi::stack_pointer() < ts.native_limit
 }
 
 /// `code` as the dispatch target it is.
@@ -596,7 +592,7 @@ fn set_fast<'gc>(ctx: Context<'gc>, proto: &Prototype<'gc>, st: &mut JitState<'g
 /// entry is `fast` branches (`known_offset`), or without one to a miss
 /// (`abi::direct_miss`).
 pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> usize {
-    use crate::jit::backend::aarch64::abi::{direct_miss, direct_miss_regs};
+    use crate::jit::backend::target::abi::{direct_miss, direct_miss_regs};
     if fast == 0 && regs {
         direct_miss_regs as *const () as usize
     } else if fast == 0 {
@@ -610,7 +606,7 @@ pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> usize {
 /// checks, and past its parameters' loads from their slots for a call
 /// passing them in registers (W4 §2).
 pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
-    let known = crate::jit::backend::aarch64::emit::KNOWN_ENTRY as usize;
+    let known = crate::jit::backend::target::emit::KNOWN_ENTRY as usize;
     known + if regs { 4 * nparams.min(8) as usize } else { 0 }
 }
 

@@ -452,7 +452,7 @@ pub(crate) fn compile<'gc>(
     frame: *const Value<'gc>,
     seen: &[(u8, TypeSet)],
 ) -> Result<crate::dmm::Gc<'gc, crate::jit::region::Region<'gc>>, CompileError> {
-    use crate::jit::backend::aarch64::{abi, emit, lower};
+    use crate::jit::backend::target::{abi, emit, lower};
     use crate::jit::region::{ExitInfo, Region, encode_snap};
     let config = &ctx.jit().config;
     let opts = Options::of(config);
@@ -534,11 +534,11 @@ pub(crate) fn compile<'gc>(
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Regalloc);
     let jit = ctx.jit();
-    use crate::jit::backend::aarch64::emit::Tramp;
+    use crate::jit::backend::target::emit::Tramp;
     let tramp = |h: usize, k: Tramp| jit.trampoline(h, k);
     let mut trampolines: Vec<(usize, usize)> = Vec::new();
     for inst in &lowered.vcode.insts {
-        use crate::jit::backend::aarch64::inst::MInst;
+        use crate::jit::backend::target::inst::MInst;
         let (a, kind) = match inst {
             MInst::HelperCold(h) => (
                 crate::jit::helpers::address(*h),

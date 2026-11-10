@@ -28,7 +28,7 @@ pub(crate) const VALUE_SLOTS: usize = VALUE_BYTES / size_of::<Value<'static>>();
 pub(crate) const NATIVE_BYTES: usize = 1024 * 1024;
 /// Native stack above its end that compiled code leaves to natives and the
 /// interpreter: past it, compiled entries refuse (H9).
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 pub(crate) const NATIVE_HEADROOM: usize = 256 * 1024;
 /// Free mappings the pool keeps; more are unmapped.
 const POOL_MAX: usize = 64;
@@ -153,7 +153,7 @@ impl ThreadStack {
     }
 
     /// The lowest address the native stack may use.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn native_end(&self) -> usize {
         self.map.as_ptr() as usize + PAGE
     }
@@ -174,7 +174,7 @@ impl Drop for ThreadStack {
 /// returns to them through `ret_to_native`. Pushed on the native stack by
 /// `abi::jit_level`, which handlers then run below; the bottom level's is
 /// `dispatch_entry`'s.
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 #[repr(C)]
 pub(crate) struct EntryRecord {
     /// The frame record of the code that started the level: its frame
@@ -196,7 +196,7 @@ pub(crate) struct EntryRecord {
     pub(crate) d: [u64; 8],
 }
 
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 pub(crate) mod rec {
     use std::mem::offset_of;
 
@@ -211,24 +211,24 @@ pub(crate) mod rec {
 
 /// The return address of a compiled frame dispatch entered
 /// (`abi::level_land`).
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 #[inline]
 pub(crate) fn level_land() -> usize {
-    crate::jit::backend::aarch64::abi::level_land()
+    crate::jit::backend::target::abi::level_land()
 }
 
 /// `abi::ret_to_native` as header words hold it.
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 #[inline]
 pub(crate) fn ret_to_native_bits() -> u64 {
-    crate::vm::abi::handler_bits(crate::jit::backend::aarch64::abi::ret_to_native)
+    crate::vm::abi::handler_bits(crate::jit::backend::target::abi::ret_to_native)
 }
 
 /// `abi::ret_shim` as header words hold it.
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 #[inline]
 pub(crate) fn ret_shim_bits() -> u64 {
-    crate::vm::abi::handler_bits(crate::jit::backend::aarch64::abi::ret_shim)
+    crate::vm::abi::handler_bits(crate::jit::backend::target::abi::ret_shim)
 }
 
 /// Why a thread handed control back to the host.

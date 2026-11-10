@@ -2424,7 +2424,7 @@ impl Instruction {
     /// `LOOP`, `JMP_BACK` and the JIT words, `b` of a `FORLOOP` form and
     /// `TFORLOOP`. For the slow paths: a handler knows its byte
     /// (`count_hot!`).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn hot_counter(self) -> usize {
         let i = match self.op() {
             Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F | Op::TFORLOOP => self.b(),

@@ -215,7 +215,7 @@ struct RawTableInner {
 impl<T: Copy, A: Allocator> RawTable<T, A> {
     const TABLE_LAYOUT: TableLayout = TableLayout::new::<T>();
     /// The live item count, for compiled code.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const ITEMS_OFFSET: usize =
         core::mem::offset_of!(Self, table) + core::mem::offset_of!(RawTableInner, items);
 

@@ -61,11 +61,11 @@ pub struct Prototype<'gc> {
     pub templates: Box<[Template<'gc>]>,
     /// The JIT's record of this prototype, created when one of its entries
     /// first gets hot.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) jit: crate::dmm::Lock<Option<crate::jit::state::JitStateRef<'gc>>>,
     /// The fast entry of the function region at pc 0 while it is installed,
     /// else 0: compiled callers branch to it with `blr` (5.4).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[collect(require_static)]
     pub(crate) jit_fast: Cell<usize>,
     /// Closures made of it, up to 2: a callee whose prototype made several
@@ -75,7 +75,7 @@ pub struct Prototype<'gc> {
     pub(crate) closures: Cell<u8>,
     /// IR instructions of its last build, a function region's or an
     /// inlined body's (0 before one): the inliner's size estimate (W3 §12).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[collect(require_static)]
     pub(crate) ir_size: Cell<u32>,
 }
@@ -215,7 +215,7 @@ unsafe impl<'gc> Collect<'gc> for UpvalueCell<'gc> {
 impl<'gc> UpvalueCell<'gc> {
     /// Where compiled code finds the pointer to the value, from the cell's
     /// `Gc` (its box).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const V_OFFSET: usize = Gc::<'static, UpvalueCell<'static>>::VALUE_OFFSET
         + std::mem::offset_of!(UpvalueCell<'static>, v);
 

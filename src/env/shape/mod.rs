@@ -34,7 +34,7 @@ use crate::env::symbols::METAMETHOD_COUNT;
 use crate::env::table::Table;
 use crate::env::value::Value;
 use crate::jit::deps;
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 use crate::jit::deps::DepSlot;
 
 mod kind;
@@ -479,7 +479,7 @@ pub struct ShapeData<'gc> {
     /// The regions assuming tables in this shape stay in it (ws2 §6.2),
     /// a watched holder its slots' values (§5.2), by `deps::SHAPE_GROUP` and
     /// `deps::slot_group`.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     deps: DepSlot<'gc>,
     /// A table left this shape: one seen in it may be elsewhere now.
     #[collect(require_static)]
@@ -589,9 +589,9 @@ pub struct MtCacheData<'gc> {
     pub dict_sentinel: Lock<Option<Shape<'gc>>>,
     pub dict_sentinel_poly: Lock<Option<Shape<'gc>>>,
     /// The regions assuming the bits stay (ws2 §5.3), by the bits.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     deps: DepSlot<'gc>,
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     volatile: Cell<bool>,
 }
 
@@ -606,7 +606,7 @@ unsafe impl<'gc> Collect<'gc> for MtCacheData<'gc> {
         cc.trace(&self.rest);
         cc.trace(&self.dict_sentinel);
         cc.trace(&self.dict_sentinel_poly);
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         cc.trace(&self.deps);
         if !self.stale.get() && !self.bits.get().is_empty() {
             cc.defer(crate::env::DEFER_CLASSES);
@@ -707,22 +707,22 @@ fn content_hash(
 impl<'gc> MtCache<'gc> {
     // Where compiled code reads the live bits and `__index`/`__newindex`,
     // from the class's box (`as_word`).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const BITS_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(MtCacheData<'static>, bits);
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const INDEX_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(MtCacheData<'static>, index);
     /// The box of the other metamethods (`rest`), null before the first.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const REST_OFFSET: usize = Gc::<'static, MtCacheData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(MtCacheData<'static>, rest);
     /// The metamethod of bit index `i` at `8 * i` past this, from `rest`.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const REST_VALUES_OFFSET: usize = Gc::<'static, MmValues<'static>>::VALUE_OFFSET;
 
     /// The class's box address, what a shape holds.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn as_word(self) -> u64 {
         Gc::erased_ptr(self.0) as u64
     }
@@ -758,9 +758,9 @@ impl<'gc> MtCache<'gc> {
                 rest: Lock::new(rest),
                 dict_sentinel: Lock::new(None),
                 dict_sentinel_poly: Lock::new(None),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 deps: Lock::new(None),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 volatile: Cell::new(false),
             },
         ))
@@ -903,7 +903,7 @@ impl<'gc> MtCache<'gc> {
     /// had some is volatile from then on.
     fn changed(self, mc: &Mutation<'gc>, bits: MetamethodBits) {
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => {
+            jit => {
                 if !bits.is_empty() && deps::invalidate(mc, &self.0.deps, bits.bits() as u64) {
                     self.0.volatile.set(true);
                 }
@@ -916,7 +916,7 @@ impl<'gc> MtCache<'gc> {
 
     /// Note that `region` assumes `bits` of this class stay as they are
     /// (ws2 §5.5).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn depend(
         self,
         mc: &Mutation<'gc>,
@@ -928,7 +928,7 @@ impl<'gc> MtCache<'gc> {
 
     /// Whether code that depended on this class was invalidated: the
     /// compiler reads its bits live instead (V8's mutable property cells).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[inline]
     pub(crate) fn is_volatile(self) -> bool {
         self.0.volatile.get()
@@ -1071,31 +1071,31 @@ impl<'gc> MtCache<'gc> {
 impl<'gc> Shape<'gc> {
     /// Where compiled code reads the class (`MtCache::as_word`, or null)
     /// from a shape's box.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const MT_CACHE_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(ShapeData<'static>, mt_cache);
     /// The slot count (`u32`), inline slot count (`u8`), metatable slot
     /// (`u32`) and the box of the keys from a shape's box.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const SLOT_COUNT_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(ShapeData<'static>, slot_count);
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const INLINE_CAP_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(ShapeData<'static>, inline_cap);
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const MT_SLOT_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(ShapeData<'static>, mt_slot);
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const KEYS_OFFSET: usize = Gc::<'static, ShapeData<'static>>::VALUE_OFFSET
         + core::mem::offset_of!(ShapeData<'static>, keys);
     /// The keys' array (string boxes) from the keys' box: the first word of
     /// the slice box (a layout test checks it).
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) const KEYS_SLOTS_OFFSET: usize =
         Gc::<'static, Keys<'static>>::VALUE_OFFSET + core::mem::offset_of!(Keys<'static>, slots);
 
     /// The shape's box address, what a table's `shape` field holds.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn as_word(self) -> u64 {
         Gc::erased_ptr(self.0) as u64
     }
@@ -1122,7 +1122,7 @@ impl<'gc> Shape<'gc> {
                 transitions: RefLock::new(TransitionTable::new()),
                 keys: Keys::new(mc, None, 0, 0),
                 watch: Watch::default(),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 deps: Lock::new(None),
                 unstable: Cell::new(false),
             },
@@ -1152,7 +1152,7 @@ impl<'gc> Shape<'gc> {
                 transitions: RefLock::new(TransitionTable::new()),
                 keys: Keys::new(mc, None, 0, 0),
                 watch: Watch::default(),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 deps: Lock::new(None),
                 unstable: Cell::new(false),
             },
@@ -1431,7 +1431,7 @@ impl<'gc> Shape<'gc> {
                     mutable: Cell::new(mutable),
                     volatile: Cell::new(volatile),
                 },
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 deps: Lock::new(None),
                 unstable: Cell::new(false),
             },
@@ -1456,7 +1456,7 @@ impl<'gc> Shape<'gc> {
 
     /// Note that `region` assumes `groups` of this shape hold: its tables
     /// stay (`deps::SHAPE_GROUP`), a watched holder's slots keep their values.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn depend(
         self,
         mc: &Mutation<'gc>,
@@ -1474,7 +1474,7 @@ impl<'gc> Shape<'gc> {
         if w.mutable.get() & g == 0 {
             w.mutable.set(w.mutable.get() | g);
             cfg_select! {
-                all(feature = "jit", target_arch = "aarch64") => {
+                jit => {
                     deps::invalidate(mc, &self.0.deps, g);
                 }
                 _ => {
@@ -1489,9 +1489,7 @@ impl<'gc> Shape<'gc> {
     pub(crate) fn left(self, mc: &Mutation<'gc>) -> bool {
         self.data().unstable.set(true);
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => {
-                deps::invalidate(mc, &self.0.deps, u64::MAX)
-            }
+            jit => deps::invalidate(mc, &self.0.deps, u64::MAX),
             _ => {
                 let _ = mc;
                 false
@@ -1513,7 +1511,7 @@ impl<'gc> Shape<'gc> {
     pub(crate) fn unstabilize(self, mc: &Mutation<'gc>) {
         self.data().unstable.set(true);
         cfg_select! {
-            all(feature = "jit", target_arch = "aarch64") => {
+            jit => {
                 deps::invalidate(mc, &self.0.deps, deps::SHAPE_GROUP);
             }
             _ => {
@@ -1592,7 +1590,7 @@ pub fn transition_add_prop<'gc>(
             transitions: RefLock::new(TransitionTable::new()),
             keys: keys_with(mc, parent, key),
             watch: p.watch.inherit(),
-            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            #[cfg(jit)]
             deps: Lock::new(None),
             unstable: Cell::new(false),
         },
@@ -1670,7 +1668,7 @@ pub fn transition_set_metatable<'gc>(
             transitions: RefLock::new(TransitionTable::new()),
             keys,
             watch: p.watch.inherit(),
-            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            #[cfg(jit)]
             deps: Lock::new(None),
             unstable: Cell::new(false),
         },
@@ -1719,7 +1717,7 @@ pub fn transition_adopt<'gc>(
                     transitions: RefLock::new(TransitionTable::new()),
                     keys: p.keys,
                     watch: p.watch.inherit(),
-                    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                    #[cfg(jit)]
                     deps: Lock::new(None),
                     unstable: Cell::new(false),
                 },

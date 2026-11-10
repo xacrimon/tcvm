@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 use crate::dmm::{Collect, Gc, Mutation, RefLock, Trace};
 use crate::env::function::Prototype;
 use crate::instruction::{HOT_COUNTERS, Instruction};
+use crate::jit::backend::target::abi::EXIT_REGS;
 use crate::jit::region::Region;
 
 /// Regions one prototype may hold at once: a function entry and three loops.
@@ -20,11 +21,6 @@ pub(crate) const MAX_STRIKES: u8 = 3;
 /// Takings of one widenable exit that mark its entry for recompilation,
 /// before backoff (`Region::exit_hot`).
 pub(crate) const EXIT_HOT: u32 = 10;
-/// Words of the register image `exit_common` writes: x0-x15, x19-x21,
-/// x26-x28, d0-d31, then the region's spill slots from word `IMAGE_SPILLS`.
-pub(crate) const EXIT_REGS: usize = 320;
-/// Image word of the first spill slot.
-pub(crate) const IMAGE_SPILLS: usize = 64;
 
 /// Settings read from the environment when a `Lua` is created: `TCVM_JIT=off`,
 /// and with `tcvm-dev` the development knobs.
@@ -219,10 +215,10 @@ impl JitRuntime {
             trampoline_code: RefCell::new(Vec::new()),
             code: RefCell::new(None),
             ra: RefCell::new(crate::jit::backend::ra::Ctx::new(
-                crate::jit::backend::aarch64::abi::ra_env(),
+                crate::jit::backend::target::abi::ra_env(),
             )),
             exhausted: Cell::new(false),
-            level_ret: crate::jit::backend::aarch64::abi::level_return_addr(),
+            level_ret: crate::jit::backend::target::abi::level_return_addr(),
             level_land: crate::vm::stack::level_land(),
             jump_target: Cell::new(0),
             #[cfg(feature = "tcvm-dev")]
@@ -287,12 +283,12 @@ impl JitRuntime {
     pub(crate) fn trampoline(
         &self,
         helper: usize,
-        kind: crate::jit::backend::aarch64::emit::Tramp,
+        kind: crate::jit::backend::target::emit::Tramp,
     ) -> Result<usize, crate::jit::compile::CompileError> {
         if let Some(&(_, t)) = self.trampolines.borrow().iter().find(|(h, _)| *h == helper) {
             return Ok(t);
         }
-        let (asm, frame) = crate::jit::backend::aarch64::emit::trampoline(helper, kind);
+        let (asm, frame) = crate::jit::backend::target::emit::trampoline(helper, kind);
         let alloc = self.code_alloc();
         let mut block = alloc.reserve(asm.offset() + asm.pool_bytes() + 16)?;
         let words = asm

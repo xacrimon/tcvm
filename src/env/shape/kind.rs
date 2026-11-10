@@ -7,7 +7,7 @@ use core::cell::Cell;
 use crate::dmm::{Collect, Gc, Lock, Mutation};
 use crate::env::shape::Shape;
 use crate::env::value::{TYPE_WORDS, Value};
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 use crate::jit::deps::{self, DepSlot};
 
 /// The upper 32 bits of a value's encoding give each type a contiguous
@@ -186,7 +186,7 @@ pub struct FieldData<'gc> {
     /// arc holds tables of several (or before the first table).
     shape: Lock<Option<Shape<'gc>>>,
     /// The regions assuming the kind stays.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     deps: DepSlot<'gc>,
 }
 
@@ -205,7 +205,7 @@ impl<'gc> Field<'gc> {
                 kind: Cell::new(Kind::NONE.to_word()),
                 widenings: Cell::new(0),
                 shape: Lock::new(None),
-                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                #[cfg(jit)]
                 deps: Lock::new(None),
             },
         ))
@@ -296,12 +296,12 @@ impl<'gc> Field<'gc> {
             mc.backward_barrier(Gc::erase(self.0), None);
             unsafe { self.0.shape.as_cell() }.set(shape);
         }
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         deps::invalidate(mc, &self.0.deps, u64::MAX);
     }
 
     /// Note that `region` assumes the kind stays.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn depend(
         self,
         mc: &Mutation<'gc>,
@@ -310,7 +310,7 @@ impl<'gc> Field<'gc> {
         deps::add(mc, self.0, &self.0.deps, region, 1);
     }
 
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) fn as_word(self) -> u64 {
         Gc::as_ptr(self.0) as u64
     }

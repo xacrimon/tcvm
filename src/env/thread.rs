@@ -108,21 +108,21 @@ pub struct ThreadState<'gc> {
     pub(crate) sw: crate::vm::stack::SwitchPoint,
     /// The entry record of the level the thread runs in (`vm::stack`), 0
     /// before it first runs.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) record: usize,
     /// Compiled entries refuse with the stack pointer below this: the native
     /// stack's end plus headroom for natives.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) native_limit: usize,
     /// Fast calls with the stack pointer below this branch with a tagged
     /// return address instead of `blr` (5.4): this level's return address
     /// stack is full from here.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) native_deep: usize,
     /// The frame pointer and return address of the compiled code a native
     /// runs for through `jit_call_native` (I1): its frame's caller while
     /// the frame returns through `ret_shim`.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     pub(crate) shim: [usize; 2],
     /// The function a seeded thread calls, until it gets its stack.
     pub(crate) entry: Option<Value<'gc>>,
@@ -197,7 +197,7 @@ pub struct ThreadState<'gc> {
 pub struct ValueStack<'gc>(UnsafeCell<StackView<'gc>>);
 
 /// The first slot's address in a `ThreadState`, for compiled code.
-#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[cfg(jit)]
 pub(crate) const STACK_PTR_OFFSET: usize = std::mem::offset_of!(ThreadState<'static>, stack)
     + std::mem::offset_of!(StackView<'static>, ptr);
 
@@ -257,7 +257,7 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
                 continue;
             }
             // An inlined frame's slots are its compiled frame's.
-            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            #[cfg(jit)]
             if f.inlined {
                 continue;
             }
@@ -272,7 +272,7 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
             }
             let window = &mut stack[bi..upper];
             cfg_select! {
-                all(feature = "jit", target_arch = "aarch64") => {
+                jit => {
                     if let Some((fp, site, region)) = f.compiled {
                         // SAFETY: a compiled frame of the walk, `window` its slots.
                         unsafe { self.trace_compiled(cc, window, bi, fp, &*site, &*region) }
@@ -312,7 +312,7 @@ impl<'gc> ThreadState<'gc> {
     ///
     /// # Safety
     /// `fp` is the frame's native frame pointer.
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     unsafe fn trace_compiled<T: Trace<'gc>>(
         &self,
         cc: &mut T,
@@ -373,7 +373,7 @@ impl<'gc> ThreadState<'gc> {
     pub(crate) fn ensure_stack(&mut self, pool: &std::rc::Rc<crate::vm::stack::StackPool>) {
         if self.mem.is_none() {
             let mem = pool.acquire();
-            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            #[cfg(jit)]
             {
                 self.native_limit = mem.native_end() + crate::vm::stack::NATIVE_HEADROOM;
             }
@@ -408,7 +408,7 @@ impl<'gc> ThreadState<'gc> {
             len: 0,
         };
         self.sw = Default::default();
-        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        #[cfg(jit)]
         {
             self.record = 0;
         }
@@ -621,13 +621,13 @@ impl<'gc> Thread<'gc> {
             stack_end: std::ptr::null(),
             mem: None,
             sw: Default::default(),
-            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            #[cfg(jit)]
             record: 0,
-            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            #[cfg(jit)]
             native_limit: 0,
-            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            #[cfg(jit)]
             native_deep: 0,
-            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            #[cfg(jit)]
             shim: [0; 2],
             entry: None,
             top: 0,
@@ -693,7 +693,7 @@ impl<'gc> Thread<'gc> {
     ///
     /// # Safety
     /// As [`Thread::state_mut`].
-    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[cfg(jit)]
     #[inline(always)]
     pub(crate) unsafe fn state_mut_if_gray(self) -> Option<&'gc mut ThreadState<'gc>> {
         if !Gc::is_gray(self.0) {
