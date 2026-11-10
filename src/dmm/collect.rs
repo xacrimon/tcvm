@@ -58,7 +58,7 @@ pub unsafe trait Collect<'gc> {
 /// This trait is not itself unsafe, but implementers of [`Collect`] *must* uphold the safety
 /// guarantees of [`Collect`] when using this trait.
 /// Deferral queues an arena keeps ([`Trace::defer`]).
-pub const DEFER_QUEUES: usize = 2;
+pub const DEFER_QUEUES: usize = 3;
 
 pub trait Trace<'gc> {
     /// Trace a [`Gc`] pointer (of any real type).

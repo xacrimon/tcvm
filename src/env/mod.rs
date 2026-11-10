@@ -9,11 +9,13 @@ pub mod thread;
 pub mod userdata;
 pub mod value;
 
-/// The collector's deferral queues ([`crate::dmm::Trace::defer`]): weak tables, and
-/// prototypes whose feedback holds weak references.
+/// The collector's deferral queues ([`crate::dmm::Trace::defer`]): weak tables,
+/// prototypes whose feedback holds weak references, and metatable classes with
+/// metamethods.
 pub(crate) const DEFER_TABLES: usize = 0;
 pub(crate) const DEFER_FEEDBACK: usize = 1;
-const _: () = assert!(DEFER_FEEDBACK < crate::dmm::DEFER_QUEUES);
+pub(crate) const DEFER_CLASSES: usize = 2;
+const _: () = assert!(DEFER_CLASSES < crate::dmm::DEFER_QUEUES);
 
 /// Master metamethod table — single source of truth for the set of
 /// names that drive bit positions in `MetamethodBits`, byte-name
