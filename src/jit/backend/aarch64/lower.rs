@@ -766,6 +766,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     | Op::NumMtSet
                     | Op::TypeMtIs { .. }
                     | Op::FnFixedLua
+                    | Op::FnNative
                     | Op::FnFits
                     | Op::TabHasRoom(_)
                     | Op::TabNoKeys(_) => true,
@@ -932,6 +933,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::NumMtSet => (Test::NumMtSet, Cond::Ne, args),
             Op::TypeMtIs { slot, word } => (Test::TypeMtIs { slot, word }, Cond::Eq, args),
             Op::FnFixedLua => (Test::FnFixedLua, Cond::Eq, args),
+            Op::FnNative => (Test::FnNative, Cond::Hi, args),
             Op::FnFits => (Test::FnFits, Cond::Ls, args),
             Op::TabHasRoom(loc) => (Test::TabHasRoom(loc), Cond::Hi, args),
             Op::TabNoKeys(parts) => (Test::TabNoKeys(parts), Cond::Eq, args),
@@ -1400,6 +1402,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             | Op::NumMtSet
             | Op::TypeMtIs { .. }
             | Op::FnFixedLua
+            | Op::FnNative
             | Op::FnFits
             | Op::TabHasRoom(_)
             | Op::TabNoKeys(_) => {

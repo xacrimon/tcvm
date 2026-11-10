@@ -1657,10 +1657,11 @@ impl<'a> Em<'a> {
                 cond
             }
             // A native function has the niche value of `is_vararg` there.
-            Test::FnFixedLua => {
+            Test::FnFixedLua | Test::FnNative => {
+                // 0 and 1 for a Lua closure's flag, past them a native's niche.
                 let f = self.r(i, k);
                 self.a.ldrb(X16, f, layout::FN_IS_VARARG as i32);
-                self.a.cmp_imm(Sz::W, X16, 0);
+                self.a.cmp_imm(Sz::W, X16, (test == Test::FnNative) as u64);
                 cond
             }
             Test::FnFits => {

@@ -1562,7 +1562,7 @@ fn helper_or_mm(
 
 /// Branch on the test `op` of `v`: continue in the arm where it holds and
 /// return the block where it does not.
-fn arm(b: &mut Builder<'_, '_>, op: Op, v: Val) -> Block {
+pub(super) fn arm(b: &mut Builder<'_, '_>, op: Op, v: Val) -> Block {
     let c = b.ins(op, &[v]);
     branch_arm(b, c)
 }
@@ -2284,6 +2284,22 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
         .get(pc as usize + 1)
         .copied()
         .unwrap_or_default();
+    let (rs, resume) = real_call(b, pc, (a, nb, c), callee, proto, live);
+    let s = b.note_def(&rs, Some(resume));
+    b.lazy_exit(s);
+}
+
+/// A call of `callee` from `R[a]` as `CALL a nb c` at `pc` makes it, `live`
+/// what the frame reads after it: its results set from `R[a]`, in the resume
+/// block. Its caller leaves lazily past it.
+pub(super) fn real_call(
+    b: &mut Builder<'_, '_>,
+    pc: u32,
+    (a, nb, c): (u8, u8, u8),
+    callee: Val,
+    proto: u32,
+    live: RegSet,
+) -> (Vec<Val>, Block) {
     // The arguments in the callee's slots (up to `top`: those before the
     // ones a call or VARARG landed there), and the captured registers, which
     // it may read through their cells. A fixed count's first eight are the
@@ -2338,8 +2354,7 @@ fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     for (k, &v) in rs.iter().enumerate() {
         b.set(a + k as u8, v);
     }
-    let s = b.note_def(&rs, Some(resume));
-    b.lazy_exit(s);
+    (rs, resume)
 }
 
 // --- loops --------------------------------------------------------------------

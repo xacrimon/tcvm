@@ -709,6 +709,8 @@ pub(crate) enum Op {
     /// Whether the function (a `Ptr` to its closure) is a Lua closure
     /// without varargs.
     FnFixedLua,
+    /// Whether the function (a `Ptr` to its closure) is a native.
+    FnNative,
     /// Whether the Lua closure's window fits from this frame's base.
     FnFits,
 
@@ -1070,6 +1072,7 @@ impl Op {
                 | NumMtSet
                 | TypeMtIs { .. }
                 | FnFixedLua
+                | FnNative
                 | FnFits
                 | TabHasRoom(_)
                 | TabNoKeys(_)
@@ -1149,7 +1152,7 @@ impl Op {
             TabArray => Ty::PTR,
             TabHasRoom(_) | TabNoKeys(_) | ShapeIs(_) | ShapeIn(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
-            HasFlag(_) | FnFixedLua | FnFits | NumMtSet | TypeMtIs { .. } => Ty::B1,
+            HasFlag(_) | FnFixedLua | FnNative | FnFits | NumMtSet | TypeMtIs { .. } => Ty::B1,
             ClassMm(_) => Ty::ANY,
             Box => args[0].boxed(),
             Unbox(rep) => Ty {

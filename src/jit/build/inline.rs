@@ -17,8 +17,8 @@ use super::intrinsics::{Callee, callee_of};
 use super::{Builder, Inline, SlotState, Top};
 use crate::instruction::{Instruction, Op as BcOp};
 use crate::jit::build::cfg::{Cfg, RegSet, use_def};
-use crate::jit::ir::ops::{Cc, ExitTag, HelperId, Op};
-use crate::jit::ir::types::{Rep, Ty};
+use crate::jit::ir::ops::{Cc, ExitTag, HelperId, NO_PROTO, Op};
+use crate::jit::ir::types::{Rep, Ty, TypeSet};
 use crate::jit::ir::{InlineFrame, Val};
 
 /// Inlined frames nest at most this deep: a snapshot holds three frames.
@@ -943,17 +943,84 @@ fn return_values(b: &mut Builder<'_, '_>, res: &[Val], seen: Vec<Val>, count: Op
 }
 
 /// The body's `TAILCALL` of `callee` with `nargs` arguments from `R[a+4]`
-/// as a real call replacing its frame (W3 §5): from the body's header
-/// slot, wanting what its caller wanted, its results the body's returns.
-/// A lazy exit past it leaves as the caller, after the call it made; after
-/// a metamethod's instruction, which makes its own once `R[A]` holds the
-/// result (`mm_call_a`'s callers).
+/// (W3 §5). A Lua callee replaces the body's frame; a native runs above
+/// it, as the interpreter calls one from the tail-calling frame, so that
+/// its errors and the levels it reads name the body. A callee of unknown
+/// kind is told apart where it is called.
 pub(super) fn tail_call(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8, callee: Val) {
+    let (callee, proto) = super::emit::known_callee(b, pc, callee);
+    let native = match b.f.def_op(callee) {
+        _ if proto != NO_PROTO => Some(false),
+        Some(Op::KObj(k)) => (b.f.pool[k as usize].get_function()).map(|f| f.as_lua().is_none()),
+        _ => None,
+    };
+    match native {
+        Some(true) => native_tail_call(b, pc, a, nargs, callee),
+        Some(false) => replacing_tail_call(b, a, nargs, callee, proto),
+        None => {
+            let f = b.boxed(callee);
+            let replaces = b.new_block();
+            let other = super::emit::arm(b, Op::IsType(TypeSet::FUN), f);
+            let fun = b.ins(Op::Refine(TypeSet::FUN), &[f]);
+            let p = b.ins(Op::Unbox(Rep::Ptr), &[fun]);
+            let lua = super::emit::arm(b, Op::FnNative, p);
+            native_tail_call(b, pc, a, nargs, callee);
+            for o in [other, lua] {
+                b.switch_to(o);
+                b.jump(replaces);
+            }
+            super::emit::enter_join(b, replaces);
+            replacing_tail_call(b, a, nargs, callee, proto);
+        }
+    }
+}
+
+/// A lazy exit past the body's tail call leaves as the body's caller, after
+/// the call the body was inlined at, with the results `res` where that call
+/// leaves them; after a metamethod's instruction, which makes its own once
+/// `R[A]` holds the result (`mm_call_a`'s callers).
+fn leave_as_caller(b: &mut Builder<'_, '_>, res: &[Val]) {
     let i = b.inline.as_ref().expect("an inlined body");
-    let (base, wanted, mm) = (i.base, i.wanted, i.mm);
+    if i.mm {
+        return;
+    }
+    let hdr = (i.base - 4) as u8;
+    let x = b.f.inline_frames[i.frame as usize];
+    let outer = i.outer_entries();
+    let from = b.f.snap_pool.len();
+    b.f.snap_pool.extend_from_slice(&outer);
+    for (k, &v) in res.iter().enumerate() {
+        b.f.snap_pool.push((hdr + k as u8, v));
+    }
+    let s =
+        b.f.finish_snap(x.parent, x.caller_pc, crate::jit::ir::ExitKind::After, from);
+    b.lazy_exit(s);
+}
+
+/// The tail call of a native: a call from the body's frame, whose results
+/// are the body's returns.
+fn native_tail_call(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8, callee: Val) {
+    let i = b.inline.as_ref().expect("an inlined body");
+    let wanted = i.wanted;
+    let c = b.f.inline_frames[i.frame as usize].c;
+    let seen = watched(b);
+    let call = (a, nargs + 1, c);
+    super::emit::real_call(b, pc, call, callee, NO_PROTO, RegSet::EMPTY);
+    b.flush();
+    let res: Vec<Val> = (0..wanted).map(|k| b.reg(a + k)).collect();
+    close_frame(b);
+    leave_as_caller(b, &res);
+    return_values(b, &res, seen, None);
+}
+
+/// The tail call of a Lua callee as a real call replacing the body's
+/// frame: from the body's header slot, wanting what its caller wanted, its
+/// results the body's returns.
+fn replacing_tail_call(b: &mut Builder<'_, '_>, a: u8, nargs: u8, callee: Val, proto: u32) {
+    let i = b.inline.as_ref().expect("an inlined body");
+    let (base, wanted) = (i.base, i.wanted);
     let x = b.f.inline_frames[i.frame as usize];
     let seen = watched(b);
-    let (callee, proto) = super::emit::known_callee(b, pc, callee);
     let vals: Vec<Val> = (0..nargs)
         .map(|k| {
             let v = b.reg(a + 4 + k);
@@ -984,16 +1051,6 @@ pub(super) fn tail_call(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8, call
     } else {
         (0..wanted).map(|k| b.ins(Op::Load(hdr + k), &[])).collect()
     };
-    if !mm {
-        let from = b.f.snap_pool.len();
-        let outer = b.inline.as_ref().unwrap().outer_entries();
-        b.f.snap_pool.extend_from_slice(&outer);
-        for (k, &v) in res.iter().enumerate() {
-            b.f.snap_pool.push((hdr + k as u8, v));
-        }
-        let s =
-            b.f.finish_snap(x.parent, x.caller_pc, crate::jit::ir::ExitKind::After, from);
-        b.lazy_exit(s);
-    }
+    leave_as_caller(b, &res);
     return_values(b, &res, seen, None);
 }

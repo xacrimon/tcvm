@@ -69,6 +69,8 @@ pub(crate) enum Test {
     TypeMtIs { slot: u8, word: u64 },
     /// The function is a Lua closure without varargs (`Eq`): `[f]`.
     FnFixedLua,
+    /// The function is a native (`Hi`): `[f]`.
+    FnNative,
     /// The Lua closure's window fits from `base` (`Ls`): `[f]`.
     FnFits,
     /// The table's spill cell has room for the spilled `loc` (`Hi`): `[t]`.

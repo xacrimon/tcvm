@@ -2503,6 +2503,38 @@ fn tail_calls_in_bodies_replace_their_frames() {
     );
 }
 
+/// A native an inlined body tail-calls runs above the body, as the
+/// interpreter runs it from the tail-calling frame: its error names the
+/// body's line, not that of the call the body was inlined at. A body made
+/// where it is called is known by its prototype; a callee that varies is
+/// told from a Lua function where it is called.
+#[test]
+fn natives_tail_called_from_bodies_name_the_body() {
+    for (made, call) in [
+        ("local function f(y) return string.rep(y) end", "f(x)"),
+        ("", "local f = function(y) return string.rep(y) end f(x)"),
+        (
+            "local hs = {string.rep, string.len, string.upper}
+            local n = 0
+            local function f(y) n = n + 1 return hs[n % 3 + 1](y and nil) end",
+            "f(x)",
+        ),
+    ] {
+        agrees(&format!(
+            "{made}
+            local function g(x)
+              {call}
+            end
+            local msg
+            for i = 1, 3000 do
+              local ok, e = pcall(g, 'a')
+              msg = e
+            end
+            return msg"
+        ));
+    }
+}
+
 /// A metamethod inlined at `SUB` and at `GETFIELD` tail-calls a callee too
 /// polymorphic to inline, which replaces the metamethod and so invalidates
 /// the region: the lazy exit past the call resumes after the instruction
