@@ -223,6 +223,11 @@ pub(crate) fn build_ir<'gc>(
     };
     check(&f, "build")?;
     #[cfg(feature = "tcvm-dev")]
+    if opts.check {
+        crate::jit::ir::verify::checkpoints(&f)
+            .map_err(|e| CompileError::Verify(format!("after build: {e}\n{}", f.print())))?;
+    }
+    #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Build);
     let mut kinds = EntryKinds {
         frame: Vec::new(),

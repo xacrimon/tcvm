@@ -300,6 +300,10 @@ pub(crate) struct Builder<'a, 'gc> {
     pc_site: Option<Snap>,
     /// The registers the instruction being emitted has written so far.
     pc_written: RegSet,
+    /// Where the instruction being emitted starts: the block, and its last
+    /// instruction then.
+    #[cfg(feature = "tcvm-dev")]
+    pc_start: (Block, Option<Inst>),
 }
 
 /// What the builder of an inlined callee knows of its call (E1).
@@ -444,6 +448,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             entry_ckpt: None,
             pc_site: None,
             pc_written: RegSet::EMPTY,
+            #[cfg(feature = "tcvm-dev")]
+            pc_start: (Block(0), None),
         }
     }
 
@@ -495,6 +501,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             pc_effect: false,
             pc_site: None,
             pc_written: RegSet::EMPTY,
+            #[cfg(feature = "tcvm-dev")]
+            pc_start: (Block(0), None),
         }
     }
 
@@ -1421,6 +1429,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.cur_snap = Some(s);
         if !self.pc_effect {
             self.ckpt = Some(s);
+            #[cfg(feature = "tcvm-dev")]
+            self.f.ckpts.push((s.0, self.pc_start.0, self.pc_start.1));
         }
         s
     }
@@ -2309,6 +2319,13 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.pc_refines.clear();
         self.pc_site = None;
         self.pc_written = RegSet::EMPTY;
+        #[cfg(feature = "tcvm-dev")]
+        {
+            // Not a lazy exit, which goes when the region has no dependency.
+            let insts = self.f.insts_of(self.cur).iter().rev();
+            let last = insts.copied().find(|&i| self.f.op(i) != Op::LazyExit);
+            self.pc_start = (self.cur, last);
+        }
     }
 
     fn emit_instance(&mut self, ii: usize, bc: u32) {

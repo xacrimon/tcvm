@@ -310,6 +310,10 @@ pub(crate) struct Func<'gc> {
     /// hold what they will be read as after it, which the collector traces
     /// while the call runs (H11); it clears the frame's other slots there.
     pub(crate) call_homes: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
+    /// Where the builder started each checkpoint, for `verify::checkpoints`:
+    /// its snapshot, the block and the instruction there it follows.
+    #[cfg(feature = "tcvm-dev")]
+    pub(crate) ckpts: Vec<(u32, Block, Option<Inst>)>,
     /// The region slots closures capture, of every frame the region inlines,
     /// which a call may write through their cells.
     pub(crate) captured: crate::jit::build::cfg::RegSet,
@@ -405,6 +409,8 @@ impl<'gc> Func<'gc> {
             landings: Vec::new(),
             boundaries: false,
             call_homes: Default::default(),
+            #[cfg(feature = "tcvm-dev")]
+            ckpts: Vec::new(),
             captured: Default::default(),
             inline_frames: Vec::new(),
             window: 0,
