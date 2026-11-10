@@ -98,10 +98,10 @@ pub(crate) fn expand(f: &mut Func<'_>) -> Option<Vec<Inst>> {
         let k = pos(f, g);
         let (v, has) = (f.args(g)[0], f.args(g)[1]);
         let miss = Snap(f.insts[g.idx()].snap);
-        let site = f.exit_sites.get(&g).copied().unwrap_or(f.snap_site(miss));
+        let blame = f.insts[g.idx()].blame;
         let mut guard = |f: &mut Func<'_>, arm: Block| {
             let x = f.make_inst(Op::GuardFalse, &[has], Some(miss), ExitTag::Bounds);
-            f.exit_sites.insert(x, site);
+            f.insts[x.idx()].blame = blame;
             f.append(arm, x);
             arms.push(x);
         };
@@ -111,7 +111,6 @@ pub(crate) fn expand(f: &mut Func<'_>) -> Option<Vec<Inst>> {
                 unreachable!()
             };
             let (kind, tag) = (Snap(f.insts[w.idx()].snap), f.insts[w.idx()].tag);
-            let kind_site = f.exit_sites.remove(&w);
             let cont = f.new_block();
             let fail = cold_block(f);
             let mm = cold_block(f);
@@ -127,7 +126,12 @@ pub(crate) fn expand(f: &mut Func<'_>) -> Option<Vec<Inst>> {
             }
             // `w` keeps its result, now refined where the test passed.
             f.insts[w.idx()].op = Op::Refine(set);
-            f.insts[w.idx()].snap = NO_SNAP;
+            // Its exit leaves before what moves after the test.
+            let kind_blame = match f.insts[w.idx()].blame {
+                NO_SNAP => NO_SNAP,
+                _ => f.moved_blame(w, |f, v| f.def_inst(v).is_none_or(|d| !after.contains(&d))),
+            };
+            f.drop_exit(w);
             let c = f.make_inst(Op::IsType(set), &[v], None, ExitTag::Type);
             f.append(b, c);
             branch(f, b, f.result(c), cont, fail);
@@ -141,13 +145,11 @@ pub(crate) fn expand(f: &mut Func<'_>) -> Option<Vec<Inst>> {
             f.append(mm, j);
             f.set_edges(j, &[edge(other)]);
             let d = f.make_inst(Op::Deopt, &[], Some(kind), tag);
-            if let Some(s) = kind_site {
-                f.exit_sites.insert(d, s);
-            }
+            f.insts[d.idx()].blame = kind_blame;
             f.append(other, d);
         } else if hot.contains(&has) {
             let x = f.make_inst(Op::GuardFalse, &[has], Some(miss), ExitTag::Bounds);
-            f.exit_sites.insert(x, site);
+            f.insts[x.idx()].blame = blame;
             f.retain(b, |_, i| i != g);
             f.insert(b, k, x);
         } else {

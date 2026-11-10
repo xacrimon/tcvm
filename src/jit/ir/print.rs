@@ -74,6 +74,21 @@ impl Func<'_> {
                         ents.join(" ")
                     );
                 }
+                if d.blame != NO_SNAP {
+                    let s = &self.snaps[d.blame as usize];
+                    let ents: Vec<String> = (self.entries(d.blame).iter())
+                        .map(|&(r, v)| match r {
+                            crate::jit::ir::BLAME_TESTED => format!("tested=v{}", v.0),
+                            r => format!("r{r}=v{}", v.0),
+                        })
+                        .collect();
+                    let fr = if s.frame == crate::jit::ir::NO_FRAME {
+                        String::new()
+                    } else {
+                        format!(" f{}", s.frame)
+                    };
+                    let _ = write!(out, " [blame{fr} pc{} {}]", s.pc, ents.join(" "));
+                }
                 let _ = writeln!(out);
             }
         }

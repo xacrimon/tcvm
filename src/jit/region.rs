@@ -191,13 +191,47 @@ pub(crate) struct ExitInfo {
     /// `FeedbackVector::seen` of the exit's site when compiled: one the exit
     /// changed means the recompile learns something.
     pub(crate) seen: u64,
-    /// The site, when not the snapshot's pc: a check hoisted out of a loop
-    /// records its access's miss (E2).
-    pub(crate) site: Option<u32>,
+    /// The site's pc when not the snapshot's (`ExitInfo::site`), else
+    /// `NO_BLAME`.
+    site: u32,
     /// The `Region::site_protos` index of the site's function when it is
     /// not the snapshot's (a check moved out of an inlined body), or
     /// `u16::MAX`.
     pub(crate) site_proto: u16,
+    /// A moved exit's blame entries, the site's operands by its registers:
+    /// a snapshot without frames in the arena, or `NO_BLAME`.
+    blame: u32,
+}
+
+pub(crate) const NO_BLAME: u32 = u32::MAX;
+const _: () = assert!(size_of::<ExitInfo>() == 32);
+
+impl ExitInfo {
+    pub(crate) fn new(
+        snap: u32,
+        tag: ExitTag,
+        seen: u64,
+        site: Option<u32>,
+        site_proto: u16,
+        blame: u32,
+    ) -> Self {
+        ExitInfo {
+            snap,
+            tag,
+            count: Cell::new(0),
+            seen,
+            site: site.unwrap_or(NO_BLAME),
+            site_proto,
+            blame,
+        }
+    }
+
+    /// The site, when not the snapshot's pc: a check hoisted out of a loop
+    /// records its access's miss (E2), one at a checkpoint its instruction.
+    #[inline]
+    pub(crate) fn site(&self) -> Option<u32> {
+        (self.site != NO_BLAME).then_some(self.site)
+    }
 }
 
 /// A region of compiled code, owned by its prototype's `JitState`.
@@ -307,6 +341,10 @@ pub(crate) struct Site {
 impl<'gc> Region<'gc> {
     pub(crate) fn snap(&self, e: &ExitInfo) -> SnapView<'_> {
         SnapView::decode(&self.snaps[e.snap as usize..])
+    }
+
+    pub(crate) fn blame(&self, e: &ExitInfo) -> Option<SnapView<'_>> {
+        (e.blame != NO_BLAME).then(|| SnapView::decode(&self.snaps[e.blame as usize..]))
     }
 
     /// A dependency broke (ws2 §5.4): from now on its entry goes to

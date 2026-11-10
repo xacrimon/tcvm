@@ -287,6 +287,19 @@ pub(crate) struct Builder<'a, 'gc> {
     /// The refinements the instruction being emitted made, in order: its
     /// `Before` snapshot, shared by all its arms, names what they refined.
     pc_refines: Vec<(Val, Val)>,
+    /// The `Before` snapshot exits take until a side effect (Maglev's
+    /// checkpointed frame): every instruction from its pc on can run again.
+    ckpt: Option<Snap>,
+    /// The instruction being emitted has a side effect: `ckpt` ends with it.
+    pc_effect: bool,
+    /// What the next instance starts `ckpt` with: an inlined body's entry
+    /// takes its call's.
+    entry_ckpt: Option<Snap>,
+    /// The site alone of the instruction being emitted, the blame of its
+    /// exits whose feedback reads no operands, once one needs it.
+    pc_site: Option<Snap>,
+    /// The registers the instruction being emitted has written so far.
+    pc_written: RegSet,
 }
 
 /// What the builder of an inlined callee knows of its call (E1).
@@ -330,6 +343,11 @@ pub(crate) struct Inline {
     /// The window what is built in it needs, which counts toward the
     /// region's once it is inlined (`Builder::need_window`).
     pub(crate) window: u16,
+    /// The caller's checkpoint at the call, which the body's exits take
+    /// until its first side effect.
+    pub(crate) ckpt: Option<Snap>,
+    /// The body (or one inlined into it) has a side effect.
+    pub(crate) effects: bool,
 }
 
 /// How many values an inlined call left up to `top` (W3 §7).
@@ -421,6 +439,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             inline: None,
             chain: Vec::new(),
             pc_refines: Vec::new(),
+            ckpt: None,
+            pc_effect: false,
+            entry_ckpt: None,
+            pc_site: None,
+            pc_written: RegSet::EMPTY,
         }
     }
 
@@ -464,9 +487,14 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             cold: outer.cold,
             entry_frame: Vec::new(),
             loop_entry: false,
+            entry_ckpt: inline.ckpt,
             inline: Some(inline),
             chain: Vec::new(),
             pc_refines: Vec::new(),
+            ckpt: None,
+            pc_effect: false,
+            pc_site: None,
+            pc_written: RegSet::EMPTY,
         }
     }
 
@@ -794,7 +822,10 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let inst = self
             .f
             .make_inst(Op::KVal(v.to_raw()), &[], None, ExitTag::Type);
-        self.f.insert(b, 0, inst);
+        // A resume block starts with its `Resume`.
+        let first = self.f.insts_of(b).first().map(|&i| self.f.op(i));
+        let at = matches!(first, Some(Op::Resume { .. })) as usize;
+        self.f.insert(b, at, inst);
         if self.bs[b.idx()].root {
             self.bs[b.idx()].root_at += 1;
         }
@@ -817,6 +848,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     pub(crate) fn flush(&mut self) {
         for k in 0..self.pending.len() {
             let (r, v) = self.pending[k];
+            self.pc_written.insert(r as usize);
             self.set_def(self.cur, r, v);
             // A slot whose root value is unchanged still holds it.
             let keep = match self.slot(self.cur, r as usize) {
@@ -1097,6 +1129,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             .f
             .make_inst(Op::TabSetShape(k), &[t], None, ExitTag::Type);
         self.inline_check(Op::TabSetShape(k));
+        self.note_effect(Op::TabSetShape(k));
         self.f.append(self.cur, i);
         let r = self.fact_key(t);
         let s = &mut self.bs[self.cur.idx()].facts;
@@ -1146,6 +1179,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         }
         self.inline_check(op);
         self.note_effects(op);
+        self.note_effect(op);
         let i = self.f.make_inst(op, args, None, ExitTag::Type);
         self.f.append(self.cur, i);
         i
@@ -1162,9 +1196,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     pub(crate) fn ins_exit(&mut self, op: Op, args: &[Val], tag: ExitTag) -> Inst {
         self.inline_check(op);
         self.note_effects(op);
+        self.note_effect(op);
         let s = self.snap_before();
         let i = self.f.make_inst(op, args, Some(s), tag);
         self.f.append(self.cur, i);
+        self.note_site(i, s);
         self.note_check(i);
         i
     }
@@ -1172,8 +1208,10 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     pub(crate) fn ins_snap(&mut self, op: Op, args: &[Val], snap: Snap, tag: ExitTag) -> Inst {
         self.inline_check(op);
         self.note_effects(op);
+        self.note_effect(op);
         let i = self.f.make_inst(op, args, Some(snap), tag);
         self.f.append(self.cur, i);
+        self.note_site(i, snap);
         self.note_check(i);
         i
     }
@@ -1196,12 +1234,16 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     ) -> Inst {
         debug_assert!(!self.terminated());
         self.inline_check(op);
+        self.note_effect(op);
         let (s, tag) = match snap {
             Some((s, t)) => (Some(s), t),
             None => (None, ExitTag::Type),
         };
         let i = self.f.make_inst(op, args, s, tag);
         self.f.append(self.cur, i);
+        if let Some(s) = s {
+            self.note_site(i, s);
+        }
         let none = BlockCall {
             target: Block(0),
             args: List::default(),
@@ -1366,13 +1408,106 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// The snapshot that re-runs the instruction being emitted.
     pub(crate) fn snap_before(&mut self) -> Snap {
+        if !self.pc_effect
+            && let Some(s) = self.ckpt
+        {
+            return s;
+        }
         if let Some(s) = self.cur_snap {
             return s;
         }
         let live = self.cfg.live_in[self.pc as usize];
         let s = self.snapshot(self.pc, ExitKind::Before, live);
         self.cur_snap = Some(s);
+        if !self.pc_effect {
+            self.ckpt = Some(s);
+        }
         s
+    }
+
+    /// The checkpoint an exit here would take, made if there is none yet.
+    pub(crate) fn live_ckpt(&mut self) -> Option<Snap> {
+        (!self.pc_effect).then(|| self.snap_before())
+    }
+
+    /// A side effect ends the checkpoint with the instruction making it.
+    fn note_effect(&mut self, op: Op) {
+        if op.side_effect() {
+            self.side_effect();
+        }
+    }
+
+    pub(crate) fn side_effect(&mut self) {
+        self.pc_effect = true;
+        if let Some(i) = self.inline.as_mut() {
+            i.effects = true;
+        }
+    }
+
+    /// An exit taking the checkpoint of an earlier instruction is blamed on
+    /// this one.
+    fn note_site(&mut self, i: Inst, s: Snap) {
+        let d = self.f.snaps[s.idx()];
+        if self.ckpt != Some(s)
+            || d.kind != ExitKind::Before
+            || (d.pc, d.frame) == (self.pc, self.frame_id())
+        {
+            return;
+        }
+        if !self.f.insts[i.idx()].tag.blames_operands() {
+            let site = match self.pc_site {
+                Some(b) => b,
+                None => {
+                    let from = self.f.snap_pool.len();
+                    let b = (self.f).finish_snap(self.frame_id(), self.pc, ExitKind::Before, from);
+                    *self.pc_site.insert(b)
+                }
+            };
+            self.f.insts[i.idx()].blame = site.0;
+            return;
+        }
+        let mut ents = self.blame();
+        // A shape guard names the table it tested: an upvalue's is in no
+        // register.
+        if self.f.insts[i.idx()].tag == ExitTag::Shape {
+            let t = self.root_of(self.f.args(i)[0]);
+            if self.ty(t).rep == Rep::Val || matches!(self.f.def_op(t), Some(Op::KPtr(_))) {
+                ents.push((crate::jit::ir::BLAME_TESTED, t));
+            }
+        }
+        let from = self.f.snap_pool.len();
+        self.f.snap_pool.extend_from_slice(&ents);
+        let b = (self.f).finish_snap(self.frame_id(), self.pc, ExitKind::Before, from);
+        self.f.insts[i.idx()].blame = b.0;
+    }
+
+    /// The blame entries of an exit of the instruction being emitted: the
+    /// registers it reads (but those it wrote). One whose kind is known
+    /// here, by its type or a guard of the instruction that passed, is
+    /// named by a constant of the kind, which is all its feedback reads;
+    /// the others, the one the exit's guard tests among them, by their
+    /// values.
+    fn blame(&mut self) -> Vec<(u8, Val)> {
+        let insn = self.code(self.pc);
+        let uses = cfg::use_def(&self.proto, insn, self.nregs, &self.cfg.captured).uses;
+        let mut ents = Vec::new();
+        for r in uses.iter() {
+            if self.pc_written.contains(r) {
+                continue;
+            }
+            let v = self.reg(r as u8);
+            let ty = self.ty(v);
+            // At the block's start: the exit's instruction is in already.
+            let v = if ty.rep == Rep::F64 || ty.set == TypeSet::FLOAT {
+                self.konst_in(self.cur, Value::float(0.0))
+            } else if ty.rep == Rep::I32 || ty.set == TypeSet::SMALL {
+                self.konst_in(self.cur, Value::small(0))
+            } else {
+                v
+            };
+            ents.push((r as u8, v));
+        }
+        ents
     }
 
     /// The snapshot that continues after the instruction at `pc`, once its
@@ -2177,20 +2312,33 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.bs[b.idx()].facts = facts;
     }
 
+    /// What the builder keeps of one instruction starts over at `pc`.
+    fn start_pc(&mut self, pc: u32) {
+        self.pc = pc;
+        self.cur_snap = None;
+        self.pc_refines.clear();
+        self.pc_site = None;
+        self.pc_written = RegSet::EMPTY;
+    }
+
     fn emit_instance(&mut self, ii: usize, bc: u32) {
         let blk = &self.cfg.blocks[bc as usize];
         let (start, end) = (blk.start, blk.end);
-        self.cur_snap = None;
-        self.pc_refines.clear();
+        self.pc_effect = false;
+        self.start_pc(start);
+        // An inlined body's entry continues its call's checkpoint, unless a
+        // loop's back edge enters it too.
+        self.ckpt = self
+            .entry_ckpt
+            .take()
+            .filter(|_| !self.cfg.loops.iter().any(|l| l.header == bc));
         if self.cfg.never_ran[bc as usize] {
-            self.pc = start;
             self.deopt(ExitTag::NeverRan);
             return;
         }
         if self.cfg.loops.iter().any(|l| l.header == bc) {
             // The collector's chance once per iteration; `prune_gc_checks`
             // keeps it only in loops that allocate or call.
-            self.pc = start;
             let s = self.snap_before();
             self.ins_snap(Op::GcCheck, &[], s, ExitTag::Gc);
         }
@@ -2200,9 +2348,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             *s = self.instances[self.succ_at(ii, k)].ir;
         }
         for pc in start..end {
-            self.pc = pc;
-            self.cur_snap = None;
-            self.pc_refines.clear();
+            self.start_pc(pc);
             let last = pc + 1 == end;
             // A `next` or `ipairs` step branches as its TFORLOOP would.
             let fused = pc + 2 == end
@@ -2214,6 +2360,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             let succs = if last || fused { &sb[..ns] } else { &[][..] };
             emit::emit(self, pc, succs);
             self.flush();
+            if std::mem::take(&mut self.pc_effect) {
+                self.ckpt = None;
+            }
             if self.terminated() {
                 return;
             }

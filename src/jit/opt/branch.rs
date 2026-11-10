@@ -195,8 +195,8 @@ fn eliminate_merges(f: &mut Func<'_>) -> bool {
             let a: Vec<Val> = f.args(i).iter().map(|&x| map(&vmap, x)).collect();
             let snap = (d.snap != NO_SNAP).then(|| f.map_snap(Snap(d.snap), |v| map(&vmap, v)));
             let ni = f.make_inst(d.op, &a, snap, d.tag);
-            if let Some(&s) = f.exit_sites.get(&i) {
-                f.exit_sites.insert(ni, s);
+            if d.blame != NO_SNAP {
+                f.insts[ni.idx()].blame = f.map_snap(Snap(d.blame), |v| map(&vmap, v)).0;
             }
             for (r, nr) in f.results(i).zip(f.results(ni)) {
                 f.vals[nr.idx()].ty = f.vals[r.idx()].ty;

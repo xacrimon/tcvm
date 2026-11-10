@@ -103,14 +103,14 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                             }
                             Rep::I32 if set.contains(TypeSet::SMALL) => {
                                 f.insts[i.idx()].op = Op::IToF;
-                                f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                                f.drop_exit(i);
                                 f.args_mut(i)[0] = y;
                                 changed = true;
                                 continue;
                             }
                             Rep::I64 if set.contains(TypeSet::INT) => {
                                 f.insts[i.idx()].op = Op::LToF;
-                                f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                                f.drop_exit(i);
                                 f.args_mut(i)[0] = y;
                                 changed = true;
                                 continue;
@@ -130,7 +130,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                     {
                         f.insts[i.idx()].op = Op::KF64(n.to_bits());
                         f.insts[i.idx()].an = 0;
-                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.drop_exit(i);
                         changed = true;
                         continue;
                     }
@@ -138,7 +138,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                     if t.within(TypeSet::FLOAT) && !t.set.is_empty() && set.contains(TypeSet::FLOAT)
                     {
                         f.insts[i.idx()].op = Op::Unbox(Rep::F64);
-                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.drop_exit(i);
                         changed = true;
                     } else if t.rep == Rep::Val
                         && t.within(TypeSet::SMALL)
@@ -150,7 +150,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         f.insert(b, k, u);
                         let u = f.result(u);
                         f.insts[i.idx()].op = Op::IToF;
-                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.drop_exit(i);
                         f.args_mut(i)[0] = u;
                         changed = true;
                     }
@@ -178,7 +178,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         let n = n.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                         f.insts[i.idx()].op = Op::KI32(n);
                         f.insts[i.idx()].an = 0;
-                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.drop_exit(i);
                         changed = true;
                         continue;
                     }
@@ -189,7 +189,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                         && set.contains(TypeSet::SMALL)
                     {
                         f.insts[i.idx()].op = Op::Unbox(Rep::I32);
-                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.drop_exit(i);
                         changed = true;
                     }
                 }
@@ -204,7 +204,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                     {
                         f.insts[i.idx()].op = Op::KI32(c as i32);
                         f.insts[i.idx()].an = 0;
-                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.drop_exit(i);
                         changed = true;
                     }
                 }
@@ -212,7 +212,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                     let x = args[0];
                     if let Some(Op::IToF) = f.def_op(x) {
                         f.insts[i.idx()].op = Op::IToL;
-                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.drop_exit(i);
                         f.args_mut(i)[0] = f.args(f.def_inst(x).unwrap())[0];
                         changed = true;
                     } else if let Some(c) = konst_f64(f, x)
@@ -220,7 +220,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                     {
                         f.insts[i.idx()].op = Op::KI64(n);
                         f.insts[i.idx()].an = 0;
-                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.drop_exit(i);
                         changed = true;
                     }
                 }
@@ -239,7 +239,7 @@ pub(crate) fn simplify(f: &mut Func<'_>) -> bool {
                     {
                         f.insts[i.idx()].op = Op::KPtr(p);
                         f.insts[i.idx()].an = 0;
-                        f.insts[i.idx()].snap = crate::jit::ir::NO_SNAP;
+                        f.drop_exit(i);
                         changed = true;
                         continue;
                     }
@@ -559,7 +559,7 @@ fn fold_arith(f: &mut Func<'_>, i: Inst, op: Op, args: &[Val]) -> bool {
     let d = &mut f.insts[i.idx()];
     d.op = k;
     d.an = 0;
-    d.snap = crate::jit::ir::NO_SNAP;
+    (d.snap, d.blame) = (crate::jit::ir::NO_SNAP, crate::jit::ir::NO_SNAP);
     let r = f.result(i);
     f.vals[r.idx()].ty = k.result_ty(&[]);
     true
@@ -597,7 +597,7 @@ fn become_op(f: &mut Func<'_>, i: Inst, op: Op, args: &[Val]) {
     d.op = op;
     d.an = args.len() as u16;
     if !op.may_deopt() {
-        d.snap = crate::jit::ir::NO_SNAP;
+        (d.snap, d.blame) = (crate::jit::ir::NO_SNAP, crate::jit::ir::NO_SNAP);
     }
     f.args_mut(i).copy_from_slice(args);
     let r = f.result(i);

@@ -492,6 +492,8 @@ fn inline_site(
             returns: Vec::new(),
             closure,
             window: 0,
+            ckpt: if tail { None } else { b.live_ckpt() },
+            effects: false,
         };
         let from = b.cur;
         let mut ib = Builder::new_inline(b, lf, proto, &code.cfg, inline);
@@ -571,6 +573,10 @@ fn inline_site(
     }
     let end = (base + proto.max_stack_size as usize) as u16;
     b.need_window(end.max(inline.window));
+    // The body's side effects follow the guards that enter it.
+    if inline.effects {
+        b.side_effect();
+    }
     b.flush();
     let slots: Vec<SlotState> = (0..(a as usize).min(b.nregs))
         .map(|r| b.slot(b.cur, r))

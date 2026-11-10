@@ -147,6 +147,9 @@ fn peel_loop(f: &mut Func<'_>, h: Block, body: &[Block]) {
             args.extend(f.args(i).iter().map(|&a| map(&vmap, a)));
             let snap = (d.snap != NO_SNAP).then(|| f.map_snap(Snap(d.snap), |v| map(&vmap, v)));
             let ni = f.make_inst(d.op, &args, snap, d.tag);
+            if d.blame != NO_SNAP {
+                f.insts[ni.idx()].blame = f.map_snap(Snap(d.blame), |v| map(&vmap, v)).0;
+            }
             for (r, nr) in f.results(i).zip(f.results(ni)) {
                 f.vals[nr.idx()].ty = f.vals[r.idx()].ty;
                 vmap.insert(r, nr);
@@ -242,24 +245,7 @@ fn repair_ssa(f: &mut Func<'_>, side: &[Side], vmap: &HashMap<Val, Val>) {
             let r = reach.at(f, b);
             for k in 0..f.blocks[b.idx()].insts.len() {
                 let i = f.insts_of(b)[k];
-                for a in f.args_mut(i) {
-                    if *a == v {
-                        *a = r;
-                    }
-                }
-                for e in 0..f.edges(i).len() {
-                    for a in f.edge_args_mut(i, e) {
-                        if *a == v {
-                            *a = r;
-                        }
-                    }
-                }
-                let s = f.insts[i.idx()].snap;
-                // A shared snapshot is copied before it is changed.
-                if s != NO_SNAP && f.entries(s).iter().any(|e| e.1 == v) {
-                    let ns = f.map_snap(Snap(s), |x| if x == v { r } else { x });
-                    f.insts[i.idx()].snap = ns.0;
-                }
+                f.replace_uses(i, v, r);
             }
         }
     }

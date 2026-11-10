@@ -129,7 +129,7 @@ fn builds_loop_entry_in_nest() {
             // A compiled loop's word is its entry's.
             let op = |i: &crate::instruction::Instruction| {
                 if i.is_jit_word() {
-                    super::original_of(lf, *i).generic_op()
+                    super::original_of(lf.proto, *i).generic_op()
                 } else {
                     i.generic_op()
                 }
@@ -343,7 +343,7 @@ fn loops_entered_from_compiled_code_compile() {
         let forms: Vec<Op> = (lf.proto.code.iter())
             .map(|w| {
                 if w.is_jit_word() {
-                    super::original_of(lf, w).op()
+                    super::original_of(lf.proto, w).op()
                 } else {
                     w.op()
                 }
@@ -473,7 +473,7 @@ fn hoisted_inlined_bounds_miss_at_the_callee() {
             .flat_map(|r| {
                 r.exits
                     .iter()
-                    .filter(|x| x.site.is_some() && x.site_proto != u16::MAX)
+                    .filter(|x| x.site().is_some() && x.site_proto != u16::MAX)
                     .map(|x| r.site_protos[x.site_proto as usize])
                     .collect::<Vec<_>>()
             })
@@ -1662,8 +1662,17 @@ fn bodies_start_with_their_callers_facts() {
     let ir = ir_of(src, "f", 0);
     let body = ir
         .lines()
-        .filter(|l| l.contains("guardshape") && l.contains("before f0"));
+        .filter(|l| l.contains("guardshape") && blamed_in(l, "f0"));
     assert_eq!(body.count(), 0, "{ir}");
+}
+
+/// Whether the exit an IR line prints is a site of inlined frame `fr`: its
+/// blame's frame for a moved exit, else its snapshot's.
+fn blamed_in(line: &str, fr: &str) -> bool {
+    match line.find("[blame") {
+        Some(k) => line[k..].starts_with(&format!("[blame {fr} ")),
+        None => line.contains(&format!("before {fr} ")),
+    }
 }
 
 /// The same read first in an inlined body: the caller continues with the
@@ -1678,7 +1687,7 @@ fn callers_continue_with_their_bodies_facts() {
     let ir = ir_of(src, "f", 0);
     let caller = ir
         .lines()
-        .filter(|l| l.contains("guardshape") && !l.contains("before f0"));
+        .filter(|l| l.contains("guardshape") && !blamed_in(l, "f0"));
     assert_eq!(caller.count(), 0, "{ir}");
 }
 

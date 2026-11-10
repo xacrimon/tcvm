@@ -29,6 +29,8 @@ pub(crate) struct LExit {
     pub(crate) tag: ExitTag,
     /// `(register, rep, source)`.
     pub(crate) entries: Vec<(u8, SRep, Src)>,
+    /// A moved exit's blame entries, by the blamed instruction's registers.
+    pub(crate) blame: Vec<(u8, SRep, Src)>,
     /// The VCode instruction that exits, once lowered.
     pub(crate) inst: Option<usize>,
     /// Whether `TCVM_JIT_DEOPT_ALL` may take it where it is first reached:
@@ -1026,11 +1028,20 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let mut ops: Vec<Operand> = Vec::new();
         let mut seen: Vec<(VReg, u16)> = Vec::new();
         let mut entries = Vec::new();
-        for &(r, v) in self.f.entries(d.snap) {
+        let mut blame = Vec::new();
+        let blamed = (self.f.blame_entries(i).iter()).map(|&e| (true, e));
+        for (is_blame, (r, v)) in self
+            .f
+            .entries(d.snap)
+            .iter()
+            .map(|&e| (false, e))
+            .chain(blamed)
+        {
             // A call's kept value, in a snapshot an exit shares.
-            if r == crate::jit::ir::KEPT {
+            if r == crate::jit::ir::KEPT && !is_blame {
                 continue;
             }
+            let out = if is_blame { &mut blame } else { &mut entries };
             // Boxes in snapshots are the exit's work.
             let v = match self.f.def_op(v) {
                 Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
@@ -1038,14 +1049,14 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             };
             let rep = self.reg_rep(v);
             if let Some(k) = self.const_word(v) {
-                entries.push((r, SRep::Val, Src::Const(k)));
+                out.push((r, SRep::Val, Src::Const(k)));
                 continue;
             }
             // A home load's slot holds it here: nothing to write for its
             // own register, a copy within the frame for another.
             if let Some(s) = self.home_load(v) {
-                if s != r {
-                    entries.push((r, srep(rep), Src::Slot(s)));
+                if s != r || is_blame {
+                    out.push((r, srep(rep), Src::Slot(s)));
                 }
                 continue;
             }
@@ -1066,7 +1077,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     k
                 }
             };
-            entries.push((r, srep(rep), Src::Operand(k)));
+            out.push((r, srep(rep), Src::Operand(k)));
         }
         let pc = s.pc;
         let kind = s.kind;
@@ -1083,11 +1094,12 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         self.exits.push(LExit {
             pc,
             frames,
-            site: self.f.exit_sites.get(&i).copied(),
+            site: (d.blame != NO_SNAP).then(|| self.f.exit_site(i)),
             frame: s.frame,
             kind,
             tag,
             entries,
+            blame,
             inst: None,
             forced: !store_failed,
         });
@@ -1098,7 +1110,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     fn const_word(&self, v: Val) -> Option<u64> {
         match self.f.def_op(v)? {
             Op::KVal(b) => Some(b),
-            Op::KObj(p) => Some(self.f.pool[p as usize].to_raw()),
+            // A pointer constant in a blame stands for the object.
+            Op::KObj(p) | Op::KPtr(p) => Some(self.f.pool[p as usize].to_raw()),
             Op::KI32(n) => Some(Value::small(n).to_raw()),
             Op::KF64(b) => Some(Value::float(f64::from_bits(b)).to_raw()),
             Op::KB1(c) => Some(Value::boolean(c).to_raw()),

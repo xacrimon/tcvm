@@ -98,6 +98,7 @@ pub(crate) struct ExitOut {
     pub(crate) kind: crate::jit::ir::ExitKind,
     pub(crate) tag: crate::jit::ir::ops::ExitTag,
     pub(crate) entries: Vec<SnapEntry>,
+    pub(crate) blame: Vec<SnapEntry>,
     pub(crate) consts: Vec<u64>,
 }
 
@@ -816,7 +817,9 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
         Value::boolean(false).to_raw(),
         Value::boolean(true).to_raw(),
     );
-    for &(reg, rep, src) in &e.entries {
+    let mut blame = Vec::new();
+    let all = (e.entries.iter().map(|&x| (false, x))).chain(e.blame.iter().map(|&x| (true, x)));
+    for (is_blame, (reg, rep, src)) in all {
         let loc = match src {
             Src::Const(w) if w == nil => Loc::Nil,
             Src::Const(w) if w == f => Loc::False,
@@ -837,7 +840,8 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
                 }
             }
         };
-        entries.push(SnapEntry { reg, rep, loc });
+        let out = if is_blame { &mut blame } else { &mut entries };
+        out.push(SnapEntry { reg, rep, loc });
     }
     ExitOut {
         pc: e.pc,
@@ -847,6 +851,7 @@ fn exit_out(l: &Lowered, out: &Output, e: &LExit, _k: usize) -> ExitOut {
         kind: e.kind,
         tag: e.tag,
         entries,
+        blame,
         consts,
     }
 }
