@@ -37,8 +37,6 @@ pub(crate) struct Emitted {
     pub(crate) num_spills: u32,
     /// Bytes of the native frame.
     pub(crate) frame_size: u32,
-    /// `Region::kept_mask` and `kept_slots`.
-    pub(crate) kept: (u16, [u8; 16]),
     /// The 8-byte word holding the region pointer.
     pub(crate) region_word: Label,
     pub(crate) exits: Vec<ExitOut>,
@@ -791,20 +789,12 @@ fn emit_with(
         .collect();
     let entry = dispatch;
     let frame_size = em.frame;
-    let mut kept = (0u16, [0u8; 16]);
-    for &(r, slot) in &out.kept {
-        let k = (crate::jit::backend::aarch64::abi::kept().position(|p| p == r))
-            .expect("a register calls keep");
-        kept.0 |= 1 << k;
-        kept.1[k] = u8::try_from(slot).map_err(|_| "a caller's value past slot 255")?;
-    }
     Ok(Emitted {
         asm: em.a,
         entry,
         fast: fast_label,
         num_spills: out.num_spillslots as u32,
         frame_size,
-        kept,
         region_word,
         exits,
         sites: em.sites,

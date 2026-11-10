@@ -4,7 +4,7 @@
 //! operand's register, and snapshot values attached as `Any` uses.
 
 use crate::env::value::Value;
-use crate::jit::backend::aarch64::abi::{call_clobbers, caller_saved, kept, preg_float, preg_int};
+use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, preg_int};
 use crate::jit::backend::aarch64::asm::{Asm, Cond, Shift, Sz, logical_imm};
 use crate::jit::backend::aarch64::emit::is_single_test;
 use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
@@ -268,7 +268,6 @@ pub(crate) fn lower<'gc>(
         }
         if b == f.entry {
             lw.push(MInst::Prologue, &[], PRegSet::empty());
-            lw.entry_kept();
             lw.entry_params();
         }
         // A resume block's first instruction is where a fast callee returns.
@@ -391,31 +390,6 @@ impl<'a, 'gc> Lower<'a, 'gc> {
 
     /// Every parameter entries pass in registers, used or not: an entry
     /// guard's failure stores them all for the interpreter.
-    /// A function region's caller's values (`call-protocol.md`): defined
-    /// in the registers calls keep, used there where the region leaves.
-    fn entry_kept(&mut self) {
-        if self.own.is_none() {
-            return;
-        }
-        let ops: Vec<Operand> = (kept())
-            .map(|p| {
-                let v = self.v.new_vreg(p.class());
-                self.v.kept.push((v.vreg() as u32, p));
-                Operand::reg_fixed_def(v, p)
-            })
-            .collect();
-        self.push(MInst::Params, &ops, PRegSet::empty());
-    }
-
-    /// The caller's values back in their registers, for an instruction
-    /// leaving the region.
-    fn kept_uses(&self, ops: &mut Vec<Operand>) {
-        ops.extend(
-            (self.v.kept.iter())
-                .map(|&(v, p)| Operand::reg_fixed_use(VReg::new(v as usize, p.class()), p)),
-        );
-    }
-
     fn entry_params(&mut self) {
         let f = self.f;
         if f.meta.params == 0 {
@@ -1180,7 +1154,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             };
             entries.push((r, srep(self.reg_rep(v)), Src::Operand(k)));
         }
-        self.v.push(mk, &ops, call_clobbers());
+        self.v.push(mk, &ops, allocatable());
         self.snap_ops.push(base as u32);
         let resume = self.f.edges(i)[0].target;
         self.sites.push((
@@ -2018,11 +1992,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     true => self.resume_a(i),
                     false => (0, 0),
                 };
-                // Only the registers calls keep hold anything here: the
-                // rest of what lives across the call is in the frame (C1),
-                // and its reloads come after. The results land in x0 and
-                // x1, which a clobber cannot name.
-                let mut clob = call_clobbers();
+                // Nothing is in a register here: what lives across the call
+                // is in the frame (C1), and its reloads come after. The
+                // results land in x0 and x1, which a clobber cannot name.
+                let mut clob = allocatable();
                 let ops: Vec<Operand> = if c == 2 || c == 3 {
                     let rs: Vec<Val> = f.results(i).collect();
                     rs.into_iter()
@@ -2102,9 +2075,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::Dispatch { pc, word } => {
                 let pc_after = self.pc_base + (pc as usize + 1) * 8;
                 let op = (word & 0xff) as u8;
-                let mut ops = Vec::new();
-                self.kept_uses(&mut ops);
-                self.push(MInst::Dispatch { op, word, pc_after }, &ops, none);
+                self.push(MInst::Dispatch { op, word, pc_after }, &[], none);
             }
             Op::TailEnter { nargs, proto } => {
                 let p = self.use_(args[0]);
@@ -2112,9 +2083,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     let p = f.protos[proto as usize];
                     (p.ptr.as_ptr() as u64, p.num_params)
                 });
-                let mut ops = vec![p];
-                self.kept_uses(&mut ops);
-                self.push(MInst::TailEnter { nargs, known }, &ops, none);
+                self.push(MInst::TailEnter { nargs, known }, &[p], none);
             }
             Op::CallMm { pc, nargs, hdr, .. } => {
                 let pc_after = self.pc_after(i, pc);
@@ -2132,14 +2101,11 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
             Op::Return { a, n } => match self.returned(i) {
                 Some(v) => {
-                    let mut ops = vec![Operand::reg_fixed_use(self.vr(v), preg_int(0))];
-                    self.kept_uses(&mut ops);
-                    self.push(MInst::Return { a, n, x0: true }, &ops, none);
+                    let u = Operand::reg_fixed_use(self.vr(v), preg_int(0));
+                    self.push(MInst::Return { a, n, x0: true }, &[u], none);
                 }
                 None => {
-                    let mut ops = Vec::new();
-                    self.kept_uses(&mut ops);
-                    self.push(MInst::Return { a, n, x0: false }, &ops, none);
+                    self.push(MInst::Return { a, n, x0: false }, &[], none);
                 }
             },
             Op::Deopt => self.push_exit(i, |exit| MInst::Deopt { exit }, vec![], none),

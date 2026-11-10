@@ -880,8 +880,6 @@ pub(crate) fn compile<'gc>(
             nest: nest.into_boxed_slice(),
             num_spills: em.num_spills,
             frame_size: em.frame_size,
-            kept_mask: em.kept.0,
-            kept_slots: em.kept.1,
             retired: std::cell::Cell::new(false),
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
             sites: sites.into_boxed_slice(),

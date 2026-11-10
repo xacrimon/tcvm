@@ -254,16 +254,11 @@ impl Ra {
                 self.sequence(group, |e| edits.push((at, e)))?;
             }
         }
-        let kept = (f.kept.iter())
-            .filter(|&&(v, _)| self.vregs[v as usize].slot != NONE)
-            .map(|&(v, r)| (r, self.vregs[v as usize].slot))
-            .collect();
         Ok(Output {
             num_spillslots: self.num_slots as usize,
             edits,
             edge_edits,
             allocs: std::mem::take(&mut self.allocs),
-            kept,
         })
     }
 
@@ -903,12 +898,6 @@ impl Ra {
                 continue;
             }
             ivs.clear();
-            // A caller's value is read from its slot at every exit.
-            if self.callers.contains(&(g as u32)) {
-                push_coalesced(all, all.len(), (0, Pos::MAX));
-                busy.push((g as u32, all.len() as u32 - 1, all.len() as u32));
-                continue;
-            }
             for &x in self.pieces_of(g as u32) {
                 // Stores land in the gaps around: a point either side.
                 let iv = self.ivs_of(x);
@@ -984,8 +973,8 @@ impl Ra {
     }
 
     /// Moves on every edge whose ends hold a value in different places: on
-    /// the successor's side when it has one predecessor (a resume block's
-    /// past its `Resume`, where returns land), else on the predecessor's.
+    /// the successor's side when it has one predecessor (not a resume block,
+    /// which a return enters past its moves), else on the predecessor's.
     /// Only values of split groups can be in two places.
     #[inline(never)]
     fn edge_moves<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve) -> Result<(), String> {
@@ -1095,16 +1084,12 @@ impl Ra {
                     // or on the edge itself when both have company.
                     let (at, phase) = if preds.len() == 1 && !resume {
                         (self.first[si], EDGE_IN)
-                    } else if resume {
-                        // Past the `Resume`, where every return has landed:
-                        // what a call's edge moves is in registers the call
-                        // keeps or in slots, which the `Resume` leaves alone.
-                        (self.first[si] + 1, EDGE_IN)
                     } else if succs.len() == 1 {
                         (self.last[pi], EDGE_OUT)
                     } else {
                         (self.last[pi], EDGE | (k as u8) << 3)
                     };
+                    let before = moves.len();
                     for &(v, y) in live.iter() {
                         let x = from(v, y, pi)?;
                         if x == y {
@@ -1137,6 +1122,12 @@ impl Ra {
                             let m = self.mv_from(f, a.vreg() as u32, from, pe, to, cls);
                             moves.push((at, phase, m));
                         }
+                    }
+                    if resume && moves.len() != before {
+                        return Err(format!(
+                            "moves into resume block b{si}: {:?}",
+                            &moves[before..]
+                        ));
                     }
                 }
             }

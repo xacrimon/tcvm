@@ -64,7 +64,6 @@ fn env() -> Env {
         ],
         scratch: [int(17), float(31)],
         transport: int(16),
-        kept: [0; 2],
     }
 }
 

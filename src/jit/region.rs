@@ -289,13 +289,6 @@ pub(crate) struct Region<'gc> {
     /// Bytes of the region's native frame, which `exit_common` pops.
     #[collect(require_static)]
     pub(crate) frame_size: u32,
-    /// The registers calls keep whose caller's value the frame holds in a
-    /// spill slot (bits in `abi::kept` order, then each one's slot):
-    /// `exit_common` gives them back.
-    #[collect(require_static)]
-    pub(crate) kept_mask: u16,
-    #[collect(require_static)]
-    pub(crate) kept_slots: [u8; 16],
     #[collect(require_static)]
     pub(crate) retired: Cell<bool>,
     /// Takings of one exit that ask for a recompile: `EXIT_HOT`, doubled
@@ -386,8 +379,6 @@ pub(crate) mod layout {
 
     pub(crate) const NUM_SPILLS: usize = std::mem::offset_of!(Region<'static>, num_spills);
     pub(crate) const FRAME_SIZE: usize = std::mem::offset_of!(Region<'static>, frame_size);
-    pub(crate) const KEPT_MASK: usize = std::mem::offset_of!(Region<'static>, kept_mask);
-    pub(crate) const KEPT_SLOTS: usize = std::mem::offset_of!(Region<'static>, kept_slots);
 }
 
 #[cfg(test)]
