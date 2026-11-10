@@ -485,6 +485,56 @@ fn hoisted_inlined_bounds_miss_at_the_callee() {
     });
 }
 
+/// An array load's miss guard that the type guard on its element stands for
+/// (`opt::miss::covered`): the exit on a nil under `__index` records nothing
+/// at the use, and the miss at the load is the interpreter's to record as it
+/// runs the load again, which the next compile's slow arm depends on.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn covered_misses_are_recorded_by_the_load() {
+    use crate::instruction::Op;
+    use crate::jit::feedback as fb;
+    let warm = "function f(t, n) local s = 0.5 for i = 1, n do s = s + t[i] end return s end
+        local t = {}
+        for i = 1, 100 do t[i] = i + 0.5 end
+        for r = 1, 300 do f(t, 100) end";
+    let ir = ir_of(warm, "f", 0);
+    assert!(ir.contains("table=v") && !ir.contains("guard.miss"), "{ir}");
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.load_all();
+    let src = format!(
+        "{warm}
+        local u = setmetatable({{}}, {{__index = function() return 1.5 end}})
+        for i = 1, 100 do u[i] = i + 0.5 end
+        u[50] = nil
+        for r = 1, 3 do f(u, 100) end"
+    );
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load(&src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    lua.finish(&ex).expect("run");
+    lua.enter(|ctx| {
+        let f = ctx
+            .globals()
+            .raw_get(Value::string(LuaString::new(ctx, b"f")))
+            .get_function()
+            .and_then(|f| f.as_lua())
+            .unwrap();
+        let site = |op: Op| {
+            (f.proto.code.iter())
+                .position(|i| crate::jit::compile::resolve_original(&f.proto, i).generic_op() == op)
+                .expect("the instruction")
+        };
+        let bits = |op: Op| f.proto.feedback.bits(site(op));
+        assert_ne!(bits(Op::GETTABLE) & fb::ARR_MISS, 0);
+        assert_eq!(bits(Op::ADD) & fb::OTHER, 0);
+    });
+}
+
 /// One shape guard per receiver while nothing changes shapes, a field read
 /// again is the first read, and a read after a store is the stored value.
 #[test]

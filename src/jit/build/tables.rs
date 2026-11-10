@@ -1372,14 +1372,16 @@ fn array_guards(b: &mut Builder<'_, '_>, pc: u32, t: Val, i: Val) -> Option<Val>
 /// read only for a nil (LuaJIT `lj_record.c:1597-1612`) unless it is read
 /// anyway (`opt::miss`): up front it costs a varying table three dependent
 /// loads per access.
-fn nil_guard(b: &mut Builder<'_, '_>, t: Val, v: Val, bit: MetamethodBits) {
+fn nil_guard(b: &mut Builder<'_, '_>, recv: Val, t: Val, v: Val, bit: MetamethodBits) {
     let has = match known_class_bit(b, t, bit) {
         Some(false) => return,
         Some(true) => b.ins(Op::KB1(true), &[]),
         None => live_class_bit(b, t, bit),
     };
     let s = b.snap_before();
-    b.ins_snap(Op::GuardMiss, &[v, has], s, ExitTag::Bounds);
+    // The table by its root, so that GVN still merges equal guards.
+    let recv = b.root_of(recv);
+    b.ins_snap(Op::GuardMiss, &[v, has, recv], s, ExitTag::Bounds);
 }
 
 /// `R[a] = R[b][R[c]]`: a small integer key inside the array part loads
@@ -1409,7 +1411,7 @@ pub(super) fn emit_gettable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
     };
     if let Some(arr) = array_guards(b, pc, t, i) {
         let v = b.ins(Op::ArrLoad, &[arr, i]);
-        nil_guard(b, t, v, MetamethodBits::INDEX);
+        nil_guard(b, recv, t, v, MetamethodBits::INDEX);
         match other {
             None => b.set(dst, v),
             Some(other) => {
@@ -1483,7 +1485,7 @@ pub(super) fn emit_settable(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction)
     if let Some(arr) = array_guards(b, pc, t, i) {
         // Unused, so dropped, where the class lacks `__newindex` for good.
         let old = b.ins(Op::ArrLoad, &[arr, i]);
-        nil_guard(b, t, old, MetamethodBits::NEWINDEX);
+        nil_guard(b, recv, t, old, MetamethodBits::NEWINDEX);
         barrier_for(b, t, v);
         b.push(Op::ArrStore, &[arr, i, v]);
         b.jump(join);

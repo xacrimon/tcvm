@@ -192,8 +192,11 @@ pub(crate) struct ExitSite {
 }
 
 /// A blame entry's register for the value the exit's guard tested: a shape
-/// guard's table (an upvalue's is in no register).
+/// guard's table (an upvalue's is in no register), and the element of a
+/// type guard standing for an array load's miss guard (`opt::miss`), which
+/// names the table it came from too (`BLAME_TABLE`).
 pub(crate) const BLAME_TESTED: u8 = u8::MAX;
+pub(crate) const BLAME_TABLE: u8 = u8::MAX - 1;
 
 /// The register of a call snapshot's entry for a value no register holds,
 /// which the call keeps in the frame (C1): past every region slot (the
@@ -852,6 +855,15 @@ impl<'gc> Func<'gc> {
         Snap(self.snaps.len() as u32 - 1)
     }
 
+    /// Whether exits with snapshots `a` and `b` leave alike: the same
+    /// snapshot, or copies of one (a clone's, a replaced value's).
+    pub(crate) fn same_snap(&self, a: u32, b: u32) -> bool {
+        a == b || {
+            let (x, y) = (&self.snaps[a as usize], &self.snaps[b as usize]);
+            (x.pc, x.kind, x.frame) == (y.pc, y.kind, y.frame) && self.entries(a) == self.entries(b)
+        }
+    }
+
     /// The site of an exit with snapshot `s` that stays where it is.
     pub(crate) fn snap_site(&self, s: Snap) -> ExitSite {
         let d = self.snaps[s.0 as usize];
@@ -927,8 +939,8 @@ impl<'gc> Func<'gc> {
             .collect();
         let from = self.snap_pool.len();
         self.snap_pool.extend_from_slice(&kept);
-        let s = self.finish_snap(site.frame, site.pc, ExitKind::Before, from);
-        s.0
+        self.finish_snap(site.frame, site.pc, ExitKind::Before, from)
+            .0
     }
 
     /// `inst` exits no more: its snapshot and blame go.

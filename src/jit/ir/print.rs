@@ -79,6 +79,7 @@ impl Func<'_> {
                     let ents: Vec<String> = (self.entries(d.blame).iter())
                         .map(|&(r, v)| match r {
                             crate::jit::ir::BLAME_TESTED => format!("tested=v{}", v.0),
+                            crate::jit::ir::BLAME_TABLE => format!("table=v{}", v.0),
                             r => format!("r{r}=v{}", v.0),
                         })
                         .collect();

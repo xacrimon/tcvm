@@ -750,10 +750,17 @@ fn on_exit<'gc>(
     {
         return;
     }
+    // A type guard standing for an array load's miss guard
+    // (`opt::miss::covered`), its element nil under a class with `__index`:
+    // the load's miss, which tells the use's kinds nothing. The interpreter
+    // records it (`ARR_MISS`, `gettable_general`) as it runs the load again.
+    let missed = (ops.named(crate::jit::ir::BLAME_TESTED)).is_some_and(|v| v.is_nil())
+        && (ops.named(crate::jit::ir::BLAME_TABLE))
+            .is_some_and(|t| !ctx.mm_of(t, crate::env::MetamethodBits::INDEX).is_nil());
     // A `Before` exit's operands are in their home slots or its blame; the
     // other kinds follow a completed instruction and have no failed guard,
     // as a lazy exit has none.
-    if kind == ExitKind::Before && e.tag != ExitTag::Lazy {
+    if kind == ExitKind::Before && e.tag != ExitTag::Lazy && !missed {
         let extra = match e.tag {
             ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
             ExitTag::Mm => crate::jit::feedback::MM,
@@ -816,7 +823,8 @@ fn on_exit<'gc>(
         // Feedback only grows (kinds, the overflow, misses and metamethod
         // bits, shapes up to `MAX_SHAPES + 1`), so a recompile that learns
         // some is outside the budget, as the never-executed rule's are.
-        let learned = exit_seen(site_proto(region, e, closure), e.site().unwrap_or(pc)) != e.seen;
+        let learned =
+            missed || exit_seen(site_proto(region, e, closure), e.site().unwrap_or(pc)) != e.seen;
         request_recompile(ctx, region_closure, region, learned);
     }
 }
@@ -1076,9 +1084,16 @@ impl<'gc> Operands<'_, 'gc> {
                     unsafe { u.value }
                 })
             }
-            Operands::Blame(b) => (b.iter())
-                .find(|e| e.0 == crate::jit::ir::BLAME_TESTED)
-                .map(|e| e.1),
+            Operands::Blame(_) => self.named(crate::jit::ir::BLAME_TESTED),
+        }
+    }
+
+    /// A blame's entry of what no register names (`BLAME_TESTED`,
+    /// `BLAME_TABLE`).
+    fn named(self, r: u8) -> Option<Value<'gc>> {
+        match self {
+            Operands::Frame(..) => None,
+            Operands::Blame(b) => b.iter().find(|e| e.0 == r).map(|e| e.1),
         }
     }
 }
