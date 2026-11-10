@@ -178,6 +178,13 @@ pub(crate) struct SnapData {
     pub(crate) entries: List,
     /// The inlined frame `pc` is in (`Func::inline_frames`), or `NO_FRAME`.
     pub(crate) frame: u32,
+    /// A blame's: the pc, in its frame, of the array load whose miss guard
+    /// the exit's type guard stands for (`opt::miss`), else `NO_SNAP`. Its
+    /// entries then name the tested element (`BLAME_TESTED`) and the table
+    /// (`BLAME_TABLE`).
+    pub(crate) miss: u32,
+    /// The inlined frame `miss` is in.
+    pub(crate) miss_frame: u32,
 }
 
 pub(crate) const NO_FRAME: u32 = u32::MAX;
@@ -189,11 +196,17 @@ pub(crate) const NO_FRAME: u32 = u32::MAX;
 pub(crate) struct ExitSite {
     pub(crate) pc: u32,
     pub(crate) frame: u32,
+    /// `SnapData::miss` and `miss_frame` of the blame.
+    pub(crate) miss: u32,
+    pub(crate) miss_frame: u32,
 }
 
 /// A blame entry's register for the value the exit's guard tested: a shape
-/// guard's table (an upvalue's is in no register).
+/// guard's table (an upvalue's is in no register), and the element of a
+/// type guard standing for a miss guard (`SnapData::miss`), which names
+/// the table it came from too (`BLAME_TABLE`).
 pub(crate) const BLAME_TESTED: u8 = u8::MAX;
+pub(crate) const BLAME_TABLE: u8 = u8::MAX - 1;
 
 /// The register of a call snapshot's entry for a value no register holds,
 /// which the call keeps in the frame (C1): past every region slot (the
@@ -853,6 +866,7 @@ impl<'gc> Func<'gc> {
             && last.pc == pc
             && last.kind == kind
             && last.frame == frame
+            && last.miss == NO_SNAP
             && self.snap_pool[last.entries.range()] == self.snap_pool[entries.range()]
         {
             self.snap_pool.truncate(from);
@@ -863,8 +877,21 @@ impl<'gc> Func<'gc> {
             kind,
             entries,
             frame,
+            miss: NO_SNAP,
+            miss_frame: NO_FRAME,
         });
         Snap(self.snaps.len() as u32 - 1)
+    }
+
+    /// Whether exits with snapshots `a` and `b` leave alike: the same
+    /// snapshot, or copies of one (a clone's, a replaced value's).
+    pub(crate) fn same_snap(&self, a: u32, b: u32) -> bool {
+        a == b || {
+            let (x, y) = (&self.snaps[a as usize], &self.snaps[b as usize]);
+            (x.pc, x.kind, x.frame, x.miss, x.miss_frame)
+                == (y.pc, y.kind, y.frame, y.miss, y.miss_frame)
+                && self.entries(a) == self.entries(b)
+        }
     }
 
     /// The site of an exit with snapshot `s` that stays where it is.
@@ -873,6 +900,8 @@ impl<'gc> Func<'gc> {
         ExitSite {
             pc: d.pc,
             frame: d.frame,
+            miss: d.miss,
+            miss_frame: d.miss_frame,
         }
     }
 
@@ -892,6 +921,8 @@ impl<'gc> Func<'gc> {
                 len: d.entries.len,
             },
             frame: d.frame,
+            miss: d.miss,
+            miss_frame: d.miss_frame,
         });
         let ns = Snap(self.snaps.len() as u32 - 1);
         if let Some(&homes) = self.call_homes.get(&s.0) {
@@ -946,6 +977,22 @@ impl<'gc> Func<'gc> {
         let from = self.snap_pool.len();
         self.snap_pool.extend_from_slice(&kept);
         let s = self.finish_snap(site.frame, site.pc, ExitKind::Before, from);
+        // The miss stays while what the handler tells it by does.
+        if site.miss != NO_SNAP
+            && [BLAME_TESTED, BLAME_TABLE]
+                .iter()
+                .all(|r| kept.iter().any(|e| e.0 == *r))
+        {
+            return self.miss_blame(s, site.miss, site.miss_frame);
+        }
+        s.0
+    }
+
+    /// `blame` as a snapshot of its own standing for the miss guard of the
+    /// load at `pc` of `frame` too (`SnapData::miss`).
+    pub(crate) fn miss_blame(&mut self, blame: Snap, pc: u32, frame: u32) -> u32 {
+        let s = self.map_snap(blame, |v| v);
+        (self.snaps[s.idx()].miss, self.snaps[s.idx()].miss_frame) = (pc, frame);
         s.0
     }
 

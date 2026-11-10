@@ -745,10 +745,30 @@ fn on_exit<'gc>(
     {
         return;
     }
+    // A type guard standing for an array load's miss guard, its element
+    // nil under a class with the metamethod: the load's miss.
+    let miss = region.miss(e);
+    let missed = miss.is_some()
+        && ops
+            .reg(crate::jit::ir::BLAME_TESTED)
+            .is_some_and(|v| v.is_nil())
+        && ops
+            .reg(crate::jit::ir::BLAME_TABLE)
+            .is_some_and(|t| !ctx.mm_of(t, crate::env::MetamethodBits::INDEX).is_nil());
+    if missed {
+        let (at, k) = miss.unwrap();
+        let proto = match k {
+            u16::MAX => closure.proto,
+            k => region.site_protos[k as usize],
+        };
+        proto
+            .feedback
+            .add_bits(at as usize, crate::jit::feedback::ARR_MISS);
+    }
     // A `Before` exit's operands are in their home slots or its blame; the
     // other kinds follow a completed instruction and have no failed guard,
     // as a lazy exit has none.
-    if kind == ExitKind::Before && e.tag != ExitTag::Lazy {
+    if kind == ExitKind::Before && e.tag != ExitTag::Lazy && !missed {
         let extra = match e.tag {
             ExitTag::Overflow => crate::jit::feedback::OVERFLOW,
             ExitTag::Mm => crate::jit::feedback::MM,
@@ -811,7 +831,8 @@ fn on_exit<'gc>(
         // Feedback only grows (kinds, the overflow, misses and metamethod
         // bits, shapes up to `MAX_SHAPES + 1`), so a recompile that learns
         // some is outside the budget, as the never-executed rule's are.
-        let learned = exit_seen(site_proto(region, e, closure), e.site().unwrap_or(pc)) != e.seen;
+        let learned =
+            missed || exit_seen(site_proto(region, e, closure), e.site().unwrap_or(pc)) != e.seen;
         request_recompile(ctx, region_closure, region, learned);
     }
 }

@@ -1,7 +1,8 @@
 //! Array misses (W2.3): `GuardMiss(v, has)`, an element `v` nil under a
 //! class with the metamethod (`has`), expands once the loops are optimized.
-//! One a guard that excludes nil from `v` dominates goes; the rest become
-//! the cheapest of:
+//! One a guard that excludes nil from `v` dominates goes, as does one such a
+//! guard follows under its checkpoint, whose exit runs the load again
+//! ([`covered`]); the rest become the cheapest of:
 //! - the type guard on `v` of its use, as a branch whose failing arm tests
 //!   nil, then the class; the guards between with the use's snapshot (the
 //!   other operand's) follow the branch, as an exit there is the same exit;
@@ -65,6 +66,7 @@ pub(crate) fn expand(f: &mut Func<'_>) -> Option<Vec<Inst>> {
         f.retain(b, |_, i| i != g);
     }
     guards.retain(|g| !gone.contains(g));
+    guards.retain(|&g| !covered(f, g, pos(f, g)));
     let loops = natural_loops(f);
     let uses = f.use_counts();
     let fusions: Vec<Option<(usize, Vec<usize>)>> = guards
@@ -169,6 +171,59 @@ pub(crate) fn expand(f: &mut Func<'_>) -> Option<Vec<Inst>> {
         }
     }
     Some(arms)
+}
+
+/// Whether a type guard on its element excluding nil takes miss guard `g`'s
+/// place, `g` at `k` of its block: one after it on the only path on, with
+/// its snapshot (a shared checkpoint, so its exit runs the load again) and
+/// no side effect between. That guard's blame then names the element and
+/// the table, for the exit to tell a miss from another type
+/// (`SnapData::miss`), and `g` goes.
+fn covered(f: &mut Func<'_>, g: Inst, k: usize) -> bool {
+    use crate::jit::ir::{BLAME_TABLE, BLAME_TESTED};
+    let (v, t) = (f.args(g)[0], f.args(g)[2]);
+    let (snap, site) = (f.insts[g.idx()].snap, f.exit_site(g));
+    let (mut b, mut from) = (f.insts[g.idx()].block, k + 1);
+    let w = 'found: loop {
+        for &i in &f.insts_of(b)[from..] {
+            let op = f.op(i);
+            if let Op::Guard(set) = op
+                && f.args(i)[0] == v
+                && !set.intersects(TypeSet::NIL)
+            {
+                break 'found i;
+            }
+            if op == Op::Jump
+                && let [e] = f.edges(i)
+                && f.cfg().preds(e.target) == [b]
+            {
+                (b, from) = (e.target, 0);
+                continue 'found;
+            }
+            if op.side_effect() || op.is_terminator() {
+                return false;
+            }
+        }
+        return false;
+    };
+    let d = f.insts[w.idx()];
+    let at = f.exit_site(w);
+    if d.blame == NO_SNAP
+        || d.tag != ExitTag::Type
+        || at.miss != NO_SNAP
+        || !f.same_snap(d.snap, snap)
+    {
+        return false;
+    }
+    let from = f.snap_pool.len();
+    let mut ents = f.entries(d.blame).to_vec();
+    ents.extend([(BLAME_TESTED, v), (BLAME_TABLE, t)]);
+    f.snap_pool.extend_from_slice(&ents);
+    let s = f.finish_snap(at.frame, at.pc, crate::jit::ir::ExitKind::Before, from);
+    f.insts[w.idx()].blame = f.miss_blame(s, site.pc, site.frame);
+    let gb = f.insts[g.idx()].block;
+    f.retain(gb, |_, i| i != g);
+    true
 }
 
 /// The type guard on `v` excluding nil that the miss guard at `k` can take

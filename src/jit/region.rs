@@ -199,14 +199,19 @@ pub(crate) struct ExitInfo {
     /// `u16::MAX`.
     pub(crate) site_proto: u16,
     /// A moved exit's blame entries, the site's operands by its registers:
-    /// a snapshot without frames in the arena, or `NO_BLAME`.
+    /// a snapshot without frames in the arena, or `NO_BLAME`. With
+    /// `BLAME_MISS`, two words before it name the array load whose miss the
+    /// exit stands for too (`Region::miss`).
     blame: u32,
 }
 
 pub(crate) const NO_BLAME: u32 = u32::MAX;
+const BLAME_MISS: u32 = 1 << 31;
 const _: () = assert!(size_of::<ExitInfo>() == 32);
 
 impl ExitInfo {
+    /// `site` and `blame` as offsets into the arena; `miss` the words of
+    /// `Region::miss` at `blame - 2`.
     pub(crate) fn new(
         snap: u32,
         tag: ExitTag,
@@ -214,6 +219,7 @@ impl ExitInfo {
         site: Option<u32>,
         site_proto: u16,
         blame: u32,
+        miss: bool,
     ) -> Self {
         ExitInfo {
             snap,
@@ -222,7 +228,7 @@ impl ExitInfo {
             seen,
             site: site.unwrap_or(NO_BLAME),
             site_proto,
-            blame,
+            blame: if miss { blame | BLAME_MISS } else { blame },
         }
     }
 
@@ -344,7 +350,16 @@ impl<'gc> Region<'gc> {
     }
 
     pub(crate) fn blame(&self, e: &ExitInfo) -> Option<SnapView<'_>> {
-        (e.blame != NO_BLAME).then(|| SnapView::decode(&self.snaps[e.blame as usize..]))
+        let at = (e.blame & !BLAME_MISS) as usize;
+        (e.blame != NO_BLAME).then(|| SnapView::decode(&self.snaps[at..]))
+    }
+
+    /// The array load whose miss guard exit `e`'s type guard stands for
+    /// (`ir::SnapData::miss`): its pc and its function as `site_proto`.
+    pub(crate) fn miss(&self, e: &ExitInfo) -> Option<(u32, u16)> {
+        let at = (e.blame & !BLAME_MISS) as usize;
+        (e.blame != NO_BLAME && e.blame & BLAME_MISS != 0)
+            .then(|| (self.snaps[at - 2], self.snaps[at - 1] as u16))
     }
 
     /// A dependency broke (ws2 §5.4): from now on its entry goes to

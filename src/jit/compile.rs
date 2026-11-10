@@ -782,7 +782,15 @@ pub(crate) fn compile<'gc>(
             (k as u16, p)
         };
         let (site_proto, seen_proto) = e.site.map_or((u16::MAX, proto), |s| proto_of(s.frame));
+        let miss_proto = match e.site {
+            Some(s) if s.miss != crate::jit::ir::NO_SNAP => proto_of(s.miss_frame).0,
+            _ => u16::MAX,
+        };
         let site = e.site.map(|s| s.pc);
+        let miss = e.site.is_some_and(|s| s.miss != crate::jit::ir::NO_SNAP) && !e.blame.is_empty();
+        if miss {
+            snaps.extend([e.site.unwrap().miss, miss_proto as u32]);
+        }
         let blame = match (site, e.blame.is_empty()) {
             (Some(pc), false) => {
                 let at = snaps.len() as u32;
@@ -804,6 +812,7 @@ pub(crate) fn compile<'gc>(
             site,
             site_proto,
             blame,
+            miss,
         ));
     }
     // The sites, their snapshots after the exits'.
