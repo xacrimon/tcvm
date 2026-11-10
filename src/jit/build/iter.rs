@@ -90,9 +90,9 @@ pub(super) fn emit_tforcall_next(
     let rest = branch_arm(b, in_array);
     let i = b.ins(Op::ArrNext, &[t, p]);
     let n = b.ins(Op::TabASize, &[t]);
+    let arr = b.ins(Op::TabArray, &[t]);
     let found = b.ins(Op::ICmp(Cc::Lo), &[i, n]);
     let past = branch_arm(b, found);
-    let arr = b.ins(Op::TabArray, &[t]);
     let v = b.ins(Op::ArrLoad, &[arr, i]);
     let k = b.ins(Op::Box, &[i]);
     let one = b.ki32(1);
@@ -191,9 +191,10 @@ pub(super) fn emit_tforcall_ipairs(
     let k = b.f.result(k);
     let kv = b.ins(Op::Box, &[k]);
     let n = b.ins(Op::TabASize, &[t]);
+    // Before the branch: the first step's then dominates the loop's.
+    let arr = b.ins(Op::TabArray, &[t]);
     let inside = b.ins(Op::ICmp(Cc::Lo), &[k, n]);
     let outside = branch_arm(b, inside);
-    let arr = b.ins(Op::TabArray, &[t]);
     let v = b.ins(Op::ArrLoad, &[arr, k]);
     let nil = b.ins(Op::IsType(TypeSet::NIL), &[v]);
     let found = branch_arm(b, nil);
