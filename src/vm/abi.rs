@@ -517,8 +517,15 @@ macro_rules! handler_impl {
     };
 
     (@jump $h:ident, $i:ident, $p:ident, $b:ident, $rt:ident, [$th:ident], $c:expr) => {{
-        $rt.jit().jump_target.set($h as usize);
-        become $crate::jit::backend::aarch64::abi::level_jump($i, $p, $b, $rt, $c, $th)
+        cfg_select! {
+            all(feature = "jit", target_arch = "aarch64") => {
+                $rt.jit().jump_target.set($h as usize);
+                become $crate::jit::backend::aarch64::abi::level_jump($i, $p, $b, $rt, $c, $th)
+            }
+            _ => {
+                become $h($i, $p, $b, $rt, $c, $th)
+            }
+        }
     }};
     (@jump $h:ident, $i:ident, $p:ident, $b:ident, $rt:ident, [], $c:expr) => {{
         become $h($i, $p, $b, $rt, $c)

@@ -418,7 +418,7 @@ pub(crate) fn unmap_out(rx: NonNull<u8>, size: usize) {
 /// Make bytes written through `rw` fetchable through `rx`. Apple Silicon has
 /// `CTR_EL0.IDC = 1` (no data-cache clean needed) and a fixed 64-byte line,
 /// and its `CTR_EL0` is not readable from EL0.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 pub(crate) unsafe fn sync_icache(_rw: *mut u8, rx: *mut u8, len: usize) {
     use std::arch::asm;
     const LINE: usize = 64;
@@ -434,7 +434,7 @@ pub(crate) unsafe fn sync_icache(_rw: *mut u8, rx: *mut u8, len: usize) {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(target_os = "linux")]
 pub(crate) unsafe fn sync_icache(rw: *mut u8, rx: *mut u8, len: usize) {
     use std::arch::asm;
     let ctr: u64;
@@ -464,12 +464,7 @@ pub(crate) unsafe fn sync_icache(rw: *mut u8, rx: *mut u8, len: usize) {
     unsafe { asm!("isb", options(nostack, preserves_flags)) };
 }
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn sync_icache(_rw: *mut u8, _rx: *mut u8, _len: usize) {
-    unsafe { std::arch::asm!("mfence", options(nostack, preserves_flags)) };
-}
-
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

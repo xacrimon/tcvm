@@ -87,11 +87,13 @@ impl<'gc> Context<'gc> {
         self.state
     }
 
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     #[inline(always)]
     pub(crate) fn jit(self) -> &'gc crate::jit::state::JitRuntime {
         &self.state.jit
     }
 
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     /// Hot counter `i` (< `HOT_COUNTERS`).
     #[inline(always)]
     pub(crate) fn hot_counter(self, i: usize) -> &'gc std::cell::Cell<u16> {
@@ -99,12 +101,14 @@ impl<'gc> Context<'gc> {
         unsafe { self.state.jit.hot.get_unchecked(i) }
     }
 
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     /// `JitRuntime::call_mask`.
     #[inline(always)]
     pub(crate) fn call_mask(self) -> u64 {
         self.state.jit.call_mask.get()
     }
 
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     /// What entry-table slot `d` tails into.
     #[inline(always)]
     pub(crate) fn jit_entry(self, d: u16) -> Handler {
@@ -277,6 +281,7 @@ impl<'gc> Context<'gc> {
     /// The metatable numbers share, usually none.
     #[inline]
     /// The word compiled code reads from the cell of strings' metatable.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) fn string_metatable_word(self) -> u64 {
         let cell = self.state.type_metatable(crate::lua::ValueKind::String);
         // SAFETY: the cell holds an `Option<Table>`, a pointer or null.

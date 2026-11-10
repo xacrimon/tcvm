@@ -77,6 +77,7 @@ unsafe impl<'gc, T: 'gc> Collect<'gc> for Owned<T> {
 }
 
 impl<'gc, T: 'gc> Owned<T> {
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(super) const VALUE_OFFSET: usize = core::mem::offset_of!(Self, 0);
 
     pub(super) fn new(mc: &Mutation<'gc>, value: T) -> Gc<'gc, Self> {

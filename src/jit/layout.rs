@@ -42,10 +42,6 @@ pub(crate) fn rt_read(ctx: crate::lua::Context<'_>, off: usize) -> usize {
 /// The pointer to the arena's `Metrics`.
 pub(crate) const METRICS: usize =
     offset_of!(State<'static>, rt) + offset_of!(Runtime<'static>, metrics);
-/// The running thread's state, from `rt`.
-#[cfg(target_arch = "x86_64")]
-pub(crate) const RT_THREAD: usize =
-    offset_of!(State<'static>, rt) + offset_of!(Runtime<'static>, thread);
 /// The allocation counter and threshold pair inside `Metrics`.
 pub(crate) const GC_CHECK: usize = crate::dmm::metrics::Metrics::GC_CHECK_OFFSET;
 

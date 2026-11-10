@@ -73,8 +73,7 @@ impl JitConfig {
     pub(crate) fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok();
         JitConfig {
-            enabled: var("TCVM_JIT").is_none_or(|v| v != "off" && v != "0")
-                && cfg!(target_arch = "aarch64"),
+            enabled: var("TCVM_JIT").is_none_or(|v| v != "off" && v != "0"),
             #[cfg(feature = "tcvm-dev")]
             dev: Dev::from_env(),
         }
@@ -176,11 +175,9 @@ pub(crate) struct JitRuntime {
     /// The cold-arm trampolines made so far: (helper, its entry). Their code
     /// is freed before the allocator below.
     trampolines: RefCell<Vec<(usize, usize)>>,
-    #[cfg(target_arch = "aarch64")]
     trampoline_code: RefCell<Vec<crate::jit::backend::alloc::CodeBlock>>,
     code: RefCell<Option<std::rc::Rc<crate::jit::backend::alloc::CodeAllocator>>>,
     /// The register allocator, its buffers kept from compile to compile.
-    #[cfg(target_arch = "aarch64")]
     pub(crate) ra: RefCell<crate::jit::backend::ra::Ctx>,
     /// Compile failures from running out of code memory turn the JIT off.
     pub(crate) exhausted: Cell<bool>,
@@ -219,18 +216,13 @@ impl JitRuntime {
             exit_regs_buf,
             config,
             trampolines: RefCell::new(Vec::new()),
-            #[cfg(target_arch = "aarch64")]
             trampoline_code: RefCell::new(Vec::new()),
             code: RefCell::new(None),
-            #[cfg(target_arch = "aarch64")]
             ra: RefCell::new(crate::jit::backend::ra::Ctx::new(
                 crate::jit::backend::aarch64::abi::ra_env(),
             )),
             exhausted: Cell::new(false),
-            #[cfg(target_arch = "aarch64")]
             level_ret: crate::jit::backend::aarch64::abi::level_return_addr(),
-            #[cfg(not(target_arch = "aarch64"))]
-            level_ret: 0,
             level_land: crate::vm::stack::level_land(),
             jump_target: Cell::new(0),
             #[cfg(feature = "tcvm-dev")]
@@ -281,7 +273,6 @@ impl JitRuntime {
     }
 
     /// The code allocator, created with the first compile.
-    #[cfg(target_arch = "aarch64")]
     pub(crate) fn code_alloc(&self) -> std::rc::Rc<crate::jit::backend::alloc::CodeAllocator> {
         self.code
             .borrow_mut()
@@ -293,7 +284,6 @@ impl JitRuntime {
 
     /// The trampoline that calls `helper` keeping the registers (A5), made
     /// on first use.
-    #[cfg(target_arch = "aarch64")]
     pub(crate) fn trampoline(
         &self,
         helper: usize,

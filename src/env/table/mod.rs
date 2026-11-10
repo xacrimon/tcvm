@@ -261,12 +261,14 @@ impl<'gc> Table<'gc> {
     }
 
     /// [`raw_get`](Self::raw_get) of a string key.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     #[inline]
     pub(crate) fn raw_get_str(self, key: LuaString<'gc>) -> Value<'gc> {
         self.0.borrow().get_string_key(key)
     }
 
     /// [`raw_set_keyed`](Self::raw_set_keyed) of a string key.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     #[inline]
     pub(crate) fn raw_set_str_keyed(
         self,
@@ -622,6 +624,7 @@ impl SlotLoc {
     }
 
     /// The encoded word, for an IR payload.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) fn raw(self) -> u32 {
         self.0
     }
@@ -652,6 +655,7 @@ impl SlotLoc {
         }
     }
 
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) fn from_raw(raw: u32) -> Self {
         SlotLoc(raw)
     }
@@ -756,23 +760,33 @@ pub struct InvalidKey;
 
 impl<'gc> TableState<'gc> {
     // Field offsets compiled code reads (`jit::layout`).
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const SHAPE_OFFSET: usize = core::mem::offset_of!(TableState<'static>, shape);
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const SPILL_OFFSET: usize = core::mem::offset_of!(TableState<'static>, spill);
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const SPILL_CAP_OFFSET: usize =
         core::mem::offset_of!(TableState<'static>, spill_cap);
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const ARRAY_OFFSET: usize = core::mem::offset_of!(TableState<'static>, array);
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const ASIZE_OFFSET: usize = core::mem::offset_of!(TableState<'static>, asize);
     /// The `aux` cell, null when there is none, and in it how many keys
     /// each hash part holds.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const AUX_OFFSET: usize = core::mem::offset_of!(TableState<'static>, aux);
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     const AUX_VALUE: usize =
         Gc::<'static, Owned<Aux<'static>>>::VALUE_OFFSET + Owned::<Aux<'static>>::VALUE_OFFSET;
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const AUX_INTS_OFFSET: usize = Self::AUX_VALUE
         + core::mem::offset_of!(Aux<'static>, ints)
         + hash_part::Part::<'static, i64, GcAlloc<'static>>::ITEMS_OFFSET;
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const AUX_STRS_OFFSET: usize = Self::AUX_VALUE
         + core::mem::offset_of!(Aux<'static>, strs)
         + hash_part::Part::<'static, LuaString<'static>, GcAlloc<'static>>::ITEMS_OFFSET;
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const AUX_MISC_OFFSET: usize = Self::AUX_VALUE
         + core::mem::offset_of!(Aux<'static>, misc)
         + hash_part::Part::<'static, Value<'static>, GcAlloc<'static>>::ITEMS_OFFSET;

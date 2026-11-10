@@ -60,14 +60,14 @@ enum SlotState {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Shapes {
     n: u8,
-    k: [u32; crate::jit::MAX_SHAPES],
+    k: [u32; crate::jit::feedback::MAX_SHAPES],
 }
 
 impl Shapes {
     pub(crate) fn one(k: u32) -> Shapes {
         let mut s = Shapes {
             n: 1,
-            k: [0; crate::jit::MAX_SHAPES],
+            k: [0; crate::jit::feedback::MAX_SHAPES],
         };
         s.k[0] = k;
         s
@@ -97,7 +97,7 @@ impl Shapes {
     pub(crate) fn of(ks: &[u32]) -> Option<Shapes> {
         let mut s = Shapes {
             n: 0,
-            k: [0; crate::jit::MAX_SHAPES],
+            k: [0; crate::jit::feedback::MAX_SHAPES],
         };
         for &k in ks {
             if !s.contains(k) {
@@ -122,7 +122,7 @@ impl Shapes {
     fn without(self, k: u32) -> Shapes {
         let mut s = Shapes {
             n: 0,
-            k: [0; crate::jit::MAX_SHAPES],
+            k: [0; crate::jit::feedback::MAX_SHAPES],
         };
         for &x in self.as_slice().iter().filter(|&&x| x != k) {
             s.k[s.n as usize] = x;

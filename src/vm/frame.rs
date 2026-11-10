@@ -21,8 +21,10 @@ use crate::env::function::{FunctionKind, LuaFn, NativeClosure};
 use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::Instruction;
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 use crate::jit::region::{Region, Site};
 use crate::vm::abi::{Handler, handler_from_bits};
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 use crate::vm::stack::EntryRecord;
 
 /// Header words below a frame's base.
@@ -327,13 +329,16 @@ pub(crate) struct Frame<'gc> {
     pub(crate) pc: *const Instruction,
     /// The entry record of the level the frame runs in (`vm::stack`), 0
     /// where there are none.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) level: usize,
     /// For a compiled frame below a level: its native frame pointer and the
     /// call it is in, whose snapshot names what it keeps in spill slots.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) compiled: Option<(usize, *const Site, *const Region<'static>)>,
     /// A frame inlined into the compiled frame below it, which a call from
     /// its body is made in (W3 §4): no header of its own (`ret` is 0), its
     /// slots part of the compiled frame's window.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) inlined: bool,
 }
 
@@ -355,13 +360,18 @@ impl<'gc> Frame<'gc> {
     /// one through its native frame, and calls from compiled code leave them
     /// holding whatever was there.
     pub(crate) fn caller_words_dead(&self) -> bool {
-        let ret = self.ret & !flag::MASK;
-        ret == crate::vm::stack::ret_to_native_bits()
-            || ret == crate::vm::stack::ret_shim_bits()
-            || self.compiled.is_some_and(|(fp, ..)| {
-                // SAFETY: a compiled frame's saved return address is at `fp + 8`.
-                unsafe { *((fp + 8) as *const usize) != crate::vm::stack::level_land() }
-            })
+        cfg_select! {
+            all(feature = "jit", target_arch = "aarch64") => {
+                let ret = self.ret & !flag::MASK;
+                ret == crate::vm::stack::ret_to_native_bits()
+                    || ret == crate::vm::stack::ret_shim_bits()
+                    || self.compiled.is_some_and(|(fp, ..)| {
+                        // SAFETY: a compiled frame's saved return address is at `fp + 8`.
+                        unsafe { *((fp + 8) as *const usize) != crate::vm::stack::level_land() }
+                    })
+            }
+            _ => false,
+        }
     }
 
     /// Whether the continuation is `h`.
@@ -407,13 +417,20 @@ pub(crate) fn frames<'gc>(ts: &ThreadState<'gc>) -> Walk<'gc> {
     Walk {
         base: ts.top_base,
         pc: ts.top_pc,
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         rec: ts.record,
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         level: ts.record,
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         shim: ts.shim,
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         cross: false,
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         compiled: None,
         elided: None,
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         queue: [None; 3],
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         queued: 0,
     }
 }
@@ -424,21 +441,28 @@ pub(crate) struct Walk<'gc> {
     base: *mut Value<'gc>,
     pc: *const Instruction,
     /// The innermost entry record not crossed yet.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     rec: usize,
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     level: usize,
     /// `ThreadState::shim`.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     shim: [usize; 2],
     /// The frame just walked was a level's first: its caller is compiled.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     cross: bool,
     /// Walking compiled frames: the next one's frame pointer, return
     /// address, and its callee's base; for the first, whether that may be
     /// `BASE` from a record, the frame's own where its site is a level's.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     compiled: Option<(usize, usize, *mut Value<'gc>, bool)>,
     elided: Option<Frame<'gc>>,
     /// The frames of the compiled frame just reached that come after its
     /// innermost inlined one: its other inlined frames, then itself, the
     /// last first.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     queue: [Option<Frame<'gc>>; 3],
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     queued: usize,
 }
 
@@ -449,98 +473,111 @@ impl<'gc> Iterator for Walk<'gc> {
         if let Some(f) = self.elided.take() {
             return Some(f);
         }
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        if let Some(f) = self.next_compiled() {
+            return Some(f);
+        }
+        if self.base.is_null() {
+            return None;
+        }
+        let base = self.base;
+        let f = unsafe {
+            Frame {
+                base,
+                func: func_word(base),
+                ret: ret_word(base),
+                pc: self.pc,
+                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                level: self.level,
+                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                compiled: None,
+                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+                inlined: false,
+            }
+        };
+        self.header_caller(&f);
+        self.elide(f);
+        Some(f)
+    }
+}
+
+impl<'gc> Walk<'gc> {
+    /// The next frame if it is compiled or inlined into one: queued, past a
+    /// level's first frame, or below the bottom of a level's run.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    fn next_compiled(&mut self) -> Option<Frame<'gc>> {
         if self.queued > 0 {
             self.queued -= 1;
             let f = self.queue[self.queued].take().expect("a queued frame");
             self.elide(f);
             return Some(f);
         }
-        loop {
-            if let Some((fp, ra, child, first)) = self.compiled {
-                // SAFETY: the return address into a compiled frame names its
-                // region and one of its call sites.
-                let (f, next) = unsafe {
-                    let region = Region::of_return(ra);
-                    let (site, _) = (*region)
-                        .site(ra)
-                        .expect("a return address without its site");
-                    let base = if first && site.level {
-                        child
-                    } else {
-                        child.sub(site.hdr as usize + HDR)
-                    };
-                    let f = Frame {
-                        base,
-                        func: func_word(base),
-                        ret: ret_word(base),
-                        pc: site.pc_after as usize as *const Instruction,
-                        level: self.level,
-                        compiled: Some((fp, site as *const Site, region)),
-                        inlined: false,
-                    };
-                    let lr = *((fp + 8) as *const usize);
-                    let next = (lr != crate::vm::stack::level_land())
-                        .then(|| (*(fp as *const usize), lr & !1, base, false));
-                    (f, next)
-                };
-                self.compiled = next;
-                if next.is_none() {
-                    // Dispatch entered it: its header goes on as any other,
-                    // complete or a level's first.
-                    self.header_caller(&f);
-                }
-                // SAFETY: as above.
-                let f = unsafe { self.expand(f) };
-                self.elide(f);
-                return Some(f);
-            }
-            let below = self.rec != 0
-                && !self.base.is_null()
-                && (self.base as usize) < unsafe { (*(self.rec as *const EntryRecord)).first };
-            if self.cross || below {
-                self.cross = false;
-                // SAFETY: the thread's records chain from `ts.record`.
-                let r = unsafe { &*(self.rec as *const EntryRecord) };
-                self.compiled = Some((r.fp, r.lr & !1, r.x[3] as *mut Value<'gc>, true));
-                self.rec = r.prev;
-                self.level = r.prev;
-                continue;
-            }
-            if self.base.is_null() {
-                return None;
-            }
-            let base = self.base;
-            let f = unsafe {
-                Frame {
-                    base,
-                    func: func_word(base),
-                    ret: ret_word(base),
-                    pc: self.pc,
-                    level: self.level,
-                    compiled: None,
-                    inlined: false,
-                }
-            };
-            self.header_caller(&f);
-            self.elide(f);
-            return Some(f);
+        let below = self.rec != 0
+            && !self.base.is_null()
+            && (self.base as usize) < unsafe { (*(self.rec as *const EntryRecord)).first };
+        if self.compiled.is_none() && (self.cross || below) {
+            self.cross = false;
+            // SAFETY: the thread's records chain from `ts.record`.
+            let r = unsafe { &*(self.rec as *const EntryRecord) };
+            self.compiled = Some((r.fp, r.lr & !1, r.x[3] as *mut Value<'gc>, true));
+            self.rec = r.prev;
+            self.level = r.prev;
         }
+        let (fp, ra, child, first) = self.compiled?;
+        // SAFETY: the return address into a compiled frame names its
+        // region and one of its call sites.
+        let (f, next) = unsafe {
+            let region = Region::of_return(ra);
+            let (site, _) = (*region)
+                .site(ra)
+                .expect("a return address without its site");
+            let base = if first && site.level {
+                child
+            } else {
+                child.sub(site.hdr as usize + HDR)
+            };
+            let f = Frame {
+                base,
+                func: func_word(base),
+                ret: ret_word(base),
+                pc: site.pc_after as usize as *const Instruction,
+                level: self.level,
+                compiled: Some((fp, site as *const Site, region)),
+                inlined: false,
+            };
+            let lr = *((fp + 8) as *const usize);
+            let next = (lr != crate::vm::stack::level_land())
+                .then(|| (*(fp as *const usize), lr & !1, base, false));
+            (f, next)
+        };
+        self.compiled = next;
+        if next.is_none() {
+            // Dispatch entered it: its header goes on as any other,
+            // complete or a level's first.
+            self.header_caller(&f);
+        }
+        // SAFETY: as above.
+        let f = unsafe { self.expand(f) };
+        self.elide(f);
+        Some(f)
     }
-}
 
-impl<'gc> Walk<'gc> {
     /// Go on to the caller of `f`, whose header names it: through its
     /// caller words, or below its level for a level's first frame, whose
     /// caller is compiled, as is a native's that `jit_call_native` runs.
     fn header_caller(&mut self, f: &Frame<'gc>) {
-        let ret = f.ret & !flag::MASK;
-        if ret == crate::vm::stack::ret_to_native_bits() {
-            self.cross = true;
-        } else if ret == crate::vm::stack::ret_shim_bits() {
-            self.compiled = Some((self.shim[0], self.shim[1], f.base, true));
-        } else {
-            unsafe { (self.pc, self.base) = (caller_pc(f.base), caller_base(f.base)) };
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        {
+            let ret = f.ret & !flag::MASK;
+            if ret == crate::vm::stack::ret_to_native_bits() {
+                self.cross = true;
+                return;
+            } else if ret == crate::vm::stack::ret_shim_bits() {
+                self.compiled = Some((self.shim[0], self.shim[1], f.base, true));
+                return;
+            }
         }
+        unsafe { (self.pc, self.base) = (caller_pc(f.base), caller_base(f.base)) };
     }
 
     fn elide(&mut self, f: Frame<'gc>) {
@@ -552,8 +589,11 @@ impl<'gc> Walk<'gc> {
                 func: 0,
                 ret: flag::NATIVE,
                 pc: std::ptr::null(),
+                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
                 level: f.level,
+                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
                 compiled: None,
+                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
                 inlined: false,
             });
         }
@@ -567,6 +607,7 @@ impl<'gc> Walk<'gc> {
     ///
     /// # Safety
     /// `f0` is a compiled frame from the walk.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     unsafe fn expand(&mut self, f0: Frame<'gc>) -> Frame<'gc> {
         use crate::jit::region::{DYNAMIC, Loc};
         let (fp, site, region) = f0.compiled.expect("a compiled frame");

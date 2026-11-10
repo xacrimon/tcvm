@@ -211,7 +211,6 @@ fn forms_drop_on_foreign_kinds() {
 
 /// A `while` loop's entry points its back edge at the `JIT_LOOP` over its
 /// `LOOP`, and retiring the entry points it past the `LOOP` again.
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn back_edges_follow_loop_entries() {
     use crate::instruction::Op;
@@ -259,7 +258,6 @@ fn back_edges_follow_loop_entries() {
 
 /// Running out of code memory turns the JIT off, rather than failing each
 /// later prototype's compile in turn.
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn exhausted_code_memory_turns_the_jit_off() {
     let mut lua = Lua::new();
@@ -304,7 +302,6 @@ fn exhausted_code_memory_turns_the_jit_off() {
 /// takes the integer form when it runs, which that FORPREP could not write:
 /// a generic FORLOOP left no feedback, so every build saw a loop that never
 /// ran, and refused it.
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn loops_entered_from_compiled_code_compile() {
     use crate::instruction::Op;
@@ -357,7 +354,6 @@ fn loops_entered_from_compiled_code_compile() {
 /// Under `TCVM_JIT_FAR` (a test mode, `tmodes.sh`'s `far`) the code range
 /// lies out of the text's reach, and compiled code calls into the text
 /// through islands.
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn far_code_reaches_the_text_through_islands() {
     if std::env::var_os("TCVM_JIT_FAR").is_none() {
@@ -387,7 +383,6 @@ fn far_code_reaches_the_text_through_islands() {
 
 /// A frame whose to-be-closed variables all closed runs its compiled CLOSEs
 /// and RETURN, which exit while `HAS_TBC` is set.
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn closed_scopes_clear_has_tbc() {
     let mut lua = Lua::new();
@@ -435,7 +430,6 @@ fn closed_scopes_clear_has_tbc() {
 /// A bounds check moved out of an inlined accessor into its caller's loop
 /// (E2) records its miss at the accessor's site: its exit names the
 /// accessor's prototype, the snapshot being the caller's.
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn hoisted_inlined_bounds_miss_at_the_callee() {
     let mut lua = Lua::new();
@@ -489,7 +483,6 @@ fn hoisted_inlined_bounds_miss_at_the_callee() {
 /// (`opt::miss::covered`): the exit on a nil under `__index` records nothing
 /// at the use, and the miss at the load is the interpreter's to record as it
 /// runs the load again, which the next compile's slow arm depends on.
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn covered_misses_are_recorded_by_the_load() {
     use crate::instruction::Op;

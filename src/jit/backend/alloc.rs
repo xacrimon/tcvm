@@ -220,7 +220,6 @@ impl Range {
     }
 
     /// The island branching on to `target`, made on first use.
-    #[cfg(target_arch = "aarch64")]
     fn island(&mut self, target: usize) -> Option<usize> {
         if let Some(&(_, i)) = self.islands.iter().find(|i| i.0 == target) {
             return Some(i);
@@ -247,11 +246,6 @@ impl Range {
         *next += ISLAND;
         self.islands.push((target, at_rx));
         Some(at_rx)
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    fn island(&mut self, _target: usize) -> Option<usize> {
-        None
     }
 }
 
@@ -288,7 +282,6 @@ pub(crate) struct CodeBlock {
     rx: NonNull<u8>,
     rw: NonNull<u8>,
     len_units: u16,
-    #[cfg(target_arch = "aarch64")]
     unwind: Option<crate::jit::backend::aarch64::unwind::Fde>,
 }
 
@@ -319,7 +312,6 @@ impl CodeBlock {
 
     /// Tell the unwinder the block's calls are made with a frame of
     /// `frame` bytes open (`unwind::Fde`).
-    #[cfg(target_arch = "aarch64")]
     pub(crate) fn describe_frame(&mut self, frame: u32) {
         self.unwind = Some(crate::jit::backend::aarch64::unwind::Fde::register(
             self.rx() as usize,
@@ -364,7 +356,6 @@ impl CodeBlock {
 impl Drop for CodeBlock {
     fn drop(&mut self) {
         // Out of the unwinder's tables before the units are reused.
-        #[cfg(target_arch = "aarch64")]
         drop(self.unwind.take());
         let rw = self.rw.as_ptr() as usize;
         let base = rw & !(SEG_SIZE - 1);
@@ -438,7 +429,6 @@ impl CodeAllocator {
             rx: NonNull::new(rx).expect("segment rx"),
             rw: NonNull::new(rw).expect("segment rw"),
             len_units: units as u16,
-            #[cfg(target_arch = "aarch64")]
             unwind: None,
         })
     }
@@ -536,7 +526,7 @@ impl Inner {
     }
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

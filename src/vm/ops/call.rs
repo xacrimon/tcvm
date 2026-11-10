@@ -112,18 +112,26 @@ macro_rules! start {
 
 /// Count an interpreted invocation of the closure `$f`, whose `FUNC` is
 /// `$word`, in its feedback vector's header; every `hot_call` of them its
-/// entry may compile (`jit_hot`), with `pc` past the `FUNC`.
+/// entry may compile (`jit_hot`), with `pc` past the `FUNC`. Nothing counts
+/// without the JIT.
 macro_rules! count_invocation {
     ($rt:ident, $f:expr, $word:expr) => {{
-        // SAFETY: the word before slot 0 is the invocation count.
-        let n = unsafe { &*$f.feedback.sub(1) };
-        let c = n.get().wrapping_add(1);
-        n.set(c);
-        if std::hint::unlikely(c & $rt.call_mask() == 0) {
-            tail!(
-                crate::jit::jit_hot,
-                insn = $crate::vm::abi::Slot::insn($word)
-            )
+        cfg_select! {
+            all(feature = "jit", target_arch = "aarch64") => {
+                // SAFETY: the word before slot 0 is the invocation count.
+                let n = unsafe { &*$f.feedback.sub(1) };
+                let c = n.get().wrapping_add(1);
+                n.set(c);
+                if std::hint::unlikely(c & $rt.call_mask() == 0) {
+                    tail!(
+                        crate::jit::jit_hot,
+                        insn = $crate::vm::abi::Slot::insn($word)
+                    )
+                }
+            }
+            _ => {
+                let _ = (&$f, &$word);
+            }
         }
     }};
 }

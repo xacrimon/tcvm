@@ -918,6 +918,7 @@ pub(crate) fn native_continue<'gc>(
 /// `native_continue` for `jit_call_native`, which switched for the native
 /// in place: a pass-through lands at the window, `win .. top`, as a plain
 /// return; anything else is the continuation's answer, to act on.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) fn continued<'gc>(
     ctx: Context<'gc>,
     ts: *mut ThreadState<'gc>,
@@ -950,6 +951,7 @@ pub(crate) fn continued<'gc>(
 
 /// `native_catch` for `jit_call_native`: the continuation's answer to the
 /// error that reached the native frame at window `win`.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) fn caught<'gc>(
     ctx: Context<'gc>,
     ts: *mut ThreadState<'gc>,

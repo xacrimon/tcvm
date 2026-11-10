@@ -11,6 +11,7 @@
 
 use crate::env::Thread;
 use crate::env::error::Error;
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 use crate::env::function::NativeClosure;
 use crate::env::thread::{ThreadState, ThreadStatus};
 use crate::env::value::Value;
@@ -246,6 +247,7 @@ fn may_resume<'gc>(ts: &ThreadState<'gc>, co: Thread<'gc>, n: usize) -> bool {
 
 /// The coroutine builtins compiled code switches for itself
 /// (`abi::coro_resume` and its siblings).
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Switch {
     Resume,
@@ -254,6 +256,7 @@ pub(crate) enum Switch {
 }
 
 /// Which of the switching builtins `nc` is, by its fast entry.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) fn switch_kind(nc: &NativeClosure<'_>) -> Option<Switch> {
     let e = handler_bits(nc.entry);
     [
@@ -269,6 +272,7 @@ pub(crate) fn switch_kind(nc: &NativeClosure<'_>) -> Option<Switch> {
 /// values at window `w` (index `win`) wait with `h` for what comes back,
 /// returning through `ret_shim` (whose walks find the caller through
 /// `shim`).
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 #[inline(always)]
 unsafe fn compiled_wait<'gc>(
     ts: &mut ThreadState<'gc>,
@@ -297,6 +301,7 @@ unsafe fn compiled_wait<'gc>(
 /// # Safety
 /// `a` is the running thread, `w` a window on its stack with room for a
 /// header below it, and no reference to its state is live.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 #[inline(always)]
 pub(crate) unsafe fn compiled_resume<'gc>(
     ctx: Context<'gc>,
@@ -367,6 +372,7 @@ pub(crate) unsafe fn compiled_resume<'gc>(
 ///
 /// # Safety
 /// As [`compiled_resume`].
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 #[inline(always)]
 pub(crate) unsafe fn compiled_yield<'gc>(
     ctx: Context<'gc>,

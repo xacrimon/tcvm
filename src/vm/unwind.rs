@@ -112,6 +112,7 @@ pub(crate) fn unwind<'gc>(
         t.status = ThreadStatus::Stopped;
         // Out of the thread from its bottom level: an upper one's end would
         // return to the compiled code that started it.
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         pop_levels(t, bottom_level(t));
         return Jump::Exit(Exit::End);
     }
@@ -138,6 +139,7 @@ pub(crate) fn unwind<'gc>(
         }
         // A frame of a lower level: the levels above it are gone with the
         // compiled frames their records name.
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
         pop_levels(t, f.level);
         let base = f.base;
         let bi = t.slot_index(base);
@@ -196,6 +198,7 @@ pub(crate) fn unwind<'gc>(
     t.top_base = std::ptr::null_mut();
     t.top_pc = std::ptr::null();
     // Nothing caught: on, or out of the thread, from its bottom level.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pop_levels(t, bottom_level(t));
     // The host's call closes like a `pcall`; a dead coroutine keeps its
     // variables for `coroutine.close` (`lua_resume` leaves them open).
@@ -248,6 +251,7 @@ fn pop_frame<'gc>(
 /// Drop the levels above `level` (an entry record of the thread's, H6),
 /// restoring what each saved of the level below. The native frames go when
 /// the thread next continues at `level`'s start (`jump!`, `level_jump`).
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 fn pop_levels(t: &mut ThreadState<'_>, level: usize) {
     while t.record != level {
         // SAFETY: the thread's records chain from `t.record`, and `level` is
@@ -259,6 +263,7 @@ fn pop_levels(t: &mut ThreadState<'_>, level: usize) {
 }
 
 /// The thread's bottom level, the record dispatch started on its stack.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 fn bottom_level(t: &ThreadState<'_>) -> usize {
     let mut r = t.record;
     while r != 0 {

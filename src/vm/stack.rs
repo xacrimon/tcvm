@@ -28,6 +28,7 @@ pub(crate) const VALUE_SLOTS: usize = VALUE_BYTES / size_of::<Value<'static>>();
 pub(crate) const NATIVE_BYTES: usize = 1024 * 1024;
 /// Native stack above its end that compiled code leaves to natives and the
 /// interpreter: past it, compiled entries refuse (H9).
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) const NATIVE_HEADROOM: usize = 256 * 1024;
 /// Free mappings the pool keeps; more are unmapped.
 const POOL_MAX: usize = 64;
@@ -152,6 +153,7 @@ impl ThreadStack {
     }
 
     /// The lowest address the native stack may use.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) fn native_end(&self) -> usize {
         self.map.as_ptr() as usize + PAGE
     }
@@ -172,6 +174,7 @@ impl Drop for ThreadStack {
 /// returns to them through `ret_to_native`. Pushed on the native stack by
 /// `abi::jit_level`, which handlers then run below; the bottom level's is
 /// `dispatch_entry`'s.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 #[repr(C)]
 pub(crate) struct EntryRecord {
     /// The frame record of the code that started the level: its frame
@@ -193,6 +196,7 @@ pub(crate) struct EntryRecord {
     pub(crate) d: [u64; 8],
 }
 
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) mod rec {
     use std::mem::offset_of;
 
@@ -206,45 +210,25 @@ pub(crate) mod rec {
 }
 
 /// The return address of a compiled frame dispatch entered
-/// (`abi::level_land`), 0 where there are no levels.
+/// (`abi::level_land`).
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 #[inline]
 pub(crate) fn level_land() -> usize {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::jit::backend::aarch64::abi::level_land()
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        0
-    }
+    crate::jit::backend::aarch64::abi::level_land()
 }
 
-/// `abi::ret_to_native` as header words hold it, a value no handler has
-/// where there are no levels.
+/// `abi::ret_to_native` as header words hold it.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 #[inline]
 pub(crate) fn ret_to_native_bits() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::vm::abi::handler_bits(crate::jit::backend::aarch64::abi::ret_to_native)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        u64::MAX
-    }
+    crate::vm::abi::handler_bits(crate::jit::backend::aarch64::abi::ret_to_native)
 }
 
-/// `abi::ret_shim` as header words hold it, a value no handler has where
-/// there are no compiled natives.
+/// `abi::ret_shim` as header words hold it.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 #[inline]
 pub(crate) fn ret_shim_bits() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::vm::abi::handler_bits(crate::jit::backend::aarch64::abi::ret_shim)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        u64::MAX - 1
-    }
+    crate::vm::abi::handler_bits(crate::jit::backend::aarch64::abi::ret_shim)
 }
 
 /// Why a thread handed control back to the host.
@@ -300,6 +284,7 @@ pub(crate) mod sw {
     pub(crate) const SP: usize = std::mem::offset_of!(super::SwitchPoint, sp);
     #[cfg(target_arch = "x86_64")]
     pub(crate) const CONT: usize = std::mem::offset_of!(super::SwitchPoint, cont);
+    #[cfg(target_arch = "aarch64")]
     pub(crate) const LR: usize = std::mem::offset_of!(super::SwitchPoint, lr);
     #[cfg(target_arch = "x86_64")]
     pub(crate) const FP: usize = std::mem::offset_of!(super::SwitchPoint, fp);
@@ -491,7 +476,8 @@ unsafe extern "C" fn thread_entry() {
         "mov rsi, [r15 + {thread}]",
         "call {start}",
         "ud2",
-        thread = const crate::jit::layout::RT_THREAD,
+        thread = const std::mem::offset_of!(crate::lua::State<'static>, rt)
+            + std::mem::offset_of!(crate::vm::dispatch::Runtime<'static>, thread),
         start = sym thread_start,
     )
 }

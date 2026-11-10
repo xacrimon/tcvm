@@ -889,7 +889,7 @@ fn site_shapes<'gc>(
     first: Option<Shape<'gc>>,
     recv: Val,
 ) -> Option<Vec<Shape<'gc>>> {
-    const MAX: usize = crate::jit::MAX_SHAPES;
+    const MAX: usize = crate::jit::feedback::MAX_SHAPES;
     let has = |v: &[Shape<'gc>], s| v.iter().any(|&x| Shape::ptr_eq(x, s));
     // A deprecated shape's tables move to the poly one at their next exit.
     let first = first.filter(|s| !s.is_deprecated());

@@ -56,7 +56,6 @@ impl From<CfgError> for CompileError {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
 impl From<crate::jit::backend::alloc::ReserveError> for CompileError {
     fn from(e: crate::jit::backend::alloc::ReserveError) -> Self {
         match e {
@@ -446,7 +445,6 @@ fn note_upvalues_offset(closure: LuaFn<'_>) {
 
 /// Compile the region of `closure` entered at `pc`, place its code, and
 /// return it ready to install.
-#[cfg(target_arch = "aarch64")]
 pub(crate) fn compile<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,

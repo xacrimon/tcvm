@@ -38,10 +38,13 @@ unsafe impl TrailingBytes for StringData {
 
 impl<'gc> LuaString<'gc> {
     /// Where compiled code reads the length from a string value's payload.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const LEN_OFFSET: usize = core::mem::offset_of!(StringData, len);
     /// Where compiled code reads the bytes from a string value's payload.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const DATA_OFFSET: usize = Gc::<'static, StringData>::TRAILING_FROM_VALUE;
     /// A string's payload from its box.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const VALUE_OFFSET: usize = Gc::<'static, StringData>::VALUE_OFFSET;
 
     /// Panics past [`MAX_LEN`].

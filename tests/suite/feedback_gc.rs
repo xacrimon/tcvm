@@ -69,6 +69,7 @@ return get(mk(77)) .. " " .. get(mk(78))
 /// another class than the dead holder's, whose compiled read it must not
 /// take. Each holder's class has two metatables, so its tables are in the
 /// shape a later member's tables would get.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 #[test]
 fn dead_holder_address_reused() {
     let src = r#"

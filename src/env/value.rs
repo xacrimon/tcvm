@@ -42,10 +42,12 @@ const TAG_USERDATA: u64 = 1;
 pub(crate) const TAG_BOXED_INT: u64 = 2;
 pub(crate) const TAG_STRING: u64 = 3;
 /// A string value's bits above its payload, the value address of its box.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) const STRING_BITS: u64 = QNAN_NEG | TAG_STRING << TAG_SHIFT;
 pub(crate) const TAG_TABLE: u64 = 4;
 const TAG_FUNCTION: u64 = 5;
 /// A function value's bits but its payload, the closure's address.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) const FUNCTION_BITS: u64 = QNAN_NEG | TAG_FUNCTION << TAG_SHIFT;
 const TAG_THREAD: u64 = 6;
 const TAG_IMMEDIATE: u64 = 7;

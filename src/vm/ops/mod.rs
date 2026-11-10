@@ -326,15 +326,22 @@ pub(crate) use family;
 
 /// Count on hot counter `word.$byte()` of the counting instruction `word`;
 /// at zero its entry may compile (`jit_hot`), with the frame at `word` and
-/// `pc` past it.
+/// `pc` past it. Nothing counts without the JIT.
 macro_rules! count_hot {
     ($rt:ident, $word:expr, $byte:ident) => {{
         let w: $crate::instruction::Instruction = $word;
-        let c = $rt.hot_counter(w.$byte() as usize % $crate::instruction::HOT_COUNTERS);
-        let n = c.get().wrapping_sub(1);
-        c.set(n);
-        if std::hint::unlikely(n == 0) {
-            tail!(crate::jit::jit_hot, insn = $crate::vm::abi::Slot::insn(w))
+        cfg_select! {
+            all(feature = "jit", target_arch = "aarch64") => {
+                let c = $rt.hot_counter(w.$byte() as usize % $crate::instruction::HOT_COUNTERS);
+                let n = c.get().wrapping_sub(1);
+                c.set(n);
+                if std::hint::unlikely(n == 0) {
+                    tail!(crate::jit::jit_hot, insn = $crate::vm::abi::Slot::insn(w))
+                }
+            }
+            _ => {
+                let _ = w;
+            }
         }
     }};
 }

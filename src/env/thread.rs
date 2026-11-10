@@ -107,18 +107,22 @@ pub struct ThreadState<'gc> {
     /// is 0 before it first runs.
     pub(crate) sw: crate::vm::stack::SwitchPoint,
     /// The entry record of the level the thread runs in (`vm::stack`), 0
-    /// before it first runs and on x86-64.
+    /// before it first runs.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) record: usize,
     /// Compiled entries refuse with the stack pointer below this: the native
     /// stack's end plus headroom for natives.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) native_limit: usize,
     /// Fast calls with the stack pointer below this branch with a tagged
     /// return address instead of `blr` (5.4): this level's return address
     /// stack is full from here.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) native_deep: usize,
     /// The frame pointer and return address of the compiled code a native
     /// runs for through `jit_call_native` (I1): its frame's caller while
     /// the frame returns through `ret_shim`.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) shim: [usize; 2],
     /// The function a seeded thread calls, until it gets its stack.
     pub(crate) entry: Option<Value<'gc>>,
@@ -193,6 +197,7 @@ pub struct ThreadState<'gc> {
 pub struct ValueStack<'gc>(UnsafeCell<StackView<'gc>>);
 
 /// The first slot's address in a `ThreadState`, for compiled code.
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) const STACK_PTR_OFFSET: usize = std::mem::offset_of!(ThreadState<'static>, stack)
     + std::mem::offset_of!(StackView<'static>, ptr);
 
@@ -248,8 +253,12 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         let sp = stack.as_ptr();
         let mut upper = live;
         for f in frame::frames(self) {
+            if f.is_elided() {
+                continue;
+            }
             // An inlined frame's slots are its compiled frame's.
-            if f.is_elided() || f.inlined {
+            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            if f.inlined {
                 continue;
             }
             let bi = unsafe { f.base.offset_from_unsigned(sp) };
@@ -261,46 +270,17 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
             if f.caller_words_dead() {
                 stack[bi - 2..bi].fill(Value::nil());
             }
-            match f.compiled {
-                None => cc.trace(&stack[bi..upper]),
-                // SAFETY: the site's snapshot names the frame's spill slots
-                // that hold values across the call and the registers whose
-                // home slots hold theirs. Its other registers below the
-                // callee's header slot are dead until written, and may hold
-                // what an earlier frame left there: they are cleared, as the
-                // slots above the live region are. A to-be-closed variable's
-                // slot is the exception, read by a close the region exits
-                // for. From the header slot up the slots are the callee's (a
-                // vararg callee's extras sit below its header).
-                Some((fp, site, region)) => unsafe {
-                    use crate::jit::region::{Loc, SRep, SnapView};
-                    let snap = SnapView::decode(&(&*region).snaps[(*site).snap as usize..]);
-                    let mut homes = crate::jit::build::cfg::RegSet::EMPTY;
-                    for e in snap.entries() {
-                        match (e.loc, e.rep) {
-                            (Loc::Spill(i), SRep::Val) => {
-                                let p = (fp + crate::jit::FRAME_SPILLS + 8 * i as usize)
-                                    as *const Value<'gc>;
-                                cc.trace(&*p);
-                            }
-                            (Loc::Slot(r), _) => homes.insert(r as usize),
-                            _ => {}
-                        }
+            let window = &mut stack[bi..upper];
+            cfg_select! {
+                all(feature = "jit", target_arch = "aarch64") => {
+                    if let Some((fp, site, region)) = f.compiled {
+                        // SAFETY: a compiled frame of the walk, `window` its slots.
+                        unsafe { self.trace_compiled(cc, window, bi, fp, &*site, &*region) }
+                    } else {
+                        cc.trace(window)
                     }
-                    let hdr = (*site).hdr as usize;
-                    let tbc = |s| {
-                        self.tbc_list
-                            .iter()
-                            .any(|e| matches!(e, TbcEntry::Slot(i) if *i == s))
-                    };
-                    for (r, slot) in stack[bi..upper].iter_mut().enumerate() {
-                        if r >= hdr || homes.contains(r) || tbc(bi + r) {
-                            cc.trace(slot);
-                        } else {
-                            *slot = Value::nil();
-                        }
-                    }
-                },
+                }
+                _ => cc.trace(window),
             }
             upper = bi - frame::HDR;
         }
@@ -315,6 +295,58 @@ unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
         cc.trace(&self.transfer);
         for (v, _) in &self.locals {
             cc.trace(v);
+        }
+    }
+}
+
+impl<'gc> ThreadState<'gc> {
+    /// Trace compiled frame `bi` of `region`, stopped at `site`, whose slots
+    /// are `window`. The site's snapshot names the frame's spill slots that
+    /// hold values across the call and the registers whose home slots hold
+    /// theirs. Its other registers below the callee's header slot are dead
+    /// until written, and may hold what an earlier frame left there: they are
+    /// cleared, as the slots above the live region are. A to-be-closed
+    /// variable's slot is the exception, read by a close the region exits
+    /// for. From the header slot up the slots are the callee's (a vararg
+    /// callee's extras sit below its header).
+    ///
+    /// # Safety
+    /// `fp` is the frame's native frame pointer.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    unsafe fn trace_compiled<T: Trace<'gc>>(
+        &self,
+        cc: &mut T,
+        window: &mut [Value<'gc>],
+        bi: usize,
+        fp: usize,
+        site: &crate::jit::region::Site,
+        region: &crate::jit::region::Region<'_>,
+    ) {
+        use crate::jit::region::{Loc, SRep, SnapView};
+        let snap = SnapView::decode(&region.snaps[site.snap as usize..]);
+        let mut homes = crate::jit::build::cfg::RegSet::EMPTY;
+        for e in snap.entries() {
+            match (e.loc, e.rep) {
+                (Loc::Spill(i), SRep::Val) => {
+                    let p = (fp + crate::jit::FRAME_SPILLS + 8 * i as usize) as *const Value<'gc>;
+                    cc.trace(unsafe { &*p });
+                }
+                (Loc::Slot(r), _) => homes.insert(r as usize),
+                _ => {}
+            }
+        }
+        let hdr = site.hdr as usize;
+        let tbc = |s| {
+            self.tbc_list
+                .iter()
+                .any(|e| matches!(e, TbcEntry::Slot(i) if *i == s))
+        };
+        for (r, slot) in window.iter_mut().enumerate() {
+            if r >= hdr || homes.contains(r) || tbc(bi + r) {
+                cc.trace(slot);
+            } else {
+                *slot = Value::nil();
+            }
         }
     }
 }
@@ -341,7 +373,10 @@ impl<'gc> ThreadState<'gc> {
     pub(crate) fn ensure_stack(&mut self, pool: &std::rc::Rc<crate::vm::stack::StackPool>) {
         if self.mem.is_none() {
             let mem = pool.acquire();
-            self.native_limit = mem.native_end() + crate::vm::stack::NATIVE_HEADROOM;
+            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            {
+                self.native_limit = mem.native_end() + crate::vm::stack::NATIVE_HEADROOM;
+            }
             let v = self.stack.0.get_mut();
             v.ptr = unsafe { NonNull::new_unchecked(mem.values()) };
             v.len = 0;
@@ -373,7 +408,10 @@ impl<'gc> ThreadState<'gc> {
             len: 0,
         };
         self.sw = Default::default();
-        self.record = 0;
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        {
+            self.record = 0;
+        }
         self.top = 0;
         self.update_stack_end();
         Some(mem)
@@ -583,9 +621,13 @@ impl<'gc> Thread<'gc> {
             stack_end: std::ptr::null(),
             mem: None,
             sw: Default::default(),
+            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
             record: 0,
+            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
             native_limit: 0,
+            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
             native_deep: 0,
+            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
             shim: [0; 2],
             entry: None,
             top: 0,
@@ -651,6 +693,7 @@ impl<'gc> Thread<'gc> {
     ///
     /// # Safety
     /// As [`Thread::state_mut`].
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     #[inline(always)]
     pub(crate) unsafe fn state_mut_if_gray(self) -> Option<&'gc mut ThreadState<'gc>> {
         if !Gc::is_gray(self.0) {

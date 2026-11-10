@@ -127,8 +127,6 @@ pub(crate) const TABLE: [Handler; 256] = {
         (Op::TFORCALL_IPAIRS, control::op_tforcall_ipairs),
         (Op::FUNC, control::op_func),
         (Op::LOOP, control::op_loop),
-        (Op::JIT_ENTRY, crate::jit::op_jit_entry),
-        (Op::JIT_LOOP, crate::jit::op_jit_loop),
         (Op::JMP_BACK, control::op_jmp_back),
     ];
     let ops: [Handler; Op::COUNT] = Op::table_of(
@@ -141,6 +139,7 @@ pub(crate) const TABLE: [Handler; 256] = {
             compare::F_ROWS,
             field::GET_ROWS,
             field::SET_ROWS,
+            JIT_ROWS,
         ],
     );
     let mut t: [Handler; 256] = [control::op_invalid; 256];
@@ -151,6 +150,22 @@ pub(crate) const TABLE: [Handler; 256] = {
     }
     t
 };
+
+cfg_select! {
+    all(feature = "jit", target_arch = "aarch64") => {
+        const JIT_ROWS: &[(Op, Handler)] = &[
+            (Op::JIT_ENTRY, crate::jit::op_jit_entry),
+            (Op::JIT_LOOP, crate::jit::op_jit_loop),
+        ];
+    }
+    // Without the JIT no `JIT_ENTRY` or `JIT_LOOP` is ever written.
+    _ => {
+        const JIT_ROWS: &[(Op, Handler)] = &[
+            (Op::JIT_ENTRY, control::op_invalid),
+            (Op::JIT_LOOP, control::op_invalid),
+        ];
+    }
+}
 
 /// CALL's continuation by its `c` operand (0 = MULTRET).
 pub(crate) const RETS: [Handler; 256] = {
@@ -225,20 +240,19 @@ fn call_handler<'gc>(
     closure: Slot,
     thread: *mut ThreadState<'gc>,
 ) -> Exit {
-    #[cfg(target_arch = "aarch64")]
-    {
+    cfg_select! {
         // SAFETY: `dispatch_entry` starts the bottom level and branches to
         // `h` with these arguments.
-        unsafe {
+        all(feature = "jit", target_arch = "aarch64") => unsafe {
             crate::jit::backend::aarch64::abi::dispatch_entry(
                 insn, pc, base, rt, closure, thread, h,
             )
+        },
+        target_arch = "aarch64" => h(insn, pc, base, rt, closure, thread),
+        _ => {
+            let _ = thread;
+            h(insn, pc, base, rt, closure)
         }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = thread;
-        h(insn, pc, base, rt, closure)
     }
 }
 

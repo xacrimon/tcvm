@@ -43,6 +43,7 @@ pub struct State<'gc> {
     #[collect(require_static)]
     pub(crate) rets: [Handler; 256],
     pub(crate) rt: Runtime<'gc>,
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     #[collect(require_static)]
     pub(crate) jit: crate::jit::state::JitRuntime,
     /// Root shapes by inline capacity (`INLINE_CAPS`). Each anchors a
@@ -131,6 +132,7 @@ impl Lua {
                 dispatch: crate::vm::dispatch::TABLE,
                 rets: crate::vm::dispatch::RETS,
                 rt: Runtime::new(mc.metrics()),
+                #[cfg(all(feature = "jit", target_arch = "aarch64"))]
                 jit: crate::jit::state::JitRuntime::new(),
                 root_shapes,
                 empty_dict_sentinel,
@@ -216,10 +218,16 @@ impl Lua {
     }
 
     /// Turn the JIT on or off for what runs from now on; installed regions
-    /// stay.
+    /// stay. A no-op in a build without the JIT.
     pub fn set_jit(&mut self, on: bool) {
-        self.arena
-            .mutate_root(|_, root| root.jit.config.enabled = on && cfg!(target_arch = "aarch64"));
+        cfg_select! {
+            all(feature = "jit", target_arch = "aarch64") => self
+                .arena
+                .mutate_root(|_, root| root.jit.config.enabled = on),
+            _ => {
+                let _ = on;
+            }
+        }
     }
 
     /// Drop `TCVM_GC_STRESS`'s extra collections, for a test that counts
@@ -233,15 +241,26 @@ impl Lua {
     /// refusing the code.
     #[cfg(feature = "tcvm-dev")]
     pub fn jit_internal_errors(&mut self) -> u32 {
-        self.arena.mutate(|_, root| root.jit.internal_errors.get())
+        cfg_select! {
+            all(feature = "jit", target_arch = "aarch64") => {
+                self.arena.mutate(|_, root| root.jit.internal_errors.get())
+            }
+            _ => 0,
+        }
     }
 
     /// Turn inlining (E1) on or off for regions compiled from now on: tests
     /// of the call protocol keep their calls real whatever the inliner takes.
     #[cfg(feature = "tcvm-dev")]
     pub fn set_jit_inline(&mut self, on: bool) {
-        self.arena
-            .mutate_root(|_, root| root.jit.config.dev.inline = on);
+        cfg_select! {
+            all(feature = "jit", target_arch = "aarch64") => self
+                .arena
+                .mutate_root(|_, root| root.jit.config.dev.inline = on),
+            _ => {
+                let _ = on;
+            }
+        }
     }
 
     /// Force a full garbage-collection cycle (mark + sweep) to completion.

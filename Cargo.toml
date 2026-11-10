@@ -59,6 +59,6 @@ getrandom = "0.4.2"
 libc = "0.2.186"
 
 [dev-dependencies]
-tcvm = { path = ".", features = ["tcvm-dev"] }
+tcvm = { path = ".", default-features = false, features = ["tcvm-dev"] }
 paste = "1.0.15"
 insta = "1.47.2"

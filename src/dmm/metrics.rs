@@ -79,6 +79,7 @@ pub struct Metrics(MetricsInner);
 impl Metrics {
     /// Offset of the allocation counter, followed by the threshold
     /// `gc_check_due` compares it with, for compiled code.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     pub(crate) const GC_CHECK_OFFSET: usize = std::mem::offset_of!(Metrics, 0.gc_check);
 }
 
