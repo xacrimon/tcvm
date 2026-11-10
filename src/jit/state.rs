@@ -291,10 +291,10 @@ impl JitRuntime {
         let (asm, frame) = crate::jit::backend::target::emit::trampoline(helper, kind);
         let alloc = self.code_alloc();
         let mut block = alloc.reserve(asm.offset() + asm.pool_bytes() + 16)?;
-        let words = asm
+        let code = asm
             .finish(block.rx() as usize)
             .map_err(|e| crate::jit::compile::CompileError::Backend(format!("assembler: {e:?}")))?;
-        block.write(&words);
+        block.write(&code);
         block.describe_frame(frame);
         let t = block.rx() as usize;
         self.trampoline_code.borrow_mut().push(block);

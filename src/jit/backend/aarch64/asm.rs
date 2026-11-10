@@ -278,8 +278,8 @@ impl Asm {
     }
 
     /// Emit the literal pool, resolve every branch for code placed at
-    /// `base`, and hand back the words.
-    pub(crate) fn finish(mut self, base: usize) -> Result<Vec<u32>, AsmError> {
+    /// `base`, and hand back the code.
+    pub(crate) fn finish(mut self, base: usize) -> Result<Vec<u8>, AsmError> {
         if !self.literals.is_empty() {
             self.align(8);
             for (l, v) in std::mem::take(&mut self.literals) {
@@ -329,7 +329,9 @@ impl Asm {
             let delta = (target as i64 - here as i64) / 4;
             self.words[at as usize] |= (delta as u32) & 0x03ff_ffff;
         }
-        Ok(self.words)
+        Ok((self.words.iter().map(|w| w.to_le_bytes()))
+            .collect::<Vec<_>>()
+            .into_flattened())
     }
 
     // --- moves and immediates ---------------------------------------------
@@ -1474,7 +1476,9 @@ mod tests {
         let mut c = Asm::new();
         c.mov_imm(x0, 0x1234_5678_9abc_def0);
         assert_eq!(c.words().len(), 1, "a four-half constant is one load");
-        let words = a.finish(0).unwrap();
+        let words: Vec<u32> = (a.finish(0).unwrap().as_chunks::<4>().0.iter())
+            .map(|&c| u32::from_le_bytes(c))
+            .collect();
         let Some(sys) = system_asm(&src) else {
             eprintln!("no system assembler; skipping");
             return;

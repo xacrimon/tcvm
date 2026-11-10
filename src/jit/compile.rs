@@ -670,28 +670,26 @@ pub(crate) fn compile<'gc>(
             )
         })
         .collect();
-    // Each patch as the `b` it writes.
-    let lazy: Box<[(u32, u32)]> = em
-        .lazy
-        .iter()
+    let lazy: Box<[(u32, u32)]> = (em.lazy.iter())
         .map(|&(at, to)| {
-            let (at, to) = (em.asm.label_offset(at), em.asm.label_offset(to));
-            let d = (to as i64 - at as i64) >> 2;
-            (at as u32, 0x1400_0000 | (d as u32 & 0x03ff_ffff))
+            (
+                em.asm.label_offset(at) as u32,
+                em.asm.label_offset(to) as u32,
+            )
         })
         .collect();
-    let words = em
+    let code = em
         .asm
         .finish(start as usize)
         .map_err(|e| CompileError::Backend(format!("assembler: {e:?}")))?;
-    block.write(&words);
+    block.write(&code);
     block.describe_frame(em.frame_size);
     #[cfg(feature = "tcvm-dev")]
     if config.dev.dump.asm {
         eprintln!(
             "-- jit asm {} pc{pc} at {start:p}, {} bytes, entry +{:#x}, cold +{cold_at:#x}",
             chunk_name(closure),
-            words.len() * 4,
+            code.len(),
             entry as usize - start as usize
         );
         let hot: Vec<String> = hot_at.iter().map(|(b, o)| format!("b{b}+{o:#x}")).collect();
@@ -714,7 +712,7 @@ pub(crate) fn compile<'gc>(
                 (at, tag)
             })
             .collect();
-        dump_words(start as usize, &words, &tags);
+        dump_words(start as usize, &code, &tags);
     }
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Emit);
@@ -929,7 +927,10 @@ pub(crate) fn chunk_name(closure: LuaFn<'_>) -> String {
 /// With each line tagged `@origin` after a `;` (`tags`: word index, origin,
 /// sorted).
 #[cfg(feature = "tcvm-dev")]
-fn dump_words(base: usize, words: &[u32], tags: &[(u32, String)]) {
+fn dump_words(base: usize, code: &[u8], tags: &[(u32, String)]) {
+    let words: Vec<u32> = (code.as_chunks::<4>().0.iter())
+        .map(|&c| u32::from_le_bytes(c))
+        .collect();
     let tag = |line: &str| -> Option<&str> {
         let off = line.trim_start().split(':').next()?;
         let w = (usize::from_str_radix(off, 16).ok()? / 4) as u32;
@@ -941,7 +942,7 @@ fn dump_words(base: usize, words: &[u32], tags: &[(u32, String)]) {
     let _ = std::fs::create_dir_all(&dir);
     let (src, obj) = (dir.join("code.s"), dir.join("code.o"));
     let mut text = String::from(".text\n");
-    for w in words {
+    for w in &words {
         text.push_str(&format!(".inst {w:#010x}\n"));
     }
     let ok = std::fs::write(&src, text).is_ok()

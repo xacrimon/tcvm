@@ -300,7 +300,8 @@ pub(crate) struct Region<'gc> {
     #[collect(require_static)]
     pub(crate) sites: Box<[Site]>,
     /// For a region with dependencies (ws2 §5.3), what `invalidate`
-    /// writes: (code offset, branch), the entry's and each lazy exit's.
+    /// writes: (patch point, jump target), code offsets, the entry's and
+    /// each lazy exit's.
     #[collect(require_static)]
     pub(crate) lazy: Box<[(u32, u32)]>,
     /// Code offsets of self-calls' return addresses whose result guard runs
@@ -351,8 +352,8 @@ impl<'gc> Region<'gc> {
         if self.invalidated.replace(true) {
             return;
         }
-        for &(off, w) in &self.lazy {
-            self.code.patch_u32(off as usize, w);
+        for &(at, to) in &self.lazy {
+            self.code.patch_jump(at as usize, to as usize);
         }
     }
 

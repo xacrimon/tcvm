@@ -9,9 +9,10 @@
 //!
 //! Every segment's executable alias is a slot of the process's one code
 //! range (`Range`), shared by every `Lua`: code reaches other code with
-//! `b`/`bl` wherever the range is, and the text too when the range is near
-//! it; a far range branches to the text, and every range to shared
-//! libraries (libm), through islands (`branch_target`).
+//! direct branches wherever the range is, and the text too when the range
+//! is near it; a far range branches to the text, and every range to shared
+//! libraries (libm), through islands (`branch_target`). Encodings and reach
+//! are the target's (`target::code`).
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -19,7 +20,7 @@ use std::ptr::NonNull;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::jit::backend::code::{map_in, reserve as reserve_space, unmap_out};
-use crate::jit::backend::target::code::sync_icache;
+use crate::jit::backend::target::code::{self as tcode, sync_icache};
 
 pub(crate) const SEG_SIZE: usize = 64 * 1024;
 const UNIT: usize = 64;
@@ -136,15 +137,8 @@ impl Drop for Segment {
     }
 }
 
-/// Sizes tried for a range within reach of the text, largest first; a far
-/// range is the first of them.
-const NEAR_SIZES: [usize; 3] = [64 << 20, 32 << 20, 16 << 20];
-
-/// Bytes of an island: `ldr` of its target, `br`, the target.
-const ISLAND: usize = 16;
-
 /// The process's code range: one reservation, made on first use, near the
-/// text if any of `NEAR_SIZES` fits in reach, else anywhere (beyond reach
+/// text if any of `RANGE_SIZES` fits in reach, else anywhere (beyond reach
 /// under `TCVM_JIT_FAR`, for tests of far code). Never given back.
 struct Range {
     base: usize,
@@ -173,7 +167,7 @@ impl Range {
         let far = false;
         let near = (!far)
             .then(|| {
-                NEAR_SIZES.iter().find_map(|&size| {
+                tcode::RANGE_SIZES.iter().find_map(|&size| {
                     reserve_space(size, SEG_SIZE, true, false)
                         .ok()
                         .map(|p| (p, size))
@@ -183,8 +177,8 @@ impl Range {
         let (p, size) = match near {
             Some(r) => r,
             None => (
-                reserve_space(NEAR_SIZES[0], SEG_SIZE, false, far)?,
-                NEAR_SIZES[0],
+                reserve_space(tcode::RANGE_SIZES[0], SEG_SIZE, false, far)?,
+                tcode::RANGE_SIZES[0],
             ),
         };
         let base = p.as_ptr() as usize;
@@ -227,7 +221,7 @@ impl Range {
         }
         if self
             .island_slot
-            .is_none_or(|(_, _, next)| next + ISLAND > SEG_SIZE)
+            .is_none_or(|(_, _, next)| next + tcode::ISLAND > SEG_SIZE)
         {
             let rx = self.take()?;
             let slot = NonNull::new(rx as *mut u8).expect("a slot at 0");
@@ -238,13 +232,13 @@ impl Range {
             self.island_slot = Some((rx, rw.as_ptr() as usize, 0));
         }
         let (rx, rw, next) = self.island_slot.as_mut().expect("an island slot");
-        let words = crate::jit::backend::target::abi::island(target);
+        let bytes = tcode::island(target);
         let (at_rx, at_rw) = (*rx + *next, *rw + *next);
         unsafe {
-            std::ptr::copy_nonoverlapping(words.as_ptr(), at_rw as *mut u32, words.len());
-            sync_icache(at_rw as *mut u8, at_rx as *mut u8, ISLAND);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at_rw as *mut u8, bytes.len());
+            sync_icache(at_rw as *mut u8, at_rx as *mut u8, bytes.len());
         }
-        *next += ISLAND;
+        *next += tcode::ISLAND;
         self.islands.push((target, at_rx));
         Some(at_rx)
     }
@@ -256,17 +250,11 @@ pub(crate) fn range_state() -> Option<(bool, usize)> {
     range().as_ref().map(|r| (r.near, r.islands.len()))
 }
 
-/// Whether a `b`/`bl` at `from` reaches `target`.
-fn in_b26(from: usize, target: usize) -> bool {
-    let d = target as i64 - from as i64;
-    d % 4 == 0 && (-(1 << 27)..(1 << 27)).contains(&d)
-}
-
-/// Where a `b`/`bl` at `from`, code in the range, goes for `target`: the
+/// Where a direct branch at `from`, code in the range, goes for `target`: the
 /// target itself in reach, else its island (a far range's branch into the
 /// text, or any range's into a shared library); none if neither reaches.
 pub(crate) fn branch_target(from: usize, target: usize) -> Option<usize> {
-    if in_b26(from, target) {
+    if tcode::reaches(from, target) {
         return Some(target);
     }
     let mut g = range();
@@ -275,7 +263,7 @@ pub(crate) fn branch_target(from: usize, target: usize) -> Option<usize> {
         return None;
     }
     let i = r.island(target)?;
-    in_b26(from, i).then_some(i)
+    tcode::reaches(from, i).then_some(i)
 }
 
 /// One region's code in a segment.
@@ -301,13 +289,21 @@ impl CodeBlock {
         unsafe { &*(base as *const SegHeader) }
     }
 
-    /// Copy `words` in at the start of the block and publish them.
-    pub(crate) fn write(&self, words: &[u32]) {
-        let len = words.len() * 4;
-        assert!(len <= self.len());
+    /// Copy `code` in at the start of the block and publish it.
+    pub(crate) fn write(&self, code: &[u8]) {
+        assert!(code.len() <= self.len());
         unsafe {
-            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), self.rw.as_ptr(), len);
-            sync_icache(self.rw.as_ptr(), self.rx.as_ptr(), len);
+            std::ptr::copy_nonoverlapping(code.as_ptr(), self.rw.as_ptr(), code.len());
+            sync_icache(self.rw.as_ptr(), self.rx.as_ptr(), code.len());
+        }
+    }
+
+    /// Overwrite the bytes at `off` and publish them.
+    fn patch<const N: usize>(&self, off: usize, f: impl FnOnce(&mut [u8; N])) {
+        assert!(off + N <= self.len());
+        unsafe {
+            f(&mut *self.rw.as_ptr().add(off).cast::<[u8; N]>());
+            sync_icache(self.rw.as_ptr().add(off), self.rx.as_ptr().add(off), N);
         }
     }
 
@@ -321,36 +317,26 @@ impl CodeBlock {
         ));
     }
 
-    /// Point the `b` or `bl` at byte `off` at `target` (or its island) and
-    /// publish it.
+    /// Point the direct branch or call at byte `off` at `target` (or its
+    /// island) and publish it.
     pub(crate) fn repoint_branch(&self, off: usize, target: usize) {
-        assert!(off + 4 <= self.len() && off.is_multiple_of(4));
         let at = self.rx() as usize + off;
         let target = branch_target(at, target).expect("a branch target out of reach");
-        let d = target as i64 - at as i64;
-        unsafe {
-            let p = self.rw.as_ptr().add(off).cast::<u32>();
-            p.write(p.read() & 0xfc00_0000 | (d >> 2) as u32 & 0x03ff_ffff);
-            sync_icache(self.rw.as_ptr().add(off), self.rx.as_ptr().add(off), 4);
-        }
+        self.patch(off, |b| tcode::retarget(b, at, target));
     }
 
-    /// Overwrite the instruction at byte `off` and publish it.
-    pub(crate) fn patch_u32(&self, off: usize, w: u32) {
-        assert!(off + 4 <= self.len() && off.is_multiple_of(4));
-        unsafe {
-            self.rw.as_ptr().add(off).cast::<u32>().write(w);
-            sync_icache(self.rw.as_ptr().add(off), self.rx.as_ptr().add(off), 4);
-        }
+    /// Overwrite the patch point at byte `off` with a jump to byte `to` of
+    /// the block and publish it.
+    pub(crate) fn patch_jump(&self, off: usize, to: usize) {
+        assert!(to < self.len());
+        let rx = self.rx() as usize;
+        self.patch(off, |b| *b = tcode::jump(rx + off, rx + to));
     }
 
     /// Overwrite the 64-bit word at byte `off` and publish it.
     pub(crate) fn patch_u64(&self, off: usize, v: u64) {
-        assert!(off + 8 <= self.len() && off.is_multiple_of(8));
-        unsafe {
-            self.rw.as_ptr().add(off).cast::<u64>().write(v);
-            sync_icache(self.rw.as_ptr().add(off), self.rx.as_ptr().add(off), 8);
-        }
+        assert!(off.is_multiple_of(8));
+        self.patch(off, |b| *b = v.to_ne_bytes());
     }
 }
 
@@ -532,8 +518,9 @@ mod tests {
     use super::*;
 
     fn ret_const(alloc: &CodeAllocator, imm: u16) -> CodeBlock {
-        let b = alloc.reserve(8).expect("reserve");
-        b.write(&[0xD280_0000 | (imm as u32) << 5, 0xD65F_03C0]);
+        let code = tcode::ret_imm(imm);
+        let b = alloc.reserve(code.len()).expect("reserve");
+        b.write(&code);
         b
     }
 

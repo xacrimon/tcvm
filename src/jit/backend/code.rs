@@ -2,8 +2,8 @@
 //! writes through and a read/execute alias the CPU fetches from, so no page
 //! is ever both. The executable aliases go into one reservation per process
 //! (`alloc`'s code range), placed within direct-branch reach of tcvm's text
-//! when there is room, so regions branch to handlers and helpers with
-//! `b`/`bl`; a range out of reach branches to them through islands.
+//! when there is room, so regions branch to handlers and helpers directly;
+//! a range out of reach branches to them through islands.
 //!
 //! After writing, the instruction cache must be invalidated over the
 //! executable range (the target's `code::sync_icache`).
@@ -12,8 +12,7 @@ use std::io;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
-/// Reach of `b`/`bl`, less a margin for code inside the segment.
-const BRANCH_REACH: usize = (128 << 20) - (1 << 20);
+use crate::jit::backend::target::code::REACH;
 
 /// Bounds of the executable text holding tcvm, which every branch target of a
 /// region lies in.
@@ -88,17 +87,19 @@ fn find_text() -> (usize, usize) {
 /// Whether code at `[addr, addr + len)` reaches all of the text directly.
 pub(crate) fn in_reach(addr: usize, len: usize) -> bool {
     let (lo, hi) = text_range();
-    addr + len <= lo + BRANCH_REACH && addr + BRANCH_REACH >= hi
+    addr + len <= lo + REACH && addr + REACH >= hi
 }
 
-/// Candidate executable addresses for a mapping of `size`, nearest the text
-/// first, alternating above and below, in `step` increments.
+/// Candidate executable addresses for a mapping of `size` aligned to
+/// `align`, nearest the text first, alternating above and below, in steps
+/// of an eighth of `size`: at most 16 * REACH / size probes.
 #[cfg(target_os = "linux")]
-fn candidates(size: usize, step: usize) -> impl Iterator<Item = usize> {
+fn candidates(size: usize, align: usize) -> impl Iterator<Item = usize> {
+    let step = (size / 8).max(align).next_multiple_of(align);
     let (lo, hi) = text_range();
     let up = hi.next_multiple_of(step);
     let down = (lo.saturating_sub(size)) / step * step;
-    let n = BRANCH_REACH / step;
+    let n = REACH / step;
     (0..n)
         .flat_map(move |i| {
             let a = up + i * step;
@@ -151,7 +152,7 @@ pub(crate) fn reserve(
         #[cfg(target_os = "macos")]
         {
             let (lo, hi) = text_range();
-            for hint in [hi, lo.saturating_sub(BRANCH_REACH)] {
+            for hint in [hi, lo.saturating_sub(REACH)] {
                 let Some(p) = reserve_at(Place::From(hint.next_multiple_of(align)), size, align)
                 else {
                     continue;
@@ -174,7 +175,7 @@ pub(crate) fn reserve(
     }
     if out_of_reach {
         let (_, hi) = text_range();
-        let p = reserve_at(Place::From(hi + 2 * BRANCH_REACH), size, align)
+        let p = reserve_at(Place::From(hi + 2 * REACH), size, align)
             .ok_or_else(io::Error::last_os_error)?;
         if in_reach(p.as_ptr() as usize, size) {
             return Err(io::Error::other("no code address out of reach"));

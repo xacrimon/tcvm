@@ -3614,8 +3614,8 @@ mod tests {
                 a.bind(other);
                 a.mov_imm(Gpr(0), !fail as u64);
                 a.ret();
-                let words = a.finish(block.rx() as usize).expect("assemble");
-                block.write(&words);
+                let code = a.finish(block.rx() as usize).expect("assemble");
+                block.write(&code);
                 let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(block.rx()) };
                 for &(w, k) in &samples {
                     let want = set.contains(TypeSet::BY_WORDS[k]);
