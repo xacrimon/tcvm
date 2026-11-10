@@ -61,6 +61,9 @@ pub(crate) enum Test {
     B1,
     /// Bit `k` of a w register is set (`Ne`) or clear (`Eq`): `[x]`.
     Bit(u8),
+    /// Bit `k` of the table's class's metamethod bits is set (`Ne`) or
+    /// clear (`Eq`), clear without a class: `[t]`.
+    MmBit(u8),
     /// The frame's header has the flag (`Ne`): `[]`.
     HasFlag(u8),
     /// Numbers have a metatable (`Ne`): `[]`.
@@ -281,8 +284,6 @@ pub(crate) enum MInst {
     },
     /// `[def d, use t]`: the metamethod of a bit index from the table's class.
     ClassMm(u8),
-    /// `[def d, use t]`: the class bits of the table, 0 without a class.
-    TabMmBits,
     /// `[def d, use i, use f, temp t (float)]`: `IFCmp`.
     IFCmp {
         cc: Cc,

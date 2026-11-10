@@ -508,11 +508,8 @@ pub(super) fn class_bit(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) ->
 }
 
 fn live_class_bit(b: &mut Builder<'_, '_>, t: Val, bit: MetamethodBits) -> Val {
-    let bits = b.ins(Op::TabMmBits, &[t]);
-    let mask = b.ki32(bit.bits() as i32);
-    let has = b.ins(Op::IAnd, &[bits, mask]);
-    let zero = b.ki32(0);
-    b.ins(Op::ICmp(Cc::Ne), &[has, zero])
+    debug_assert!(bit.bits().is_power_of_two());
+    b.ins(Op::TabHasMm(bit.bits().trailing_zeros() as u8), &[t])
 }
 
 /// The metamethod of `bit` the class of table `t` (a `Ptr`) has: a constant

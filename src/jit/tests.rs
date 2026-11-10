@@ -1399,13 +1399,13 @@ fn array_classes_wait_for_nils() {
             .count()
     };
     let ir = ir_of(src, "f", 0);
-    assert_eq!(hot(&ir, "tabmmbits"), 0, "{ir}");
+    assert_eq!(hot(&ir, "tabhasmm"), 0, "{ir}");
     // `row[j + 1]`'s old value only.
     assert_eq!(2 * hot(&ir, "istype val:nil"), hot(&ir, "arrstore"), "{ir}");
     assert!(!ir.contains("guard.miss"), "{ir}");
     let ir = ir_of(src, "g", 0);
     assert_eq!(hot(&ir, "arrload"), 0, "{ir}");
-    assert_eq!(hot(&ir, "tabmmbits"), 1, "{ir}");
+    assert_eq!(hot(&ir, "tabhasmm"), 1, "{ir}");
 }
 
 /// A table loaded from a slot that tracks its tables' stable shape needs no

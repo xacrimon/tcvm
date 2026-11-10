@@ -775,7 +775,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     | Op::FnNative
                     | Op::FnFits
                     | Op::TabHasRoom(_)
-                    | Op::TabNoKeys(_) => true,
+                    | Op::TabNoKeys(_)
+                    | Op::TabHasMm(_) => true,
                     // A select takes flags: no test that branches.
                     Op::IsType(set) => op != Op::Select || is_single_test(set),
                     _ => false,
@@ -943,6 +944,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::FnFits => (Test::FnFits, Cond::Ls, args),
             Op::TabHasRoom(loc) => (Test::TabHasRoom(loc), Cond::Hi, args),
             Op::TabNoKeys(parts) => (Test::TabNoKeys(parts), Cond::Eq, args),
+            Op::TabHasMm(k) => (Test::MmBit(k), Cond::Ne, args),
             op => panic!("test_of {op:?}"),
         }
     }
@@ -1411,7 +1413,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             | Op::FnNative
             | Op::FnFits
             | Op::TabHasRoom(_)
-            | Op::TabNoKeys(_) => {
+            | Op::TabNoKeys(_)
+            | Op::TabHasMm(_) => {
                 let r = res.unwrap();
                 let (test, cond, targs) = self.test_of(r);
                 let mut ops = vec![self.def(r)];
@@ -1424,14 +1427,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let (d, t) = (self.def(res.unwrap()), self.use_(args[0]));
                 self.push(MInst::ClassMm(k), &[d, t], none);
             }
-            Op::TabMmBits | Op::StrLenOf => {
+            Op::StrLenOf => {
                 let (d, t) = (self.def(res.unwrap()), self.use_(args[0]));
-                let m = if op == Op::TabMmBits {
-                    MInst::TabMmBits
-                } else {
-                    MInst::StrLenOf
-                };
-                self.push(m, &[d, t], none);
+                self.push(MInst::StrLenOf, &[d, t], none);
             }
             Op::UpvalCell(k) => {
                 let d = self.def(res.unwrap());

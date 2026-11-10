@@ -231,27 +231,24 @@ pub(crate) fn recompute(f: &mut Func<'_>, arms: &[Inst]) {
         if f.def_block(has).is_none_or(|d| f.blocks[d.idx()].cold) {
             continue;
         }
-        let mut at = at;
-        let again = class_again(f, has, b, &mut at);
+        let again = class_again(f, has, b, at);
         f.args_mut(x)[0] = again;
     }
 }
 
 /// `has` computed again in `b` at `at`, where it is the class test
 /// `build::tables` emits.
-fn class_again(f: &mut Func<'_>, has: Val, b: Block, at: &mut usize) -> Val {
+fn class_again(f: &mut Func<'_>, has: Val, b: Block, at: usize) -> Val {
     let Some(d) = f.def_inst(has) else {
         return has;
     };
     let op = f.op(d);
-    if !matches!(op, Op::ICmp(_) | Op::IAnd | Op::TabMmBits) {
+    if !matches!(op, Op::TabHasMm(_)) {
         return has;
     }
-    let args: Vec<Val> = f.args(d).to_vec();
-    let args: Vec<Val> = args.into_iter().map(|a| class_again(f, a, b, at)).collect();
-    let c = f.make_inst(op, &args, None, ExitTag::Type);
-    f.insert(b, *at, c);
-    *at += 1;
+    let t = f.args(d)[0];
+    let c = f.make_inst(op, &[t], None, ExitTag::Type);
+    f.insert(b, at, c);
     f.result(c)
 }
 

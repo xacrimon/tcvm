@@ -744,8 +744,9 @@ pub(crate) enum Op {
     TabSetShape(u32),
     /// The metamethod of bit index `i` the table's class has, nil without.
     ClassMm(u8),
-    /// The live metamethod bits (`I32`) of the table's class, 0 without one.
-    TabMmBits,
+    /// Whether the table's class has the metamethod of bit index `i` now, a
+    /// `B1`: false without a class.
+    TabHasMm(u8),
     /// Whether the table's hash parts in the mask (`HASH_*`) hold no key, a
     /// `B1`.
     TabNoKeys(u8),
@@ -997,9 +998,12 @@ impl Op {
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
             ShapeIs(_) | ShapeIn(_) | TabHasRoom(_) | NamedKey => Effects::reads(Mem::SHAPE),
             // A table's class changes only through helpers, which write `META`.
-            ClassBits(_) | ClassIndex(_) | ClassMm(_) | TabMmBits | NumMtSet | TypeMtIs { .. } => {
-                Effects::reads(Mem::META)
-            }
+            ClassBits(_)
+            | ClassIndex(_)
+            | ClassMm(_)
+            | TabHasMm(_)
+            | NumMtSet
+            | TypeMtIs { .. } => Effects::reads(Mem::META),
             TabLoad { .. } | TabNoKeys(_) => Effects::reads(Mem::TAB),
             TabStore { .. } => e(Flags::empty(), Mem::empty(), Mem::TAB),
             TabASize | TabArray | ArrLoad | ArrNext => Effects::reads(Mem::ARR),
@@ -1076,6 +1080,7 @@ impl Op {
                 | IMulNo
                 | LMul
                 | IAnd
+                | TabHasMm(_)
         )
     }
 
@@ -1141,12 +1146,12 @@ impl Op {
             | Resume { .. } => Ty::ANY,
             UpvalCell(_) | UpvalCellOf(_) => Ty::PTR,
             FrameFn => Ty::val(TypeSet::FUN),
-            NumVarargs | ClassBits(_) | TabASize | ArrNext | TabMmBits | NamedNext => Ty::I32,
+            NumVarargs | ClassBits(_) | TabASize | ArrNext | NamedNext => Ty::I32,
             NamedVal => Ty::ANY,
             NamedKey => Ty::val(TypeSet::STR),
             ClassIndex(_) | TabLoad { .. } | ArrLoad => Ty::ANY,
             TabArray => Ty::PTR,
-            TabHasRoom(_) | TabNoKeys(_) | ShapeIs(_) | ShapeIn(_) => Ty::B1,
+            TabHasRoom(_) | TabNoKeys(_) | TabHasMm(_) | ShapeIs(_) | ShapeIn(_) => Ty::B1,
             VarargAt(_) | VarargIdx => Ty::ANY,
             HasFlag(_) | FnFixedLua | FnNative | FnFits | NumMtSet | TypeMtIs { .. } => Ty::B1,
             ClassMm(_) => Ty::ANY,
