@@ -169,6 +169,66 @@ pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// The builder's checkpoints (`Builder::snap_before`), on its IR before any
+/// pass: an exit blamed on a later instruction than its snapshot's runs
+/// with no side effect since the checkpoint started, on every path.
+#[cfg(feature = "tcvm-dev")]
+pub(crate) fn checkpoints(f: &Func<'_>) -> Result<(), String> {
+    let cfg = f.cfg();
+    // The checkpoints live at each block's end; `None` before it is reached.
+    let mut out: Vec<Option<Vec<u32>>> = vec![None; f.blocks.len()];
+    let walk = |b: Block, out: &[Option<Vec<u32>>], check: bool| -> Result<Vec<u32>, String> {
+        let start = |live: &mut Vec<u32>, at: Option<Inst>| {
+            live.extend(
+                f.ckpts
+                    .iter()
+                    .filter(|c| c.1 == b && c.2 == at)
+                    .map(|c| c.0),
+            );
+        };
+        let mut live: Option<Vec<u32>> = None;
+        for o in cfg.preds(b).iter().filter_map(|p| out[p.idx()].as_ref()) {
+            match &mut live {
+                Some(l) => l.retain(|s| o.contains(s)),
+                None => live = Some(o.clone()),
+            }
+        }
+        let mut live = live.unwrap_or_default();
+        start(&mut live, None);
+        for &i in f.insts_of(b) {
+            let d = &f.insts[i.idx()];
+            if check && d.blame != NO_SNAP && !live.contains(&d.snap) {
+                return Err(format!(
+                    "i{} ({}) takes checkpoint s{} past a side effect",
+                    i.0,
+                    d.op.name(),
+                    d.snap
+                ));
+            }
+            if d.op.side_effect() {
+                live.clear();
+            }
+            start(&mut live, Some(i));
+        }
+        Ok(live)
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &cfg.rpo {
+            let live = Some(walk(b, &out, false)?);
+            if out[b.idx()] != live {
+                out[b.idx()] = live;
+                changed = true;
+            }
+        }
+    }
+    for &b in &cfg.rpo {
+        walk(b, &out, true)?;
+    }
+    Ok(())
+}
+
 /// Once the call-boundary pass ran, what is live across a call is a value
 /// its snapshot names, a constant, or a table's pointer whose table it
 /// names (C1).

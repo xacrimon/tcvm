@@ -324,6 +324,10 @@ pub(crate) struct Func<'gc> {
     /// Calls an inlined body's `TAILCALL` makes in its place (W3 §5), by
     /// snapshot.
     pub(crate) tail_sites: crate::jit::FastMap<u32, TailSite>,
+    /// Where the builder started each checkpoint, for `verify::checkpoints`:
+    /// its snapshot, the block and the instruction there it follows.
+    #[cfg(feature = "tcvm-dev")]
+    pub(crate) ckpts: Vec<(u32, Block, Option<Inst>)>,
     /// The region slots closures capture, of every frame the region inlines,
     /// which a call may write through their cells.
     pub(crate) captured: crate::jit::build::cfg::RegSet,
@@ -420,6 +424,8 @@ impl<'gc> Func<'gc> {
             boundaries: false,
             call_homes: Default::default(),
             tail_sites: Default::default(),
+            #[cfg(feature = "tcvm-dev")]
+            ckpts: Vec::new(),
             captured: Default::default(),
             inline_frames: Vec::new(),
             window: 0,
