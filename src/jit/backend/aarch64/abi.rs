@@ -68,11 +68,36 @@ pub(crate) fn ra_env() -> crate::jit::backend::ra::Env {
         ],
         scratch: [preg_int(17), preg_float(31)],
         transport: preg_int(16),
+        // The C ABI's callee-saved ones: last in each list.
+        kept: [
+            mask(INT_PREFERRED.len(), INT_OTHER.len()),
+            mask(FLOAT_PREFERRED.len(), FLOAT_OTHER.len()),
+        ],
     }
 }
 
-/// Every register the allocator hands out: what a call into another region
-/// may change.
+fn mask(from: usize, n: usize) -> u32 {
+    (((1u64 << n) - 1) << from) as u32
+}
+
+/// The registers every call keeps (`call-protocol.md`): a callee gives them
+/// back as it found them, by whichever way it returns.
+/// In `Region::kept_mask`'s order.
+pub(crate) fn kept() -> impl Iterator<Item = PReg> {
+    (INT_OTHER.iter().map(|&r| preg_int(r))).chain(FLOAT_OTHER.iter().map(|&r| preg_float(r)))
+}
+
+/// What a call into another region may change: the allocatable registers
+/// it does not keep.
+pub(crate) fn call_clobbers() -> PRegSet {
+    let mut s = allocatable();
+    for r in kept() {
+        s.remove(r);
+    }
+    s
+}
+
+/// Every register the allocator hands out.
 pub(crate) fn allocatable() -> PRegSet {
     let mut s = PRegSet::empty();
     for r in INT_PREFERRED.iter().chain(&INT_OTHER) {
@@ -150,9 +175,10 @@ const _: () = assert!(IMAGE_SPILLS + MAX_SPILLS <= EXIT_REGS);
 /// Entered from a region's exit trampoline with x16 = region | exit << 48
 /// and the region's frame still open: stores the register image in
 /// `image_index` order, copies the frame's spill slots after it, and pops
-/// the frame. A frame dispatch entered tails `jit_exit` in its level; a
-/// fast-called one starts a level that returns to its caller, and the
-/// interpreter runs the rest of it there (H10). Every allocatable register
+/// the frame, the caller's values it held back in their registers. A frame
+/// dispatch entered tails `jit_exit` in its level; a fast-called one starts
+/// a level that returns to its caller, and the interpreter runs the rest of
+/// it there (H10). Every allocatable register
 /// may hold a value: the runtime comes from the level's record.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn exit_common() {
@@ -199,8 +225,79 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "str x13, [x12], #8",
         "subs w10, w10, #1",
         "b.ne 1b",
-        // Pop the frame.
+        // The caller's values the frame holds, back in the registers calls
+        // keep: the level started below saves them for the return.
         "2:",
+        "ldrh w10, [x9, #{kept_mask}]",
+        "cbz w10, 5f",
+        "add x11, x29, #{frame_spills}",
+        "add x12, x9, #{kept_slots}",
+        "tbz w10, #0, 7f",
+        "ldrb w13, [x12, #0]",
+        "ldr x19, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #1, 7f",
+        "ldrb w13, [x12, #1]",
+        "ldr x20, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #2, 7f",
+        "ldrb w13, [x12, #2]",
+        "ldr x21, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #3, 7f",
+        "ldrb w13, [x12, #3]",
+        "ldr x23, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #4, 7f",
+        "ldrb w13, [x12, #4]",
+        "ldr x24, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #5, 7f",
+        "ldrb w13, [x12, #5]",
+        "ldr x26, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #6, 7f",
+        "ldrb w13, [x12, #6]",
+        "ldr x27, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #7, 7f",
+        "ldrb w13, [x12, #7]",
+        "ldr x28, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #8, 7f",
+        "ldrb w13, [x12, #8]",
+        "ldr d8, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #9, 7f",
+        "ldrb w13, [x12, #9]",
+        "ldr d9, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #10, 7f",
+        "ldrb w13, [x12, #10]",
+        "ldr d10, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #11, 7f",
+        "ldrb w13, [x12, #11]",
+        "ldr d11, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #12, 7f",
+        "ldrb w13, [x12, #12]",
+        "ldr d12, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #13, 7f",
+        "ldrb w13, [x12, #13]",
+        "ldr d13, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #14, 7f",
+        "ldrb w13, [x12, #14]",
+        "ldr d14, [x11, x13, lsl #3]",
+        "7:",
+        "tbz w10, #15, 7f",
+        "ldrb w13, [x12, #15]",
+        "ldr d15, [x11, x13, lsl #3]",
+        "7:",
+        // Pop the frame.
+        "5:",
         "ldr w10, [x9, #{frame_size}]",
         "add x10, x29, x10",
         "ldp x29, x30, [x29]",
@@ -228,6 +325,8 @@ pub(crate) unsafe extern "C" fn exit_common() {
         ptr_mask = const PTR_MASK,
         num_spills = const crate::jit::region::layout::NUM_SPILLS,
         frame_size = const crate::jit::region::layout::FRAME_SIZE,
+        kept_mask = const crate::jit::region::layout::KEPT_MASK,
+        kept_slots = const crate::jit::region::layout::KEPT_SLOTS,
         spills = const IMAGE_SPILLS * 8,
         level_ret = const crate::jit::layout::LEVEL_RET,
         level_land = const crate::jit::layout::LEVEL_LAND,

@@ -46,6 +46,9 @@ pub(crate) struct VCode<I> {
     /// header), and for a header the enclosing loop's; `u32::MAX` for none.
     pub(crate) loop_of: Vec<u32>,
     pub(crate) loop_parent: Vec<u32>,
+    /// A function region's caller's values: per register calls keep, the
+    /// vreg defined in it at entry and used in it where the region leaves.
+    pub(crate) kept: Vec<(u32, crate::jit::backend::reg::PReg)>,
 }
 
 /// A value the allocator may compute again where it is needed.
@@ -97,6 +100,7 @@ impl<I: TargetInst> VCode<I> {
             entry: RBlock::new(0),
             loop_of: Vec::new(),
             loop_parent: Vec::new(),
+            kept: Vec::new(),
         }
     }
 

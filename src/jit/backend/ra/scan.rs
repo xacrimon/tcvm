@@ -4,7 +4,7 @@
 
 use std::cmp::Reverse;
 
-use super::{FIXED, Held, Loc, MAX_REGS, NONE, Piece, Pos, Ra, Want, Why, intersect};
+use super::{FIXED, Held, Ivs, Loc, MAX_REGS, NONE, PINNED, Piece, Pos, Ra, Want, Why, intersect};
 use crate::jit::backend::reg::PReg;
 use crate::jit::backend::vcode::{TargetInst, VCode};
 
@@ -65,7 +65,7 @@ impl Ra {
         Some(((k >> 32) as Pos, k as u32))
     }
 
-    fn queue(&mut self, x: u32) {
+    pub(super) fn queue(&mut self, x: u32) {
         let k = super::build::key(self.start(x), x);
         self.unhandled.push(Reverse(k));
     }
@@ -204,6 +204,15 @@ impl Ra {
             {
                 out[k] = out[k].min(x);
             }
+        }
+        // A pinned piece holds its register over its whole range.
+        let mut m = self.pinned[cls];
+        while m != 0 {
+            let k = m.trailing_zeros() as usize;
+            if let Some(x) = intersect(Ivs::plain(&self.pin[cls][k]), iv, s) {
+                out[k] = out[k].min(x);
+            }
+            m &= m - 1;
         }
         out
     }
@@ -504,7 +513,7 @@ impl Ra {
         self.fixed_conflicts(c)[..n].iter().any(|&x| x >= end)
     }
 
-    fn in_loop(&self, b: u32, h: u32) -> bool {
+    pub(super) fn in_loop(&self, b: u32, h: u32) -> bool {
         let mut x = self.inner[b as usize];
         while x != NONE {
             if x == h {
@@ -788,6 +797,9 @@ impl Ra {
             if let Some(live) = self.piece_at(v, ls)
                 && !self.pieces[live as usize].loc.spilled()
             {
+                if self.pieces[live as usize].flags & PINNED != 0 {
+                    return (begin, pos);
+                }
                 let mut y = live;
                 while y != NONE && self.start(y) < pos {
                     if (self.next_use(y, ls, Want::Beneficial)).is_some_and(|u| u.pos <= pos) {
@@ -809,7 +821,7 @@ impl Ra {
         if begin == end {
             return;
         }
-        let keep = |p: &Piece| p.loc.spilled() || p.flags & super::FIXED != 0;
+        let keep = |p: &Piece| p.loc.spilled() || p.flags & (FIXED | PINNED) != 0;
         if !keep(&self.pieces[begin as usize]) {
             self.spill_after(begin, pos, Why::Spilled);
         }

@@ -3919,3 +3919,165 @@ fn loaded_values_outlive_their_slots() {
 "##,
     );
 }
+
+/// What a compiled caller holds in the registers calls keep comes back
+/// however the callee leaves: here by an exit (its argument's type changes
+/// late), the caller a loop and a function called from one.
+#[test]
+fn kept_registers_survive_a_callee_exit() {
+    agrees_calling(
+        "local function g(x) return x + 1 end
+        local function f(n)
+          local a, b, c, d, t, s = 1, 2.5, 3, 4.25, {7}, 'k'
+          local acc = 0
+          for i = 1, n do
+            local v = g(i < n - 20 and i or i + 0.5)
+            acc = acc + v + a + b + c + d + t[1] + #s
+            a = a + 1 b = b + 0.5 c = c + 2 d = d + 0.25
+          end
+          return acc
+        end
+        local p, q, r, total = 10, 0.5, {3}, 0
+        for j = 1, 60 do
+          total = total + f(150 + j) + p + q + r[1]
+          p = p + 1 q = q + 0.125
+        end
+        return tostring(total)",
+    );
+}
+
+/// A callee the interpreter runs (varargs: no fast entry) in a level.
+#[test]
+fn kept_registers_survive_an_interpreted_callee() {
+    agrees_calling(
+        "local function g(...) local a, b = ... return select('#', ...) + a + (b or 0) end
+        local function f(n)
+          local a, b, t, s, acc = 1, 2.5, {7}, 'kk', 0
+          for i = 1, n do
+            acc = acc + g(i, a) + g(i) + a + b + t[1] + #s
+            a = a + 1 b = b + 0.5
+          end
+          return acc
+        end
+        local p, q, total = 10, 0.5, 0
+        for j = 1, 60 do
+          total = total + f(100 + j) + p + q
+          p = p + 1 q = q + 0.125
+        end
+        return tostring(total)",
+    );
+}
+
+/// A native that does not return plainly: an error caught by `pcall`, and
+/// one thrown through compiled frames to a `pcall` below them.
+#[test]
+fn kept_registers_survive_errors_under_pcall() {
+    agrees_calling(
+        "local function boom(i) if i % 7 == 0 then error('x' .. i) end return i end
+        local function mid(i, k) local a, b = k + 1, k * 0.5 return boom(i) + a + b end
+        local function f(n)
+          local a, b, t, s, acc = 1, 2.5, {7}, 'kk', 0
+          for i = 1, n do
+            local ok, v = pcall(mid, i, a)
+            local ok2, e = pcall(error, s)
+            acc = acc + (ok and v or #v) + (ok2 and 1 or #e) + a + b + t[1]
+            a = a + 1 b = b + 0.5
+          end
+          return acc
+        end
+        local p, q, total = 10, 0.5, 0
+        for j = 1, 40 do
+          total = total + f(100 + j) + p + q
+          p = p + 1 q = q + 0.125
+        end
+        return tostring(total)",
+    );
+}
+
+/// Switches: a compiled loop resuming a coroutine and one yielding from it
+/// each hold values across the switch, which runs the other's code.
+#[test]
+fn kept_registers_survive_coroutine_switches() {
+    agrees_calling(
+        "local yield = coroutine.yield
+        local function body(n)
+          local a, b, t, acc = 5, 1.5, {2}, 0
+          for i = 1, n do
+            local got = yield(i + a)
+            acc = acc + got + a + b + t[1]
+            a = a + 3 b = b + 0.25
+          end
+          return acc
+        end
+        local function f(n)
+          local co = coroutine.wrap(body)
+          local a, b, t, s, acc = 1, 2.5, {7}, 'kk', 0
+          local v = co(n)
+          for i = 1, n do
+            v = co(i + a)
+            acc = acc + (v or 0) + a + b + t[1] + #s
+            a = a + 1 b = b + 0.5
+          end
+          return acc
+        end
+        local p, q, total = 10, 0.5, 0
+        for j = 1, 40 do
+          total = total + f(100 + j) + p + q
+          p = p + 1 q = q + 0.125
+        end
+        return tostring(total)",
+    );
+}
+
+/// The caller leaves at the lazy exit past a call: its callee replaced the
+/// method the caller's code depends on.
+#[test]
+fn kept_registers_survive_a_lazy_exit() {
+    agrees_calling(
+        "local C = {}
+        C.__index = C
+        function C.get(o, i) return o.v + i end
+        local function swap(i)
+          if i == 900 then C.get = function(o, i) return o.v - i end end
+          return i
+        end
+        local function f(n, o)
+          local a, b, t, acc = 1, 2.5, {7}, 0
+          for i = 1, n do
+            local x = swap(i)
+            acc = acc + o:get(x) + a + b + t[1]
+            a = a + 1 b = b + 0.5
+          end
+          return acc
+        end
+        local o = setmetatable({v = 3}, C)
+        return tostring(f(600, o) + f(600, o) + f(600, o))",
+    );
+}
+
+/// Boxed values in kept registers across calls that allocate: the
+/// collector finds them through their slots, the code through the register.
+#[test]
+fn boxed_values_in_kept_registers_survive_collections() {
+    agrees_calling(
+        "local function churn(i)
+          local t = {}
+          for k = 1, 20 do t[k] = {k, tostring(i + k)} end
+          return #t
+        end
+        local function f(n)
+          local acc = 0
+          for i = 1, n do
+            local a, b, c = {i}, 's' .. i, {i * 2, {i * 3}}
+            local m = churn(i)
+            local d = {a, b}
+            m = m + churn(i + 1)
+            acc = acc + m + a[1] + #b + c[1] + c[2][1] + d[1][1] + #d[2]
+          end
+          return acc
+        end
+        local total = 0
+        for j = 1, 30 do total = total + f(80 + j) end
+        return tostring(total)",
+    );
+}

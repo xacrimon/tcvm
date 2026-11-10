@@ -24,6 +24,7 @@ mod build;
 pub(crate) mod checker;
 #[cfg(feature = "tcvm-dev")]
 pub(crate) mod corpus;
+mod keep;
 mod resolve;
 mod scan;
 #[cfg(test)]
@@ -57,6 +58,9 @@ pub(crate) struct Output {
     pub(crate) edits: Vec<(ProgPoint, Edit)>,
     pub(crate) edge_edits: Vec<(Inst, u8, Edit)>,
     pub(crate) allocs: Vec<Allocation>,
+    /// The registers calls keep that the function took, each with the
+    /// slot holding its caller's value through the body.
+    pub(crate) kept: Vec<(PReg, u32)>,
 }
 
 pub(crate) enum InstOrEdit<'a> {
@@ -118,6 +122,9 @@ pub(crate) struct Env {
     /// An integer register never allocated, carrying stack-to-stack moves
     /// (64 bits, any class).
     pub(crate) transport: PReg,
+    /// Per class, the registers every call keeps, as bits of `regs`
+    /// indices.
+    pub(crate) kept: [u32; 2],
 }
 
 fn class_index(c: RegClass) -> usize {
@@ -249,6 +256,8 @@ pub(crate) enum Why {
 
 const FIXED: u8 = 1;
 const STACK: u8 = 2;
+/// Given its register before the scan (`keep`): never moved or spilled.
+const PINNED: u8 = 4;
 
 impl Piece {
     /// Merged back into the piece before it.
@@ -433,6 +442,7 @@ impl Ctx {
         ra.layout(f, order, hot)?;
         ra.liveness(f, live)?;
         ra.build(f, build)?;
+        ra.keep(f);
         ra.scan(f)?;
         ra.resolve(f, resolve)
     }
@@ -549,6 +559,16 @@ struct Ra {
     /// this point (V8's `next_active_ranges_change_` and inactive's).
     next_change: Pos,
     scratch: Vec<Held>,
+    /// Per class and register (`keep`): the intervals its pinned pieces
+    /// hold it over, sorted; the registers with any.
+    pin: [Vec<Vec<(Pos, Pos)>>; 2],
+    pinned: [u32; 2],
+    /// The caller's values of a function region, by group.
+    callers: Vec<u32>,
+    /// `keep`'s candidates refused a register, by what making one again
+    /// costs: one instruction, more, a load.
+    #[cfg(feature = "tcvm-dev")]
+    refused: [u32; 3],
 }
 
 /// Operands of one instruction that may not share a register: an early
@@ -659,6 +679,11 @@ impl Ra {
             inactive: Vec::new(),
             next_change: 0,
             scratch: Vec::new(),
+            pin: [Vec::new(), Vec::new()],
+            pinned: [0; 2],
+            callers: Vec::new(),
+            #[cfg(feature = "tcvm-dev")]
+            refused: [0; 3],
         }
     }
 
@@ -667,9 +692,17 @@ impl Ra {
         clear!(self; order, rank, first, last, lin_block, at_lin, freq, inner, outer, hot_end,
             live_in, anyuse, ivs, own, uses, snaps, snap_off, next_of, defs, defs_off, members,
             members_off, pieces, flat, flat_off, flat_start, vregs, rep, deferred, clobs, initial,
-            unhandled, active, inactive, scratch);
+            unhandled, active, inactive, scratch, callers);
         for l in &mut self.fixres {
             l.clear();
+        }
+        for l in self.pin.iter_mut().flatten() {
+            l.clear();
+        }
+        self.pinned = [0; 2];
+        #[cfg(feature = "tcvm-dev")]
+        {
+            self.refused = [0; 3];
         }
         self.cold_start = Pos::MAX;
         self.words = 0;
@@ -1048,6 +1081,13 @@ impl Ctx {
             Loc::Remat => "remat".to_string(),
         };
         let mut s = String::new();
+        let [one, more, load] = ra.refused;
+        if one + more + load != 0 {
+            let _ = writeln!(
+                s,
+                "refused a kept register: {one} one-instruction constants, {more} other constants, {load} loads"
+            );
+        }
         for g in 0..ra.vregs.len() {
             let gi = &ra.vregs[g];
             if ra.rep[g] as usize != g || gi.head == NONE {
@@ -1135,6 +1175,9 @@ impl Ctx {
                 }
                 if p.flags & STACK != 0 {
                     let _ = write!(s, " S");
+                }
+                if p.flags & PINNED != 0 {
+                    let _ = write!(s, " P");
                 }
             }
             let _ = writeln!(s);

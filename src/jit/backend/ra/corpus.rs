@@ -125,6 +125,7 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
         regs,
         scratch: [s[0], s[1]],
         transport: preg(r.u32()),
+        kept: [0; 2],
     };
     let mut f = VCode::new();
     for _ in 0..r.u32() {
@@ -210,6 +211,7 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
             edits,
             edge_edits,
             allocs,
+            kept: Vec::new(),
         },
     })
 }
