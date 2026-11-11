@@ -137,12 +137,12 @@ macro_rules! count_invocation {
 }
 pub(crate) use count_invocation;
 
-/// The Lua arm of CALL, shared by the CALL forms; `$fv` is the callee
-/// (`R[a]`, or the source register of a CALLS, which has just stored it
-/// there) and `$ret` the callee's continuation.
-/// The callee feedback of the call `insn` of `closure` (I2): a hit costs a
-/// load and a compare, a miss records the function `fv` in `call_note`. A
-/// handler that called out to record it would push a frame on every call.
+/// The Lua arm of CALL, shared by the CALL forms; `$fv` is the callee (`R[a]`,
+/// or the source register of a CALLS, which has just stored it there) and
+/// `$ret` the callee's continuation. The callee feedback of the call `insn` of
+/// `closure`: a hit costs a load and a compare, a miss records the function
+/// `fv` in `call_note`. A handler that called out to record it would push a
+/// frame on every call.
 macro_rules! note_callee {
     ($closure:ident, $insn:expr, $fv:expr) => {{
         // The callee word, after the slot's site word.

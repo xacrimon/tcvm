@@ -105,11 +105,11 @@ use crate::jit::backend::reg::{
 };
 use crate::jit::backend::vcode::{TargetInst, VCode};
 
-// Vendored from regalloc2 0.15.2 `src/checker.rs` (M1 step 2a): std maps for
-// FxHash, `Vec` for `SmallVec`, no tracing; `Edit::Remat` defines its target
-// as the value, and a constant's definition left unmaterialized (allocation
-// none) defines nothing. Checks `VCode` directly (no `Function` trait), without
-// fixed stack slots (no `MachineEnv`).
+// Vendored from regalloc2 0.15.2 `src/checker.rs`: std maps for FxHash, `Vec`
+// for `SmallVec`, no tracing; `Edit::Remat` defines its target as the value,
+// and a constant's definition left unmaterialized (allocation none) defines
+// nothing. Checks `VCode` directly (no `Function` trait), without fixed stack
+// slots (no `MachineEnv`).
 type FxHashMap<K, V> = std::collections::HashMap<K, V>;
 type FxHashSet<K> = std::collections::HashSet<K>;
 

@@ -1,7 +1,6 @@
-//! Table access (`jit-design.md` 7.4, 7.6): constant-key sites from their
-//! inline caches, integer keys through the array part, everything else
-//! through `jit_index` and `jit_newindex`, whose failure (a metamethod to
-//! call, an error) deopts.
+//! Table access: constant-key sites from their inline caches, integer keys
+//! through the array part, everything else through `jit_index` and
+//! `jit_newindex`, whose failure (a metamethod to call, an error) deopts.
 
 use crate::dmm::Gc;
 use crate::env::function::InlineCache;
@@ -55,10 +54,10 @@ fn kind_types(kind: Kind) -> TypeSet {
     TypeSet::of_classes(kind.classes())
 }
 
-/// What tables of `shape` hold in `slot`, assumed (ws2 §6.1). A weak
-/// table's slot the collector clears takes nil then, which the code meets
-/// only after leaving: collections run at parks, past a `gccheck` exit or in
-/// a call, whose lazy exit an invalidation takes.
+/// What tables of `shape` hold in `slot`, assumed. A weak table's slot the
+/// collector clears takes nil then, which the code meets only after leaving:
+/// collections run at parks, past a `gccheck` exit or in a call, whose lazy
+/// exit an invalidation takes.
 fn slot_types<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, slot: u32) -> TypeSet {
     let f = shape.field(slot);
     let kind = f.kind();
@@ -88,8 +87,8 @@ fn slot_load<'gc>(
     let slot = loc.slot(shape);
     let set = slot_types(b, shape, slot);
     b.set_ty(v, Ty::val(set));
-    // A table loaded from a slot that tracks its tables' stable shape is in
-    // it (ws2 §6.1's `table(S)`), for as long as nothing leaves it.
+    // A table loaded from a slot that tracks its tables' stable shape is in it,
+    // for as long as nothing leaves it.
     if let Some(s) = shape.field(slot).shape()
         && s.is_stable()
     {
@@ -195,9 +194,9 @@ enum Way {
 /// Classes and holders an access walks at compile time.
 const MAX_WALK: usize = 8;
 
-/// What the `__index` walk gives for a key that a table of some class lacks
-/// or holds nil, as far as the region may assume it; each assumption is a
-/// dependency (ws2 §5.5).
+/// What the `__index` walk gives for a key that a table of some class lacks or
+/// holds nil, as far as the region may assume it; each assumption is a
+/// dependency.
 #[derive(Clone, Copy)]
 enum Found<'gc> {
     /// Nil: no `__index` past the tables without the key.
@@ -236,9 +235,9 @@ impl Found<'_> {
     }
 }
 
-/// The `__index` walk for `key` from a table of `class` that lacks it or
-/// holds nil: through `__index` tables that are watched holders, their
-/// shapes and unchanged slots assumed (ws2 §5.5).
+/// The `__index` walk for `key` from a table of `class` that lacks it or holds
+/// nil: through `__index` tables that are watched holders, their shapes and
+/// unchanged slots assumed.
 fn walk<'gc>(
     b: &mut Builder<'_, 'gc>,
     class: Option<MtCache<'gc>>,
@@ -430,10 +429,10 @@ fn dispatch<'gc>(
     enter_join(b, join);
 }
 
-/// Whether the class `shape` pins has `bit` (a shape pins its class, not
-/// the class's bits): a constant the region depends on (ws2 §5.5), or read
-/// live from a class whose dependents were invalidated before; `None` for a
-/// shape without a class, whose tables have no metatable.
+/// Whether the class `shape` pins has `bit` (a shape pins its class, not the
+/// class's bits): a constant the region depends on, or read live from a class
+/// whose dependents were invalidated before; `None` for a shape without a
+/// class, whose tables have no metatable.
 fn class_has<'gc>(b: &mut Builder<'_, 'gc>, shape: Shape<'gc>, bit: MetamethodBits) -> Option<Val> {
     shape.mt_cache()?;
     if let Some(has) = known_bit(b, shape, bit) {
@@ -545,8 +544,8 @@ fn barrier_for(b: &mut Builder<'_, '_>, t: Val, v: Val) {
     }
 }
 
-/// `recv[key]` through `__index` tables into `dst`, an `__index` function
-/// on `recv`'s own metatable called (5.4); any other walk deopts.
+/// `recv[key]` through `__index` tables into `dst`, an `__index` function on
+/// `recv`'s own metatable called; any other walk deopts.
 fn index(b: &mut Builder<'_, '_>, dst: u8, recv: Val, key: Val) -> Val {
     let recv = b.boxed(recv);
     let key = b.boxed(key);
@@ -660,8 +659,8 @@ fn absent<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>, shape: Shape
     }
 }
 
-/// `GETFIELD`, `GETTABUP` and `SELF` in all their forms: what the site's
-/// cache entry holds, which is authoritative over its form (7.4).
+/// `GETFIELD`, `GETTABUP` and `SELF` in all their forms: what the site's cache
+/// entry holds, which is authoritative over its form.
 pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     let (dst, _, ic, e) = insn.abde();
     let recv = receiver(b, insn);
@@ -736,10 +735,10 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     }
 }
 
-/// A read from strings, which the site only saw (11.5): the strings'
-/// metatable still the one now, its `__index` the table it is now, that
-/// table's slot for the key, each guarded. False when that chain is not
-/// there to compile (a dict, an `__index` function), for the helper.
+/// A read from strings, which the site only saw: the strings' metatable still
+/// the one now, its `__index` the table it is now, that table's slot for the
+/// key, each guarded. False when that chain is not there to compile (a dict, an
+/// `__index` function), for the helper.
 fn string_method<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>) -> bool {
     let ty = b.ty(site.recv);
     let kinds = b.feedback(b.pc) & fb::KINDS;
@@ -881,9 +880,9 @@ impl<'gc> Site<'gc> {
 }
 
 /// The shapes a site tests for: its cache's first, those its shape exits
-/// recorded, then, while there is room, those earlier sites tested on the
-/// same receiver value, which it most likely has here too. `None` past
-/// `MAX_SHAPES` or for a dict shape, a site left to the helper (6.4).
+/// recorded, then, while there is room, those earlier sites tested on the same
+/// receiver value, which it most likely has here too. `None` past `MAX_SHAPES`
+/// or for a dict shape, a site left to the helper.
 fn site_shapes<'gc>(
     b: &mut Builder<'_, 'gc>,
     first: Option<Shape<'gc>>,
@@ -1114,9 +1113,9 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
     }
 }
 
-/// Whether compiled code may store `key` to tables of `shape` itself: a
-/// watched holder only to a slot an earlier store changed, so nothing
-/// assumes its value, and never adding a key (ws2 §5.2).
+/// Whether compiled code may store `key` to tables of `shape` itself: a watched
+/// holder only to a slot an earlier store changed, so nothing assumes its
+/// value, and never adding a key.
 fn stores_inline<'gc>(shape: Shape<'gc>, key: LuaString<'gc>) -> bool {
     !shape.is_watched() || shape.find_slot(key).is_some_and(|s| shape.slot_mutable(s))
 }
@@ -1136,7 +1135,7 @@ fn trans_store<'gc>(
     v: Val,
 ) {
     // The interpreter made this move first, which left `from` unstable;
-    // compiled moves never mark it (ws2 §6.2).
+    // compiled moves never mark it.
     debug_assert!(!from.is_stable());
     if from.is_stable() {
         return newindex(b, recv, key, v, false);
@@ -1254,10 +1253,10 @@ fn table_site(b: &mut Builder<'_, '_>, pc: u32, recv: Val) -> Option<Val> {
 
 /// The small-integer key of an array access: `Ok` its `I32`, guarded small
 /// unless the site's feedback saw other keys; then `Err(other)`, the block a
-/// test sends them to. `None` for a key never small: no array access. A
-/// float with an integral value is that integer's key, so where the site saw
-/// floats a number key converts (W2.6), exiting (`Type`) at a fraction or
-/// past i32, after which the site's floats take the helper.
+/// test sends them to. `None` for a key never small: no array access. A float
+/// with an integral value is that integer's key, so where the site saw floats a
+/// number key converts, exiting (`Type`) at a fraction or past i32, after which
+/// the site's floats take the helper.
 fn int_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Result<Val, (Val, Block)>> {
     let ty = b.ty(k);
     if ty.rep == Rep::I32 || (!ty.set.is_empty() && ty.within(TypeSet::SMALL)) {
@@ -1301,8 +1300,8 @@ fn int_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Result<Val, (Val,
     Some(Err((conv(b, kb), other)))
 }
 
-/// The string key of a table access, boxed: a string, or guarded one where
-/// the site saw only strings (W2.5).
+/// The string key of a table access, boxed: a string, or guarded one where the
+/// site saw only strings.
 fn str_key(b: &mut Builder<'_, '_>, pc: u32, k: Val) -> Option<Val> {
     let ty = b.ty(k);
     if !ty.set.is_empty() && ty.within(TypeSet::STR) {

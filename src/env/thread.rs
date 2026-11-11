@@ -114,14 +114,14 @@ pub struct ThreadState<'gc> {
     /// stack's end plus headroom for natives.
     #[cfg(jit)]
     pub(crate) native_limit: usize,
-    /// Fast calls with the stack pointer below this branch with a tagged
-    /// return address instead of `blr` (5.4): this level's return address
-    /// stack is full from here.
+    /// Fast calls with the stack pointer below this branch with a tagged return
+    /// address instead of `blr`: this level's return address stack is full from
+    /// here.
     #[cfg(all(jit, target_arch = "aarch64"))]
     pub(crate) native_deep: usize,
-    /// The frame pointer and return address of the compiled code a native
-    /// runs for through `jit_call_native` (I1): its frame's caller while
-    /// the frame returns through `ret_shim`.
+    /// The frame pointer and return address of the compiled code a native runs
+    /// for through `jit_call_native`: its frame's caller while the frame
+    /// returns through `ret_shim`.
     #[cfg(jit)]
     pub(crate) shim: [usize; 2],
     /// The function a seeded thread calls, until it gets its stack.
@@ -232,16 +232,16 @@ impl<'gc> DerefMut for ValueStack<'gc> {
     }
 }
 
-// SAFETY: traces every field that can own a `Gc` pointer. Slots above the
-// live region are dead scratch and must NOT be traced; they are nil-filled
-// here instead, as in LuaJIT and PUC, so every slot below the live region
-// holds a marked object or a primitive and every slot above holds nil. Header
-// words are skipped except word 0, traced as the frame's function, and dead
-// words 2 and 3, cleared (`vm::frame`). A compiled frame below a level (H11)
-// keeps values in its native frame and in the home slots of the registers
-// its call site's snapshot names; the rest of its window is cleared.
-// Writing through `&self` is sound because collection runs outside `mutate`,
-// with no borrow of the thread outstanding and every thread parked.
+// SAFETY: traces every field that can own a `Gc` pointer. Slots above the live
+// region are dead scratch and must NOT be traced; they are nil-filled here
+// instead, as in LuaJIT and PUC, so every slot below the live region holds a
+// marked object or a primitive and every slot above holds nil. Header words are
+// skipped except word 0, traced as the frame's function, and dead words 2 and
+// 3, cleared (`vm::frame`). A compiled frame below a level keeps values in its
+// native frame and in the home slots of the registers its call site's snapshot
+// names; the rest of its window is cleared. Writing through `&self` is sound
+// because collection runs outside `mutate`, with no borrow of the thread
+// outstanding and every thread parked.
 unsafe impl<'gc> Collect<'gc> for ThreadState<'gc> {
     fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
         let live = self.live_top().min(self.stack.len());

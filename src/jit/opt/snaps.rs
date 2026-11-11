@@ -1,13 +1,13 @@
-//! Snapshot re-pruning (`jit-design.md` 9.8): an exit need not restore a
-//! register whose slot holds the value its snapshot names, so a value only
-//! exits use dies at its last other use. The slots' contents are followed
-//! through the region: a load tells what a slot holds, a store sets it, and
-//! a call clears what it keeps neither in its homes (`Func::call_homes`)
-//! nor in a slot its snapshot names with that very value, which joins its
-//! homes (the collector traces the slot in place while the call runs,
-//! `ThreadState::trace`). The same walk finds the home loads (`Op::Home`):
-//! a load whose slot holds its value wherever its register is read, which
-//! the allocator may load from the slot again instead of spilling.
+//! Snapshot re-pruning: an exit need not restore a register whose slot holds
+//! the value its snapshot names, so a value only exits use dies at its last
+//! other use. The slots' contents are followed through the region: a load tells
+//! what a slot holds, a store sets it, and a call clears what it keeps neither
+//! in its homes (`Func::call_homes`) nor in a slot its snapshot names with that
+//! very value, which joins its homes (the collector traces the slot in place
+//! while the call runs, `ThreadState::trace`). The same walk finds the home
+//! loads (`Op::Home`): a load whose slot holds its value wherever its register
+//! is read, which the allocator may load from the slot again instead of
+//! spilling.
 
 use crate::jit::FastMap;
 use crate::jit::build::cfg::RegSet;

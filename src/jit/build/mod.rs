@@ -1,7 +1,7 @@
-//! The builder (`jit-design.md` 8.7): one pass over the bytecode from the
-//! entry, Braun-style SSA over the registers, home-slot tracking for the
-//! stores at tail-outs and the entries of snapshots, and the outer-loop
-//! peeling of a loop entry inside a nest.
+//! The builder: one pass over the bytecode from the entry, Braun-style SSA over
+//! the registers, home-slot tracking for the stores at tail-outs and the
+//! entries of snapshots, and the outer-loop peeling of a loop entry inside a
+//! nest.
 
 pub(crate) mod cfg;
 mod emit;
@@ -27,12 +27,12 @@ pub(crate) enum BuildError {
     TooLarge,
 }
 
-/// Bytecode instructions the outer-loop peeling of a loop entry may copy
-/// (8.7), about 400 IR instructions; past it the outermost levels stay
-/// merged into the entry's loop.
+/// Bytecode instructions the outer-loop peeling of a loop entry may copy, about
+/// 400 IR instructions; past it the outermost levels stay merged into the
+/// entry's loop.
 const OSR_PEEL_LIMIT: u32 = 150;
 
-/// A copy of a bytecode block in an outer-loop peeling version (8.7).
+/// A copy of a bytecode block in an outer-loop peeling version.
 struct Instance {
     bc: u32,
     version: u32,
@@ -172,18 +172,18 @@ struct BlockState {
     facts: Facts,
 }
 
-/// What the builder knows of values on a path (W3 §3). A block starts
-/// with the meet over its predecessors'; an inlined body with its caller's
-/// at the call, the code after the call with the meet over its returns'.
-/// Refinements are the registers' (`BlockState::refines`): a body's of its
-/// arguments reach the caller through the parameters it never writes.
+/// What the builder knows of values on a path. A block starts with the meet
+/// over its predecessors'; an inlined body with its caller's at the call, the
+/// code after the call with the meet over its returns'. Refinements are the
+/// registers' (`BlockState::refines`): a body's of its arguments reach the
+/// caller through the parameters it never writes.
 #[derive(Clone, Default)]
 struct Facts {
-    /// The shapes tables have here, by fact key (`fact_key`): the shape
-    /// guards and tests passed since an instruction that may change shapes
-    /// (W1.7 5.2), and whether a fact holds only while its shapes stay
-    /// stable (ws2 §6.2): one kept across such an instruction, or a load
-    /// from a slot that tracks its tables' shape.
+    /// The shapes tables have here, by fact key (`fact_key`): the shape guards
+    /// and tests passed since an instruction that may change shapes, and
+    /// whether a fact holds only while its shapes stay stable: one kept across
+    /// such an instruction, or a load from a slot that tracks its tables'
+    /// shape.
     shapes: Vec<(Val, Shapes, bool)>,
     /// The facts of stable shapes an instruction that may change shapes
     /// left, back at the lazy exit after it: no frame passes that exit
@@ -212,9 +212,9 @@ impl Facts {
     }
 }
 
-/// What holds of values wherever they are, shared by a region's builders
-/// with its block states: an inlined body's builder takes them at the call
-/// and gives them back (W3 §3).
+/// What holds of values wherever they are, shared by a region's builders with
+/// its block states: an inlined body's builder takes them at the call and gives
+/// them back.
 #[derive(Default)]
 pub(crate) struct Known<'gc> {
     /// The receiver and constant key of each direct field load, for values
@@ -231,7 +231,7 @@ pub(crate) struct Known<'gc> {
     pub(crate) callees: crate::jit::FastMap<usize, Option<std::rc::Rc<inline::InlineCode>>>,
     /// Closures a `CLOSURE` of the compile made, with their prototypes.
     pub(crate) made: crate::jit::FastMap<Val, Gc<'gc, Prototype<'gc>>>,
-    /// The inlining plan (W3 §12).
+    /// The inlining plan.
     pub(crate) plan: inline::Plan,
 }
 
@@ -271,16 +271,16 @@ pub(crate) struct Builder<'a, 'gc> {
     /// its arms join (`intrinsics::moved_shape`).
     pub(crate) moved_shape: Option<u32>,
     /// What an inlined call left up to `top` from a register, for the next
-    /// instruction (W3 §7); `cur_top` is the current instruction's.
+    /// instruction; `cur_top` is the current instruction's.
     pub(crate) top: Option<(u8, Top)>,
     pub(crate) cur_top: Option<(u8, Top)>,
-    /// Blocks made now are cold arms (A5).
+    /// Blocks made now are cold arms.
     cold: bool,
     /// A loop entry's frame, by register: what `intrinsics::value_now`
     /// guesses a loop header's value of a register is.
     pub(crate) entry_frame: Vec<Value<'gc>>,
     loop_entry: bool,
-    /// Set when this builds an inlined callee's body (E1).
+    /// Set when this builds an inlined callee's body.
     pub(crate) inline: Option<Inline>,
     /// Scratch for `read_var_at`'s walk.
     chain: Vec<Block>,
@@ -306,7 +306,7 @@ pub(crate) struct Builder<'a, 'gc> {
     pc_start: (Block, Option<Inst>),
 }
 
-/// What the builder of an inlined callee knows of its call (E1).
+/// What the builder of an inlined callee knows of its call.
 pub(crate) struct Inline {
     /// Its frame in `Func::inline_frames`.
     pub(crate) frame: u32,
@@ -327,11 +327,11 @@ pub(crate) struct Inline {
     /// It, or a body inlined into it, makes a call, which may write its
     /// callers' captured registers through their cells.
     pub(crate) called: bool,
-    /// It replaces the region's own frame (W3 §5): its returns and tail
-    /// calls are the region's, and `cont` is none.
+    /// It replaces the region's own frame: its returns and tail calls are the
+    /// region's, and `cont` is none.
     pub(crate) region_return: bool,
-    /// Its call wants every result (W3 §7): its returns pass `wanted`
-    /// values, nil past theirs, and their count.
+    /// Its call wants every result: its returns pass `wanted` values, nil past
+    /// theirs, and their count.
     pub(crate) counted: bool,
     /// Its call is a metamethod's, or the one of the body it replaces was.
     pub(crate) mm: bool,
@@ -354,7 +354,7 @@ pub(crate) struct Inline {
     pub(crate) effects: bool,
 }
 
-/// How many values an inlined call left up to `top` (W3 §7).
+/// How many values an inlined call left up to `top`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Top {
     Fixed(u8),
@@ -1181,7 +1181,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     pub(crate) fn push(&mut self, op: Op, args: &[Val]) -> Inst {
         // A cold arm's allocation has its own collector check, so the loop
-        // around it needs none (A5): garbage waits for the arm's next run.
+        // around it needs none: garbage waits for the arm's next run.
         if let Op::Helper(h) = op
             && self.f.blocks[self.cur.idx()].cold
             && h.sig().effects.has(crate::jit::ir::ops::Flags::MAY_ALLOC)
@@ -1542,7 +1542,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// Note the `After` snapshot of `v`'s definition, the instruction at the
     /// current pc, and of the loads of the block it starts when that is a
-    /// resume block (9.1).
+    /// resume block.
     pub(crate) fn note_def(&mut self, vals: &[Val], resume: Option<Block>) -> Snap {
         self.flush();
         let s = self.snap_after(self.pc);
@@ -1555,8 +1555,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         s
     }
 
-    /// A lazy exit with `s` (ws2 §5.4), for a point right after a call or a
-    /// table write, before anything that assumes what a dependency names.
+    /// A lazy exit with `s`, for a point right after a call or a table write,
+    /// before anything that assumes what a dependency names.
     pub(crate) fn lazy_exit(&mut self, s: Snap) {
         self.ins_snap(Op::LazyExit, &[], s, ExitTag::Lazy);
         let st = &mut self.bs[self.cur.idx()].facts;
@@ -1581,7 +1581,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.snapshot(pc, ExitKind::Before, live)
     }
 
-    /// Assume `class` keeps `bits` as they are now (ws2 §5.5).
+    /// Assume `class` keeps `bits` as they are now.
     pub(crate) fn depend_class(&mut self, class: crate::env::MtCache<'gc>, bits: MetamethodBits) {
         self.depend(DepOn::Class(class), bits.bits() as u64);
     }
@@ -1591,7 +1591,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         self.depend(DepOn::Shape(shape), groups);
     }
 
-    /// Assume `field`'s kind stays (ws2 §6.1).
+    /// Assume `field`'s kind stays.
     pub(crate) fn depend_field(&mut self, field: crate::env::shape::Field<'gc>) {
         self.depend(DepOn::Field(field), 1);
     }
@@ -1676,9 +1676,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// which becomes current. Of the registers `live` after it, those it
     /// `written` and the captured ones are read from their slots after it;
     /// those whose slots hold their values keep them there (its homes: the
-    /// call-boundary pass reloads what is used after it, typed as before);
-    /// the others keep their values in the region's frame across it, the
-    /// call-site snapshot naming them for the collector (H11).
+    /// call-boundary pass reloads what is used after it, typed as before); the
+    /// others keep their values in the region's frame across it, the call-site
+    /// snapshot naming them for the collector.
     pub(crate) fn call(
         &mut self,
         op: Op,
@@ -1760,10 +1760,10 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     }
 
     /// End an inlined body with a real call that replaces its frame (its
-    /// `TAILCALL`, W3 §5): made from the body's header slot, as its caller
-    /// made the call the body was inlined at, so its site is the caller's
-    /// frame there, keeping what the caller kept. Continues in the resume
-    /// block, where the body's registers are dead.
+    /// `TAILCALL`): made from the body's header slot, as its caller made the
+    /// call the body was inlined at, so its site is the caller's frame there,
+    /// keeping what the caller kept. Continues in the resume block, where the
+    /// body's registers are dead.
     pub(crate) fn tail_call(&mut self, op: Op, args: &[Val], c: u8) -> Block {
         let i = self.inline.as_mut().expect("an inlined body");
         i.called = true;
@@ -2127,8 +2127,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         post
     }
 
-    /// Whether the block is compiled as one deopt: it never ran (6.3), or
-    /// an instruction in it always deopts, cutting its successors.
+    /// Whether the block is compiled as one deopt: it never ran, or an
+    /// instruction in it always deopts, cutting its successors.
     fn block_deopts(&self, bc: u32) -> bool {
         if self.cfg.never_ran[bc as usize] {
             return true;
@@ -2398,8 +2398,8 @@ impl<'a, 'gc> Builder<'a, 'gc> {
 
     /// Whether compiled code exited at the site at `pc` on operand kinds its
     /// form does not cover. Its form may have changed since, and may change
-    /// again: the interpreter's forms do not only widen, a region's
-    /// speculation must (6.4).
+    /// again: the interpreter's forms do not only widen, a region's speculation
+    /// must.
     pub(crate) fn kind_exited(&self, pc: u32) -> bool {
         self.feedback(pc) & crate::jit::feedback::KIND_EXIT != 0
     }

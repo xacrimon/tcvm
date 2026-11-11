@@ -1,5 +1,4 @@
-//! The optimizer (`jit-design.md` 9): passes over a `Func`, each verified in
-//! checking builds.
+//! The optimizer: passes over a `Func`, each verified in checking builds.
 
 pub(crate) mod branch;
 pub(crate) mod calls;
@@ -89,8 +88,8 @@ pub(crate) fn natural_loops(f: &Func<'_>) -> Vec<(Block, Vec<Block>)> {
 pub(crate) fn prune_gc_checks(f: &mut Func<'_>) {
     use crate::jit::ir::types::Rep;
     // A call is not an allocation: its callee checks its own, as the
-    // interpreter's allocating handlers and `native_enter` do (5.7). A cold
-    // arm checks before its own allocations.
+    // interpreter's allocating handlers and `native_enter` do. A cold arm
+    // checks before its own allocations.
     let allocates = |f: &Func<'_>, b: Block| {
         !f.blocks[b.idx()].cold
             && f.insts_of(b).iter().any(|&i| match f.op(i) {

@@ -1,10 +1,10 @@
 #!/bin/sh
-# gate.sh NEW [OLD] [OUT]: the per-commit cost gate (jit-perf-fixes2.md G3).
-# Runs the operation table (opcost.py) for NEW, and OLD when given, then the
-# corpus (tools/corpus) and the LJR regressions and Are We Fast Yet programs
-# with NEW, NEW's interpreter and OLD interleaved, two rounds each. Results
-# go to OUT (default: a fresh temporary directory). Copy the binaries out of
-# target/ first: a rebuild during the run would replace them.
+# gate.sh NEW [OLD] [OUT]: the per-commit cost gate. Runs the operation table
+# (opcost.py) for NEW, and OLD when given, then the corpus (tools/corpus) and
+# the LJR regressions and Are We Fast Yet programs with NEW, NEW's interpreter
+# and OLD interleaved, two rounds each. Results go to OUT (default: a fresh
+# temporary directory). Copy the binaries out of target/ first: a rebuild
+# during the run would replace them.
 #
 # The program runs use tools/ljr.py on bench/ljr (LJR=dir overrides).
 set -e

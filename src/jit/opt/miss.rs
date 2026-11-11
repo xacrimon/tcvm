@@ -1,14 +1,14 @@
-//! Array misses (W2.3): `GuardMiss(v, has)`, an element `v` nil under a
-//! class with the metamethod (`has`), expands once the loops are optimized.
-//! One a guard that excludes nil from `v` dominates goes, as does one such a
-//! guard follows under its checkpoint, whose exit runs the load again
-//! ([`covered`]); the rest become the cheapest of:
+//! Array misses: `GuardMiss(v, has)`, an element `v` nil under a class with the
+//! metamethod (`has`), expands once the loops are optimized. One a guard that
+//! excludes nil from `v` dominates goes, as does one such a guard follows under
+//! its checkpoint, whose exit runs the load again ([`covered`]); the rest
+//! become the cheapest of:
 //! - the type guard on `v` of its use, as a branch whose failing arm tests
 //!   nil, then the class; the guards between with the use's snapshot (the
 //!   other operand's) follow the branch, as an exit there is the same exit;
 //! - a guard on `has` alone where `has` is computed on the hot path anyway:
-//!   outside the loop (LICM moved it), or for a guard of this form sharing
-//!   it; LICM moves it as well, recording the miss at the access (E2);
+//!   outside the loop (LICM moved it), or for a guard of this form sharing it;
+//!   LICM moves it as well, recording the miss at the access;
 //! - a nil test whose arm tests the class.
 //!
 //! Once LICM and GVN have run again, each arm computes the class test again

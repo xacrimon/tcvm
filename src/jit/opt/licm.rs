@@ -1,13 +1,12 @@
-//! Loop-invariant code motion (9.5): instructions whose operands come from
-//! outside a loop, and whose memory the loop does not write, move to its
-//! preheader. Pure instructions move from anywhere in the loop. Exiting
-//! instructions and loads move only from blocks every entered iteration
-//! runs, and a load or a memory guard only until an exiting instruction
-//! stays: it may rely on the guards before it (a table's shape for a slot's
-//! offset). A moved exit leaves `Before` the loop header with the
-//! preheader's frame. Invariant i32 arithmetic elsewhere in the loop moves
-//! as i64 arithmetic and a narrowing exit (E3): it exits only where the
-//! interpreter's result would leave i32 anyway.
+//! Loop-invariant code motion: instructions whose operands come from outside a
+//! loop, and whose memory the loop does not write, move to its preheader. Pure
+//! instructions move from anywhere in the loop. Exiting instructions and loads
+//! move only from blocks every entered iteration runs, and a load or a memory
+//! guard only until an exiting instruction stays: it may rely on the guards
+//! before it (a table's shape for a slot's offset). A moved exit leaves
+//! `Before` the loop header with the preheader's frame. Invariant i32
+//! arithmetic elsewhere in the loop moves as i64 arithmetic and a narrowing
+//! exit: it exits only where the interpreter's result would leave i32 anyway.
 
 use crate::jit::ir::ops::{ExitTag, Flags, Mem, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -98,7 +97,7 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
                 None => !wkeys.iter().any(|&(c, _)| r.intersects(c)),
             }
     };
-    // Across a call only what can be computed again may live (R6, 9.8).
+    // Across a call only what can be computed again may live.
     let calls = body.iter().any(|&b| {
         f.terminator(b)
             .is_some_and(|i| matches!(f.op(i), Op::Call { .. } | Op::CallMm { .. }))

@@ -335,9 +335,9 @@ pub(crate) struct Frame<'gc> {
     /// call it is in, whose snapshot names what it keeps in spill slots.
     #[cfg(jit)]
     pub(crate) compiled: Option<(usize, *const Site, *const Region<'static>)>,
-    /// A frame inlined into the compiled frame below it, which a call from
-    /// its body is made in (W3 §4): no header of its own (`ret` is 0), its
-    /// slots part of the compiled frame's window.
+    /// A frame inlined into the compiled frame below it, which a call from its
+    /// body is made in: no header of its own (`ret` is 0), its slots part of
+    /// the compiled frame's window.
     #[cfg(jit)]
     pub(crate) inlined: bool,
 }
@@ -402,17 +402,16 @@ impl<'gc> Frame<'gc> {
     }
 }
 
-/// The thread's frames from the published top down (H7). Headers chain the
-/// frames a level runs; a level's first frame returns through
-/// `ret_to_native`, and below it are the compiled frames of the code that
-/// started the level, which its entry record names: the walk follows their
-/// frame records, each frame's region and call site from its return
-/// address, down to the frame dispatch entered, whose header is complete.
-/// A call site in an inlined body shows the frames inlined around it first
-/// (`Frame::inlined`), from its snapshot's frame chain.
-/// A `pcall`/`xpcall` that called a frame without a frame of its own still
-/// counts as a level: a synthetic native frame follows the frame it called,
-/// so error levels match the reference.
+/// The thread's frames from the published top down. Headers chain the frames a
+/// level runs; a level's first frame returns through `ret_to_native`, and below
+/// it are the compiled frames of the code that started the level, which its
+/// entry record names: the walk follows their frame records, each frame's
+/// region and call site from its return address, down to the frame dispatch
+/// entered, whose header is complete. A call site in an inlined body shows the
+/// frames inlined around it first (`Frame::inlined`), from its snapshot's frame
+/// chain. A `pcall`/`xpcall` that called a frame without a frame of its own
+/// still counts as a level: a synthetic native frame follows the frame it
+/// called, so error levels match the reference.
 pub(crate) fn frames<'gc>(ts: &ThreadState<'gc>) -> Walk<'gc> {
     Walk {
         base: ts.top_base,
@@ -621,7 +620,7 @@ impl<'gc> Walk<'gc> {
         let mut cur = f0;
         let mut code = f0.closure().code;
         for fr in snap.frames() {
-            // A tail callee in the compiled frame's place (W3 §5).
+            // A tail callee in the compiled frame's place.
             if fr.delta == 0 {
                 let callee = region.pool[fr.func as usize]
                     .get_function()

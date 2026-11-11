@@ -335,8 +335,8 @@ impl<'gc> Context<'gc> {
         } else if let Some(u) = v.get_userdata() {
             u.set_metatable(self.mutation(), mt);
         } else {
-            // A class, so that compiled code may assume its `__index` table
-            // (a string's methods) as for tables' (ws2 §5.2).
+            // A class, so that compiled code may assume its `__index` table (a
+            // string's methods) as for tables'.
             if let Some(mt) = mt {
                 mt.ensure_mt_cache(self);
             }

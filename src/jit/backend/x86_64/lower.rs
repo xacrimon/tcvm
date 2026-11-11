@@ -144,8 +144,8 @@ impl Select for Lower<'_, '_> {
                         let (d, u) = (self.def(r), self.use_(x));
                         self.push(MInst::BoxB1, &[d, u], none);
                     }
-                    // The slow case calls through a trampoline (A5): only
-                    // rax changes.
+                    // The slow case calls through a trampoline: only rax
+                    // changes.
                     Rep::I64 => {
                         let d = Operand::reg_fixed_def(self.vr(r), preg_int(RAX));
                         let u = Operand::reg_fixed_use(self.vr(x), preg_int(ARGS[1]));
@@ -859,9 +859,9 @@ impl Select for Lower<'_, '_> {
                     true => self.resume_a(i),
                     false => (0, 0),
                 };
-                // Nothing is in a register here: what lives across the call
-                // is in the frame (C1), and its reloads come after. The
-                // results land in rax and rdx, which a clobber cannot name.
+                // Nothing is in a register here: what lives across the call is
+                // in the frame, and its reloads come after. The results land in
+                // rax and rdx, which a clobber cannot name.
                 let mut clob = allocatable();
                 let ops: Vec<Operand> = if c == 2 || c == 3 {
                     let rs: Vec<Val> = f.results(i).collect();
@@ -908,8 +908,8 @@ impl Select for Lower<'_, '_> {
                     }
                     _ => false,
                 };
-                // A known Lua callee takes its first arguments in `ARGS` (W4
-                // §2); any other callee finds them in its slots.
+                // A known Lua callee takes its first arguments in `ARGS`; any
+                // other callee finds them in its slots.
                 let ops: Vec<Operand> = if nargs == u8::MAX {
                     args.iter().map(|&x| self.use_(x)).collect()
                 } else if matches!(known, Some(Known::Lua { .. })) {

@@ -1,15 +1,14 @@
-//! Inlining (E1): a call of a known small Lua function becomes its body,
-//! built by a builder of its own into the same function. The body's
-//! snapshots name its frame and the callers' registers at the call, so an
-//! exit rebuilds both; its returns jump to a block taking the results.
-//! A call in the body is the region's, its frame past the body's registers;
-//! the frame walk finds the inlined frames from its site (W3 §4). Its
-//! cells and closures go through the callee closure, and what its closures
-//! open on its slots closes at its returns (§6). A body that needs its
-//! frame on the stack (a to-be-closed variable, varargs) is not inlined.
-//! The callee is what the call would guard
-//! (`intrinsics::callee_of`): a closure, whose upvalues are constants, or
-//! one of a prototype, whose upvalues are loaded from it.
+//! Inlining: a call of a known small Lua function becomes its body, built by a
+//! builder of its own into the same function. The body's snapshots name its
+//! frame and the callers' registers at the call, so an exit rebuilds both; its
+//! returns jump to a block taking the results. A call in the body is the
+//! region's, its frame past the body's registers; the frame walk finds the
+//! inlined frames from its site. Its cells and closures go through the callee
+//! closure, and what its closures open on its slots closes at its returns. A
+//! body that needs its frame on the stack (a to-be-closed variable, varargs) is
+//! not inlined. The callee is what the call would guard
+//! (`intrinsics::callee_of`): a closure, whose upvalues are constants, or one
+//! of a prototype, whose upvalues are loaded from it.
 
 use std::rc::Rc;
 
@@ -41,9 +40,9 @@ const MAX_BYTECODES: usize = 460;
 /// bodies over the LJR programs average 5.36 (1754 bodies, median 3.73).
 const IR_PER_BC: u32 = 5;
 
-/// Which call sites inline (W3 §12): ranked before the build by frequency
-/// over size, a site in a loop by half again, and taken greedily within the
-/// budget, tiny callees always. Sites by their function's code and pc.
+/// Which call sites inline: ranked before the build by frequency over size, a
+/// site in a loop by half again, and taken greedily within the budget, tiny
+/// callees always. Sites by their function's code and pc.
 #[derive(Default)]
 pub(crate) struct Plan {
     take: std::collections::HashSet<(usize, u32), foldhash::fast::FixedState>,
@@ -161,7 +160,7 @@ fn push_sites<'gc>(
         let Some(callee) = callee.filter(|p| !p.is_vararg) else {
             continue;
         };
-        // Recursion inlines one copy (W3 §8).
+        // Recursion inlines one copy.
         let ptr = callee.code.as_ptr() as usize;
         if calls == 0.0 || chain.iter().filter(|&&c| c == ptr).count() > 1 {
             continue;
@@ -219,20 +218,20 @@ pub(crate) struct InlineCode {
     tails: bool,
 }
 
-/// Inline the CALL at `pc` of `callee`; whether it did, the current block
-/// then the one after the call. A `TAILCALL` inlines its callee in its
-/// frame's place (W3 §5): the frame it replaces is gone, so the callee has
-/// its base, caller and continuation, and its returns are that frame's. In
-/// the region's own frame (none of whose registers a closure captured) a
-/// constant callee takes it over: exits give frame 0's header the callee,
-/// and its returns are the region's.
+/// Inline the CALL at `pc` of `callee`; whether it did, the current block then
+/// the one after the call. A `TAILCALL` inlines its callee in its frame's
+/// place: the frame it replaces is gone, so the callee has its base, caller and
+/// continuation, and its returns are that frame's. In the region's own frame
+/// (none of whose registers a closure captured) a constant callee takes it
+/// over: exits give frame 0's header the callee, and its returns are the
+/// region's.
 pub(super) fn try_inline(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> bool {
     inline_site(b, pc, Site::Call(insn), callee).is_some()
 }
 
-/// Inline the call of the metamethod `f`, a constant, with `args` (W3 §9),
-/// whose result goes to `R[A]` of the instruction at `pc` (`ret_store_a`);
-/// its result, then in the block after it.
+/// Inline the call of the metamethod `f`, a constant, with `args`, whose result
+/// goes to `R[A]` of the instruction at `pc` (`ret_store_a`); its result, then
+/// in the block after it.
 pub(super) fn try_inline_mm(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Option<Val> {
     if !matches!(b.f.def_op(f), Some(Op::KObj(_))) {
         return None;
@@ -285,8 +284,8 @@ fn inline_site(
         (None, _) if tail => 1,
         (_, Site::Call(insn)) => insn.c(),
     };
-    // Every result (W3 §7): for an instruction after it that takes them up
-    // to `top`, from a callee each of whose returns gives a fixed count.
+    // Every result: for an instruction after it that takes them up to `top`,
+    // from a callee each of whose returns gives a fixed count.
     let multi = c == 0 && !tail;
     if multi && !takes_top(b.code(pc + 1)) {
         return None;
@@ -296,8 +295,8 @@ fn inline_site(
         return None;
     }
     // A callee known by its prototype (several closures of it, or one this
-    // compile made) is built from its prototype, its upvalues loaded from
-    // the closure value (W3 §10); one the compile made needs no guard.
+    // compile made) is built from its prototype, its upvalues loaded from the
+    // closure value; one the compile made needs no guard.
     let known = match mm {
         // A metamethod site's feedback is not a call's.
         Some(_) => match b.f.def_op(callee) {
@@ -674,8 +673,7 @@ fn inline_site(
 }
 
 /// How many frames of the chain from the region's to the current one run
-/// `proto`: recursion inlines one copy (W3 §8), whose own calls of it stay
-/// real calls.
+/// `proto`: recursion inlines one copy, whose own calls of it stay real calls.
 fn runs_in_chain(
     b: &Builder<'_, '_>,
     proto: crate::dmm::Gc<'_, crate::env::function::Prototype<'_>>,
@@ -817,8 +815,8 @@ pub(super) fn inline_return(b: &mut Builder<'_, '_>, a: u8, n: u8) {
     return_values(b, &res, seen, count);
 }
 
-/// The body's `RETURN` of `R[a..top)` at `pc`, which a real call set (W3
-/// §7); false if no call before it did.
+/// The body's `RETURN` of `R[a..top)` at `pc`, which a real call set; false if
+/// no call before it did.
 pub(super) fn inline_return_top(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> bool {
     let wanted = b.inline.as_ref().expect("an inlined body").wanted;
     // A body's slots start past a header: `TopArgs(s)` counts from `s + 4`.
@@ -948,11 +946,11 @@ fn return_values(b: &mut Builder<'_, '_>, res: &[Val], seen: Vec<Val>, count: Op
     b.inline.as_mut().unwrap().returns.push((t, seen));
 }
 
-/// The body's `TAILCALL` of `callee` with `nargs` arguments from `R[a+4]`
-/// (W3 §5). A Lua callee replaces the body's frame; a native runs above
-/// it, as the interpreter calls one from the tail-calling frame, so that
-/// its errors and the levels it reads name the body. A callee of unknown
-/// kind is told apart where it is called.
+/// The body's `TAILCALL` of `callee` with `nargs` arguments from `R[a+4]`. A
+/// Lua callee replaces the body's frame; a native runs above it, as the
+/// interpreter calls one from the tail-calling frame, so that its errors and
+/// the levels it reads name the body. A callee of unknown kind is told apart
+/// where it is called.
 pub(super) fn tail_call(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8, callee: Val) {
     let (callee, proto) = super::emit::known_callee(b, pc, callee);
     let native = match b.f.def_op(callee) {
@@ -1034,8 +1032,8 @@ fn replacing_tail_call(b: &mut Builder<'_, '_>, a: u8, nargs: u8, callee: Val, p
         })
         .collect();
     close_frame(b);
-    // The first `REG_ARGS` are the call's operands (W4 §2), the rest go to the
-    // callee's slots, the body's from its base.
+    // The first `REG_ARGS` are the call's operands, the rest go to the callee's
+    // slots, the body's from its base.
     let in_regs = (nargs as usize).min(crate::jit::REG_ARGS as usize);
     for (k, &v) in vals.iter().enumerate().skip(in_regs) {
         b.push(Op::Store((base + k) as u8), &[v]);

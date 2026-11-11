@@ -93,8 +93,8 @@ impl TypeSet {
 }
 
 /// A fact about a value beyond its type set, valid for as long as the value
-/// exists. Shapes are not facts of a value (a store changes them), except
-/// a stable one's (ws2 §6.2).
+/// exists. Shapes are not facts of a value (a store changes them), except a
+/// stable one's.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Refine {
     None,

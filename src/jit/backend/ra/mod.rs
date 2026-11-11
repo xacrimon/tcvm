@@ -1,6 +1,6 @@
-//! The register allocator (M1, `m1-regalloc.md`): an SSA linear scan with
-//! V8's split and spill positions (TurboFan `register-allocator.cc`) over a
-//! `VCode`, writing an `Output`.
+//! The register allocator: an SSA linear scan with V8's split and spill
+//! positions (TurboFan `register-allocator.cc`) over a `VCode`, writing an
+//! `Output`.
 //!
 //! Positions: instruction `n` of the linear order has an early point `2n`
 //! (uses read, early defs and temporaries written) and a late point

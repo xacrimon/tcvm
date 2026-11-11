@@ -1,5 +1,5 @@
-//! The bytecode side of the builder: blocks, register liveness, dominators,
-//! the loop forest, and which blocks have run (`jit-design.md` 6.3, 8.7).
+//! The bytecode side of the builder: blocks, register liveness, dominators, the
+//! loop forest, and which blocks have run.
 
 use crate::env::function::{InlineCache, Prototype};
 use crate::instruction::{Family, Instruction, Op, TFOR_VARS, UpvalSource};
@@ -344,7 +344,7 @@ pub(crate) struct Cfg {
     pub(crate) live_in: Vec<RegSet>,
     pub(crate) captured: RegSet,
     /// `TAILCALL`s of the function itself, jumps to its start (pc 1, past
-    /// `FUNC`) for a function region (W3 §5, Q6).
+    /// `FUNC`) for a function region.
     pub(crate) self_tails: Vec<u32>,
     pub(crate) loops: Vec<Loop>,
     /// The innermost loop of each block.
@@ -358,8 +358,8 @@ pub(crate) enum CfgError {
     Irreducible,
 }
 
-/// Whether the site at `pc` left a record of running (6.3), or `None` when
-/// it is not a recording site.
+/// Whether the site at `pc` left a record of running, or `None` when it is not
+/// a recording site.
 fn recorded(proto: &Prototype<'_>, i: Instruction, pc: usize) -> Option<bool> {
     let op = i.op();
     let info = op.info();
@@ -618,7 +618,7 @@ impl Cfg {
             *slot = best;
         }
 
-        // What ran (6.3).
+        // What ran.
         let mut ran = vec![false; nb];
         let mut has_site = vec![false; nb];
         for (b, blk) in blocks.iter().enumerate() {

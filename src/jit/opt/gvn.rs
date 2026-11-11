@@ -1,10 +1,10 @@
-//! Global value numbering (9.4) over the dominator tree: pure instructions,
-//! type guards (a value's type never changes, so a dominating equal guard
-//! makes a later one redundant), and loads and memory guards keyed by the
-//! version of the memory they read (8.4); a call writes every class, and
-//! scopes restart after one. Branch outcomes (W1 5.3): a `B1` is known in
-//! the blocks an edge of a `br` on it dominates and after a guard on it, and
-//! a `br`, guard or `select` on a known one folds.
+//! Global value numbering over the dominator tree: pure instructions, type
+//! guards (a value's type never changes, so a dominating equal guard makes a
+//! later one redundant), and loads and memory guards keyed by the version of
+//! the memory they read; a call writes every class, and scopes restart after
+//! one. Branch outcomes: a `B1` is known in the blocks an edge of a `br` on it
+//! dominates and after a guard on it, and a `br`, guard or `select` on a known
+//! one folds.
 
 use std::hash::BuildHasher;
 
@@ -304,8 +304,8 @@ pub(crate) fn gvn(f: &mut Func<'_>) -> bool {
             ));
         }
         let scope = numbers.marks.len() - 1;
-        // Scopes restart after a call: a value shared across one must then
-        // stay in the frame or be computed again (C1).
+        // Scopes restart after a call: a value shared across one must then stay
+        // in the frame or be computed again.
         let lo = if f.blocks[b.idx()].resume {
             scope
         } else {

@@ -168,8 +168,8 @@ fn ops_of(src: &str, name: &str) -> Vec<crate::instruction::Op> {
     })
 }
 
-/// A form drops when its site sees kinds no form covers, so the JIT can
-/// compile a form as what it says (6.5).
+/// A form drops when its site sees kinds no form covers, so the JIT can compile
+/// a form as what it says.
 #[test]
 fn forms_drop_on_foreign_kinds() {
     use crate::instruction::Op;
@@ -482,8 +482,8 @@ fn closed_scopes_clear_has_tbc() {
 }
 
 /// A bounds check moved out of an inlined accessor into its caller's loop
-/// (E2) records its miss at the accessor's site: its exit names the
-/// accessor's prototype, the snapshot being the caller's.
+/// records its miss at the accessor's site: its exit names the accessor's
+/// prototype, the snapshot being the caller's.
 #[test]
 fn hoisted_inlined_bounds_miss_at_the_callee() {
     let mut lua = Lua::new();
@@ -647,10 +647,10 @@ fn loop_carried_definitions_guard_only_down_safe() {
     assert!(!ir.contains("Type after"), "{ir}");
 }
 
-/// An exit does not restore a register whose slot still holds the value:
-/// the ninth and tenth parameters, which callers leave in slots (W4 §2:
-/// the first eight come in registers), are only ever loaded, though inside
-/// the loop the snapshots name their guarded copies.
+/// An exit does not restore a register whose slot still holds the value: the
+/// ninth and tenth parameters, which callers leave in slots (the first eight
+/// come in registers), are only ever loaded, though inside the loop the
+/// snapshots name their guarded copies.
 #[test]
 fn snapshots_leave_out_unchanged_slots() {
     let src = "function h(_1, _2, _3, _4, _5, _6, _7, _8, a, b)
@@ -673,9 +673,9 @@ fn snapshots_leave_out_unchanged_slots() {
     );
 }
 
-/// Registers a call does not write keep their values and their types after
-/// it: the entry guards cover the uses after each call. The parameters came
-/// in registers (W4 §2) and are never loaded from their slots.
+/// Registers a call does not write keep their values and their types after it:
+/// the entry guards cover the uses after each call. The parameters came in
+/// registers and are never loaded from their slots.
 #[test]
 fn calls_keep_the_types_of_unwritten_registers() {
     let src = "local g
@@ -836,8 +836,8 @@ fn polymorphic_dispatch_carries_its_shapes() {
     assert_eq!(count("deopt"), 0, "{ir}");
 }
 
-/// Only a region with dependencies keeps lazy exits (ws2 §5.4): one past
-/// each call once a class's bits are folded.
+/// Only a region with dependencies keeps lazy exits: one past each call once a
+/// class's bits are folded.
 #[test]
 fn lazy_exits_need_dependencies() {
     // No field loads either: their slots' kinds are dependencies.
@@ -925,10 +925,10 @@ fn class_writes_invalidate_dependent_regions() {
     });
 }
 
-/// Reads through `__index` tables fold to what the watched holders hold
-/// (ws2 §5.5): a method two holders up is a constant callee, an own field
-/// of a class whose walk ends in nil needs no nil test, and a key no holder
-/// has is nil; nothing reads a class or a holder.
+/// Reads through `__index` tables fold to what the watched holders hold: a
+/// method two holders up is a constant callee, an own field of a class whose
+/// walk ends in nil needs no nil test, and a key no holder has is nil; nothing
+/// reads a class or a holder.
 #[test]
 fn holder_reads_fold() {
     let src = "local Base = {}
@@ -1062,8 +1062,8 @@ fn barriers_leave_stores_of_numbers() {
     assert!(!ir.contains("barrier"), "{ir}");
 }
 
-/// String keys of a table access read and write its string part directly
-/// (W2.5), the generic walk only in a cold arm.
+/// String keys of a table access read and write its string part directly, the
+/// generic walk only in a cold arm.
 #[test]
 fn string_keys_take_the_string_helpers() {
     let src = "function f(t, s, n)
@@ -1090,8 +1090,8 @@ fn string_keys_take_the_string_helpers() {
     assert!(!has("call.index") && !has("call.newindex"), "{ir}");
 }
 
-/// Float keys with integral values index the array part (W2.6): no generic
-/// helper where the site saw only numbers.
+/// Float keys with integral values index the array part: no generic helper
+/// where the site saw only numbers.
 #[test]
 fn float_keys_index_arrays() {
     let src = "function f(t, n)
@@ -1151,9 +1151,9 @@ fn negative_zero_converts_in_compiled_code() {
     });
 }
 
-/// Closures and cell upvalues inline (W3 step 4): `make`'s closures come
-/// from `closure.of` with its closure, its cell store goes through that
-/// closure's cell, and its return closes what they opened.
+/// Closures and cell upvalues inline: `make`'s closures come from `closure.of`
+/// with its closure, its cell store goes through that closure's cell, and its
+/// return closes what they opened.
 #[test]
 fn closures_inline() {
     let src = "local count = 0
@@ -1206,8 +1206,8 @@ fn constants_stay_in_their_blocks() {
     assert!(params.is_empty(), "{params:?}\n{ir}");
 }
 
-/// Recursion inlines one copy (W3 §8): `fib`'s region inlines both of its
-/// self-calls once, and each copy's two calls of `fib` stay real calls.
+/// Recursion inlines one copy: `fib`'s region inlines both of its self-calls
+/// once, and each copy's two calls of `fib` stay real calls.
 #[test]
 fn recursion_inlines_one_copy() {
     let src = "function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end
@@ -1216,9 +1216,9 @@ fn recursion_inlines_one_copy() {
     assert_eq!(ir.matches("call r").count(), 4, "{ir}");
 }
 
-/// The plan inlines by frequency over size (W3 §12): `h`, longer than the
-/// old 48-bytecode limit, runs on every call of `f` and inlines; `g` runs
-/// on one call in a hundred, under the frequency floor, and is called.
+/// The plan inlines by frequency over size: `h`, longer than the old
+/// 48-bytecode limit, runs on every call of `f` and inlines; `g` runs on one
+/// call in a hundred, under the frequency floor, and is called.
 #[test]
 fn inlining_follows_the_plan() {
     let src = "local function h(x)
@@ -1289,8 +1289,8 @@ fn inlining_follows_the_plan() {
     assert_eq!(ir.matches("call r").count(), 1, "{ir}");
 }
 
-/// A call whose callee joins two constant functions dispatches on them
-/// (W3 §11): both bodies inline, one real call stays for any other value.
+/// A call whose callee joins two constant functions dispatches on them: both
+/// bodies inline, one real call stays for any other value.
 #[test]
 fn polymorphic_calls_dispatch() {
     let src = "local A = {} A.__index = A
@@ -1308,10 +1308,10 @@ fn polymorphic_calls_dispatch() {
     );
 }
 
-/// A `setmetatable` result with a constant metatable has the class its
-/// last move gave the table's shape, guarded after the call: its
-/// metamethods are constants that inline (W3 §9). (A second `setmetatable`
-/// would drop the fact: it may reshape any table.)
+/// A `setmetatable` result with a constant metatable has the class its last
+/// move gave the table's shape, guarded after the call: its metamethods are
+/// constants that inline. (A second `setmetatable` would drop the fact: it may
+/// reshape any table.)
 #[test]
 fn setmetatable_results_have_classes() {
     let src = "local V = {}
@@ -1326,7 +1326,7 @@ fn setmetatable_results_have_classes() {
     assert!(!ir.contains("callmm"), "{ir}");
 }
 
-/// A metamethod the operand's class gives as a constant inlines (W3 §9).
+/// A metamethod the operand's class gives as a constant inlines.
 #[test]
 fn class_metamethods_inline() {
     let src = "local V = {}
@@ -1358,9 +1358,9 @@ fn self_tail_calls_up_to_top_loop() {
     assert!(!ir.contains("dispatch"), "{ir}");
 }
 
-/// A self-call's result is what the region's returns give (W4 step 6):
-/// its guards are refinements, and one landing guard per call tests it
-/// where the ways back other than the fast return land.
+/// A self-call's result is what the region's returns give: its guards are
+/// refinements, and one landing guard per call tests it where the ways back
+/// other than the fast return land.
 #[test]
 fn self_call_results_are_trusted() {
     let src = "function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end
@@ -1370,9 +1370,9 @@ fn self_call_results_are_trusted() {
     assert_eq!(ir.matches("guard val:small").count(), 5, "{ir}");
 }
 
-/// Callees known by their prototype alone inline (W3 step 8): closures of
-/// one prototype taking turns at a site, guarded by the prototype, and one
-/// the loop makes, without a guard.
+/// Callees known by their prototype alone inline: closures of one prototype
+/// taking turns at a site, guarded by the prototype, and one the loop makes,
+/// without a guard.
 #[test]
 fn prototype_known_callees_inline() {
     let src = "local function mk(k) return function(x) return x * k end end
@@ -1398,9 +1398,9 @@ fn prototype_known_callees_inline() {
     );
 }
 
-/// Constructors and concatenation inline (W3 step 3): `NEWTABLE` takes its
-/// template by address, `SETLIST` stores from the body's slots, and the
-/// only call left is `table.unpack`, made from `copy`'s body.
+/// Constructors and concatenation inline: `NEWTABLE` takes its template by
+/// address, `SETLIST` stores from the body's slots, and the only call left is
+/// `table.unpack`, made from `copy`'s body.
 #[test]
 fn constructors_inline() {
     let src = "local function point(x, y) return {x = x, y = y} end
@@ -1428,10 +1428,10 @@ fn constructors_inline() {
     );
 }
 
-/// Callees storing through the table helpers inline (W2.7): `rawset`,
-/// `table.insert`, `table.remove`, `setmetatable` and a generic store touch
-/// table memory alone; the builtins' fallbacks are calls from the bodies.
-/// (A tail call still keeps a callee out, `inline::needs_frame`.)
+/// Callees storing through the table helpers inline: `rawset`, `table.insert`,
+/// `table.remove`, `setmetatable` and a generic store touch table memory alone;
+/// the builtins' fallbacks are calls from the bodies. (A tail call still keeps
+/// a callee out, `inline::needs_frame`.)
 #[test]
 fn table_helpers_inline() {
     let src = "local mt = {}
@@ -1468,10 +1468,10 @@ fn table_helpers_inline() {
     }
 }
 
-/// Array accesses read the class only for a nil element (W2.3): a read in
-/// the failing arm of its use's type guard, a varying table's store after
-/// testing the old value (none over an element read and typed already); an
-/// invariant table's store guards it once.
+/// Array accesses read the class only for a nil element: a read in the failing
+/// arm of its use's type guard, a varying table's store after testing the old
+/// value (none over an element read and typed already); an invariant table's
+/// store guards it once.
 #[test]
 fn array_classes_wait_for_nils() {
     let src = "function f(m, n, j)
@@ -1506,8 +1506,8 @@ fn array_classes_wait_for_nils() {
 }
 
 /// A table loaded from a slot that tracks its tables' stable shape needs no
-/// shape guard (ws2 §6.1-6.2), in a loop over a list too: only the list's
-/// head, a parameter, is guarded.
+/// shape guard, in a loop over a list too: only the list's head, a parameter,
+/// is guarded.
 #[test]
 fn loaded_tables_keep_their_tracked_shape() {
     let src = "for i = 1, 100 do keep = {v = i, next = keep} end
@@ -1634,8 +1634,8 @@ fn branches_on(ir: &str, op: &str, k: i32) -> usize {
         .count()
 }
 
-/// A branch an edge of an equal one dominates folds (W1 5.3): one branch
-/// on `x < 3` per copy of the loop body (the peeled one, the loop's).
+/// A branch an edge of an equal one dominates folds: one branch on `x < 3` per
+/// copy of the loop body (the peeled one, the loop's).
 #[test]
 fn dominated_branches_fold() {
     let src = "function f(x, n)
@@ -1653,8 +1653,8 @@ fn dominated_branches_fold() {
     assert_eq!(branches_on(&ir, "cmp.lt", 3), 2, "{ir}");
 }
 
-/// A merge whose branch each incoming edge decides is copied into the
-/// edges (W1 5.4): the second `x < 3` and the test of `y` go.
+/// A merge whose branch each incoming edge decides is copied into the edges:
+/// the second `x < 3` and the test of `y` go.
 #[test]
 fn merges_an_edge_decides_are_copied() {
     let src = "function f(x, t, n)
@@ -1747,8 +1747,8 @@ fn branches_deciding_nothing_fold() {
     assert_eq!(branches_on(&ir, "cmp.lt", 3), 0, "{ir}");
 }
 
-/// Elements of two shapes, read in the caller then in an inlined body: the
-/// body starts with the caller's facts (W3 §3) and tests no shape it knows.
+/// Elements of two shapes, read in the caller then in an inlined body: the body
+/// starts with the caller's facts and tests no shape it knows.
 #[test]
 fn bodies_start_with_their_callers_facts() {
     let src = "local A = {}

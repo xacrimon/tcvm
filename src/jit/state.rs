@@ -36,7 +36,7 @@ pub(crate) struct JitConfig {
 pub(crate) const HOT_CALL: u16 = 256;
 pub(crate) const HOT_LOOP: u16 = 200;
 
-/// The development knobs (CLAUDE.md).
+/// The development knobs.
 #[cfg(feature = "tcvm-dev")]
 #[derive(Clone, Debug)]
 pub(crate) struct Dev {
@@ -49,7 +49,7 @@ pub(crate) struct Dev {
     pub(crate) time: bool,
     pub(crate) only: Option<String>,
     pub(crate) deopt_all: bool,
-    /// Inline known small callees (E1); `TCVM_JIT_INLINE=0` turns it off.
+    /// Inline known small callees; `TCVM_JIT_INLINE=0` turns it off.
     pub(crate) inline: bool,
     /// Record each compile's allocation in this directory (`ra::corpus`).
     pub(crate) ra_capture: Option<String>,
@@ -278,8 +278,8 @@ impl JitRuntime {
             .clone()
     }
 
-    /// The trampoline that calls `helper` keeping the registers (A5), made
-    /// on first use.
+    /// The trampoline that calls `helper` keeping the registers, made on first
+    /// use.
     pub(crate) fn trampoline(
         &self,
         helper: usize,
@@ -377,8 +377,8 @@ pub(crate) struct JitState<'gc> {
     /// pcs whose entries were blacklisted or struck out.
     pub(crate) refused: Vec<u32>,
     pub(crate) age: u32,
-    /// The direct branches of compiled code to the prototype's known entry
-    /// (D2): each region's, by its code offset, with a call's stub
+    /// The direct branches of compiled code to the prototype's known entry:
+    /// each region's, by its code offset, with a call's stub
     /// (`Emitted::direct`), which `jit::set_fast` repoints as the fast entry
     /// comes and goes.
     pub(crate) callers: Vec<(crate::dmm::GcWeak<'gc, Region<'gc>>, u32, Option<u32>)>,

@@ -1,7 +1,7 @@
-//! Builtins compiled inline (`jit-design.md` 12): a CALL whose callee is,
-//! at compile time, a builtin with an intrinsic guards the callee by
-//! identity and computes the result in place; anything the inline code does
-//! not cover exits before the CALL, and the interpreter runs the builtin.
+//! Builtins compiled inline: a CALL whose callee is, at compile time, a builtin
+//! with an intrinsic guards the callee by identity and computes the result in
+//! place; anything the inline code does not cover exits before the CALL, and
+//! the interpreter runs the builtin.
 
 use crate::dmm::Gc;
 use crate::env::function::{Function, LuaFn, NativeFn, NativeKind, Prototype};
@@ -158,8 +158,8 @@ pub(super) fn value_now<'gc>(b: &Builder<'_, 'gc>, v: Val, guess: bool) -> Optio
 
 /// The function the call at `pc` calls when the builder may take it for a
 /// constant, which its user guards by identity: what `callee` holds now
-/// (`value_now`), else the one function the site has called (its callee
-/// word, I2). Neither once such a guard failed.
+/// (`value_now`), else the one function the site has called (its callee word).
+/// Neither once such a guard failed.
 pub(super) fn known_callee<'gc>(
     b: &Builder<'_, 'gc>,
     pc: u32,
@@ -191,7 +191,7 @@ pub(super) enum Callee<'gc> {
     /// ones on each call), or that a site's slot names (`proto_slot`).
     /// With a closure of it `known_callee` names.
     Proto(Gc<'gc, Prototype<'gc>>, Option<LuaFn<'gc>>),
-    /// A closure a `CLOSURE` of this compile made (W3 §10): no guard.
+    /// A closure a `CLOSURE` of this compile made: no guard.
     Made(Gc<'gc, Prototype<'gc>>),
 }
 
@@ -444,10 +444,10 @@ fn builtin<'gc>(
     out
 }
 
-/// The shape `setmetatable(t, mt)` gives `t`, known before the call, when
-/// the constant `mt`'s last move took `t`'s shape there: the result is
-/// guarded to have it after the call (`emit_call`), and its class's
-/// metamethods are then constants (W3 §9).
+/// The shape `setmetatable(t, mt)` gives `t`, known before the call, when the
+/// constant `mt`'s last move took `t`'s shape there: the result is guarded to
+/// have it after the call (`emit_call`), and its class's metamethods are then
+/// constants.
 fn moved_shape(b: &mut Builder<'_, '_>, args: &[Val]) -> Option<u32> {
     let Some(Op::KObj(k)) = b.f.def_op(args[1]) else {
         return None;
@@ -847,9 +847,9 @@ fn const_value<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<Value<'gc>> {
     }
 }
 
-/// The math intrinsics, `pairs` and `ipairs`. An argument their
-/// inline code does not take goes to the builtin (I1), but where an
-/// operation's own exit stops it (an overflow, a result outside i32).
+/// The math intrinsics, `pairs` and `ipairs`. An argument their inline code
+/// does not take goes to the builtin, but where an operation's own exit stops
+/// it (an overflow, a result outside i32).
 #[allow(clippy::too_many_arguments)]
 fn emit_math<'gc>(
     b: &mut Builder<'_, 'gc>,

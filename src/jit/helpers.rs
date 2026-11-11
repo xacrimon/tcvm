@@ -1,5 +1,5 @@
 //! Rust routines regions call with `bl` (the C ABI). None grows the stack,
-//! switches threads, runs Lua or raises (R5), except the native shim
+//! switches threads, runs Lua or raises, except the native shim
 //! (`jit_call_native`) and the coroutine switches, which return to compiled
 //! code only with a plain result and leave the rest to a level.
 
@@ -623,13 +623,13 @@ pub(crate) struct NativeRet {
     n: u64,
 }
 
-/// Run the native `nc` on its `nargs` arguments at `w` for compiled code,
-/// from `abi::native_entry` (I1): its header as `native_call` writes it,
-/// returning through `ret_shim`. A collection owed after a plain return
-/// parks here: the call's site names what the caller keeps. So does a
-/// resume or a yield, which switches threads here (H5) and goes on as
-/// `drive` would while what comes back is a plain return. A panic in the
-/// native unwinds through it into the compiled caller (`unwind::Fde`).
+/// Run the native `nc` on its `nargs` arguments at `w` for compiled code, from
+/// `abi::native_entry`: its header as `native_call` writes it, returning
+/// through `ret_shim`. A collection owed after a plain return parks here: the
+/// call's site names what the caller keeps. So does a resume or a yield, which
+/// switches threads here and goes on as `drive` would while what comes back is
+/// a plain return. A panic in the native unwinds through it into the compiled
+/// caller (`unwind::Fde`).
 pub(crate) unsafe extern "C-unwind" fn jit_call_native(
     rt: *const State<'static>,
     w: *mut Value<'static>,
@@ -874,7 +874,7 @@ pub(crate) extern "C" fn jit_land(
     }
 }
 
-// --- builtins (`jit-design.md` 12) -------------------------------------------
+// --- builtins -------------------------------------------
 
 /// `type(v)`: the interned name.
 pub(crate) extern "C" fn jit_type(rt: *const State<'static>, v: u64) -> u64 {

@@ -1,5 +1,5 @@
-//! Registers of a region (Appendix A), the allocator's machine environment,
-//! the register image order, and `exit_common`.
+//! Registers of a region, the allocator's machine environment, the register
+//! image order, and `exit_common`.
 
 use crate::jit::backend::aarch64::asm::{Fpr, Gpr};
 use crate::jit::backend::reg::{PReg, PRegSet, RegClass};
@@ -31,10 +31,10 @@ pub(crate) const IMAGE_SPILLS: usize = 64;
 /// Pinned for a region's whole body.
 pub(crate) const BASE: Gpr = Gpr(22);
 pub(crate) const THREAD: Gpr = Gpr(25);
-/// The handler ABI's runtime and closure: allocatable in a region (W4 §3),
-/// set where code goes on into a handler or a stub that reads them. The
-/// runtime is a constant of the region; a level's record keeps it
-/// (`abi::jit_level`), where stubs without it find it (`RT_OF_LEVEL`).
+/// The handler ABI's runtime and closure: allocatable in a region, set where
+/// code goes on into a handler or a stub that reads them. The runtime is a
+/// constant of the region; a level's record keeps it (`abi::jit_level`), where
+/// stubs without it find it (`RT_OF_LEVEL`).
 pub(crate) const RT: Gpr = Gpr(23);
 pub(crate) const CLOSURE: Gpr = Gpr(24);
 /// Where a level's record keeps the runtime (its x23), from the record.
@@ -133,13 +133,13 @@ pub(crate) fn image_index(p: PReg) -> u8 {
 pub(crate) const MAX_SPILLS: usize = 256;
 const _: () = assert!(IMAGE_SPILLS + MAX_SPILLS <= EXIT_REGS);
 
-/// Entered from a region's exit trampoline with x16 = region | exit << 48
-/// and the region's frame still open: stores the register image in
-/// `image_index` order, copies the frame's spill slots after it, and pops
-/// the frame. A frame dispatch entered tails `jit_exit` in its level; a
-/// fast-called one starts a level that returns to its caller, and the
-/// interpreter runs the rest of it there (H10). Every allocatable register
-/// may hold a value: the runtime comes from the level's record.
+/// Entered from a region's exit trampoline with x16 = region | exit << 48 and
+/// the region's frame still open: stores the register image in `image_index`
+/// order, copies the frame's spill slots after it, and pops the frame. A frame
+/// dispatch entered tails `jit_exit` in its level; a fast-called one starts a
+/// level that returns to its caller, and the interpreter runs the rest of it
+/// there. Every allocatable register may hold a value: the runtime comes from
+/// the level's record.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn exit_common() {
     core::arch::naked_asm!(
@@ -223,18 +223,17 @@ pub(crate) unsafe extern "C" fn exit_common() {
 
 /// Native stack below a level's start past which fast calls branch with a
 /// tagged return address instead of `blr`, and return with `br`: the M4's
-/// return address stack holds 48 to 64 entries (a chain of 64 returns runs
-/// at three times the cycles of one of 48, the tagged returns at 1.05), and
-/// the median region frame is 32 bytes (I6).
+/// return address stack holds 48 to 64 entries (a chain of 64 returns runs at
+/// three times the cycles of one of 48, the tagged returns at 1.05), and the
+/// median region frame is 32 bytes.
 pub(crate) const RAS_STACK: usize = 1536;
 
-/// Start a level (H6) for compiled code: entered by `bl` or `b` with the
-/// return address in x30, the handler to run in x16, the base of the
-/// level's first frame in x17 and the handler's arguments in x20-x25.
-/// Pushes an entry record keeping x22-x25 (`BASE`, `RT`, `CLOSURE`,
-/// `THREAD`), as the call clobbers every allocatable register, makes it the
-/// thread's, and branches to the handler with x30 = `level_return`. The
-/// level ends in `ret_to_native`.
+/// Start a level for compiled code: entered by `bl` or `b` with the return
+/// address in x30, the handler to run in x16, the base of the level's first
+/// frame in x17 and the handler's arguments in x20-x25. Pushes an entry record
+/// keeping x22-x25 (`BASE`, `RT`, `CLOSURE`, `THREAD`), as the call clobbers
+/// every allocatable register, makes it the thread's, and branches to the
+/// handler with x30 = `level_return`. The level ends in `ret_to_native`.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn jit_level() {
     core::arch::naked_asm!(
@@ -525,10 +524,9 @@ pub(crate) extern "rust-preserve-none" fn ret_shim<'gc>(
     core::arch::naked_asm!("brk #0xf1")
 }
 
-/// Compiled code's call of a native (I1), with `jit_call_native`'s
-/// arguments: records the caller's frame pointer and return address in the
-/// thread (x25) for walks, and goes on in `jit_call_native`, which returns
-/// to the caller.
+/// Compiled code's call of a native, with `jit_call_native`'s arguments:
+/// records the caller's frame pointer and return address in the thread (x25)
+/// for walks, and goes on in `jit_call_native`, which returns to the caller.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn native_entry() {
     core::arch::naked_asm!(
@@ -540,14 +538,14 @@ pub(crate) unsafe extern "C" fn native_entry() {
 }
 
 /// Compiled code's call of a coroutine builtin (`coro::Switch`), with
-/// `jit_call_native`'s arguments, recording the caller as `native_entry`
-/// does. The switch function either ran the native, whose result goes back,
-/// or names the thread to switch to (H5): this one then waits at its switch
-/// point, `BASE` and `CLOSURE` in the frame, and when switched back to
-/// returns what the landing function makes of it. Switches are branches,
-/// and the stub is entered and returns with branches too (`native_path`),
-/// so the return address stack sees only the Rust calls' pairs: a return
-/// after a switch would find the other thread's call on top.
+/// `jit_call_native`'s arguments, recording the caller as `native_entry` does.
+/// The switch function either ran the native, whose result goes back, or names
+/// the thread to switch to: this one then waits at its switch point, `BASE` and
+/// `CLOSURE` in the frame, and when switched back to returns what the landing
+/// function makes of it. Switches are branches, and the stub is entered and
+/// returns with branches too (`native_path`), so the return address stack sees
+/// only the Rust calls' pairs: a return after a switch would find the other
+/// thread's call on top.
 macro_rules! coro_stub {
     ($(#[$doc:meta])* $name:ident, $switch:path, $landed:path) => {
         $(#[$doc])*
@@ -634,8 +632,8 @@ coro_stub!(
 );
 
 /// Continue in the handler in `JitRuntime::jump_target` at the start of the
-/// thread's current level: where the unwinder resets a thread to the level
-/// of the frame that catches (H8).
+/// thread's current level: where the unwinder resets a thread to the level of
+/// the frame that catches.
 #[unsafe(naked)]
 pub(crate) extern "rust-preserve-none" fn level_jump<'gc>(
     _insn: crate::vm::abi::Slot,

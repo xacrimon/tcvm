@@ -1,5 +1,5 @@
 //! A compiled region: its code, the constants it embeds, and its exits with
-//! the snapshots that rebuild the frame, encoded as Appendix C gives.
+//! the snapshots that rebuild the frame (`encode_snap`).
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -227,7 +227,7 @@ impl ExitInfo {
     }
 
     /// The site, when not the snapshot's pc: a check hoisted out of a loop
-    /// records its access's miss (E2), one at a checkpoint its instruction.
+    /// records its access's miss, one at a checkpoint its instruction.
     #[inline]
     pub(crate) fn site(&self) -> Option<u32> {
         (self.site != NO_BLAME).then_some(self.site)
@@ -247,7 +247,7 @@ pub(crate) struct Region<'gc> {
     pub(crate) _alloc: Rc<CodeAllocator>,
     #[collect(require_static)]
     pub(crate) entry: *const u8,
-    /// A function region's entry for compiled callers (5.4), or null.
+    /// A function region's entry for compiled callers, or null.
     #[collect(require_static)]
     pub(crate) fast_entry: *const u8,
     /// Every heap value the code or a snapshot embeds.
@@ -256,8 +256,8 @@ pub(crate) struct Region<'gc> {
     pub(crate) shapes: Box<[crate::env::Shape<'gc>]>,
     #[collect(require_static)]
     pub(crate) exits: Box<[ExitInfo]>,
-    /// Under `TCVM_JIT_DEOPT_ALL`, whether each exit fired: the code takes
-    /// one that has not (14); empty otherwise.
+    /// Under `TCVM_JIT_DEOPT_ALL`, whether each exit fired: the code takes one
+    /// that has not; empty otherwise.
     #[collect(require_static)]
     pub(crate) fired: Box<[Cell<u32>]>,
     /// The snapshots, which exits with equal ones share.
@@ -301,9 +301,8 @@ pub(crate) struct Region<'gc> {
     /// it, by the code offset of the return addresses naming them.
     #[collect(require_static)]
     pub(crate) sites: Box<[Site]>,
-    /// For a region with dependencies (ws2 §5.3), what `invalidate`
-    /// writes: (patch point, jump target), code offsets, the entry's and
-    /// each lazy exit's.
+    /// For a region with dependencies, what `invalidate` writes: (patch point,
+    /// jump target), code offsets, the entry's and each lazy exit's.
     #[collect(require_static)]
     pub(crate) lazy: Box<[(u32, u32)]>,
     /// Code offsets of self-calls' return addresses whose result guard runs
@@ -315,8 +314,8 @@ pub(crate) struct Region<'gc> {
     pub(crate) invalidated: Cell<bool>,
 }
 
-/// A call of the region's: its return address, and what a walk of the
-/// frame needs there (H7, H11).
+/// A call of the region's: its return address, and what a walk of the frame
+/// needs there.
 #[derive(Clone, Copy)]
 pub(crate) struct Site {
     /// The code offset of the return address.
@@ -325,7 +324,7 @@ pub(crate) struct Site {
     /// across the call, in `snaps`.
     pub(crate) snap: u32,
     /// The callee's header slot, and the `pc` after the call, whose header
-    /// words a fast call does not write (D4).
+    /// words a fast call does not write.
     pub(crate) hdr: u16,
     pub(crate) pc_after: u64,
     /// The return address is a level's (`jit_level`): `BASE` there is this
@@ -345,11 +344,11 @@ impl<'gc> Region<'gc> {
         (e.blame != NO_BLAME).then(|| SnapView::decode(&self.snaps[e.blame as usize..]))
     }
 
-    /// A dependency broke (ws2 §5.4): from now on its entry goes to
-    /// `jit_dead_entry`, and a frame leaves at the first lazy exit it
-    /// reaches, each past a call or a table write, where any break happens.
-    /// No context is needed, so a collector's weak clear may break one; the
-    /// entry is retired by whichever comes first.
+    /// A dependency broke: from now on its entry goes to `jit_dead_entry`, and
+    /// a frame leaves at the first lazy exit it reaches, each past a call or a
+    /// table write, where any break happens. No context is needed, so a
+    /// collector's weak clear may break one; the entry is retired by whichever
+    /// comes first.
     pub(crate) fn invalidate(&self) {
         if self.invalidated.replace(true) {
             return;

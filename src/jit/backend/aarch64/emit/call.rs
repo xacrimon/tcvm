@@ -13,7 +13,7 @@ use crate::jit::backend::lower::Known;
 use crate::jit::layout;
 use crate::jit::layout::FUNCTION_TAG;
 
-/// Where a known call enters its callee (D2).
+/// Where a known call enters its callee.
 #[derive(Clone, Copy)]
 pub(super) enum Target {
     /// This region's own entry.
@@ -29,12 +29,12 @@ pub(super) enum Target {
 
 impl<'a> Em<'a> {
     /// The fast path of a call whose header is at `base + hdr`, `insn` the
-    /// argument count: a Lua callee without varargs whose prototype has a
-    /// fast entry is called with `blr`, this frame kept, and its `ret` lands
-    /// past the resume block's frame push (5.4); a native goes to `native`
-    /// (`native_path`), anything else to `slow`. Every register is free
-    /// here: what lives across the call is in the frame. Returns
-    /// `fast_enter`'s labels.
+    /// argument count: a Lua callee without varargs whose prototype has a fast
+    /// entry is called with `blr`, this frame kept, and its `ret` lands past
+    /// the resume block's frame push; a native goes to `native`
+    /// (`native_path`), anything else to `slow`. Every register is free here:
+    /// what lives across the call is in the frame. Returns `fast_enter`'s
+    /// labels.
     pub(super) fn fast_call(&mut self, hdr: i32, slow: Label, native: Label) -> (Label, Label) {
         self.a.ldr(X16, BASE, hdr);
         self.a.lsr_imm(Sz::X, X17, X16, 48);
@@ -50,13 +50,12 @@ impl<'a> Em<'a> {
         self.fast_enter(hdr, Target::Reg, None)
     }
 
-    /// `fast_call` for a known callee (D2), word 0 its closure word: the
-    /// constant `closure`'s, or the stored value's. With a static argument
-    /// count it enters past the arity and native stack checks, the
-    /// parameters left out stored nil (I3), by a direct branch
-    /// (`direct_target`); else it loads the fast entry, `slow` without
-    /// one. Returns `fast_enter`'s labels, whether it enters past the
-    /// checks, and where.
+    /// `fast_call` for a known callee, word 0 its closure word: the constant
+    /// `closure`'s, or the stored value's. With a static argument count it
+    /// enters past the arity and native stack checks, the parameters left out
+    /// stored nil, by a direct branch (`direct_target`); else it loads the fast
+    /// entry, `slow` without one. Returns `fast_enter`'s labels, whether it
+    /// enters past the checks, and where.
     pub(super) fn known_call(
         &mut self,
         hdr: i32,
@@ -65,10 +64,10 @@ impl<'a> Em<'a> {
         nargs: u8,
         window: Option<Label>,
     ) -> (Label, Label, bool, Target) {
-        // A static count passes the first arguments in x0.. (W4 §2), the
-        // parameters left out nil; past eight they are in the callee's slots,
-        // inside its window, which its known entry checks (the value stack's
-        // mapping runs past any window that fits).
+        // A static count passes the first arguments in x0.., the parameters
+        // left out nil; past eight they are in the callee's slots, inside its
+        // window, which its known entry checks (the value stack's mapping runs
+        // past any window that fits).
         let known = nargs != u8::MAX;
         if known && nargs < nparams {
             self.a.mov_imm(Gpr(9), NIL);
@@ -81,7 +80,7 @@ impl<'a> Em<'a> {
             }
         }
         let target = match self.direct_target(proto, nparams, known) {
-            // A typed self-call enters past the entry guards (W4 §2).
+            // A typed self-call enters past the entry guards.
             Some(_) if window.is_some() => Target::Own(self.typed_entry.unwrap()),
             Some(Target::Direct(p, t, _)) if known => {
                 Target::Direct(p, t, Some(self.a.new_label()))
@@ -127,7 +126,7 @@ impl<'a> Em<'a> {
     /// `jit::set_fast` keeps the branch pointed at.
     pub(super) fn direct_target(&self, proto: u64, nparams: u8, regs: bool) -> Option<Target> {
         match self.own_entry {
-            // The region cannot outlive itself (I4).
+            // The region cannot outlive itself.
             Some((p, slots, r)) if p == proto => Some(Target::Own(if regs { r } else { slots })),
             _ => (self.links.direct.iter().find(|d| d.0 == proto)).map(|&(p, _, fast)| {
                 Target::Direct(p, crate::jit::direct_target(fast, regs, nparams), None)
@@ -221,14 +220,14 @@ impl<'a> Em<'a> {
         self.a.b(slow);
     }
 
-    /// A native callee, run by `jit_call_native` on this stack (I1): from
-    /// `check`, `fast_call`'s test with the function in x16 and its
-    /// `FN_IS_VARARG` byte in w17 (1 for a vararg Lua callee, which goes to
-    /// `slow`, the enum's tag above that), or the constant closure `nc`,
-    /// whose argument count is in x2 already (else in `INSN`). A
-    /// plain return lands as a fast callee's; anything else goes on in a
-    /// level running `native_act` on the frame, which returns through
-    /// `ret_to_native`. Returns the return addresses for `call_site`.
+    /// A native callee, run by `jit_call_native` on this stack: from `check`,
+    /// `fast_call`'s test with the function in x16 and its `FN_IS_VARARG` byte
+    /// in w17 (1 for a vararg Lua callee, which goes to `slow`, the enum's tag
+    /// above that), or the constant closure `nc`, whose argument count is in x2
+    /// already (else in `INSN`). A plain return lands as a fast callee's;
+    /// anything else goes on in a level running `native_act` on the frame,
+    /// which returns through `ret_to_native`. Returns the return addresses for
+    /// `call_site`.
     pub(super) fn native_path(
         &mut self,
         hdr: i32,
@@ -366,19 +365,18 @@ impl<'a> Em<'a> {
         }
     }
 
-    /// A register call's arguments (W4 §2) to the callee's slots, the first
-    /// at `off` from `BASE`.
+    /// A register call's arguments to the callee's slots, the first at `off`
+    /// from `BASE`.
     pub(super) fn store_args(&mut self, off: i32, nargs: u8) {
         for k in 0..nargs.min(8) {
             self.a.str(Gpr(k), BASE, off + 8 * k as i32);
         }
     }
 
-    /// The slow path of a call whose header at `hdr` holds the callee's
-    /// value: a level runs it through `enter` (H6.2), with `ret_to_native`
-    /// to come back. Returns the address the level returns to, from where
-    /// the resume block goes on past its `BASE` (a level's return restores
-    /// this frame's).
+    /// The slow path of a call whose header at `hdr` holds the callee's value:
+    /// a level runs it through `enter`, with `ret_to_native` to come back.
+    /// Returns the address the level returns to, from where the resume block
+    /// goes on past its `BASE` (a level's return restores this frame's).
     pub(super) fn level_call(&mut self, hdr: i32, block: usize, pc_after: usize) -> Label {
         self.a.ldr_lit(X16, addr!(abi::ret_to_native) as u64);
         self.a.str(X16, BASE, hdr + 8);
@@ -600,9 +598,9 @@ impl<'a> Em<'a> {
             Some((self.direct_target(proto, nparams, false)?, nparams))
         });
         if let Some((target, nparams)) = target {
-            // A known callee (D2): the parameters left out nil, then
-            // its entry past the arity and native stack checks, the
-            // stack no deeper than this frame's caller left it.
+            // A known callee: the parameters left out nil, then its entry past
+            // the arity and native stack checks, the stack no deeper than this
+            // frame's caller left it.
             if nargs < nparams {
                 self.a.mov_imm(X16, NIL);
                 for k in nargs..nparams {
@@ -629,9 +627,9 @@ impl<'a> Em<'a> {
         // The frame keeps its vararg count, so its results still land
         // where its caller expects.
         self.set_frame_closure();
-        // A callee with a fast entry is entered there with this
-        // frame popped, so it returns where this one would have: to a
-        // compiled caller's `ret` or through the header (5.5).
+        // A callee with a fast entry is entered there with this frame popped,
+        // so it returns where this one would have: to a compiled caller's `ret`
+        // or through the header.
         let dispatch = self.a.new_label();
         self.a.ldr(X16, CLOSURE, layout::FN_PROTO as i32);
         self.a.ldr(X16, X16, layout::PROTO_FAST as i32);
@@ -667,13 +665,12 @@ impl<'a> Em<'a> {
         match wanted {
             0 if c == 1 => {}
             0 => {
-                // The results to `R[a..]` (I5): all of them, `top`
-                // past them, or `c - 1` filled out with nil. Up to
-                // three here, more through the helper. They come from
-                // at least a header above `R[a]`, so copying up is
-                // safe, and reading past them stays in the stack.
-                // The first is in x0: a compiled callee returning one
-                // stores none (W4 §4).
+                // The results to `R[a..]`: all of them, `top` past them, or `c
+                // - 1` filled out with nil. Up to three here, more through the
+                // helper. They come from at least a header above `R[a]`, so
+                // copying up is safe, and reading past them stays in the stack.
+                // The first is in x0: a compiled callee returning one stores
+                // none.
                 let (helper, top, done) =
                     (self.a.new_label(), self.a.new_label(), self.a.new_label());
                 let at = a as i32 * 8;
@@ -741,7 +738,7 @@ impl<'a> Em<'a> {
                 self.a.bl_far(addr!(crate::jit::helpers::jit_land));
                 self.a.bind(done);
             }
-            // The first result is in x0 (D3).
+            // The first result is in x0.
             1 => {}
             _ => {
                 let done = self.a.new_label();

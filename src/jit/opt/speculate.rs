@@ -1,6 +1,6 @@
-//! Use-driven speculation (9.1): the type guards of a value's uses agree on a
-//! set, and the value is guarded once where it is defined instead, so
-//! inference carries the type to every use.
+//! Use-driven speculation: the type guards of a value's uses agree on a set,
+//! and the value is guarded once where it is defined instead, so inference
+//! carries the type to every use.
 
 use crate::jit::FastMap;
 use crate::jit::ir::ops::{ExitTag, Op};
@@ -11,7 +11,7 @@ use crate::jit::ir::{Block, CfgInfo, ExitKind, Func, Inst, Snap, Val, ValDef};
 #[derive(Default)]
 pub(crate) struct EntryKinds {
     /// For a loop entry, the kind of each live register's value in the frame
-    /// the compile was triggered from (J7), by register; empty when unknown.
+    /// the compile was triggered from, by register; empty when unknown.
     pub(crate) frame: Vec<TypeSet>,
     /// Kinds failed entry guards saw, by register.
     pub(crate) seen: Vec<(u8, TypeSet)>,
@@ -77,8 +77,8 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
     // Where each guard goes: in the prologue for an entry value; after the
     // definition when every path from there reaches a use expecting the set;
     // else at the earliest blocks the definition dominates from which every
-    // path does, so no guard deopts an execution a use's guard would not
-    // have (9.1). Values without any keep their uses' guards.
+    // path does, so no guard deopts an execution a use's guard would not have.
+    // Values without any keep their uses' guards.
     let mut places: Vec<(usize, Option<Block>)> = Vec::new();
     for (ci, c) in cands.iter().enumerate() {
         if c.entry.is_some() || ant.after_def[ci] {
@@ -132,8 +132,8 @@ pub(crate) fn speculate(f: &mut Func<'_>, kinds: &EntryKinds) -> bool {
         };
         let g = f.make_inst(Op::Guard(c.set), &[c.v], None, tag);
         match at {
-            // After the entry's loads, before anything a snapshot of which
-            // may name them (the parameters a register entry passes, W4 §2).
+            // After the entry's loads, before anything a snapshot of which may
+            // name them (the parameters a register entry passes).
             None if c.entry.is_some() => {
                 let k = f
                     .insts_of(f.entry)
@@ -256,10 +256,10 @@ fn informative(f: &Func<'_>, i: Inst) -> Option<(Val, TypeSet)> {
     }
 }
 
-/// The set the register's entry value is guarded to, if any. An
-/// expectation of its uses holds when the kinds failed entry guards saw and,
-/// at a loop entry, the frame's value fit it; a register without one is
-/// typed at a loop entry by the frame's kind and the seen ones (J7).
+/// The set the register's entry value is guarded to, if any. An expectation of
+/// its uses holds when the kinds failed entry guards saw and, at a loop entry,
+/// the frame's value fit it; a register without one is typed at a loop entry by
+/// the frame's kind and the seen ones.
 fn entry_set(f: &Func<'_>, kinds: &EntryKinds, r: u8, e: TypeSet) -> Option<TypeSet> {
     let seen = kinds
         .seen

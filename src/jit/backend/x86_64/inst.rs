@@ -15,7 +15,7 @@ use crate::jit::backend::x86_64::asm::{Cond, Shift, Sz};
 use crate::jit::ir::ops::{Cc, HelperId};
 use crate::jit::ir::types::TypeSet;
 
-/// The exit of an entry guard: the region's entry-fail stub (6.4).
+/// The exit of an entry guard: the region's entry-fail stub.
 pub(crate) const ENTRY_FAIL: u32 = u32::MAX - 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,7 +104,7 @@ pub(crate) enum MInst {
     /// Open the native frame. The entry block's first instruction.
     Prologue,
     /// `[def p0, def p1, ..]`, fixed in `abi::ARGS`: a function region's
-    /// parameters, as every entry passes them (W4 §2). No code.
+    /// parameters, as every entry passes them. No code.
     Params,
     /// `[def d]`, int.
     MovImm(u64),
@@ -114,8 +114,8 @@ pub(crate) enum MInst {
     LoadSlot(u8),
     /// `[use v]`: `R[r] = v`.
     StoreSlot(u8),
-    /// `[def d]`: the frame's closure, from its header (W4 §3: no register
-    /// holds it), for its upvalues.
+    /// `[def d]`: the frame's closure, from its header (no register holds it),
+    /// for its upvalues.
     FrameClosure,
     /// `[def d, use c]`: a by-value upvalue of the closure `c`.
     LoadUpvalOf(u8),
@@ -254,8 +254,8 @@ pub(crate) enum MInst {
     FAlu(FOp),
     /// `[def d (float), use n]`.
     FUn(FUnOp),
-    /// `[def d (early), temp q, use a, use b]`: Lua's float `%` (E7), the
-    /// cases the floor of the rounded quotient misses out of line.
+    /// `[def d (early), temp q, use a, use b]`: Lua's float `%`, the cases the
+    /// floor of the rounded quotient misses out of line.
     FMod,
     /// `[def d, test operands..]`: `setcc`.
     Set {
@@ -371,8 +371,8 @@ pub(crate) enum MInst {
         pc_after: usize,
         /// A constant callee the call writes word 0 for itself.
         known: Option<Known>,
-        /// A self-call whose arguments pass the entry guards: it enters
-        /// past them (W4 §2).
+        /// A self-call whose arguments pass the entry guards: it enters past
+        /// them.
         typed: bool,
     },
     /// `[use f, use args.., site..]`: a metamethod call from a header at
@@ -410,8 +410,8 @@ pub(crate) enum MInst {
         /// The call's header slot: the callee's base is `hdr + 4` past ours.
         hdr: u16,
     },
-    /// Return `n` results from `R[a..]`, the first (or nil) also in rax
-    /// (D3): `[use rax]` when `reg`, else it is read from its slot.
+    /// Return `n` results from `R[a..]`, the first (or nil) also in rax: `[use
+    /// rax]` when `reg`, else it is read from its slot.
     Return {
         a: u8,
         n: u8,

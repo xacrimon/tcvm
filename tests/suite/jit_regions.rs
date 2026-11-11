@@ -42,8 +42,8 @@ fn compiles_cleanly(src: &str, inline: bool) {
     assert_eq!(lua.jit_internal_errors(), 0, "{src}");
 }
 
-/// `agrees` with inlining off, for tests of real calls: what the inliner
-/// takes changes as it grows (W3).
+/// `agrees` with inlining off, for tests of real calls: what the inliner takes
+/// changes as it grows.
 fn agrees_calling(src: &str) {
     let mut lua = Lua::new();
     lua.set_jit_inline(false);
@@ -760,8 +760,8 @@ fn length_operator() {
 }
 
 /// String methods through the strings' metatable, its `__index` and the
-/// library's slot, each guarded; replacing a method, or `__index` itself,
-/// after compiling (the design's `hijacked` example, 11.5).
+/// library's slot, each guarded; replacing a method, or `__index` itself, after
+/// compiling.
 #[test]
 fn string_methods() {
     agrees(
@@ -1184,11 +1184,11 @@ fn kinds_that_change_in_a_loop() {
     );
 }
 
-/// Values of every kind live across compiled calls (C1) stay right when the
-/// callee returns straight (the frame kept), and when it leaves compiled code
-/// first: a native, a yield, an error, a collection, deep recursion that
-/// grows the stack and tags return addresses, all resumed through the
-/// header and the values read back from their slots.
+/// Values of every kind live across compiled calls stay right when the callee
+/// returns straight (the frame kept), and when it leaves compiled code first: a
+/// native, a yield, an error, a collection, deep recursion that grows the stack
+/// and tags return addresses, all resumed through the header and the values
+/// read back from their slots.
 #[test]
 fn values_live_across_calls() {
     agrees(
@@ -1272,8 +1272,8 @@ fn invariant_arithmetic_leaves_the_loop() {
     );
 }
 
-/// Float `%` inline (E7): signed zeros, infinities, NaN, huge and tiny
-/// quotients, exact multiples and the doubles either side of them.
+/// Float `%` inline: signed zeros, infinities, NaN, huge and tiny quotients,
+/// exact multiples and the doubles either side of them.
 #[test]
 fn float_modulo_edges() {
     agrees(
@@ -1313,9 +1313,9 @@ fn float_modulo_edges() {
     );
 }
 
-/// String keys of table accesses (W2.5): counting into a dictionary, a
-/// small table, `__index` tables and functions, `__newindex` from the start
-/// and gained later, other keys and receivers at a string site.
+/// String keys of table accesses: counting into a dictionary, a small table,
+/// `__index` tables and functions, `__newindex` from the start and gained
+/// later, other keys and receivers at a string site.
 #[test]
 fn string_table_keys() {
     agrees(
@@ -1361,9 +1361,9 @@ fn string_table_keys() {
     );
 }
 
-/// Float keys of array accesses (W2.6): integral floats as the integers'
-/// keys, then fractions, -0.0, floats past i32 and NaN, read and written,
-/// at sites that saw only integral floats before.
+/// Float keys of array accesses: integral floats as the integers' keys, then
+/// fractions, -0.0, floats past i32 and NaN, read and written, at sites that
+/// saw only integral floats before.
 #[test]
 fn float_array_keys() {
     agrees(
@@ -1395,10 +1395,10 @@ fn float_array_keys() {
     );
 }
 
-/// Inlined callees that store through the table helpers (W2.7), where each
-/// helper fails over to the builtin or the interpreter: `__newindex` and
-/// `__len` under `table.insert`/`table.remove`, a protected metatable, a
-/// nil `rawset` key, and a store whose class gains `__newindex` later.
+/// Inlined callees that store through the table helpers, where each helper
+/// fails over to the builtin or the interpreter: `__newindex` and `__len` under
+/// `table.insert`/`table.remove`, a protected metatable, a nil `rawset` key,
+/// and a store whose class gains `__newindex` later.
 #[test]
 fn inlined_table_helpers() {
     agrees(
@@ -1442,10 +1442,10 @@ fn inlined_table_helpers() {
     );
 }
 
-/// Array elements under classes with `__index`/`__newindex` (W2.3): present
-/// ones read and written plainly, nil ones through the metamethod, for
-/// varying and invariant tables, a class gaining one later, a nil under a
-/// use that fails on it, and an `__index` table.
+/// Array elements under classes with `__index`/`__newindex`: present ones read
+/// and written plainly, nil ones through the metamethod, for varying and
+/// invariant tables, a class gaining one later, a nil under a use that fails on
+/// it, and an `__index` table.
 #[test]
 fn array_misses_under_classes() {
     agrees(
@@ -1514,9 +1514,8 @@ fn array_misses_under_classes() {
     );
 }
 
-/// Bounds checks against a loop's range (E2): limits past the array,
-/// early breaks, negative and non-unit steps, an array grown in the loop
-/// and empty loops.
+/// Bounds checks against a loop's range: limits past the array, early breaks,
+/// negative and non-unit steps, an array grown in the loop and empty loops.
 #[test]
 fn loop_range_bounds() {
     agrees(
@@ -1599,9 +1598,9 @@ fn int_compares_against_float_constants() {
     );
 }
 
-/// Results of compiled callees in registers (D3): none, one (stored,
-/// in its slot already, a float, a constant), two and three into one and
-/// two wanted, varargs, deep chains and returns through the interpreter.
+/// Results of compiled callees in registers: none, one (stored, in its slot
+/// already, a float, a constant), two and three into one and two wanted,
+/// varargs, deep chains and returns through the interpreter.
 #[test]
 fn call_results() {
     agrees(
@@ -1636,9 +1635,9 @@ fn call_results() {
     );
 }
 
-/// Headers a fast call leaves at word 0 (D4), read by everything after a
-/// leave: tracebacks, error positions, a native call, an exit deep in a
-/// chain and a yield across compiled frames.
+/// Headers a fast call leaves at word 0, read by everything after a leave:
+/// tracebacks, error positions, a native call, an exit deep in a chain and a
+/// yield across compiled frames.
 #[test]
 fn lazy_call_headers() {
     agrees(
@@ -1671,9 +1670,9 @@ fn lazy_call_headers() {
     );
 }
 
-/// Calls of a callee known at compile time (D2, D4): replaced through an
-/// upvalue and a global, retired and recompiled while its caller's region
-/// runs, and mutual recursion past the native depth limit.
+/// Calls of a callee known at compile time: replaced through an upvalue and a
+/// global, retired and recompiled while its caller's region runs, and mutual
+/// recursion past the native depth limit.
 #[test]
 fn known_callees() {
     agrees(
@@ -1735,10 +1734,10 @@ fn closures_in_fast_called_frames() {
     );
 }
 
-/// Inlined callees (E1): exits inside the inlined frame (a kind change, an
-/// error), results into one and two wanted, missing and extra arguments,
-/// nesting, loops and upvalues in the callee, globals, a callee replaced
-/// at run time, and one with a real call, which stays a call.
+/// Inlined callees: exits inside the inlined frame (a kind change, an error),
+/// results into one and two wanted, missing and extra arguments, nesting, loops
+/// and upvalues in the callee, globals, a callee replaced at run time, and one
+/// with a real call, which stays a call.
 #[test]
 fn inlined_calls() {
     agrees(
@@ -1779,10 +1778,10 @@ fn inlined_calls() {
     );
 }
 
-/// Calls from compiled code into the interpreter run as levels on top of
-/// the compiled frames (H6): errors unwind across them, coroutines yield
-/// inside them, the collector walks them, and a deopted fast-called frame
-/// that enters a loop region again calls through a level of its own.
+/// Calls from compiled code into the interpreter run as levels on top of the
+/// compiled frames: errors unwind across them, coroutines yield inside them,
+/// the collector walks them, and a deopted fast-called frame that enters a loop
+/// region again calls through a level of its own.
 #[test]
 fn levels() {
     agrees(
@@ -1844,9 +1843,9 @@ fn levels() {
     );
 }
 
-/// Recursion that starts a level per call (each `pcall` from compiled code
-/// is a native that calls Lua) runs past the native budget, where compiled
-/// entries refuse and the interpreter goes on, and unwinds back (H9).
+/// Recursion that starts a level per call (each `pcall` from compiled code is a
+/// native that calls Lua) runs past the native budget, where compiled entries
+/// refuse and the interpreter goes on, and unwinds back.
 #[test]
 fn levels_past_the_native_budget() {
     agrees(
@@ -2057,9 +2056,9 @@ fn deep_misses_find_their_sites() {
     agrees_calling(src);
 }
 
-/// More live values than the registers once allocatable, so x23 and x24
-/// hold some (W4 §3: no longer the runtime and closure), across a helper
-/// call and into an exit, which restores them from their image slots.
+/// More live values than the registers once allocatable, so x23 and x24 hold
+/// some (no longer the runtime and closure), across a helper call and into an
+/// exit, which restores them from their image slots.
 #[test]
 fn values_in_former_pinned_registers_survive_exits() {
     agrees(
@@ -2085,11 +2084,10 @@ fn values_in_former_pinned_registers_survive_exits() {
     );
 }
 
-/// Calls passing their arguments in registers (W4 §2): the parameters left
-/// out nil, past the eighth in slots, more arguments than parameters; a
-/// callee whose entry guard fails stores its parameters for the
-/// interpreter; one result returned in x0 alone, landed for `c = 0` and for
-/// more results than it gives.
+/// Calls passing their arguments in registers: the parameters left out nil,
+/// past the eighth in slots, more arguments than parameters; a callee whose
+/// entry guard fails stores its parameters for the interpreter; one result
+/// returned in x0 alone, landed for `c = 0` and for more results than it gives.
 #[test]
 fn register_arguments_and_results() {
     agrees_calling(
@@ -2226,12 +2224,12 @@ fn parameters_stay_at_the_entry() {
     );
 }
 
-/// Calls from inlined bodies (W3 step 2): the frame walk shows the frames
-/// inlined around a call, so error levels count them and positions are
-/// theirs. `pcall(error, msg, k)` is a native call wherever it is: level 2
-/// is `inner`, level 3 its caller `mid`, both inlined into `run`'s loop;
-/// `fs[1]` is one of two closures of a prototype, inlined by it, whose
-/// closure the walk reads from the call site.
+/// Calls from inlined bodies: the frame walk shows the frames inlined around a
+/// call, so error levels count them and positions are theirs. `pcall(error,
+/// msg, k)` is a native call wherever it is: level 2 is `inner`, level 3 its
+/// caller `mid`, both inlined into `run`'s loop; `fs[1]` is one of two closures
+/// of a prototype, inlined by it, whose closure the walk reads from the call
+/// site.
 #[test]
 fn errors_locate_inlined_frames() {
     agrees(
@@ -2358,9 +2356,9 @@ fn kept_values_need_no_dead_register() {
     compiles_cleanly(src, true);
 }
 
-/// Constructors and concatenation in inlined bodies (W3 step 3): a table
-/// from its prototype's template, positional items from the body's slots,
-/// a list ending in a call's results (to `top`), and `..`.
+/// Constructors and concatenation in inlined bodies: a table from its
+/// prototype's template, positional items from the body's slots, a list ending
+/// in a call's results (to `top`), and `..`.
 #[test]
 fn bodies_build_tables_and_strings() {
     agrees(
@@ -2382,13 +2380,13 @@ fn bodies_build_tables_and_strings() {
     );
 }
 
-/// Closures made in an inlined body (W3 step 4): `make`'s `get` and `inc`
-/// share `n`, open on the body's slot while it runs (`inc` writes it from
-/// a real call there) and closed when it returns: every `get` kept in
-/// `gets` reads its own `n` after the stack is reused. `bads[2500]` takes
-/// an arm that never ran, exiting inside the body with `n` open (the frame
-/// the exit writes must close it); a `false` raises inside `inc`, an error
-/// that unwinds through the body to the `pcall`, `saved` keeping `n`.
+/// Closures made in an inlined body: `make`'s `get` and `inc` share `n`, open
+/// on the body's slot while it runs (`inc` writes it from a real call there)
+/// and closed when it returns: every `get` kept in `gets` reads its own `n`
+/// after the stack is reused. `bads[2500]` takes an arm that never ran, exiting
+/// inside the body with `n` open (the frame the exit writes must close it); a
+/// `false` raises inside `inc`, an error that unwinds through the body to the
+/// `pcall`, `saved` keeping `n`.
 #[test]
 fn bodies_make_closures() {
     agrees(
@@ -2448,11 +2446,11 @@ fn cell_stores_in_bodies_write_their_slots() {
     );
 }
 
-/// Generic `for` and metamethod calls in inlined bodies (W3 step 5): the
-/// `next` and `ipairs` steps at the body's slots, another iterator (a
-/// closure made in the body) and `__add` as calls from a header past the
-/// body's registers, where they overwrite nothing: `p`, `q` and `r` wait
-/// in the body's slots across the metamethod call.
+/// Generic `for` and metamethod calls in inlined bodies: the `next` and
+/// `ipairs` steps at the body's slots, another iterator (a closure made in the
+/// body) and `__add` as calls from a header past the body's registers, where
+/// they overwrite nothing: `p`, `q` and `r` wait in the body's slots across the
+/// metamethod call.
 #[test]
 fn bodies_iterate_and_call_metamethods() {
     agrees(
@@ -2483,11 +2481,10 @@ fn bodies_iterate_and_call_metamethods() {
     );
 }
 
-/// Tail calls in inlined bodies (W3 step 6a) replace the body's frame, as
-/// the interpreter's do: `f` is inlined in `g`'s place and `k` (an
-/// irreducible loop, never compiled) called from `g2`'s header, so level 3
-/// from either is the loop in `run`, `g` and `g2` gone; `k`'s four results
-/// come back through the slots.
+/// Tail calls in inlined bodies replace the body's frame, as the interpreter's
+/// do: `f` is inlined in `g`'s place and `k` (an irreducible loop, never
+/// compiled) called from `g2`'s header, so level 3 from either is the loop in
+/// `run`, `g` and `g2` gone; `k`'s four results come back through the slots.
 #[test]
 fn tail_calls_in_bodies_replace_their_frames() {
     agrees(
@@ -2597,11 +2594,11 @@ fn metamethod_tail_calls_leave_with_the_result() {
     }
 }
 
-/// A tail call in a region's own frame (W3 step 6b): `outer` (its region
-/// made through `pcall`, which no caller inlines) tail-calls `inner`, which
-/// takes over its frame. Level 3 from `inner` is the `pcall`, `outer`
-/// gone; at 2500 a float exits inside `inner`, its frame's header must
-/// name it for the positions after.
+/// A tail call in a region's own frame: `outer` (its region made through
+/// `pcall`, which no caller inlines) tail-calls `inner`, which takes over its
+/// frame. Level 3 from `inner` is the `pcall`, `outer` gone; at 2500 a float
+/// exits inside `inner`, its frame's header must name it for the positions
+/// after.
 #[test]
 fn tail_calls_take_over_the_region_frame() {
     agrees(
@@ -2628,12 +2625,11 @@ fn tail_calls_take_over_the_region_frame() {
     );
 }
 
-/// A tail call of the region frame's replacement (W3 step 6b) inlines in
-/// its place only a constant callee: `mid` takes over `outer`'s frame, and
-/// `t.f`, a closure of a prototype that made several, is called for real.
-/// No slot below the region frame's window holds such a closure for exits
-/// (its header entry was register `-4`). `mid2`'s constant `leaf` takes
-/// `outer2`'s frame in turn.
+/// A tail call of the region frame's replacement inlines in its place only a
+/// constant callee: `mid` takes over `outer`'s frame, and `t.f`, a closure of a
+/// prototype that made several, is called for real. No slot below the region
+/// frame's window holds such a closure for exits (its header entry was register
+/// `-4`). `mid2`'s constant `leaf` takes `outer2`'s frame in turn.
 #[test]
 fn replacements_inline_constant_tail_callees_only() {
     compiles_cleanly(
@@ -2665,11 +2661,10 @@ fn replacements_inline_constant_tail_callees_only() {
     );
 }
 
-/// A function region's tail calls of itself are its loop (W3 step 6c), the
-/// frame reused as the interpreter's `TAILCALL` reuses it: level 3 from
-/// `find` is the loop calling it. `f1` and `f2` are closures of one
-/// prototype tail-calling each other: only the running closure loops, so
-/// each call keeps its own `k`.
+/// A function region's tail calls of itself are its loop, the frame reused as
+/// the interpreter's `TAILCALL` reuses it: level 3 from `find` is the loop
+/// calling it. `f1` and `f2` are closures of one prototype tail-calling each
+/// other: only the running closure loops, so each call keeps its own `k`.
 #[test]
 fn tail_self_calls_loop() {
     agrees(
@@ -2705,10 +2700,9 @@ fn tail_self_calls_loop() {
     );
 }
 
-/// Counts up to `top` in inlined bodies (W3 step 7a): `pair` returns `1`
-/// (a register) and what `table.unpack` left in its slots; `add3` is
-/// inlined with arguments up to `top`, a register before them or not, nil
-/// past the count.
+/// Counts up to `top` in inlined bodies: `pair` returns `1` (a register) and
+/// what `table.unpack` left in its slots; `add3` is inlined with arguments up
+/// to `top`, a register before them or not, nil past the count.
 #[test]
 fn bodies_take_values_up_to_top() {
     agrees(
@@ -2726,11 +2720,11 @@ fn bodies_take_values_up_to_top() {
     );
 }
 
-/// Inlined calls wanting every result (W3 step 7b): `two` always gives two
-/// (the next call's count fixed), `maybe` one or two (a count the next
-/// call, inlined or real, takes as a value), `wrap` returns `maybe`'s.
-/// The callee of the last call changes at 2500: that exit runs it in the
-/// interpreter, which takes `top` as the inlined call left it.
+/// Inlined calls wanting every result: `two` always gives two (the next call's
+/// count fixed), `maybe` one or two (a count the next call, inlined or real,
+/// takes as a value), `wrap` returns `maybe`'s. The callee of the last call
+/// changes at 2500: that exit runs it in the interpreter, which takes `top` as
+/// the inlined call left it.
 #[test]
 fn inlined_calls_leave_values_up_to_top() {
     agrees(
@@ -2774,9 +2768,9 @@ fn exits_before_takers_see_the_inlined_top() {
     );
 }
 
-/// Recursion inlines one copy (W3 §8), through another function too: a
-/// float at depth exits inside a copy, an error two levels up names the
-/// copy's caller, and `even`/`odd` recurse through each other.
+/// Recursion inlines one copy, through another function too: a float at depth
+/// exits inside a copy, an error two levels up names the copy's caller, and
+/// `even`/`odd` recurse through each other.
 #[test]
 fn recursion_inlines_one_copy() {
     compiles_cleanly(
@@ -2801,10 +2795,10 @@ fn recursion_inlines_one_copy() {
     );
 }
 
-/// A call whose callee joins constant functions dispatches on them (W3
-/// §11): `get` of `A` or `B` by the receiver's shape, each body inlined in
-/// its arm. Float fields exit inside each arm; then a `C` takes the real
-/// call for any other callee.
+/// A call whose callee joins constant functions dispatches on them: `get` of
+/// `A` or `B` by the receiver's shape, each body inlined in its arm. Float
+/// fields exit inside each arm; then a `C` takes the real call for any other
+/// callee.
 #[test]
 fn polymorphic_calls_dispatch() {
     compiles_cleanly(
@@ -2835,10 +2829,10 @@ fn polymorphic_calls_dispatch() {
     );
 }
 
-/// A metamethod the operand's class gives as a constant inlines (W3 §9):
-/// `a + b`'s `__add`, where `a.y` guarded `a`'s shape. At 2500 its i32 add
-/// overflows and exits inside it (its frame's continuation stores the
-/// result to the `ADD`'s register), and a table field raises inside it.
+/// A metamethod the operand's class gives as a constant inlines: `a + b`'s
+/// `__add`, where `a.y` guarded `a`'s shape. At 2500 its i32 add overflows and
+/// exits inside it (its frame's continuation stores the result to the `ADD`'s
+/// register), and a table field raises inside it.
 #[test]
 fn class_metamethods_inline() {
     compiles_cleanly(
@@ -2861,9 +2855,9 @@ fn class_metamethods_inline() {
     );
 }
 
-/// A region frame's tail call taking a call's results up to `top`: `f`
-/// and `ack` loop (W3 step 6c), `f`'s arguments past `acc` from `m`'s
-/// zero, one or two results, nil past them.
+/// A region frame's tail call taking a call's results up to `top`: `f` and
+/// `ack` loop, `f`'s arguments past `acc` from `m`'s zero, one or two results,
+/// nil past them.
 #[test]
 fn tail_calls_up_to_top_loop() {
     compiles_cleanly(
@@ -2891,10 +2885,9 @@ fn tail_calls_up_to_top_loop() {
     );
 }
 
-/// Typed self-calls (W4 step 6): `f`'s calls of itself enter past its
-/// entry guard and trust its integer result. `f(31)` overflows an i32 add
-/// and exits, and the interpreter returns a big integer to a typed call,
-/// which its landing tests.
+/// Typed self-calls: `f`'s calls of itself enter past its entry guard and trust
+/// its integer result. `f(31)` overflows an i32 add and exits, and the interpreter
+/// returns a big integer to a typed call, which its landing tests.
 #[test]
 fn typed_self_calls() {
     compiles_cleanly(
@@ -2907,10 +2900,10 @@ fn typed_self_calls() {
     );
 }
 
-/// Known callees (W3 step 8): `fs`'s two closures of one prototype take
-/// turns at a site, inlined by the prototype with each one's `k` read from
-/// the closure called; `add` and `bump` are closures the loop makes, inlined
-/// unguarded, `bump` writing the loop's captured `count` through its cell.
+/// Known callees: `fs`'s two closures of one prototype take turns at a site,
+/// inlined by the prototype with each one's `k` read from the closure called;
+/// `add` and `bump` are closures the loop makes, inlined unguarded, `bump`
+/// writing the loop's captured `count` through its cell.
 #[test]
 fn known_callees_inline() {
     agrees(
@@ -2988,8 +2981,8 @@ fn closing_value_survives_collections() {
     );
 }
 
-/// Cases an intrinsic's inline code does not take, once compiled: the
-/// builtin runs from the region (I1).
+/// Cases an intrinsic's inline code does not take, once compiled: the builtin
+/// runs from the region.
 #[test]
 fn intrinsic_fallbacks() {
     agrees(
@@ -3008,9 +3001,8 @@ fn intrinsic_fallbacks() {
     );
 }
 
-/// `math.min`, `math.max`, `table.insert` and `table.remove` as intrinsics
-/// (I1): mixed number kinds, NaN, and lists whose metatables the builtin
-/// must see.
+/// `math.min`, `math.max`, `table.insert` and `table.remove` as intrinsics:
+/// mixed number kinds, NaN, and lists whose metatables the builtin must see.
 #[test]
 fn list_and_min_max_intrinsics() {
     agrees(
@@ -3053,10 +3045,9 @@ fn list_and_min_max_intrinsics() {
     );
 }
 
-/// Callees the interpreter saw at a site (I2): one function loaded from
-/// varying tables is guarded and called as a constant, a site that changes
-/// its callee after compiling leaves and recompiles, and a megamorphic one
-/// stays a call.
+/// Callees the interpreter saw at a site: one function loaded from varying
+/// tables is guarded and called as a constant, a site that changes its callee
+/// after compiling leaves and recompiles, and a megamorphic one stays a call.
 #[test]
 fn callee_feedback() {
     agrees(
@@ -3078,8 +3069,8 @@ fn callee_feedback() {
     );
 }
 
-/// Calls with fewer arguments than the callee's parameters (I3): a known
-/// callee's caller stores the nils, an unknown one's entry fills them in.
+/// Calls with fewer arguments than the callee's parameters: a known callee's
+/// caller stores the nils, an unknown one's entry fills them in.
 #[test]
 fn arity_shortfall() {
     agrees(
@@ -3095,9 +3086,9 @@ fn arity_shortfall() {
     );
 }
 
-/// A call's results landed in its registers (I5): all of them with `top`
-/// past them, for up to three and for more, and a fixed count above two
-/// from a callee returning fewer, compiled and native.
+/// A call's results landed in its registers: all of them with `top` past them,
+/// for up to three and for more, and a fixed count above two from a callee
+/// returning fewer, compiled and native.
 #[test]
 fn result_landing() {
     agrees(
@@ -3119,8 +3110,8 @@ fn result_landing() {
 }
 
 /// A recursive call of the closure being compiled enters its region's known
-/// entry by `bl` (I4); another closure of the same prototype fails the
-/// identity guard and recompiles with a guard on the prototype.
+/// entry by `bl`; another closure of the same prototype fails the identity
+/// guard and recompiles with a guard on the prototype.
 #[test]
 fn self_calls() {
     agrees(
@@ -3137,10 +3128,10 @@ fn self_calls() {
     );
 }
 
-/// Callees known by their prototype (D2): new closures of one prototype on
-/// every call, inlined with their upvalues loaded from the closure and an
-/// exit inside the inlined body; tail calls of a known callee that
-/// recompiles under its callers; a site that turns polymorphic.
+/// Callees known by their prototype: new closures of one prototype on every
+/// call, inlined with their upvalues loaded from the closure and an exit inside
+/// the inlined body; tail calls of a known callee that recompiles under its
+/// callers; a site that turns polymorphic.
 #[test]
 fn prototype_callees() {
     agrees(
@@ -3172,8 +3163,8 @@ fn prototype_callees() {
 }
 
 /// Methods found through `__index` inlined from the call sites' callee
-/// feedback (E1): three results, and an intrinsic whose builtin an inlined
-/// body cannot call, which exits there instead.
+/// feedback: three results, and an intrinsic whose builtin an inlined body
+/// cannot call, which exits there instead.
 #[test]
 fn inlined_methods() {
     agrees(
@@ -3293,8 +3284,7 @@ fn captured_slots_change_across_calls() {
 }
 
 /// A class gains `__index` in a call from a compiled loop that folded its
-/// absence (ws2 §5.4): the frame leaves past the call, the next field read
-/// walks.
+/// absence: the frame leaves past the call, the next field read walks.
 #[test]
 fn class_change_in_a_call_deopts_the_caller() {
     agrees(
@@ -3429,10 +3419,10 @@ fn class_changes_reach_metamethod_arms_and_entries() {
     );
 }
 
-/// Methods read through `__index` tables at any depth fold to constants
-/// (ws2 §5.5); replacing one, shadowing an inherited one, deleting one and
-/// re-parenting a holder each reach the compiled readers, from outside, from
-/// a call and from the loop's own stores.
+/// Methods read through `__index` tables at any depth fold to constants;
+/// replacing one, shadowing an inherited one, deleting one and re-parenting a
+/// holder each reach the compiled readers, from outside, from a call and from
+/// the loop's own stores.
 #[test]
 fn holder_changes_deopt_folded_method_reads() {
     agrees(
@@ -3572,9 +3562,8 @@ fn known_arithmetic_metamethods_follow_the_class() {
     );
 }
 
-/// Compiled loads take a slot's kind as their type (ws2 §6.1); a store that
-/// widens it, from outside, from a call or from the loop itself, reaches
-/// them.
+/// Compiled loads take a slot's kind as their type; a store that widens it,
+/// from outside, from a call or from the loop itself, reaches them.
 #[test]
 fn widened_slots_reach_typed_loads() {
     agrees(
@@ -3755,9 +3744,9 @@ fn every_writer_widens_slots() {
     );
 }
 
-/// Tables loaded from a slot that tracks their stable shape (ws2 §6.1-6.2)
-/// leave it every way a table can: a new key, a metatable, becoming an
-/// `__index` holder; a compiled loop over them is invalidated each time.
+/// Tables loaded from a slot that tracks their stable shape leave it every way
+/// a table can: a new key, a metatable, becoming an `__index` holder; a
+/// compiled loop over them is invalidated each time.
 #[test]
 fn tables_leaving_tracked_shapes_invalidate() {
     agrees(

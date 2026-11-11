@@ -1,8 +1,8 @@
-//! Self-calls' results (W4 §2): a region's call of its own prototype gets
-//! what one of its returns gives, so a guard on the result that every
-//! return's value passes is no test on the fast return. One landing guard
-//! tests it where anything else comes back: the call's slow path and a
-//! level the callee went on in (an exit, a dispatch).
+//! Self-calls' results: a region's call of its own prototype gets what one of
+//! its returns gives, so a guard on the result that every return's value passes
+//! is no test on the fast return. One landing guard tests it where anything
+//! else comes back: the call's slow path and a level the callee went on in (an
+//! exit, a dispatch).
 
 use crate::dmm::Gc;
 use crate::env::function::Prototype;

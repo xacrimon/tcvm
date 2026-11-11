@@ -1,6 +1,6 @@
 //! Structural checks of a `Func`: SSA dominance of every use (operands, edge
 //! arguments, snapshot entries), terminators, edge arity, snapshots on every
-//! exiting instruction, and R6 (nothing but constants lives across a call).
+//! exiting instruction, and that nothing but constants lives across a call.
 
 use crate::jit::ir::{Block, CfgInfo, Func};
 #[cfg(feature = "tcvm-dev")]
@@ -229,9 +229,8 @@ pub(crate) fn checkpoints(f: &Func<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// Once the call-boundary pass ran, what is live across a call is a value
-/// its snapshot names, a constant, or a table's pointer whose table it
-/// names (C1).
+/// Once the call-boundary pass ran, what is live across a call is a value its
+/// snapshot names, a constant, or a table's pointer whose table it names.
 #[cfg(feature = "tcvm-dev")]
 fn check_r6(f: &Func<'_>, rpo: &[Block], _pos: &[(Block, usize)]) -> Result<(), String> {
     if !f.boundaries {

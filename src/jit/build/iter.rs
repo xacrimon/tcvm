@@ -1,8 +1,7 @@
-//! Generic `for` loops (`jit-design.md` 7.6): `TFORPREP` as the form it
-//! wrote at its `TFORCALL` says, the `next` and `ipairs` steps without
-//! calling the iterator, each arm going where the `TFORLOOP` after it would
-//! (`emit_instance` emits the two as one), any other iterator called,
-//! `TFORLOOP` a nil test.
+//! Generic `for` loops: `TFORPREP` as the form it wrote at its `TFORCALL` says,
+//! the `next` and `ipairs` steps without calling the iterator, each arm going
+//! where the `TFORLOOP` after it would (`emit_instance` emits the two as one),
+//! any other iterator called, `TFORLOOP` a nil test.
 
 use crate::env::MetamethodBits;
 use crate::env::table::POS_PART_SHIFT;

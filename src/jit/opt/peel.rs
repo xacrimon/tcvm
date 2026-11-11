@@ -1,7 +1,7 @@
-//! Loop peeling (9.3): each innermost loop up to `PEEL_LIMIT`, and each
-//! outer loop of that size whose inner loops are small, gets a copy of its
-//! body in front of it, so the loop's header joins only steady-state values
-//! and the copy's guards dominate the loop for GVN.
+//! Loop peeling: each innermost loop up to `PEEL_LIMIT`, and each outer loop of
+//! that size whose inner loops are small, gets a copy of its body in front of
+//! it, so the loop's header joins only steady-state values and the copy's
+//! guards dominate the loop for GVN.
 
 use crate::jit::FastMap as HashMap;
 use crate::jit::ir::{Block, BlockCall, CfgInfo, Func, NO_SNAP, Snap, Val, ValDef};

@@ -1,13 +1,13 @@
-//! The call-boundary pass (9.8, C1, H11): a call clobbers every register,
-//! so a value live across it stays in the region's frame, and must then be
-//! one the call-site snapshot names: the collector traces those spill slots
-//! while the call runs. A value one of the call's home slots holds is loaded
-//! from it again; pure computations of such values are computed again after
-//! the resume. Constants stay live (the allocator makes them where used), and
-//! so does a table's pointer, the call naming its table (the collector does
-//! not see raw pointers). Later uses get whichever definition reaches them.
-//! A copy with all its uses in one later block goes there when no call
-//! comes between (`place_copies`).
+//! The call-boundary pass: a call clobbers every register, so a value live
+//! across it stays in the region's frame, and must then be one the call-site
+//! snapshot names: the collector traces those spill slots while the call runs.
+//! A value one of the call's home slots holds is loaded from it again; pure
+//! computations of such values are computed again after the resume. Constants
+//! stay live (the allocator makes them where used), and so does a table's
+//! pointer, the call naming its table (the collector does not see raw
+//! pointers). Later uses get whichever definition reaches them. A copy with all
+//! its uses in one later block goes there when no call comes between
+//! (`place_copies`).
 
 use crate::jit::FastMap;
 use crate::jit::ir::ops::{ExitTag, Mem, Op};
@@ -53,8 +53,8 @@ fn const_chain(f: &Func<'_>, v: Val) -> bool {
 /// Pointer parameters that join unboxings are an unboxing of a table value,
 /// made where their block starts: a call keeps no raw pointer, and only a
 /// definition is made again after one. The table is one value that
-/// dominates the block (the receiver of a call dispatched by shape, W3
-/// §11, across its bodies' calls), or a parameter joining the unboxed
+/// dominates the block (the receiver of a call dispatched by shape,
+/// across its bodies' calls), or a parameter joining the unboxed
 /// tables edge by edge, made when none does (branch elimination's repairs
 /// join a cloned block's table and its unboxing).
 fn fold_ptr_params(f: &mut Func<'_>) {

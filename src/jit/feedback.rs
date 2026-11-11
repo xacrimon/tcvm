@@ -7,7 +7,7 @@ use crate::env::function::LuaFn;
 use crate::env::value::Value;
 use crate::instruction::Instruction;
 
-/// Shapes a site's chain may test (6.4); one more makes it megamorphic.
+/// Shapes a site's chain may test; one more makes it megamorphic.
 pub(crate) const MAX_SHAPES: usize = 4;
 
 pub(crate) const SMALL: Bits = 1;

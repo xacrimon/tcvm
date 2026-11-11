@@ -13,8 +13,8 @@ use crate::jit::opt;
 use crate::jit::opt::speculate::EntryKinds;
 use crate::lua::Context;
 
-/// Why a compile failed: always an internal limit, never a semantic decline
-/// (6.2); it counts as a strike.
+/// Why a compile failed: always an internal limit, never a semantic decline; it
+/// counts as a strike.
 #[derive(Debug)]
 pub(crate) enum CompileError {
     Irreducible,
@@ -113,8 +113,7 @@ enum Stage {
 pub(crate) struct Times {
     last: std::time::Instant,
     stages: [u128; 5],
-    /// Each pass's share of `Passes` in nanoseconds, summed over its runs
-    /// (F1).
+    /// Each pass's share of `Passes` in nanoseconds, summed over its runs.
     pass: Vec<(&'static str, u128)>,
 }
 
@@ -206,7 +205,7 @@ pub(crate) fn build_ir<'gc>(
         b.entry_frame = (0..cfg.nregs).map(|r| unsafe { *frame.add(r) }).collect();
     }
     let mut f = b.build()?;
-    // A function region's IR is what inlining the function costs (W3 §12).
+    // A function region's IR is what inlining the function costs.
     if !loop_entry {
         closure.proto.ir_size.set(f.built() as u32);
     }
@@ -354,10 +353,9 @@ pub(crate) fn resolve_original(
 }
 
 /// The `TAILCALL`s of a function region whose call sites saw only its own
-/// prototype's closures, which become jumps to its start (W3 §5, Q6), the
-/// callee guarded to be the frame's: not for a vararg function, nor one
-/// whose closures capture its registers (the frame's open upvalues would
-/// have to close first).
+/// prototype's closures, which become jumps to its start, the callee guarded to
+/// be the frame's: not for a vararg function, nor one whose closures capture
+/// its registers (the frame's open upvalues would have to close first).
 pub(crate) fn self_tail_calls(
     closure: LuaFn<'_>,
     code: &[crate::instruction::Instruction],
@@ -473,7 +471,7 @@ pub(crate) fn compile<'gc>(
         eprintln!("-- jit ir {} pc{pc}\n{}", chunk_name(closure), f.print());
     }
     // A function region of a prototype without varargs is what a compiled
-    // caller's `blr` can enter (5.4).
+    // caller's `blr` can enter.
     let enterable = pc == 0 && !f.meta.loop_entry && !closure.proto.is_vararg;
     let own = enterable.then(|| closure.proto.ptr.as_ptr() as u64);
     let lowered = crate::jit::backend::lower::lower(

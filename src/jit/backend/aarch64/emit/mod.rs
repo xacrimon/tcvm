@@ -1,6 +1,6 @@
-//! Allocated `MInst`s to machine code (10.5, 10.6): the native frame, the
-//! allocator's moves, every instruction's sequence, the exit stubs and the
-//! region's exit trampoline in the cold section.
+//! Allocated `MInst`s to machine code: the native frame, the allocator's moves,
+//! every instruction's sequence, the exit stubs and the region's exit
+//! trampoline in the cold section.
 
 use crate::jit::backend::aarch64::abi::{BASE, FRAME_SPILLS, MAX_SPILLS};
 use crate::jit::backend::aarch64::asm::{Asm, FP, Fpr, Gpr, LR, Label, SP, Sz, ZR};
@@ -84,7 +84,7 @@ struct Em<'a> {
     region_word: Label,
     sites: Vec<SiteOut<Label>>,
     /// This region's prototype and its known entries, when it has them:
-    /// arguments in slots, and in registers (W4 §2).
+    /// arguments in slots, and in registers.
     own_entry: Option<(u64, Label, Label)>,
     /// The direct branches to known entries, by the callee's prototype.
     direct: Vec<(Label, u64, Option<Label>)>,
@@ -114,21 +114,20 @@ struct Em<'a> {
     origins: Option<Vec<(u32, u32)>>,
 }
 
-/// The fast entry past its arity and native stack checks, for a caller
-/// that proved them (D2).
+/// The fast entry past its arity and native stack checks, for a caller that
+/// proved them.
 const KNOWN_ENTRY: usize = 24;
 
-/// A fast entry's known entry, from it: `KNOWN_ENTRY`, and for a call
-/// passing the parameters in registers (W4 §2) past their loads from the
-/// slots, an instruction each.
+/// A fast entry's known entry, from it: `KNOWN_ENTRY`, and for a call passing
+/// the parameters in registers past their loads from the slots, an instruction
+/// each.
 pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
     KNOWN_ENTRY + if regs { 4 * nparams.min(8) as usize } else { 0 }
 }
 
-/// A trampoline (A5): a C call of `target` that keeps x0-x15, d0-d7 and
-/// d16-d30 but the result's register and the caller's argument registers,
-/// behind a frame record that keeps the frame chain walkable; and its
-/// frame's size.
+/// A trampoline: a C call of `target` that keeps x0-x15, d0-d7 and d16-d30 but
+/// the result's register and the caller's argument registers, behind a frame
+/// record that keeps the frame chain walkable; and its frame's size.
 pub(crate) fn trampoline(target: usize, kind: Tramp) -> (Asm, u32) {
     let first = match kind {
         Tramp::Int => 1,

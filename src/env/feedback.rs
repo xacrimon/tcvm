@@ -271,8 +271,7 @@ impl<'gc> FeedbackVector<'gc> {
         }
     }
 
-    /// The calls the interpreter made at `pc` (W1's count; 0 for a site of
-    /// another kind).
+    /// The calls the interpreter made at `pc` (0 for a site of another kind).
     #[cfg(jit)]
     #[inline]
     pub(crate) fn call_count(&self, pc: usize) -> u64 {

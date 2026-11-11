@@ -1,6 +1,6 @@
-//! Slot kinds (ws2 §6.1): what every table of the shapes sharing a named
-//! slot has held in it, so compiled loads need no type or nil checks and
-//! the interpreter checks a store with one compare.
+//! Slot kinds: what every table of the shapes sharing a named slot has held in
+//! it, so compiled loads need no type or nil checks and the interpreter checks
+//! a store with one compare.
 
 use core::cell::Cell;
 
@@ -181,9 +181,9 @@ pub struct FieldData<'gc> {
     kind: Cell<u64>,
     #[collect(require_static)]
     widenings: Cell<u8>,
-    /// The shape every table stored here had when stored, while that was
-    /// one shape and stable then (ws2 §6.1's `table(S)`); `None` once the
-    /// arc holds tables of several (or before the first table).
+    /// The shape every table stored here had when stored, while that was one
+    /// shape and stable then; `None` once the arc holds tables of several (or
+    /// before the first table).
     shape: Lock<Option<Shape<'gc>>>,
     /// The regions assuming the kind stays.
     #[cfg(jit)]

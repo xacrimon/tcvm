@@ -1,9 +1,9 @@
-//! Branch elimination (W1 5.4, after Turboshaft's
-//! `branch-elimination-reducer.h`): a merge block ending in a `br` whose
-//! outcome an incoming edge decides is copied into that edge's source, the
-//! copy's `br` a jump. The edge decides it when the condition is known
-//! there (a dominating branch edge or guard, or the edge itself), or is a
-//! test of the block's parameters its arguments answer.
+//! Branch elimination (after Turboshaft's `branch-elimination-reducer.h`):
+//! a merge block ending in a `br` whose outcome an incoming edge decides is
+//! copied into that edge's source, the copy's `br` a jump. The edge decides
+//! it when the condition is known there (a dominating branch edge or guard,
+//! or the edge itself), or is a test of the block's parameters its arguments
+//! answer.
 
 use crate::jit::FastMap;
 use crate::jit::ir::ops::Op;

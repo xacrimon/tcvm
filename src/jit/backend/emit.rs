@@ -1,8 +1,8 @@
-//! What every target's emitter shares (10.5, 10.6): the record of a
-//! region's code (`Emitted`) with its exits and call sites placed after
-//! allocation, what the code links against, and the block layout's last
-//! steps (jump threading, loop rotation). The instruction sequences, the
-//! frame and the stubs are the target's (`target::emit`).
+//! What every target's emitter shares: the record of a region's code
+//! (`Emitted`) with its exits and call sites placed after allocation, what the
+//! code links against, and the block layout's last steps (jump threading, loop
+//! rotation). The instruction sequences, the frame and the stubs are the
+//! target's (`target::emit`).
 
 use crate::env::value::Value;
 use crate::jit::backend::lower::{LExit, LSite, Lowered, Src};
@@ -20,7 +20,7 @@ use crate::jit::region::{Loc, SRep, SnapEntry, SnapFrame};
 pub(crate) struct Emitted {
     pub(crate) asm: Asm,
     /// Where the interpreter enters (`JIT_ENTRY`/`JIT_LOOP`), and where a
-    /// compiled caller does (5.4), when the region has a fast entry.
+    /// compiled caller does, when the region has a fast entry.
     pub(crate) entry: u32,
     pub(crate) fast: Option<u32>,
     pub(crate) num_spills: u32,
@@ -29,7 +29,7 @@ pub(crate) struct Emitted {
     /// The 8-byte word holding the region pointer.
     pub(crate) region_word: u32,
     pub(crate) exits: Vec<ExitOut>,
-    /// The calls, for walks of the frame (H7).
+    /// The calls, for walks of the frame.
     pub(crate) sites: Vec<SiteOut>,
     /// The direct branches to other regions' known entries, by the callee's
     /// prototype (its box), which `jit::set_fast` repoints: a call's to the
@@ -37,7 +37,7 @@ pub(crate) struct Emitted {
     /// arguments stored, then its miss path); a tail call's to the slot one.
     pub(crate) direct: Vec<(u32, u64, Option<u32>)>,
     /// What `Region::invalidate` patches: each place and the branch target
-    /// written there, the entry's first (ws2 §5.4).
+    /// written there, the entry's first.
     pub(crate) lazy: Vec<(u32, u32)>,
     /// A self-call's return addresses whose result guard runs out of line,
     /// and its landing for a level returning there (`jit::jit_exit`).
@@ -138,7 +138,7 @@ pub(crate) struct ExitOut {
 pub(crate) struct FastEntry {
     pub(crate) max_stack: u8,
     pub(crate) num_params: u8,
-    /// The region's prototype, whose calls enter here directly (D2).
+    /// The region's prototype, whose calls enter here directly.
     pub(crate) proto: u64,
 }
 

@@ -248,9 +248,9 @@ fn pop_frame<'gc>(
     t.set_top_unchecked(bi);
 }
 
-/// Drop the levels above `level` (an entry record of the thread's, H6),
-/// restoring what each saved of the level below. The native frames go when
-/// the thread next continues at `level`'s start (`jump!`, `level_jump`).
+/// Drop the levels above `level` (an entry record of the thread's), restoring
+/// what each saved of the level below. The native frames go when the thread
+/// next continues at `level`'s start (`jump!`, `level_jump`).
 #[cfg(jit)]
 fn pop_levels(t: &mut ThreadState<'_>, level: usize) {
     while t.record != level {

@@ -27,7 +27,7 @@ pub(crate) const VALUE_SLOTS: usize = VALUE_BYTES / size_of::<Value<'static>>();
 /// The default native stack size.
 pub(crate) const NATIVE_BYTES: usize = 1024 * 1024;
 /// Native stack above its end that compiled code leaves to natives and the
-/// interpreter: past it, compiled entries refuse (H9).
+/// interpreter: past it, compiled entries refuse.
 #[cfg(jit)]
 pub(crate) const NATIVE_HEADROOM: usize = 256 * 1024;
 /// Free mappings the pool keeps; more are unmapped.
@@ -169,11 +169,10 @@ impl Drop for ThreadStack {
     }
 }
 
-/// A level's entry record (`jit-perf-fixes2.md` H6): a run of dispatch
-/// started on top of compiled frames on the same native stack, which
-/// returns to them through `ret_to_native`. Pushed on the native stack by
-/// `abi::jit_level`, which handlers then run below; the bottom level's is
-/// `dispatch_entry`'s.
+/// A level's entry record: a run of dispatch started on top of compiled frames
+/// on the same native stack, which returns to them through `ret_to_native`.
+/// Pushed on the native stack by `abi::jit_level`, which handlers then run
+/// below; the bottom level's is `dispatch_entry`'s.
 #[cfg(all(jit, target_arch = "aarch64"))]
 #[repr(C)]
 pub(crate) struct EntryRecord {

@@ -25,9 +25,9 @@ pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::
 handler! {
     bind(insn, pc, base, rt, closure, thread, nret, values);
 
-    /// A compiled function entry: tail into its region, unless the native
-    /// stack is past its budget (H9): the function runs interpreted, which
-    /// takes no native stack.
+    /// A compiled function entry: tail into its region, unless the native stack
+    /// is past its budget: the function runs interpreted, which takes no native
+    /// stack.
     op fn op_jit_entry {
         if std::hint::unlikely(below_budget(thread!())) {
             next!()
@@ -195,8 +195,8 @@ handler! {
             }
             fclosure = callee;
         }
-        // A fast-called frame's header has no continuation (D4): it returns
-        // through the level `exit_common` started.
+        // A fast-called frame's header has no continuation: it returns through
+        // the level `exit_common` started.
         unsafe {
             let w = frame::ret_word(base);
             if w & !frame::flag::MASK == 0 {
@@ -540,9 +540,9 @@ fn install<'gc>(
         set_fast(ctx, &closure.proto, &mut st, region.fast_entry as usize);
     }
     if st.entries.len() > MAX_ENTRIES {
-        // A loop entry inside another live entry's loop, whose region
-        // covers it but for the rest of one outer iteration after a deopt
-        // (5.2): the deepest such, else the oldest loop entry, never this one.
+        // A loop entry inside another live entry's loop, whose region covers it
+        // but for the rest of one outer iteration after a deopt: the deepest
+        // such, else the oldest loop entry, never this one.
         let inside = |e: &Entry<'_>| {
             st.entries
                 .iter()
@@ -669,11 +669,11 @@ fn retire_invalidated<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, region: &Regi
     }
 }
 
-/// What an exit leaves behind: the operand kinds the guard saw, the count,
-/// and a recompile request when the exit is hot. `closure` and `base` are
-/// the innermost frame's, an inlined callee's when the exit is in its body
-/// (E1); `region_closure` the region's. The feedback is for the exit's site,
-/// whose operands a moved exit's `blame` holds.
+/// What an exit leaves behind: the operand kinds the guard saw, the count, and
+/// a recompile request when the exit is hot. `closure` and `base` are the
+/// innermost frame's, an inlined callee's when the exit is in its body;
+/// `region_closure` the region's. The feedback is for the exit's site, whose
+/// operands a moved exit's `blame` holds.
 #[allow(clippy::too_many_arguments)]
 fn on_exit<'gc>(
     ctx: Context<'gc>,
@@ -960,7 +960,7 @@ fn record_site<'gc>(
             _ => 0,
         },
         Op::FORLOOP | Op::FORLOOP_I | Op::FORLOOP_F => kind(i.a() + 1) | kind(i.a() + 2),
-        // An intrinsic's arguments (12): kinds it did not cover make the next
+        // An intrinsic's arguments: kinds it did not cover make the next
         // compile take them. A variable count records only the first.
         Op::CALL
         | Op::CALL_R0

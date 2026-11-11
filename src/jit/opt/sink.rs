@@ -1,10 +1,9 @@
-//! Code sinking (A5): a pure instruction whose every use, snapshot entries
-//! included, is in one block it dominates moves to the start of that block
-//! when it is cold, so the hot path neither computes it nor keeps it live
-//! across the arm's call, or when it runs no more often: in no loop the
-//! instruction's block is not in (a loop's exit edge, an arm). Into a hot
-//! block only what has at most one operand that is no constant moves, so no
-//! two live ranges grow for one.
+//! Code sinking: a pure instruction whose every use, snapshot entries included,
+//! is in one block it dominates moves to the start of that block when it is
+//! cold, so the hot path neither computes it nor keeps it live across the arm's
+//! call, or when it runs no more often: in no loop the instruction's block is
+//! not in (a loop's exit edge, an arm). Into a hot block only what has at most
+//! one operand that is no constant moves, so no two live ranges grow for one.
 
 use crate::jit::ir::ops::Op;
 use crate::jit::ir::{Block, Func, Inst, NO_SNAP};

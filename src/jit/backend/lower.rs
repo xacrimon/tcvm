@@ -1,9 +1,9 @@
-//! IR to a target's `MInst`s (10.3), the part every target shares: one VCode
-//! block per IR block in layout order, the vreg of each value (refining
-//! guards and unboxes that change no bits share their operand's), snapshot
-//! values attached to exiting instructions as `Any` uses and to calls as
-//! stack uses, and the call protocol's choices (known callees, results in
-//! the result register, floats kept in float registers).
+//! IR to a target's `MInst`s, the part every target shares: one VCode block per
+//! IR block in layout order, the vreg of each value (refining guards and
+//! unboxes that change no bits share their operand's), snapshot values attached
+//! to exiting instructions as `Any` uses and to calls as stack uses, and the
+//! call protocol's choices (known callees, results in the result register,
+//! floats kept in float registers).
 //!
 //! The target selects the instructions: it implements `Select` for `Lower`
 //! (`target::lower`), with `Isel` its own state.
@@ -30,9 +30,9 @@ use crate::jit::region::{SRep, SnapFrame};
 /// with a value in a register as operands of the exiting instruction.
 pub(crate) struct LExit {
     pub(crate) pc: u32,
-    /// The inlined frames the exit rebuilds, outermost first (E1).
+    /// The inlined frames the exit rebuilds, outermost first.
     pub(crate) frames: Vec<SnapFrame>,
-    /// The pc whose feedback the exit records, when not `pc` (E2).
+    /// The pc whose feedback the exit records, when not `pc`.
     pub(crate) site: Option<ExitSite>,
     /// The snapshot's inlined frame, or `NO_FRAME`.
     pub(crate) frame: u32,
@@ -60,31 +60,31 @@ pub(crate) enum Src {
     Slot(u8),
 }
 
-/// A call's site (C1): the values its snapshot names, which live in the
-/// frame's spill slots across it, as operands of the call, and the
-/// registers whose home slots hold theirs (`Func::call_homes`).
+/// A call's site: the values its snapshot names, which live in the frame's
+/// spill slots across it, as operands of the call, and the registers whose home
+/// slots hold theirs (`Func::call_homes`).
 pub(crate) struct LSite {
     /// `(register, rep, source)`.
     pub(crate) entries: Vec<(u8, SRep, Src)>,
     pub(crate) homes: RegSet,
     /// The inlined frames the call is made from, outermost first, which the
-    /// frame walk shows (W3 §4).
+    /// frame walk shows.
     pub(crate) frames: Vec<SnapFrame>,
 }
 
 /// A call's callee, known at compile time.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Known {
-    /// A closure without varargs of the prototype at `proto` (its box),
-    /// which takes `nparams` (D2): `closure`, a constant the call writes word
-    /// 0 for itself (the closure word on the fast path, the value on the
-    /// slow one), or one a guard proved to be of the prototype.
+    /// A closure without varargs of the prototype at `proto` (its box), which
+    /// takes `nparams`: `closure`, a constant the call writes word 0 for itself
+    /// (the closure word on the fast path, the value on the slow one), or one a
+    /// guard proved to be of the prototype.
     Lua {
         closure: Option<u64>,
         proto: u64,
         nparams: u8,
     },
-    /// A native: its closure, which `jit_call_native` runs (I1).
+    /// A native: its closure, which `jit_call_native` runs.
     Native(u64),
 }
 
@@ -112,7 +112,7 @@ pub(crate) struct Lowered {
     pub(crate) params: u8,
     /// `Func::shape_sets` as the shapes' addresses.
     pub(crate) shape_sets: Vec<Vec<u64>>,
-    /// The region has dependencies: its entry is patchable (ws2 §5.4).
+    /// The region has dependencies: its entry is patchable.
     pub(crate) invalidable: bool,
     /// The VCode blocks in the order the encoder lays them out.
     pub(crate) emit_order: Vec<u32>,
@@ -126,11 +126,11 @@ pub(crate) struct Lowered {
     pub(crate) ir_blocks: Vec<u32>,
     /// The entry guards, all on parameters, as tests the fast entry makes
     /// before the entry block (the parameter and the set), which self-calls
-    /// passing them enter (W4 §2); none in the block's code.
+    /// passing them enter; none in the block's code.
     pub(crate) prefix_guards: bool,
     pub(crate) entry_tests: Vec<(u8, TypeSet)>,
-    /// `Func::window`, when past the frame's own window: every entry makes
-    /// sure of it, once, before the guards (W4).
+    /// `Func::window`, when past the frame's own window: every entry makes sure
+    /// of it, once, before the guards.
     pub(crate) window: Option<u16>,
     /// The helpers the code calls through trampolines, by address.
     pub(crate) trampolines: Vec<(usize, Tramp)>,
@@ -152,9 +152,9 @@ pub(crate) struct Lower<'a, 'gc> {
     pub(crate) entry_regs: Vec<u8>,
     block_of: Vec<u32>,
     pub(crate) pc_base: usize,
-    /// Instructions another computes with its own: a store a known call
-    /// writes itself and its callee (D2), a result's store to its slot, and
-    /// what the target's patterns take in.
+    /// Instructions another computes with its own: a store a known call writes
+    /// itself and its callee, a result's store to its slot, and what the
+    /// target's patterns take in.
     pub(crate) absorbed: Vec<bool>,
     pub(crate) known: FastMap<Inst, Known>,
     /// The frame's closure, defined in the entry block when the region
@@ -375,8 +375,8 @@ pub(crate) fn lower<'gc>(
     })
 }
 
-/// Where the frame's closure is loaded for the upvalue reads (W4 §3): the
-/// nearest block dominating them all, or the entry when that lies in a loop.
+/// Where the frame's closure is loaded for the upvalue reads: the nearest block
+/// dominating them all, or the entry when that lies in a loop.
 fn closure_block(f: &Func<'_>, cfg: &CfgInfo, order: &[Block]) -> Option<Block> {
     let mut at: Option<Block> = None;
     for &b in order {
@@ -480,9 +480,9 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         i.index()
     }
 
-    /// Calls of a constant Lua closure without varargs (D2) or native (I1),
-    /// whose store to the call's slot nothing between reads, and of a Lua
-    /// closure of a prototype a guard proved.
+    /// Calls of a constant Lua closure without varargs or native, whose store
+    /// to the call's slot nothing between reads, and of a Lua closure of a
+    /// prototype a guard proved.
     fn find_known_callees(&mut self, order: &[Block]) {
         for &b in order {
             let Some(t) = self.f.terminator(b) else {
@@ -543,10 +543,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         }
     }
 
-    /// A return of one result passes it in the result register alone (W4
-    /// §4): its store to the result slot goes, when nothing between them
-    /// can exit or read the slot. A caller reads it from the register,
-    /// `level_land` stores it for the interpreter.
+    /// A return of one result passes it in the result register alone: its store
+    /// to the result slot goes, when nothing between them can exit or read the
+    /// slot. A caller reads it from the register, `level_land` stores it for
+    /// the interpreter.
     fn find_register_returns(&mut self, order: &[Block]) {
         for &b in order {
             let Some(t) = self.f.terminator(b) else {
@@ -831,7 +831,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
     }
 
     /// Push a call: `ops`, then its snapshot's values as uses in stack slots,
-    /// which the collector traces while the call runs (H11).
+    /// which the collector traces while the call runs.
     pub(crate) fn push_call(&mut self, i: Inst, mk: MInst, mut ops: Vec<Operand>) {
         let snap = self.f.insts[i.idx()].snap;
         let frames = self.snap_frames(self.f.snaps[snap as usize].frame);

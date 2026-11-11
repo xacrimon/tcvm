@@ -272,8 +272,8 @@ impl Lua {
         }
     }
 
-    /// Turn inlining (E1) on or off for regions compiled from now on: tests
-    /// of the call protocol keep their calls real whatever the inliner takes.
+    /// Turn inlining on or off for regions compiled from now on: tests of the
+    /// call protocol keep their calls real whatever the inliner takes.
     #[cfg(feature = "tcvm-dev")]
     pub fn set_jit_inline(&mut self, on: bool) {
         cfg_select! {

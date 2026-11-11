@@ -26,7 +26,7 @@ pub(crate) type DepList<'gc> = RefLock<Vec<Dep<'gc>>>;
 pub(crate) type DepSlot<'gc> = Lock<Option<Gc<'gc, DepList<'gc>>>>;
 
 /// A watched holder's group for its shape: its keys, their slots, its
-/// metatable (ws2 §5.1).
+/// metatable.
 #[cfg(jit)]
 pub(crate) const SHAPE_GROUP: u64 = 1 << 63;
 

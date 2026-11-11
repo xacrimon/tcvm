@@ -1,8 +1,7 @@
-//! The method JIT (`jit-design.md`): regions compiled from a prototype's
-//! function entry or a hot loop header, entered and left as dispatch targets.
-//! Compiled under `cfg(jit)` (`build.rs`); otherwise only what the
-//! interpreter keeps for it remains: the feedback kinds it records and the
-//! groups of a watched holder's slots.
+//! The method JIT: regions compiled from a prototype's function entry or a hot
+//! loop header, entered and left as dispatch targets. Compiled under `cfg(jit)`
+//! (`build.rs`); otherwise only what the interpreter keeps for it remains: the
+//! feedback kinds it records and the groups of a watched holder's slots.
 
 #[cfg(jit)]
 pub(crate) mod backend;

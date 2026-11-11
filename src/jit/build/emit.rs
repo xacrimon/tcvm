@@ -1,6 +1,6 @@
-//! Per-opcode emission (`jit-design.md` 7, Appendix D): each instruction's
-//! guards from its quickened form and feedback bits, its operation, and its
-//! result writes. What milestone 1 does not compile is a deopt.
+//! Per-opcode emission: each instruction's guards from its quickened form and
+//! feedback bits, its operation, and its result writes. What the builder does not
+//! compile is a deopt.
 
 use crate::env::MetamethodBits;
 use crate::env::function::Function;
@@ -24,8 +24,8 @@ enum NumKind {
     F64,
     /// A small integer or a float, told apart where the result depends on it.
     Num,
-    /// An integer of either size or a float, for arithmetic only (D2):
-    /// integers in i64, a float converting a big integer as Lua does.
+    /// An integer of either size or a float, for arithmetic only: integers in
+    /// i64, a float converting a big integer as Lua does.
     Wide,
 }
 
@@ -106,7 +106,7 @@ fn arith_wide(b: &Builder<'_, '_>, o: Operand, bits: fb::Bits) -> bool {
 }
 
 /// The operand kinds the quickened form at `pc` stands for, unless compiled
-/// code saw it miss (6.4): `(left, right)`, an immediate's side `None`.
+/// code saw it miss: `(left, right)`, an immediate's side `None`.
 fn form_kinds(b: &Builder<'_, '_>, pc: u32) -> Option<(Option<NumKind>, Option<NumKind>)> {
     let insn = b.code(pc);
     let op = insn.op();
@@ -211,8 +211,8 @@ fn any_f64(b: &mut Builder<'_, '_>, v: Val) -> Val {
 /// branch, `[target]` for a jump.
 pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
     let mut insn = b.code(pc);
-    // An inlined call before it left values up to `top`: a fixed number
-    // makes the instruction's count fixed (W3 §7).
+    // An inlined call before it left values up to `top`: a fixed number makes
+    // the instruction's count fixed.
     b.cur_top = b.top.take();
     if let Some((from, Top::Fixed(n))) = b.cur_top {
         fix_count(&mut insn, from, n);
@@ -332,7 +332,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             b.jump(succs[0]);
         }
         // An inlined callee's closure is a constant, and so its by-value
-        // upvalues, unless it is known by its prototype only (E1).
+        // upvalues, unless it is known by its prototype only.
         GETUPVAL if b.inline.is_some() => {
             let v = match b.inline.as_ref().and_then(|i| i.closure) {
                 Some(c) => b.ins(Op::UpvalValueOf(rb), &[c]),
@@ -613,8 +613,8 @@ fn branch(b: &mut Builder<'_, '_>, cond: Val, jump_when: bool, succs: &[Block]) 
     }
 }
 
-/// Leave for the interpreter's handler of the instruction being emitted,
-/// with what is live stored (R1): what is left of it leaves the frame.
+/// Leave for the interpreter's handler of the instruction being emitted, with
+/// what is live stored: what is left of it leaves the frame.
 fn dispatch(b: &mut Builder<'_, '_>) {
     let pc = b.pc;
     let live = b.cfg.live_in[pc as usize];
@@ -623,13 +623,13 @@ fn dispatch(b: &mut Builder<'_, '_>) {
     b.terminate(Op::Dispatch { pc, word }, &[], &[], None);
 }
 
-/// `TAILCALL` in an inlined body (W3 §5): the call replaces the body's
-/// frame, as the interpreter's does. A builtin's result is the body's; an
-/// inlinable callee is inlined in its place; any other is called as the
-/// body's caller called the body.
+/// `TAILCALL` in an inlined body: the call replaces the body's frame, as the
+/// interpreter's does. A builtin's result is the body's; an inlinable callee is
+/// inlined in its place; any other is called as the body's caller called the
+/// body.
 fn body_tailcall(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     let (a, nb) = (insn.a(), insn.b());
-    // Arguments up to `top` (W3 step 7): inlined, else the body fails.
+    // Arguments up to `top`: inlined, else the body fails.
     if nb == 0 {
         let callee = callee_at(b, pc, a);
         if !super::inline::try_inline(b, pc, insn, callee) {
@@ -671,11 +671,10 @@ fn body_tailcall(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     }
 }
 
-/// `TAILCALL a` with `nargs` arguments: the fast arm of 5.5 for a Lua
-/// closure without varargs whose window fits, from a frame with nothing to
-/// close; any other callee the interpreter's TAILCALL, from the slots. A
-/// known callee (`known_callee`) is entered past its checks (D2), its
-/// window checked there.
+/// `TAILCALL a` with `nargs` arguments: the fast arm of 5.5 for a Lua closure
+/// without varargs whose window fits, from a frame with nothing to close; any
+/// other callee the interpreter's TAILCALL, from the slots. A known callee
+/// (`known_callee`) is entered past its checks, its window checked there.
 fn emit_tailcall(b: &mut Builder<'_, '_>, pc: u32, a: u8, nargs: u8) {
     use crate::vm::frame::flag::{HAS_OPEN, HAS_TBC};
     let f = b.reg(a);
@@ -1218,9 +1217,9 @@ fn emit_bnot(b: &mut Builder<'_, '_>, pc: u32, dst: u8, src: u8) {
     b.set(dst, r);
 }
 
-/// `ARITH_MM`, `_MM_R` and `_MMI` (7.2): the metamethod the table operand's
-/// class has, called. Operands of other kinds, or a class without it, exit
-/// as a type guard would, and the site compiles generically after.
+/// `ARITH_MM`, `_MM_R` and `_MMI`: the metamethod the table operand's class
+/// has, called. Operands of other kinds, or a class without it, exit as a type
+/// guard would, and the site compiles generically after.
 fn emit_arith_mm(b: &mut Builder<'_, '_>, insn: Instruction) {
     let op = insn.op();
     let orig = insn.mm_orig();
@@ -1363,18 +1362,18 @@ fn float_arith(b: &mut Builder<'_, '_>, kind: ArithKind, x: Val, y: Val, r: Oper
     }
 }
 
-/// Call the metamethod `f` with `args` (5.4) and continue in its resume
-/// block with its one result. What is live after the instruction is stored
-/// first, as for a CALL; a window too small for the header exits to the
-/// interpreter, which grows the stack.
+/// Call the metamethod `f` with `args` and continue in its resume block with
+/// its one result. What is live after the instruction is stored first, as for a
+/// CALL; a window too small for the header exits to the interpreter, which
+/// grows the stack.
 pub(super) fn mm_call(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Val {
     let resume = staged_call(b, f, args, 0, 2);
     let first = b.f.insts_of(resume)[0];
     b.f.result(first)
 }
 
-/// `mm_call` of a metamethod whose result goes to `R[A]` of the
-/// instruction (`ret_store_a`): inlined when `f` is a constant (W3 §9).
+/// `mm_call` of a metamethod whose result goes to `R[A]` of the instruction
+/// (`ret_store_a`): inlined when `f` is a constant.
 pub(super) fn mm_call_a(b: &mut Builder<'_, '_>, f: Val, args: &[Val]) -> Val {
     if let Some(v) = super::inline::try_inline_mm(b, f, args) {
         return v;
@@ -1480,9 +1479,9 @@ pub(super) fn calls_mm(b: &Builder<'_, '_>) -> bool {
     b.feedback(b.pc) & fb::MM != 0
 }
 
-/// `R[dst] = #R[src]` (7.2): a string's length inline; a table's by helper
-/// unless its class has `__len` now; anything else, and `__len`, as the
-/// generic helper and metamethod arms do.
+/// `R[dst] = #R[src]`: a string's length inline; a table's by helper unless its
+/// class has `__len` now; anything else, and `__len`, as the generic helper and
+/// metamethod arms do.
 fn emit_len(b: &mut Builder<'_, '_>, dst: u8, src: u8) {
     let v = b.reg(src);
     let v = b.boxed(v);
@@ -1610,7 +1609,7 @@ fn call_br(b: &mut Builder<'_, '_>, c: Val, t: Block, f: Block, succs: &[Block])
     }
 }
 
-/// Emit `arm` into the current block as a cold arm (A5).
+/// Emit `arm` into the current block as a cold arm.
 pub(super) fn cold<'gc, R>(
     b: &mut Builder<'_, 'gc>,
     arm: impl FnOnce(&mut Builder<'_, 'gc>) -> R,
@@ -2145,10 +2144,10 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     }
 }
 
-/// A call whose callee joins two to four constant Lua functions (W3 §11):
-/// a test of each, its body inlined in its arm (else a call of it), a real
-/// call for any other value; the arms join after. Not with results up to
-/// `top`, which the arms would leave differently.
+/// A call whose callee joins two to four constant Lua functions: a test of
+/// each, its body inlined in its arm (else a call of it), a real call for any
+/// other value; the arms join after. Not with results up to `top`, which the
+/// arms would leave differently.
 fn poly_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> bool {
     if insn.c() == 0 || !b.ctx.jit().config.inline() {
         return false;
@@ -2232,11 +2231,10 @@ fn callee_at(b: &mut Builder<'_, '_>, pc: u32, a: u8) -> Val {
     }
 }
 
-/// `callee` as the call at `pc` may take it (`intrinsics::callee_of`),
-/// guarded, and the prototype of a Lua callee without varargs
-/// (`Func::protos`, else `NO_PROTO`), which lowering enters past its checks
-/// (D2). A function guarded by identity becomes a constant: a native is
-/// called through `jit_call_native` (I1).
+/// `callee` as the call at `pc` may take it (`intrinsics::callee_of`), guarded,
+/// and the prototype of a Lua callee without varargs (`Func::protos`, else
+/// `NO_PROTO`), which lowering enters past its checks. A function guarded by
+/// identity becomes a constant: a native is called through `jit_call_native`.
 pub(super) fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> (Val, u32) {
     use intrinsics::Callee;
     fn fixed<'gc>(
@@ -2271,7 +2269,7 @@ pub(super) fn known_callee(b: &mut Builder<'_, '_>, pc: u32, callee: Val) -> (Va
     }
 }
 
-/// The CALL at `pc` as a call of `callee` (5.4).
+/// The CALL at `pc` as a call of `callee`.
 fn call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) {
     let (a, nb, c) = (insn.a(), insn.b(), insn.c());
     let (callee, proto) = known_callee(b, pc, callee);
@@ -2297,11 +2295,11 @@ pub(super) fn real_call(
     proto: u32,
     live: RegSet,
 ) -> (Vec<Val>, Block) {
-    // The arguments in the callee's slots (up to `top`: those before the
-    // ones a call or VARARG landed there), and the captured registers, which
-    // it may read through their cells. A fixed count's first `REG_ARGS` are the
-    // call's operands instead: in registers to a known Lua callee, stored
-    // by the lowering for any other (W4 §2).
+    // The arguments in the callee's slots (up to `top`: those before the ones a
+    // call or VARARG landed there), and the captured registers, which it may
+    // read through their cells. A fixed count's first `REG_ARGS` are the call's
+    // operands instead: in registers to a known Lua callee, stored by the
+    // lowering for any other.
     let mut stored: Vec<usize> = b.cfg.captured.iter().collect();
     let (end, in_regs) = if nb != 0 {
         (

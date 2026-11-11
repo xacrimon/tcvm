@@ -16,11 +16,10 @@ impl<'a> Em<'a> {
     ///
     /// A compiled caller has written the header, set base and `insn` (the
     /// argument count) as `enter` would, and its `call` pushed the return
-    /// address; what `enter` would check of a Lua callee is checked here,
-    /// and a miss goes to the caller's slow path (`abi::direct_miss`).
-    /// Missing arguments are filled in (I3). The native stack and the
-    /// window are checked past both known entries: no caller vouches for
-    /// them.
+    /// address; what `enter` would check of a Lua callee is checked here, and a
+    /// miss goes to the caller's slow path (`abi::direct_miss`). Missing
+    /// arguments are filled in. The native stack and the window are checked
+    /// past both known entries: no caller vouches for them.
     pub(super) fn entries(&mut self, fast: Option<FastEntry>) -> Entries {
         let l = self.l;
         let nreg = l.params;
@@ -40,8 +39,8 @@ impl<'a> Em<'a> {
                 self.a.label_offset(e.known) - self.a.label_offset(entry),
                 known_offset(false, fe.num_params)
             );
-            // The parameters a caller left in slots to their registers, where
-            // a call passing them there enters (W4 §2).
+            // The parameters a caller left in slots to their registers, where a
+            // call passing them there enters.
             param_loads(&mut self.a, nreg);
             let regs = self.a.new_label();
             self.a.bind(regs);
@@ -117,16 +116,16 @@ impl<'a> Em<'a> {
         self.a.jmp_far(addr!(abi::exit_common));
     }
 
-    /// The stubs of the entries: an invalidated region's, the entry
-    /// guards' failure (which needs no register image, 6.4), and the fast
-    /// entry's arity fixup and misses.
+    /// The stubs of the entries: an invalidated region's, the entry guards'
+    /// failure (which needs no register image), and the fast entry's arity
+    /// fixup and misses.
     pub(super) fn entry_stubs(&mut self, e: &Entries, fast: Option<FastEntry>) {
         let l = self.l;
         let nreg = l.params;
         if l.invalidable {
             // An invalidated region's entry, its frame not open yet: on to
-            // `jit_dead_entry` as the entry-fail stub goes on (ws2 §5.4), the
-            // parameters a register call passed stored for the interpreter.
+            // `jit_dead_entry` as the entry-fail stub goes on, the parameters a
+            // register call passed stored for the interpreter.
             let dead = self.a.new_label();
             self.a.bind(dead);
             self.store_args(0, l.params);

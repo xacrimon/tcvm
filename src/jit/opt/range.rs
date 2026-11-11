@@ -1,9 +1,9 @@
-//! Bounds checks against a loop's range (E2): a `FORLOOP_I` counter walks
-//! from its entry value to `last` by an invariant step exactly (`IAddNo`
-//! under `idx != last`), so an array guard `idx < n` (unsigned) with `n`
-//! from outside the loop holds on every iteration when it holds at both
-//! ends, which the preheader checks once. The checks exit `Before` the loop header and
-//! record the access's miss, so the next compile keeps the guard.
+//! Bounds checks against a loop's range: a `FORLOOP_I` counter walks from its entry
+//! value to `last` by an invariant step exactly (`IAddNo` under `idx != last`), so an
+//! array guard `idx < n` (unsigned) with `n` from outside the loop holds on every
+//! iteration when it holds at both ends, which the preheader checks once. The checks
+//! exit `Before` the loop header and record the access's miss, so the next compile
+//! keeps the guard.
 
 use crate::jit::ir::ops::{Cc, ExitTag, Op};
 use crate::jit::ir::types::Rep;

@@ -64,7 +64,7 @@ pub struct Prototype<'gc> {
     #[cfg(jit)]
     pub(crate) jit: crate::dmm::Lock<Option<crate::jit::state::JitStateRef<'gc>>>,
     /// The fast entry of the function region at pc 0 while it is installed,
-    /// else 0: compiled callers branch to it with `blr` (5.4).
+    /// else 0: compiled callers branch to it with `blr`.
     #[cfg(jit)]
     #[collect(require_static)]
     pub(crate) jit_fast: Cell<usize>,
@@ -73,8 +73,8 @@ pub struct Prototype<'gc> {
     /// `PROTO_CLCOUNT`).
     #[collect(require_static)]
     pub(crate) closures: Cell<u8>,
-    /// IR instructions of its last build, a function region's or an
-    /// inlined body's (0 before one): the inliner's size estimate (W3 §12).
+    /// IR instructions of its last build, a function region's or an inlined
+    /// body's (0 before one): the inliner's size estimate.
     #[cfg(jit)]
     #[collect(require_static)]
     pub(crate) ir_size: Cell<u32>,
@@ -151,11 +151,11 @@ impl<'gc> Prototype<'gc> {
 #[derive(Clone, Copy, Default)]
 pub enum InlineCache<'gc> {
     // First, so the hottest hit tests a zero discriminant.
-    /// Tables of `shape` hold the key at `loc`. A store needs its value to
-    /// fit `kind`, a copy of the slot's (which only widens), or to be a
-    /// table of `expect`, the shape the slot tracked when filled (ws2 §6.2).
-    /// Untraced: while the slot tracks it, the slot keeps it alive; after,
-    /// the slot takes every table, so a stale match admits nothing wrong.
+    /// Tables of `shape` hold the key at `loc`. A store needs its value to fit
+    /// `kind`, a copy of the slot's (which only widens), or to be a table of
+    /// `expect`, the shape the slot tracked when filled. Untraced: while the
+    /// slot tracks it, the slot keeps it alive; after, the slot takes every
+    /// table, so a stale match admits nothing wrong.
     Own {
         shape: Shape<'gc>,
         loc: SlotLoc,

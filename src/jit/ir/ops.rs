@@ -114,9 +114,9 @@ pub(crate) enum HelperId {
         proto: u16,
         dst: u8,
     },
-    /// `Ptr -> Val`: `CLOSURE` in the inlined frame at region slot `at`, of
-    /// the operand closure's prototype `proto` (W3 §6). No header marks
-    /// its open upvalues: exits mark the frame they write (`SnapFrame`).
+    /// `Ptr -> Val`: `CLOSURE` in the inlined frame at region slot `at`, of the
+    /// operand closure's prototype `proto`. No header marks its open upvalues:
+    /// exits mark the frame they write (`SnapFrame`).
     ClosureOf {
         proto: u16,
         dst: u8,
@@ -126,7 +126,7 @@ pub(crate) enum HelperId {
     /// captured registers' home slots.
     Close(u8),
     /// `I64 -> Val`: `NEWTABLE` from the template at that address, a constant
-    /// of the frame's prototype (W3 §6), which the region keeps.
+    /// of the frame's prototype, which the region keeps.
     NewTable,
     /// `->`: `SETLIST` of `R[a+1..=a+n]`, in their slots, into the table in
     /// `R[a]` from index `off + 1`.
@@ -166,18 +166,18 @@ pub(crate) enum HelperId {
     /// `(Val, Val) -> Val`: `recv[key]` through `__index` tables, or
     /// `HELPER_FAIL_VAL` (an `__index` function, an error).
     Index,
-    /// `(Val, Val) -> Val`: `t[k]` for a table and a string (W2.5), or
+    /// `(Val, Val) -> Val`: `t[k]` for a table and a string, or
     /// `HELPER_FAIL_VAL` where `__index` may answer.
     GetStr,
     /// `(Val, Val, Val) -> Val`: `t[k] = v` for a table and a string as
     /// `t[k] = v` stores, 0, or `HELPER_FAIL_VAL` where `__newindex` may run.
     SetStr,
-    /// Builtins (12), each `-> Val` with `HELPER_FAIL_VAL` where the builtin
-    /// must run: `type(v)`, `getmetatable(v)`, `setmetatable(t, mt)` on a
-    /// table without one, `rawget(t, k)`, `rawset(t, k, v)`, `rawequal(a,
-    /// b)` (`-> I32`), `rawlen(v)`, `tostring(v)` without `__tostring`,
-    /// `tonumber(v)`, `string.len(s)`, `string.sub(s, i, j)` (`j` nil for
-    /// -1), `string.byte(s, i)`'s first result (`i` nil for 1).
+    /// Builtins, each `-> Val` with `HELPER_FAIL_VAL` where the builtin must
+    /// run: `type(v)`, `getmetatable(v)`, `setmetatable(t, mt)` on a table
+    /// without one, `rawget(t, k)`, `rawset(t, k, v)`, `rawequal(a, b)` (`->
+    /// I32`), `rawlen(v)`, `tostring(v)` without `__tostring`, `tonumber(v)`,
+    /// `string.len(s)`, `string.sub(s, i, j)` (`j` nil for -1), `string.byte(s,
+    /// i)`'s first result (`i` nil for 1).
     Type,
     GetMetatable,
     SetMetatable,
@@ -275,8 +275,8 @@ impl HelperId {
         // or adopts a metatable's class.
         let lookup = Effects::new(ALLOC, Mem::SHAPE | Mem::META, Mem::SHAPE | Mem::META);
         let table_write = Mem::TAB | Mem::ARR | Mem::SHAPE | Mem::META | Mem::GC;
-        // Stores that touch table memory alone: a metamethod fails them
-        // rather than run, and an allocation never collects (W2.7).
+        // Stores that touch table memory alone: a metamethod fails them rather
+        // than run, and an allocation never collects.
         let table_store = Effects::new(ALLOC, table_write, table_write);
         let e = Effects::new;
         let (ctx, imm, args, ret, effects): (_, _, &'static [Rep], _, _) = match self {
@@ -445,8 +445,8 @@ impl HelperId {
     }
 }
 
-/// Why an exit leaves, for counting toward recompilation (`jit-design.md`
-/// 5.6): only widenable kinds count.
+/// Why an exit leaves, for counting toward recompilation: only widenable kinds
+/// count.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum ExitTag {
     /// A type guard; a recompile with the feedback it records widens it.
@@ -459,7 +459,7 @@ pub(crate) enum ExitTag {
     Unsupported,
     /// An operand the interpreter raises on, or its slow path.
     Slow,
-    /// A collector check (5.7): leaves through `Exit::Gc`, then resumes.
+    /// A collector check: leaves through `Exit::Gc`, then resumes.
     Gc,
     /// A table's shape is not the one compiled for.
     Shape,
@@ -471,11 +471,11 @@ pub(crate) enum ExitTag {
     /// `__index`/`__newindex`, where the site's feedback never saw one: the
     /// exit records `ARR_MISS`, and the recompile keeps the slow arm.
     Bounds,
-    /// A helper failed where the site's feedback never saw a metamethod
-    /// run: the exit records one, and the recompile calls it (5.4).
+    /// A helper failed where the site's feedback never saw a metamethod run:
+    /// the exit records one, and the recompile calls it.
     Mm,
-    /// A prologue guard on an entry value (5.2): fails to the entry-fail
-    /// stub, which records the entry's kinds.
+    /// A prologue guard on an entry value: fails to the entry-fail stub, which
+    /// records the entry's kinds.
     Entry,
     /// A `LazyExit`: a dependency broke.
     Lazy,
@@ -528,7 +528,7 @@ impl ExitTag {
     }
 }
 
-// Some operations are lowered already but produced only from milestone 2.
+// Some operations are lowered but not produced by the builder yet.
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Op {
@@ -553,8 +553,8 @@ pub(crate) enum Op {
     /// (`opt::snaps`, the last pass): the allocator loads it from the slot
     /// where it is wanted, and an exit reads it there.
     Home(u8),
-    /// Parameter `k` of a function region, which every entry passes in
-    /// `x_k` (W4 §2): no slot holds it until an exit writes it.
+    /// Parameter `k` of a function region, which every entry passes in `x_k`:
+    /// no slot holds it until an exit writes it.
     Param(u8),
     /// `R[r] = v`, `v` a `Val`.
     Store(u8),
@@ -573,8 +573,8 @@ pub(crate) enum Op {
     /// Whether two `Val`s are the same word.
     SameBits,
 
-    /// The `Val` refined to the set without a test: a guarded value
-    /// rebuilt after a call (9.8), which a guard already tested.
+    /// The `Val` refined to the set without a test: a guarded value rebuilt
+    /// after a call, which a guard already tested.
     Refine(TypeSet),
 
     // --- guards (each has a snapshot) ----------------------------------------
@@ -585,7 +585,7 @@ pub(crate) enum Op {
     /// Exits when the `B1` is true.
     GuardFalse,
     /// Exits when the `Val` is nil and the `B1` true: an array element whose
-    /// table's class may have the metamethod (W2.3); `opt::miss` expands it.
+    /// table's class may have the metamethod; `opt::miss` expands it.
     GuardMiss,
     /// Exits when the two `Val`s are not the same word.
     GuardSame,
@@ -695,17 +695,17 @@ pub(crate) enum Op {
     UpvalValue(u8),
     /// The cell of a shared upvalue of the running closure.
     UpvalCell(u8),
-    /// A by-value upvalue of the Lua closure (a `Ptr`): of an inlined
-    /// callee known by its prototype (E1). A memory read, so that it stays
-    /// behind that guard.
+    /// A by-value upvalue of the Lua closure (a `Ptr`): of an inlined callee
+    /// known by its prototype. A memory read, so that it stays behind that
+    /// guard.
     UpvalValueOf(u8),
-    /// The cell of a shared upvalue of the Lua closure (a `Ptr`): of an
-    /// inlined callee (W3 §6).
+    /// The cell of a shared upvalue of the Lua closure (a `Ptr`): of an inlined
+    /// callee.
     UpvalCellOf(u8),
     /// The region frame's function, from its header.
     FrameFn,
-    /// `top` past region slot `at` and the operand's count (an i32) of
-    /// values, as a call returning them up to `top` leaves it (W3 §7).
+    /// `top` past region slot `at` and the operand's count (an i32) of values,
+    /// as a call returning them up to `top` leaves it.
     SetTop(u8),
     /// The value of an upvalue cell. An open cell is a slot, perhaps one of
     /// this region's: it reads and writes slots too.
@@ -847,28 +847,27 @@ pub(crate) enum Op {
         hdr: u8,
     },
     /// Leave for the interpreter's handler of the instruction at `pc`, the
-    /// frame in its slots (R1): a `TAILCALL` or a `RETURN` that leaves the
-    /// frame, whose interpreter work is all there is left.
+    /// frame in its slots: a `TAILCALL` or a `RETURN` that leaves the frame,
+    /// whose interpreter work is all there is left.
     Dispatch {
         pc: u32,
         word: u64,
     },
-    /// `TAILCALL`'s fast arm (5.5): the Lua closure (a `Ptr`) takes over
-    /// the frame, its `nargs` arguments stored to `R[0..]`; missing
-    /// parameters are nil-filled, header word 0 rewritten, and its first
-    /// instruction dispatched. With `proto` (`Func::protos`, else
-    /// `NO_PROTO`) the closure is known to be one of it, which takes at
-    /// least `nargs` arguments, stored nil past those given.
+    /// `TAILCALL`'s fast arm: the Lua closure (a `Ptr`) takes over the frame,
+    /// its `nargs` arguments stored to `R[0..]`; missing parameters are
+    /// nil-filled, header word 0 rewritten, and its first instruction
+    /// dispatched. With `proto` (`Func::protos`, else `NO_PROTO`) the closure
+    /// is known to be one of it, which takes at least `nargs` arguments, stored
+    /// nil past those given.
     TailEnter {
         nargs: u8,
         proto: u32,
     },
-    /// Call `R[a]` with `nargs` arguments in `R[a+4..]`, `c` the CALL's
-    /// result operand; edge 0 is the resume block. `nargs` is `u8::MAX`
-    /// for arguments up to `top` (stored), their count the operand; else
-    /// the first eight are the operands, the rest stored (W4 §2). `proto`
-    /// is the callee's prototype when a guard proved it (`Func::protos`),
-    /// else `NO_PROTO`.
+    /// Call `R[a]` with `nargs` arguments in `R[a+4..]`, `c` the CALL's result
+    /// operand; edge 0 is the resume block. `nargs` is `u8::MAX` for arguments
+    /// up to `top` (stored), their count the operand; else the first eight are
+    /// the operands, the rest stored. `proto` is the callee's prototype when a
+    /// guard proved it (`Func::protos`), else `NO_PROTO`.
     Call {
         a: u8,
         nargs: u8,
@@ -878,16 +877,15 @@ pub(crate) enum Op {
     },
     /// Leave for the interpreter (with a snapshot).
     Deopt,
-    /// Leave once the region is invalidated (ws2 §5.4): nothing until then,
-    /// its place patched to the exit after. One follows every call and
-    /// table write, where a dependency can break.
+    /// Leave once the region is invalidated: nothing until then, its place
+    /// patched to the exit after. One follows every call and table write, where
+    /// a dependency can break.
     LazyExit,
 }
 
 bitflags::bitflags! {
-    /// Memory classes, each versioned separately by GVN (8.4). `SLOT`, `TAB`
-    /// and `ARR` reads and writes may name a key within the class
-    /// (`Op::mem_key`).
+    /// Memory classes, each versioned separately by GVN. `SLOT`, `TAB` and
+    /// `ARR` reads and writes may name a key within the class (`Op::mem_key`).
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub(crate) struct Mem: u16 {
         const SLOT = 1;

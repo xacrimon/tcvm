@@ -1,9 +1,9 @@
-//! Shape checks on tables known to be in a stable shape (ws2 §6.2). A load
-//! from a slot that tracks its tables' shape is typed `Refine::Shape`, which
-//! inference carries through block parameters whose arguments all have it.
-//! A table stays in a stable shape: the first to leave it invalidates the
-//! region, whose frames leave at their next lazy exit. So the fact holds
-//! wherever no table may have moved since the last lazy exit.
+//! Shape checks on tables known to be in a stable shape. A load from a slot
+//! that tracks its tables' shape is typed `Refine::Shape`, which inference
+//! carries through block parameters whose arguments all have it. A table stays
+//! in a stable shape: the first to leave it invalidates the region, whose
+//! frames leave at their next lazy exit. So the fact holds wherever no table
+//! may have moved since the last lazy exit.
 
 use crate::jit::deps::SHAPE_GROUP;
 use crate::jit::ir::ops::{Mem, Op};

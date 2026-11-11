@@ -138,7 +138,7 @@ impl<'gc> Table<'gc> {
     ) {
         debug_assert!(state.has_room(loc) && to.slot_count() == state.shape.slot_count() + 1);
         // No cache entry or compiled store moves a watched holder, and each
-        // repeats a move a slow path made from the shape (ws2 §6.2).
+        // repeats a move a slow path made from the shape.
         debug_assert!(!state.shape.is_watched() && !state.shape.is_stable());
         unsafe { *self.slot_ptr(state, loc) = v };
         state.shape = to;
@@ -376,7 +376,7 @@ impl<'gc> Table<'gc> {
             return None;
         }
         // `set_metatable` records no move from a watched holder's shape, and
-        // made the move it records (ws2 §6.2).
+        // made the move it records.
         debug_assert!(!from.is_watched() && (Shape::ptr_eq(from, to) || !from.is_stable()));
         match to.mt_home() {
             MtHome::Class if class.owned_by(mt) && !class.is_shared() => {
@@ -638,8 +638,8 @@ impl SlotLoc {
         }
     }
 
-    /// Debug builds: `v`, read from here in a table of `shape`, fits the
-    /// slot's kind (ws2 §6.1).
+    /// Debug builds: `v`, read from here in a table of `shape`, fits the slot's
+    /// kind.
     #[inline(always)]
     pub(crate) fn check_kind<'gc>(self, shape: Shape<'gc>, v: Value<'gc>) {
         if cfg!(debug_assertions) {
@@ -833,9 +833,9 @@ impl<'gc> TableState<'gc> {
         }
     }
 
-    /// Move to `to`. A watched holder's moves invalidate what code assumed
-    /// of its old shape, and it stays watched in a shape of its own, unless
-    /// it went dict (ws2 §5.2).
+    /// Move to `to`. A watched holder's moves invalidate what code assumed of
+    /// its old shape, and it stays watched in a shape of its own, unless it
+    /// went dict.
     #[inline(always)]
     fn set_shape(&mut self, mc: &Mutation<'gc>, to: Shape<'gc>) {
         let from = self.shape;
@@ -866,9 +866,9 @@ impl<'gc> TableState<'gc> {
         self.shape = to.watched_copy(mc, from.mutable_for(to), volatile);
     }
 
-    /// Watch this table, which became a class's `__index` (ws2 §5.2): it
-    /// moves to a shape of its own, which no cache entry or compiled code
-    /// has seen. A dict table is not watched.
+    /// Watch this table, which became a class's `__index`: it moves to a shape
+    /// of its own, which no cache entry or compiled code has seen. A dict table
+    /// is not watched.
     fn watch(&mut self, mc: &Mutation<'gc>) {
         let s = self.shape;
         if !s.is_dict() && !s.is_watched() {

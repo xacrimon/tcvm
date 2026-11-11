@@ -1,6 +1,6 @@
-//! Allocated `MInst`s to machine code (10.5, 10.6): the native frame, the
-//! allocator's moves, every instruction's sequence, the exit stubs and the
-//! region's exit trampoline in the cold section.
+//! Allocated `MInst`s to machine code: the native frame, the allocator's moves,
+//! every instruction's sequence, the exit stubs and the region's exit
+//! trampoline in the cold section.
 
 use crate::jit::backend::emit::{
     Emitted, FastEntry, Links, Origin, SiteOut, exit_out, rotate_loops, thread_jumps,
@@ -85,7 +85,7 @@ struct Em<'a> {
     region_word: Label,
     sites: Vec<SiteOut<Label>>,
     /// This region's prototype and its known entries, when it has them:
-    /// arguments in slots, and in registers (W4 §2).
+    /// arguments in slots, and in registers.
     own_entry: Option<(u64, Label, Label)>,
     /// The direct branches to known entries, by the callee's prototype.
     direct: Vec<(Label, u64, Option<Label>)>,
@@ -130,9 +130,9 @@ fn arity_check(a: &mut Asm, nparams: u8, fixup: Label) {
     a.jcc(Cond::B, fixup);
 }
 
-/// A fast entry's known entry, from it, for a caller that proved the
-/// arity (D2): past the arity check, and for a call passing the parameters
-/// in registers (W4 §2) past their loads from the slots.
+/// A fast entry's known entry, from it, for a caller that proved the arity:
+/// past the arity check, and for a call passing the parameters in registers
+/// past their loads from the slots.
 pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
     let mut a = Asm::new();
     let l = a.new_label();
@@ -146,9 +146,9 @@ pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
 /// The registers a C call may change that compiled code keeps values in.
 const SAVED: [Gpr; 7] = [RAX, RCX, RDX, RSI, RDI, R8, R9];
 
-/// A trampoline (A5): a C call of `target` that keeps every allocatable
-/// register but the result's and the caller's argument registers, behind a
-/// frame record that keeps the frame chain walkable; and its frame's size.
+/// A trampoline: a C call of `target` that keeps every allocatable register but
+/// the result's and the caller's argument registers, behind a frame record that
+/// keeps the frame chain walkable; and its frame's size.
 pub(crate) fn trampoline(target: usize, kind: Tramp) -> (Asm, u32) {
     let ints: Vec<Gpr> = (SAVED.iter().copied())
         .filter(|&r| match kind {

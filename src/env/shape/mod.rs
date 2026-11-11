@@ -476,9 +476,8 @@ pub struct ShapeData<'gc> {
     /// by its children (see [`Watch`]).
     #[collect(require_static)]
     watch: Watch,
-    /// The regions assuming tables in this shape stay in it (ws2 §6.2),
-    /// a watched holder its slots' values (§5.2), by `deps::SHAPE_GROUP` and
-    /// `deps::slot_group`.
+    /// The regions assuming tables in this shape stay in it, a watched holder
+    /// its slots' values, by `deps::SHAPE_GROUP` and `deps::slot_group`.
     #[cfg(jit)]
     deps: DepSlot<'gc>,
     /// A table left this shape: one seen in it may be elsewhere now.
@@ -486,11 +485,11 @@ pub struct ShapeData<'gc> {
     unstable: Cell<bool>,
 }
 
-/// A watched holder's shape (ws2 §5.2): only the one table, a class's
-/// `__index`, is ever in it, since it is a fresh copy or a child of one, so
-/// compiled code may assume the table's keys and slot values from it. Its
-/// stores are never cached while they could change what was assumed, and
-/// every move to another shape invalidates (`TableState::set_shape`).
+/// A watched holder's shape: only the one table, a class's `__index`, is ever
+/// in it, since it is a fresh copy or a child of one, so compiled code may
+/// assume the table's keys and slot values from it. Its stores are never cached
+/// while they could change what was assumed, and every move to another shape
+/// invalidates (`TableState::set_shape`).
 #[derive(Default)]
 pub(crate) struct Watch {
     on: bool,
@@ -588,7 +587,7 @@ pub struct MtCacheData<'gc> {
     /// share a shape.
     pub dict_sentinel: Lock<Option<Shape<'gc>>>,
     pub dict_sentinel_poly: Lock<Option<Shape<'gc>>>,
-    /// The regions assuming the bits stay (ws2 §5.3), by the bits.
+    /// The regions assuming the bits stay, by the bits.
     #[cfg(jit)]
     deps: DepSlot<'gc>,
     #[cfg(jit)]
@@ -914,8 +913,7 @@ impl<'gc> MtCache<'gc> {
         }
     }
 
-    /// Note that `region` assumes `bits` of this class stay as they are
-    /// (ws2 §5.5).
+    /// Note that `region` assumes `bits` of this class stay as they are.
     #[cfg(jit)]
     pub(crate) fn depend(
         self,
@@ -1498,8 +1496,8 @@ impl<'gc> Shape<'gc> {
     }
 
     /// Whether no table has left this shape, so a table seen in it is still
-    /// there (V8's stable maps; ws2 §6.2). Every move off a shape goes
-    /// through `TableState::set_shape`, or repeats one that did from it.
+    /// there (V8's stable maps). Every move off a shape goes through
+    /// `TableState::set_shape`, or repeats one that did from it.
     #[inline(always)]
     pub fn is_stable(self) -> bool {
         !self.data().unstable.get()

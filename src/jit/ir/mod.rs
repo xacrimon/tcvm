@@ -1,7 +1,7 @@
 //! The region IR: a CFG of blocks with parameters, instructions in SSA form,
-//! snapshots in a side table, and a constant pool of the heap values the
-//! code embeds. Every list (a block's instructions and parameters, operands,
-//! edge arguments, snapshot entries) is a run of a flat pool (8.1).
+//! snapshots in a side table, and a constant pool of the heap values the code
+//! embeds. Every list (a block's instructions and parameters, operands, edge
+//! arguments, snapshot entries) is a run of a flat pool.
 
 pub(crate) mod ops;
 #[cfg(feature = "tcvm-dev")]
@@ -150,12 +150,12 @@ pub(crate) struct BlockData {
     pub(crate) resume: bool,
     /// Deleted by a pass; skipped by everything.
     pub(crate) dead: bool,
-    /// A loop header the region enters after a whole iteration of the loop
-    /// (an entry at its header, 8.7), so peeling it again buys nothing.
+    /// A loop header the region enters after a whole iteration of the loop (an
+    /// entry at its header), so peeling it again buys nothing.
     pub(crate) peeled: bool,
-    /// An arm for what the site's feedback says is rare (a helper's slow
-    /// case, a metamethod): laid out last, its helpers called through
-    /// trampolines that keep the registers (A5).
+    /// An arm for what the site's feedback says is rare (a helper's slow case,
+    /// a metamethod): laid out last, its helpers called through trampolines
+    /// that keep the registers.
     pub(crate) cold: bool,
 }
 
@@ -198,16 +198,16 @@ pub(crate) struct ExitSite {
 pub(crate) const BLAME_TESTED: u8 = u8::MAX;
 pub(crate) const BLAME_TABLE: u8 = u8::MAX - 1;
 
-/// The register of a call snapshot's entry for a value no register holds,
-/// which the call keeps in the frame (C1): past every region slot (the
-/// window ends by 255), so exits skip it.
+/// The register of a call snapshot's entry for a value no register holds, which
+/// the call keeps in the frame: past every region slot (the window ends by
+/// 255), so exits skip it.
 pub(crate) const KEPT: u8 = u8::MAX;
 
-/// An inlined call's frame (E1): the callee (a pool index, or
-/// `region::DYNAMIC` with a `Func::protos` index), the `CALL`'s `a` and `c`
-/// and pc in the enclosing frame, which is `parent` or the region's. Its
-/// base is `a + 4` past the enclosing frame's; `code` is its prototype's,
-/// which a call in its body returns into.
+/// An inlined call's frame: the callee (a pool index, or `region::DYNAMIC` with
+/// a `Func::protos` index), the `CALL`'s `a` and `c` and pc in the enclosing
+/// frame, which is `parent` or the region's. Its base is `a + 4` past the
+/// enclosing frame's; `code` is its prototype's, which a call in its body
+/// returns into.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InlineFrame {
     pub(crate) parent: u32,
@@ -218,8 +218,8 @@ pub(crate) struct InlineFrame {
     pub(crate) code: usize,
     /// The callee captures locals (`SnapFrame::open`).
     pub(crate) open: bool,
-    /// It replaces the region's own frame, which tail-called it (W3 §5):
-    /// at the same base, base delta 0 in its snapshot frame.
+    /// It replaces the region's own frame, which tail-called it: at the same
+    /// base, base delta 0 in its snapshot frame.
     pub(crate) replaces: bool,
 }
 
@@ -228,9 +228,8 @@ pub(crate) struct InlineFrame {
 pub(crate) struct RegionMeta {
     pub(crate) entry_pc: u32,
     pub(crate) loop_entry: bool,
-    /// The parameters every entry passes in registers (`Op::Param`): a
-    /// function region's first eight, none for a loop entry or a vararg
-    /// function (W4 §2).
+    /// The parameters every entry passes in registers (`Op::Param`): a function
+    /// region's first eight, none for a loop entry or a vararg function.
     pub(crate) params: u8,
 }
 
@@ -300,18 +299,18 @@ pub(crate) struct Func<'gc> {
     /// Instructions of inlined bodies that failed: dead, but still in
     /// `insts`.
     pub(crate) undone: usize,
-    /// The `After` snapshot of a value's definition, where a definition
-    /// guard (9.1) may exit: call results, loads after a call, upvalues.
+    /// The `After` snapshot of a value's definition, where a definition guard
+    /// may exit: call results, loads after a call, upvalues.
     pub(crate) def_snaps: Vec<(Val, Snap)>,
     /// Guards of self-calls' results that only the ways back other than
     /// the fast return run (`opt::selfcall`).
     pub(crate) landings: Vec<Inst>,
-    /// The call-boundary pass ran: what is live across a call is a value
-    /// its snapshot names (C1).
+    /// The call-boundary pass ran: what is live across a call is a value its
+    /// snapshot names.
     pub(crate) boundaries: bool,
     /// By a call's snapshot: the registers below its callee whose home slots
     /// hold what they will be read as after it, which the collector traces
-    /// while the call runs (H11); it clears the frame's other slots there.
+    /// while the call runs; it clears the frame's other slots there.
     pub(crate) call_homes: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
     /// Where the builder started each checkpoint, for `verify::checkpoints`:
     /// its snapshot, the block and the instruction there it follows.
@@ -329,11 +328,11 @@ pub(crate) struct Func<'gc> {
     /// The prototypes guards prove callees closures of, which the region
     /// keeps alive.
     pub(crate) protos: Vec<Gc<'gc, Prototype<'gc>>>,
-    /// What the code assumes of runtime objects, and which groups of facts
-    /// (ws2 §5.3); without any, the lazy exits go.
+    /// What the code assumes of runtime objects, and which groups of facts;
+    /// without any, the lazy exits go.
     pub(crate) deps: Vec<(DepOn<'gc>, u64)>,
-    /// Shapes (by `shapes` index) whose stability a shape fact the builder
-    /// used rests on, depended on when the build ends (ws2 §6.2).
+    /// Shapes (by `shapes` index) whose stability a shape fact the builder used
+    /// rests on, depended on when the build ends.
     pub(crate) stable_used: RefCell<Vec<u32>>,
     cfg: RefCell<Option<Rc<CfgInfo>>>,
 }

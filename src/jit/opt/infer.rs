@@ -1,6 +1,6 @@
-//! Type inference (9.2) and block-parameter narrowing (9.6): optimistic
-//! forward dataflow over the SSA graph, then parameters whose incoming values
-//! are all one numeric kind take that kind's unboxed representation.
+//! Type inference and block-parameter narrowing: optimistic forward dataflow
+//! over the SSA graph, then parameters whose incoming values are all one
+//! numeric kind take that kind's unboxed representation.
 
 use crate::jit::ir::ops::{ExitTag, Op};
 use crate::jit::ir::types::{Rep, Ty, TypeSet};

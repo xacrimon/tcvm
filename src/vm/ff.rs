@@ -12,8 +12,8 @@ use crate::vm::frame::{self, HDR, copy_values, fill_nil};
 use crate::vm::native::native_call;
 
 /// OR `bits` into the feedback of the call `call` being made from the frame at `base`: the
-/// argument kinds of a builtin whose result type follows them (D1 (a)), which the JIT's arms
-/// for it come from.
+/// argument kinds of a builtin whose result type follows them, which the JIT's arms for it come
+/// from.
 #[inline(always)]
 fn record(base: *mut Value<'_>, call: Instruction, bits: Bits) {
     // SAFETY: the caller's frame is a Lua frame, `call` one of its calls.
