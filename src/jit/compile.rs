@@ -611,7 +611,7 @@ pub(crate) fn compile<'gc>(
                 (at, tag)
             })
             .collect();
-        target::code::disassemble(start as usize, &code, &tags);
+        crate::jit::backend::code::disassemble(start as usize, &code, &tags);
     }
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Emit);
