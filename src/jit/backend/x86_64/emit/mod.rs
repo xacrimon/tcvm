@@ -75,14 +75,20 @@ struct Em<'a> {
     exit_region: Label,
     entry_fail: Label,
     links: Links,
-    /// The `TCVM_JIT_DEOPT_ALL` flags of the exits, by address.
-    fired: Option<usize>,
-    /// The exits that mode may take where first reached (`LExit::forced`).
+    /// The exits `TCVM_JIT_DEOPT_ALL` may take where first reached
+    /// (`LExit::forced`).
+    #[cfg(feature = "tcvm-dev")]
     forced: Vec<bool>,
     /// By block, for the resume blocks.
     resume: Vec<ResumeLabels>,
     /// The code's first word, the region pointer (`Region::of_return`).
     region_word: Label,
+    /// For the asm dump: where each hot block starts (its IR block), and
+    /// where the hot ones end (`Emitted::hot`, `cold`).
+    #[cfg(feature = "tcvm-dev")]
+    hot_starts: Vec<(u32, Label)>,
+    #[cfg(feature = "tcvm-dev")]
+    cold: Label,
     sites: Vec<SiteOut<Label>>,
     /// This region's prototype and its known entries, when it has them:
     /// arguments in slots, and in registers.
@@ -204,19 +210,18 @@ pub(crate) fn emit(
     l: &Lowered,
     out: &Output,
     links: Links,
-    fired: Option<usize>,
     fast: Option<FastEntry>,
     trace: bool,
 ) -> Result<Emitted, String> {
     if out.num_spillslots > MAX_SPILLS {
         return Err(format!("{} spill slots", out.num_spillslots));
     }
-    let (mut em, skip) = Em::new(l, out, links, fired, trace);
+    let (mut em, skip) = Em::new(l, out, links, trace);
     em.origin(Origin::Entry as u32);
     em.a.bind(em.region_word);
     em.a.quad(0);
     let entries = em.entries(fast);
-    let (hot, cold) = em.blocks(&skip)?;
+    em.blocks(&skip)?;
     // Each stub anew: an edge's moves inside one set the origin to theirs.
     for f in std::mem::take(&mut em.ool) {
         em.origin(Origin::OutOfLine as u32);
@@ -240,8 +245,11 @@ pub(crate) fn emit(
         direct: (em.direct.iter().map(|&(l, p, s)| (at(l), p, s.map(at)))).collect(),
         lazy: pairs(&em.lazy),
         landings: pairs(&em.landings),
-        hot: hot.iter().map(|&(b, l)| (b, at(l))).collect(),
-        cold: at(cold),
+        #[cfg(feature = "tcvm-dev")]
+        hot: em.hot_starts.iter().map(|&(b, l)| (b, at(l))).collect(),
+        #[cfg(feature = "tcvm-dev")]
+        cold: at(em.cold),
+        #[cfg(feature = "tcvm-dev")]
         origins: em.origins.take().unwrap_or_default(),
         asm: em.a,
     })
@@ -250,13 +258,7 @@ pub(crate) fn emit(
 impl<'a> Em<'a> {
     /// The emitter with its labels made, and the blocks jump threading
     /// leaves out.
-    fn new(
-        l: &'a Lowered,
-        out: &'a Output,
-        links: Links,
-        fired: Option<usize>,
-        trace: bool,
-    ) -> (Em<'a>, Vec<bool>) {
+    fn new(l: &'a Lowered, out: &'a Output, links: Links, trace: bool) -> (Em<'a>, Vec<bool>) {
         let mut a = Asm::new();
         let nb = l.vcode.blocks.len();
         let labels: Vec<Label> = (0..nb).map(|_| a.new_label()).collect();
@@ -291,10 +293,14 @@ impl<'a> Em<'a> {
             exit_region: a.new_label(),
             entry_fail,
             links,
-            fired,
+            #[cfg(feature = "tcvm-dev")]
             forced: l.exits.iter().map(|e| e.forced).collect(),
             resume,
             region_word: a.new_label(),
+            #[cfg(feature = "tcvm-dev")]
+            hot_starts: Vec::new(),
+            #[cfg(feature = "tcvm-dev")]
+            cold: a.new_label(),
             sites: Vec::new(),
             own_entry: None,
             direct: Vec::new(),
@@ -312,9 +318,9 @@ impl<'a> Em<'a> {
     }
 
     /// The blocks but `skip`'s in layout order, hot loops rotated, each with
-    /// the allocator's moves. Returns where each hot block starts (by its
-    /// IR block) and where the hot ones end.
-    fn blocks(&mut self, skip: &[bool]) -> Result<(Vec<(u32, Label)>, Label), String> {
+    /// the allocator's moves; for the asm dump, where each hot block starts
+    /// and where the hot ones end (`hot_starts`, `cold`).
+    fn blocks(&mut self, skip: &[bool]) -> Result<(), String> {
         let l = self.l;
         let mut laid: Vec<usize> = (l.emit_order.iter())
             .map(|&b| b as usize)
@@ -326,16 +332,17 @@ impl<'a> Em<'a> {
         }
         let hot_laid = laid.iter().take_while(|&&b| hot[b]).count();
         let tops = rotate_loops(l, &self.labels, &self.dest, &mut laid, hot_laid);
-        let cold = self.a.new_label();
+        #[cfg(feature = "tcvm-dev")]
         let mut cold_bound = false;
-        let mut hot_starts = Vec::new();
         for (at, &b) in laid.iter().enumerate() {
-            if !cold_bound && !hot[b] {
-                self.a.bind(cold);
-                cold_bound = true;
-            }
+            #[cfg(feature = "tcvm-dev")]
             if !cold_bound {
-                hot_starts.push((l.ir_blocks[b], self.labels[b]));
+                if hot[b] {
+                    self.hot_starts.push((l.ir_blocks[b], self.labels[b]));
+                } else {
+                    self.a.bind(self.cold);
+                    cold_bound = true;
+                }
             }
             let blk = &l.vcode.blocks[b];
             // A rotated loop's top, past the jump into its header: padding
@@ -366,10 +373,11 @@ impl<'a> Em<'a> {
                 }
             }
         }
+        #[cfg(feature = "tcvm-dev")]
         if !cold_bound {
-            self.a.bind(cold);
+            self.a.bind(self.cold);
         }
-        Ok((hot_starts, cold))
+        Ok(())
     }
 }
 

@@ -426,7 +426,8 @@ pub(crate) enum MInst {
 
 impl MInst {
     /// The exit of an instruction that may take one before its effects,
-    /// with the frame its snapshot describes.
+    /// with the frame its snapshot describes (`TCVM_JIT_DEOPT_ALL`).
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) fn exit_id(&self) -> Option<u32> {
         use MInst::*;
         let e = match *self {

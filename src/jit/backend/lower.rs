@@ -47,6 +47,7 @@ pub(crate) struct LExit {
     /// Whether `TCVM_JIT_DEOPT_ALL` may take it where it is first reached:
     /// not a test that a helper that writes failed (and did nothing), as
     /// the exit's frame would do the helper's work again.
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) forced: bool,
 }
 
@@ -123,6 +124,7 @@ pub(crate) struct Lowered {
     /// header first), innermost loops first.
     pub(crate) loops: Vec<(u32, u32)>,
     /// The IR block of each VCode block (the asm dump's names).
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) ir_blocks: Vec<u32>,
     /// The entry guards, all on parameters, as tests the fast entry makes
     /// before the entry block (the parameter and the set), which self-calls
@@ -367,6 +369,7 @@ pub(crate) fn lower<'gc>(
         emit_order,
         hot_blocks,
         loops,
+        #[cfg(feature = "tcvm-dev")]
         ir_blocks: order.iter().map(|b| b.0).collect(),
         prefix_guards: lw.prefix_guards,
         entry_tests: lw.entry_tests,
@@ -724,6 +727,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         let kind = s.kind;
         let tag = d.tag;
         let frames = self.snap_frames(s.frame);
+        #[cfg(feature = "tcvm-dev")]
         let store_failed = d.op == Op::GuardFalse
             && f.def_inst(f.args(i)[0]).is_some_and(|c| {
                 f.op(c) == Op::SameBits
@@ -741,6 +745,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             entries,
             blame,
             inst: None,
+            #[cfg(feature = "tcvm-dev")]
             forced: !store_failed,
         });
         (self.exits.len() as u32 - 1, ops)

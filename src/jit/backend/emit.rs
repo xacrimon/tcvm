@@ -45,13 +45,13 @@ pub(crate) struct Emitted {
     /// Where each hot block starts (its IR block), in layout order, and
     /// where the hot ones end: deopt blocks, cold arms and stubs after (the
     /// asm dump's `blocks` and `cold`).
-    #[cfg_attr(not(feature = "tcvm-dev"), allow(dead_code))]
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) hot: Vec<(u32, u32)>,
-    #[cfg_attr(not(feature = "tcvm-dev"), allow(dead_code))]
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) cold: u32,
     /// With `trace`: where each run of code starts and what it is, a VCode
     /// instruction's index or one of `Origin`'s, in address order.
-    #[cfg_attr(not(feature = "tcvm-dev"), allow(dead_code))]
+    #[cfg(feature = "tcvm-dev")]
     pub(crate) origins: Vec<(u32, u32)>,
 }
 
@@ -156,6 +156,9 @@ pub(crate) struct Links {
     /// Known callees' prototypes (their boxes), their parameter counts and
     /// fast entries now (0 for none; `jit::direct_target`).
     pub(crate) direct: Vec<(u64, u8, usize)>,
+    /// The `TCVM_JIT_DEOPT_ALL` flags of the exits, by address.
+    #[cfg(feature = "tcvm-dev")]
+    pub(crate) fired: Option<usize>,
 }
 
 impl Links {

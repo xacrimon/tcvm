@@ -250,7 +250,8 @@ impl<'a> Em<'a> {
         next: Option<Label>,
     ) -> Result<(), String> {
         let inst = self.v.insts[i].clone();
-        if let Some(fired) = self.fired
+        #[cfg(feature = "tcvm-dev")]
+        if let Some(fired) = self.links.fired
             && let Some(k) = inst.exit_id()
             && self.forced[k as usize]
         {
