@@ -1,5 +1,6 @@
 use crate::Context;
 use crate::builtin::util;
+use crate::builtin::util::posrelat;
 use crate::env::{Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Value};
 
 /// Original-UTF-8 (Lua flavor) max code point: 6-byte sequences up to
@@ -94,17 +95,6 @@ fn encode(cp: u32, out: &mut Vec<u8>) {
     out.push((!mfb << 1) as u8 | x as u8);
     tail.reverse();
     out.extend_from_slice(&tail);
-}
-
-/// Lua's `posrelat` for byte positions.
-fn posrelat(pos: i64, len: usize) -> i64 {
-    if pos >= 0 {
-        pos
-    } else if pos.unsigned_abs() > len as u64 {
-        0
-    } else {
-        len as i64 + pos + 1
-    }
 }
 
 /// `iscontp` at 0-based `idx`; the end of the string is not a continuation byte.

@@ -80,25 +80,6 @@ fn lua_resume<'gc>(
     NativeOut::resume(0, cont::RESUME, OnOk::ReturnTrue)
 }
 
-/// `auxresume`'s ending: `(true, ...)`, or `(false, msg)` for an error or
-/// values with no room for the leading `true`.
-pub(crate) fn resume_cont<'gc>(
-    ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
-    mut stack: Stack<'gc, '_>,
-    status: Result<(), Error<'gc>>,
-) -> NativeOut {
-    match status {
-        Ok(()) if stack.check_stack(1) => stack.insert(0, Value::boolean(true)),
-        Ok(()) => {
-            let m = Value::string(LuaString::new(ctx, b"too many results to resume"));
-            stack.replace(&[Value::boolean(false), m]);
-        }
-        Err(err) => stack.replace(&[Value::boolean(false), err.value()]),
-    }
-    NativeOut::RETURN
-}
-
 /// `None` if `co` can be resumed with `nargs` arguments, else the Lua-spec
 /// error message that `(false, msg)` should carry. Covers main thread, dead,
 /// any non-suspended status (which subsumes `running` and `normal`), and
@@ -308,42 +289,4 @@ fn wrap_callback<'gc>(
     }
     stack.insert(0, Value::thread(co));
     NativeOut::resume(0, cont::WRAP, OnOk::Return)
-}
-
-/// `auxwrap`'s ending: the coroutine's values verbatim; an error rethrown
-/// once the dead coroutine has closed its variables (`lua_closethread`).
-pub(crate) fn wrap_cont<'gc>(
-    ctx: Context<'gc>,
-    closure: &NativeClosure<'gc>,
-    mut stack: Stack<'gc, '_>,
-    status: Result<(), Error<'gc>>,
-) -> NativeOut {
-    let err = match status {
-        Ok(()) if stack.check_stack(1) => return NativeOut::RETURN,
-        Ok(()) => return NativeOut::error(Error::from_str(ctx, "too many results to resume")),
-        Err(err) => err,
-    };
-    let co = closure.upvalues()[0].get_thread().expect("wrap's thread");
-    if co.borrow().tbc_list.is_empty() {
-        // `auxwrap` re-raises a string error with the wrap caller's position
-        // prepended on top of the coroutine's own.
-        return NativeOut::error(err.with_level(1));
-    }
-    close::seed_thread_close(ctx, &mut co.borrow_mut(ctx.mutation()));
-    stack.replace(&[Value::thread(co)]);
-    NativeOut::resume(0, cont::WRAP_CLOSE, OnOk::Cont)
-}
-
-/// [`wrap_cont`] once the coroutine closed its variables: rethrow its
-/// result's error, or an error a `__close` raised.
-pub(crate) fn wrap_close_cont<'gc>(
-    ctx: Context<'gc>,
-    _closure: &NativeClosure<'gc>,
-    stack: Stack<'gc, '_>,
-    status: Result<(), Error<'gc>>,
-) -> NativeOut {
-    match status {
-        Ok(()) => NativeOut::error(Error::new(ctx, stack.get(1)).with_level(1)),
-        Err(err) => NativeOut::error(err.with_level(1)),
-    }
 }

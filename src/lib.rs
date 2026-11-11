@@ -2,6 +2,8 @@
 // Without the checked-cell guards, borrow guards are plain references; the `drop`s that release
 // them in checked builds are still needed there.
 #![cfg_attr(not(any(debug_assertions, test)), allow(clippy::drop_non_drop))]
+// Without a library, the VM's and other libraries' code for it is left unused.
+#![cfg_attr(not(feature = "lib-all"), allow(dead_code, unused_imports))]
 #![feature(fn_align)]
 #![feature(explicit_tail_calls)]
 #![feature(try_trait_v2)]

@@ -2,24 +2,24 @@
 //! a resume, a yield and a coroutine's end switch stacks: the side that
 //! switches away waits inside the switch, and the other copies the values
 //! it hands over to where it waits. Here are those routines, the `resume`,
-//! `wrap` and `yield` fast entries, and the coroutine body's bottom
-//! continuation.
+//! `wrap` and `yield` fast entries, the coroutine body's bottom
+//! continuation, and the continuations that end a `resume` or a `wrap` call.
 //!
 //! Code that switches works on raw `*mut ThreadState`s: the other side
 //! writes both states while it waits, so no reference to one may be live
 //! across a switch.
 
-use crate::env::Thread;
 use crate::env::error::Error;
-#[cfg(jit)]
 use crate::env::function::NativeClosure;
 use crate::env::thread::{ThreadState, ThreadStatus};
 use crate::env::value::Value;
+use crate::env::{LuaString, Stack, Thread};
 use crate::instruction::{Instruction, Op};
 use crate::lua::Context;
 use crate::vm::abi::{Slot, handler, handler_bits};
+use crate::vm::close;
 use crate::vm::frame::{self, HDR, NativeHdr, flag};
-use crate::vm::native::{cont, native_call, native_catch, native_continue, ok};
+use crate::vm::native::{NativeOut, OnOk, cont, native_call, native_catch, native_continue, ok};
 use crate::vm::stack::{Park, park, switch_to};
 
 /// `LUAI_MAXCCALLS`: threads resumed inside one another.
@@ -573,5 +573,62 @@ handler! {
         let vi = ts.slot_index(values);
         ts.top = vi + nret;
         unsafe { end_to(rt, thread_ptr!(), vi) }
+    }
+}
+
+/// `auxresume`'s ending: `(true, ...)`, or `(false, msg)` for an error or
+/// values with no room for the leading `true`.
+pub(crate) fn resume_cont<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    status: Result<(), Error<'gc>>,
+) -> NativeOut {
+    match status {
+        Ok(()) if stack.check_stack(1) => stack.insert(0, Value::boolean(true)),
+        Ok(()) => {
+            let m = Value::string(LuaString::new(ctx, b"too many results to resume"));
+            stack.replace(&[Value::boolean(false), m]);
+        }
+        Err(err) => stack.replace(&[Value::boolean(false), err.value()]),
+    }
+    NativeOut::RETURN
+}
+
+/// `auxwrap`'s ending: the coroutine's values verbatim; an error rethrown
+/// once the dead coroutine has closed its variables (`lua_closethread`).
+pub(crate) fn wrap_cont<'gc>(
+    ctx: Context<'gc>,
+    closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    status: Result<(), Error<'gc>>,
+) -> NativeOut {
+    let err = match status {
+        Ok(()) if stack.check_stack(1) => return NativeOut::RETURN,
+        Ok(()) => return NativeOut::error(Error::from_str(ctx, "too many results to resume")),
+        Err(err) => err,
+    };
+    let co = closure.upvalues()[0].get_thread().expect("wrap's thread");
+    if co.borrow().tbc_list.is_empty() {
+        // `auxwrap` re-raises a string error with the wrap caller's position
+        // prepended on top of the coroutine's own.
+        return NativeOut::error(err.with_level(1));
+    }
+    close::seed_thread_close(ctx, &mut co.borrow_mut(ctx.mutation()));
+    stack.replace(&[Value::thread(co)]);
+    NativeOut::resume(0, cont::WRAP_CLOSE, OnOk::Cont)
+}
+
+/// [`wrap_cont`] once the coroutine closed its variables: rethrow its
+/// result's error, or an error a `__close` raised.
+pub(crate) fn wrap_close_cont<'gc>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    stack: Stack<'gc, '_>,
+    status: Result<(), Error<'gc>>,
+) -> NativeOut {
+    match status {
+        Ok(()) => NativeOut::error(Error::new(ctx, stack.get(1)).with_level(1)),
+        Err(err) => NativeOut::error(err.with_level(1)),
     }
 }

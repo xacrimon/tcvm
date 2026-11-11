@@ -51,7 +51,7 @@ enum Intrinsic {
 fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
     use crate::builtin::basic as base;
     let nc = f.as_native()?;
-    let plain: [(NativeFn, Intrinsic); 13] = [
+    let plain: &[(NativeFn, Intrinsic)] = &[
         (base::lua_type, Intrinsic::Builtin(HelperId::Type)),
         (base::lua_error, Intrinsic::Error),
         (
@@ -64,12 +64,16 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
         (base::lua_rawlen, Intrinsic::Builtin(HelperId::RawLen)),
         (base::lua_tonumber, Intrinsic::Builtin(HelperId::ToNumber)),
         (base::lua_select, Intrinsic::Select),
+        #[cfg(feature = "lib-string")]
         (crate::builtin::string::lua_len, Intrinsic::StrLen),
+        #[cfg(feature = "lib-string")]
         (
             crate::builtin::string::lua_byte,
             Intrinsic::Builtin(HelperId::StrByte),
         ),
+        #[cfg(feature = "lib-math")]
         (crate::builtin::math::lua_min, Intrinsic::MinMax(false)),
+        #[cfg(feature = "lib-math")]
         (crate::builtin::math::lua_max, Intrinsic::MinMax(true)),
     ];
     match nc.function {
@@ -79,9 +83,11 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
             }
         }
         NativeKind::Cont(p) => {
-            let cont: [(ContFn, HelperId); 3] = [
+            let cont: &[(ContFn, HelperId)] = &[
                 (base::lua_tostring, HelperId::ToString),
+                #[cfg(feature = "lib-table")]
                 (crate::builtin::table::lua_insert, HelperId::TInsert),
+                #[cfg(feature = "lib-table")]
                 (crate::builtin::table::lua_remove, HelperId::TRemove),
             ];
             if let Some(&(_, h)) = cont.iter().find(|(f, _)| *f as usize == p as usize) {

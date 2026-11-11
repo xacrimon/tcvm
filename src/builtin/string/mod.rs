@@ -13,7 +13,7 @@ use crate::builtin::util;
 // `%d`/`%f` argument coercion reuses the shared `util` helpers so the
 // integer-representation and numeric-string rules (including `inf`/`nan`
 // rejection) match `tonumber`/`math.*` and don't drift.
-use crate::builtin::util::{to_integer, to_number as to_float};
+use crate::builtin::util::{posrelat, to_integer, to_number as to_float};
 use crate::env::function::NativeKind;
 use crate::env::string::MAX_LEN;
 use crate::env::{
@@ -27,18 +27,6 @@ pub(crate) use meta::one_result;
 mod pack;
 mod pattern;
 use pattern::{CapValue, MatchState, PatError};
-
-/// Lua's `posrelat`: translate a possibly-negative 1-based string position into
-/// an absolute 1-based position (negatives count from the end; 0 stays 0).
-pub(crate) fn posrelat(pos: i64, len: usize) -> i64 {
-    if pos >= 0 {
-        pos
-    } else if pos.unsigned_abs() > len as u64 {
-        0
-    } else {
-        len as i64 + pos + 1
-    }
-}
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[

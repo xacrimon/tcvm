@@ -509,7 +509,7 @@ fn lua_print<'gc>(
     let n = stack.len();
     let has_tostring = |i| !ctx.mm_of(stack.get(i), MetamethodBits::TOSTRING).is_nil();
     if !(0..n).any(has_tostring) {
-        let mut out = crate::builtin::io::stdout();
+        let mut out = crate::builtin::stdout::stdout();
         for i in 0..n {
             if i > 0 {
                 let _ = out.write_all(b"\t");
@@ -526,13 +526,13 @@ fn lua_print<'gc>(
     stack.spawn_action(ctx, move |cx| async move {
         for i in 0..n {
             let bytes = util::tolstring(&cx, i, n).await?;
-            let mut out = crate::builtin::io::stdout();
+            let mut out = crate::builtin::stdout::stdout();
             if i > 0 {
                 let _ = out.write_all(b"\t");
             }
             let _ = out.write_all(&bytes);
         }
-        let _ = crate::builtin::io::stdout().write_all(b"\n");
+        let _ = crate::builtin::stdout::stdout().write_all(b"\n");
         cx.enter(|_, mut stack| stack.replace(&[]));
         Ok(())
     })

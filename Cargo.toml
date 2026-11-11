@@ -31,7 +31,7 @@ lib-all = [
 lib-coroutine = []
 lib-debug = []
 lib-io = []
-lib-math = []
+lib-math = ["dep:rand_pcg", "dep:rand_core", "dep:getrandom"]
 lib-os = []
 lib-package = []
 lib-string = []
@@ -50,9 +50,9 @@ logos = "0.16.1"
 cstree = "0.14.0"
 thiserror = "2.0.18"
 ariadne = "0.6.0"
-rand_pcg = "0.10.2"
-rand_core = "0.10.1"
-getrandom = "0.4.2"
+rand_pcg = { version = "0.10.2", optional = true }
+rand_core = { version = "0.10.1", optional = true }
+getrandom = { version = "0.4.2", optional = true }
 libc = "0.2.186"
 
 [dev-dependencies]
@@ -62,3 +62,9 @@ insta = "1.47.2"
 
 [build-dependencies]
 cfg_aliases = "0.2.2"
+
+# The suite and its snapshots assume every library.
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"
+required-features = ["lib-all"]

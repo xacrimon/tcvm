@@ -6,9 +6,9 @@
 //! padding-before)`. `pack` writes values + zero padding, `unpack` reads them
 //! back (and returns the next byte position), `packsize` only sums sizes.
 
-use super::posrelat;
 use crate::Context;
 use crate::builtin::util;
+use crate::builtin::util::posrelat;
 use crate::env::{Error, LuaString, NativeClosure, Stack, Value};
 
 // Native ABI (fixed, per project decision): LP64 widths, little-endian,

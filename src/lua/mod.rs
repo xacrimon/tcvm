@@ -431,45 +431,74 @@ impl Lua {
     pub fn load(&mut self, lib: Lib) {
         self.enter(|ctx| match lib {
             Lib::Basic => builtin::load_basic(ctx),
+            #[cfg(feature = "lib-coroutine")]
             Lib::Coroutine => builtin::load_coroutine(ctx),
+            #[cfg(feature = "lib-debug")]
             Lib::Debug => builtin::load_debug(ctx),
+            #[cfg(feature = "lib-io")]
             Lib::Io => builtin::load_io(ctx),
+            #[cfg(feature = "lib-math")]
             Lib::Math => builtin::load_math(ctx),
+            #[cfg(feature = "lib-os")]
             Lib::Os => builtin::load_os(ctx),
+            #[cfg(feature = "lib-package")]
             Lib::Package => builtin::load_package(ctx),
+            #[cfg(feature = "lib-string")]
             Lib::String => builtin::load_string(ctx),
+            #[cfg(feature = "lib-table")]
             Lib::Table => builtin::load_table(ctx),
+            #[cfg(feature = "lib-utf8")]
             Lib::Utf8 => builtin::load_utf8(ctx),
         });
     }
 
+    /// Load every library this build has.
     pub fn load_all(&mut self) {
         self.enter(|ctx| {
             builtin::load_basic(ctx);
+            #[cfg(feature = "lib-coroutine")]
             builtin::load_coroutine(ctx);
+            #[cfg(feature = "lib-debug")]
             builtin::load_debug(ctx);
+            #[cfg(feature = "lib-io")]
             builtin::load_io(ctx);
+            #[cfg(feature = "lib-math")]
             builtin::load_math(ctx);
+            #[cfg(feature = "lib-os")]
             builtin::load_os(ctx);
+            #[cfg(feature = "lib-package")]
             builtin::load_package(ctx);
+            #[cfg(feature = "lib-string")]
             builtin::load_string(ctx);
+            #[cfg(feature = "lib-table")]
             builtin::load_table(ctx);
+            #[cfg(feature = "lib-utf8")]
             builtin::load_utf8(ctx);
         });
     }
 }
 
+/// A standard library. Each but `Basic` exists with its `lib-*` feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lib {
     Basic,
+    #[cfg(feature = "lib-coroutine")]
     Coroutine,
+    #[cfg(feature = "lib-debug")]
     Debug,
+    #[cfg(feature = "lib-io")]
     Io,
+    #[cfg(feature = "lib-math")]
     Math,
+    #[cfg(feature = "lib-os")]
     Os,
+    #[cfg(feature = "lib-package")]
     Package,
+    #[cfg(feature = "lib-string")]
     String,
+    #[cfg(feature = "lib-table")]
     Table,
+    #[cfg(feature = "lib-utf8")]
     Utf8,
 }
 
@@ -1612,6 +1641,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lib-math")]
     fn load_single_lib_registers_only_that_lib() {
         let mut lua = Lua::new();
         lua.load(Lib::Math);
@@ -1622,6 +1652,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "lib-string", feature = "lib-table"))]
     fn load_libs_incrementally() {
         let mut lua = Lua::new();
         lua.load(Lib::String);

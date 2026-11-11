@@ -26,6 +26,11 @@ jobs:
       - run: cargo clippy --lib --tests -- -D warnings
         env:
           RUSTFLAGS: --cfg tcvm_generic_group
+      - name: clippy without each library
+        run: |
+          for lib in "" coroutine debug io math os package string table utf8; do
+            cargo clippy -p tcvm --lib --no-default-features --features "jit${lib:+,lib-$lib}" -- -D warnings
+          done
 
   test:
     runs-on: ubuntu-26.04

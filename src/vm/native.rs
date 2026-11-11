@@ -66,52 +66,57 @@ pub(crate) type NativeCont = for<'gc, 'a> fn(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ContIdx(pub(crate) u8);
 
-/// The continuation table and its indices by name. The test
-/// continuations follow the others, so every index holds in every build.
+/// The continuation table and its indices by name. An entry's attributes
+/// (a `cfg`) apply to its index and its table slot alike.
 macro_rules! cont_table {
-    ($($name:ident => $f:path),* $(,)? ; test: $($tname:ident => $tf:path),* $(,)?) => {
-        pub(crate) mod cont {
-            use super::ContIdx;
-            $(pub(crate) const $name: ContIdx = ContIdx(${index()});)*
-            #[cfg(test)]
-            const TEST_BASE: usize = ${count($name)};
-            $(
-                #[cfg(test)]
-                pub(crate) const $tname: ContIdx = ContIdx((TEST_BASE + ${index()}) as u8);
-            )*
+    ($($(#[$m:meta])* $name:ident => $f:path),* $(,)?) => {
+        #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+        #[repr(u8)]
+        enum ContName {
+            $($(#[$m])* $name,)*
         }
-        #[cfg(not(test))]
-        pub(crate) static CONT_TABLE: &[NativeCont] = &[$($f as NativeCont,)*];
-        #[cfg(test)]
-        pub(crate) static CONT_TABLE: &[NativeCont] = &[$($f as NativeCont,)* $($tf as NativeCont,)*];
+        pub(crate) mod cont {
+            use super::{ContIdx, ContName};
+            $($(#[$m])* pub(crate) const $name: ContIdx = ContIdx(ContName::$name as u8);)*
+        }
+        pub(crate) static CONT_TABLE: &[NativeCont] = &[$($(#[$m])* ($f as NativeCont),)*];
     };
 }
 
 cont_table! {
     NONE => no_cont,
     ASYNC => crate::vm::async_native::async_cont,
-    RESUME => crate::builtin::resume_cont,
-    WRAP => crate::builtin::wrap_cont,
-    WRAP_CLOSE => crate::builtin::wrap_close_cont,
+    RESUME => crate::vm::coro::resume_cont,
+    WRAP => crate::vm::coro::wrap_cont,
+    WRAP_CLOSE => crate::vm::coro::wrap_close_cont,
+    #[cfg(feature = "lib-coroutine")]
     CORO_CLOSE => crate::builtin::coroutine_close_cont,
     PCALL => crate::builtin::pcall_cont,
     XPCALL => crate::builtin::xpcall_cont,
     PAIRS => crate::builtin::pairs_cont,
     TOSTRING => crate::builtin::tostring_cont,
     DOFILE => crate::builtin::return_cont,
+    #[cfg(feature = "lib-table")]
     SORT_LEN => crate::builtin::sort_len_cont,
+    #[cfg(feature = "lib-table")]
     SORT => crate::builtin::sort_cont,
+    #[cfg(feature = "lib-string")]
     GSUB => crate::builtin::gsub_cont,
+    #[cfg(feature = "lib-string")]
     ONE_RESULT => crate::builtin::one_result,
     HANDLER => crate::vm::unwind::handler_cont,
     CLOSE => crate::vm::unwind::close_cont,
     CLOSE_ENTRY => crate::vm::close::close_entry_cont,
-    CLOSE_RUNNING => crate::vm::close::close_running_cont;
-    test:
+    CLOSE_RUNNING => crate::vm::close::close_running_cont,
+    #[cfg(test)]
     TEST_RETURNED => crate::vm::tests::protocol::returned,
+    #[cfg(test)]
     TEST_ADD_ONE => crate::vm::tests::protocol::add_one,
+    #[cfg(test)]
     TEST_CL_ADD_ONE => crate::vm::tests::calls_lua::add_one,
+    #[cfg(test)]
     TEST_CL_RETURNED => crate::vm::tests::calls_lua::returned,
+    #[cfg(test)]
     TEST_THROUGH => crate::vm::tests::pcall_through::through_cont,
 }
 

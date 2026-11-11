@@ -617,3 +617,15 @@ pub(crate) fn num_to_value<'gc>(mc: &Mutation<'gc>, f: f64) -> Value<'gc> {
 }
 
 pub(crate) use crate::vm::num::raw_eq;
+
+/// Lua's `posrelat`: translate a possibly-negative 1-based string position into
+/// an absolute 1-based position (negatives count from the end; 0 stays 0).
+pub(crate) fn posrelat(pos: i64, len: usize) -> i64 {
+    if pos >= 0 {
+        pos
+    } else if pos.unsigned_abs() > len as u64 {
+        0
+    } else {
+        len as i64 + pos + 1
+    }
+}
