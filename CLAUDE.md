@@ -34,7 +34,7 @@ Tests: `tests/suite/*.rs` (runtime), `test-files/*.lua` (snapshots), `src/compil
 - `src/dmm`: GC. `Gc<'gc, T>` with invariant lifetimes, `Collect` trait, barriers, non-moving Immix heap (`heap.rs`).
 - `src/jit`: method JIT. Regions start at function entry or a hot loop, run through IR → `opt/` → `backend/` (own register allocator; targets `aarch64/` and `x86_64/`, each exporting what `backend/mod.rs` lists).
 - `src/builtin`: standard library. `src/lua`: embedding API and executor.
-- `tools/`: perf and differential scripts (`gate.sh`, `opcost.py`, `ljr.py`, `corpus/`).
+- `tools/`: perf and differential scripts (`gate.sh`, `opcost.py`, `ljr.py`, `corpus/`, `fuzz/`: the JIT differential fuzzer, start at `fuzz/run.py --help`).
 
 Use rust-analyzer for anything the module docs don't answer; don't rely on this file for details.
 
