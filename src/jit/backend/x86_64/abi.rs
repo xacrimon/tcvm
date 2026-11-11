@@ -329,30 +329,18 @@ pub(crate) unsafe extern "C" fn direct_miss() {
 }
 
 /// A fast callee's entry checks failed: on to its caller's slow path, which
-/// the caller's site table names by the return address on the stack, the
-/// arguments a register call passed kept for it to store. The slow path is
+/// the caller's site table names by the return address on the stack. Every
+/// path here has the arguments in the callee's slots. The slow path is
 /// reached by returning to it, so the return address stack stays in step.
 /// The pinned registers and `insn` are callee-saved.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn call_miss() {
     core::arch::naked_asm!(
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push r8",
-        "push r9",
-        "push rax",
-        "mov rdi, [rsp + 56]",
+        "sub rsp, 8",
+        "mov rdi, [rsp + 8]",
         "call {target}",
-        "mov [rsp + 56], rax",
-        "pop rax",
-        "pop r9",
-        "pop r8",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
+        "mov [rsp + 8], rax",
+        "add rsp, 8",
         "ret",
         target = sym crate::jit::jit_call_miss,
     )

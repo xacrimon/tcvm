@@ -406,25 +406,17 @@ pub(crate) unsafe extern "C" fn direct_miss() {
 
 /// A fast callee's entry checks failed: on to its caller's slow path, which
 /// the caller's site table names by the return address in x30 (tagged or
-/// not), the arguments a register call passed in x0-x7 kept for it to
-/// store (W4 §2). The pinned registers and `insn` are callee-saved.
+/// not). Every path here has the arguments in the callee's slots, and the
+/// pinned registers and `insn` are callee-saved.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn call_miss() {
     core::arch::naked_asm!(
-        "stp x0, x1, [sp, #-80]!",
-        "stp x2, x3, [sp, #16]",
-        "stp x4, x5, [sp, #32]",
-        "stp x6, x7, [sp, #48]",
-        "stp x29, x30, [sp, #64]",
-        "add x29, sp, #64",
+        "stp x29, x30, [sp, #-16]!",
+        "mov x29, sp",
         "and x0, x30, #~1",
         "bl {target}",
         "mov x16, x0",
-        "ldp x29, x30, [sp, #64]",
-        "ldp x6, x7, [sp, #48]",
-        "ldp x4, x5, [sp, #32]",
-        "ldp x2, x3, [sp, #16]",
-        "ldp x0, x1, [sp], #80",
+        "ldp x29, x30, [sp], #16",
         "br x16",
         target = sym crate::jit::jit_call_miss,
     )
