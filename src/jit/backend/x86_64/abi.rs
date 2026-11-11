@@ -289,8 +289,8 @@ pub(crate) unsafe extern "C" fn level_return() {
     )
 }
 
-/// Where a fast entry's failed checks go, and a direct call while its
-/// callee's prototype has no fast entry (`jit::direct_target`). A tail call
+/// Where a fast entry's failed checks go, and a direct tail call while its
+/// callee's prototype has no fast entry (`jit::tail_miss`). A tail call
 /// from a frame dispatch entered has its landing for a return address:
 /// `enter` runs the call from the header the tail call wrote (its closure
 /// there), in the level. Otherwise on to the caller's slow path.
@@ -325,37 +325,6 @@ pub(crate) unsafe extern "C" fn direct_miss() {
         tag = const crate::jit::layout::FUNCTION_TAG,
         call_miss = sym call_miss,
         enter = sym crate::vm::ops::call::enter,
-    )
-}
-
-/// `direct_miss` for a call passing its arguments in registers: the slow
-/// path finds them in the callee's slots (r14 its base, r12 their count). A
-/// tail call's own branch goes to `direct_miss`, its arguments in the slots
-/// already.
-#[unsafe(naked)]
-pub(crate) unsafe extern "C" fn direct_miss_regs() {
-    core::arch::naked_asm!(
-        "test r12, r12",
-        "jz 2f",
-        "mov [r14], rdi",
-        "cmp r12, 1",
-        "jbe 2f",
-        "mov [r14 + 8], rsi",
-        "cmp r12, 2",
-        "jbe 2f",
-        "mov [r14 + 16], rdx",
-        "cmp r12, 3",
-        "jbe 2f",
-        "mov [r14 + 24], rcx",
-        "cmp r12, 4",
-        "jbe 2f",
-        "mov [r14 + 32], r8",
-        "cmp r12, 5",
-        "jbe 2f",
-        "mov [r14 + 40], r9",
-        "2:",
-        "jmp {direct_miss}",
-        direct_miss = sym direct_miss,
     )
 }
 

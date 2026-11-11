@@ -19,10 +19,11 @@
 //!   `stack_pointer`, and the stubs
 //!   between compiled code, the interpreter's handlers and levels
 //!   (`dispatch_entry`, `level_jump`, `level_land`, `level_return_addr`,
-//!   `ret_to_native`, `ret_shim`, `direct_miss`, `direct_miss_regs`).
+//!   `ret_to_native`, `ret_shim`, `direct_miss`).
 //! - `target::code`: branch reach and the encodings code memory patches
-//!   (`REACH`, `RANGE_SIZES`, `reaches`, `BRANCH`, `retarget`, `JUMP`, `jump`,
-//!   `ISLAND`, `island`), `sync_icache`, and `disassemble` for the dumps.
+//!   (`REACH`, `RANGE_SIZES`, `reaches`, `BRANCH`, `retarget`, `call`, `JUMP`,
+//!   `jump`, `ISLAND`, `island`), `sync_icache`, and `disassemble` for the
+//!   dumps.
 //! - `target::unwind`: the DWARF registers and rules of `unwind::Fde`
 //!   (`CODE_ALIGN`, `RETURN_COLUMN`, `entry_rules`, `frame_rules`).
 

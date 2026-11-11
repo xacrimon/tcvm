@@ -743,6 +743,13 @@ impl Asm {
         }
     }
 
+    /// A `jmp rel32` where a `call` is patched in (`code::call`): what
+    /// follows is reached then, so not `after_jump`.
+    pub(crate) fn jmp_patched(&mut self, l: Label) {
+        self.b(0xe9);
+        self.rel32(l);
+    }
+
     pub(crate) fn call(&mut self, l: Label) {
         self.b(0xe8);
         self.rel32(l);

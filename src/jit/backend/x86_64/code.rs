@@ -25,6 +25,13 @@ pub(crate) fn retarget(inst: &mut [u8; BRANCH], at: usize, to: usize) {
     inst[1..].copy_from_slice(&rel.to_le_bytes());
 }
 
+/// A `call` at `at` to `to`, in reach.
+pub(crate) fn call(at: usize, to: usize) -> [u8; BRANCH] {
+    let mut b = [0xe8, 0, 0, 0, 0];
+    retarget(&mut b, at, to);
+    b
+}
+
 /// Bytes a patch point holds (`Asm::patch_point`).
 pub(crate) const JUMP: usize = 5;
 

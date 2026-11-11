@@ -575,28 +575,33 @@ fn install<'gc>(
 fn set_fast<'gc>(ctx: Context<'gc>, proto: &Prototype<'gc>, st: &mut JitState<'gc>, entry: usize) {
     proto.jit_fast.set(entry);
     st.callers
-        .retain(|&(r, off, regs)| match r.upgrade(ctx.mutation()) {
+        .retain(|&(r, off, stub)| match r.upgrade(ctx.mutation()) {
             Some(r) => {
-                let target = direct_target(entry, regs, proto.num_params);
-                r.code.repoint_branch(off as usize, target);
+                let target = direct_target(entry, stub.is_some(), proto.num_params);
+                match (stub, target) {
+                    (Some(_), Some(t)) => r.code.patch_call(off as usize, t),
+                    // Not a call that misses: nothing is pushed for the
+                    // return predictor, and no site lookup runs.
+                    (Some(s), None) => r.code.patch_jump(off as usize, s as usize),
+                    (None, t) => r
+                        .code
+                        .repoint_branch(off as usize, t.unwrap_or(tail_miss())),
+                }
                 true
             }
             None => false,
         });
 }
 
-/// Where a direct call of a prototype of `nparams` parameters whose fast
-/// entry is `fast` branches (the target's `known_offset`), or without one
-/// to a miss (`abi::direct_miss`).
-pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> usize {
-    use crate::jit::backend::target::abi::{direct_miss, direct_miss_regs};
-    if fast == 0 && regs {
-        direct_miss_regs as *const () as usize
-    } else if fast == 0 {
-        direct_miss as *const () as usize
-    } else {
-        fast + crate::jit::backend::target::emit::known_offset(regs, nparams)
-    }
+/// The known entry (the target's `known_offset`) of a prototype of
+/// `nparams` parameters whose fast entry is `fast`, none without one.
+pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> Option<usize> {
+    (fast != 0).then(|| fast + crate::jit::backend::target::emit::known_offset(regs, nparams))
+}
+
+/// Where a direct tail call branches while its callee has no fast entry.
+pub(crate) fn tail_miss() -> usize {
+    crate::jit::backend::target::abi::direct_miss as *const () as usize
 }
 
 /// Where the fast call whose return address is `ra` goes when its callee's

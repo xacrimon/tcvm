@@ -30,6 +30,12 @@ pub(crate) fn retarget(inst: &mut [u8; BRANCH], at: usize, to: usize) {
     *inst = w.to_le_bytes();
 }
 
+/// A `bl` at `at` to `to`, in reach.
+pub(crate) fn call(at: usize, to: usize) -> [u8; BRANCH] {
+    let d = (to as i64 - at as i64) >> 2;
+    (0x9400_0000 | d as u32 & 0x03ff_ffff).to_le_bytes()
+}
+
 /// Bytes a patch point holds (`Asm::patch_point`).
 pub(crate) const JUMP: usize = 4;
 

@@ -87,7 +87,7 @@ struct Em<'a> {
     /// arguments in slots, and in registers (W4 §2).
     own_entry: Option<(u64, Label, Label)>,
     /// The direct branches to known entries, by the callee's prototype.
-    direct: Vec<(Label, u64, bool)>,
+    direct: Vec<(Label, u64, Option<Label>)>,
     lazy: Vec<(Label, Label)>,
     /// Where self-calls whose arguments pass the entry guards enter (the
     /// entry block, past the fast entry's tests), checking the window
@@ -246,7 +246,7 @@ fn emit_with(
         region_word: at(em.region_word),
         exits: l.exits.iter().map(|e| exit_out(l, out, e)).collect(),
         sites: em.sites.into_iter().map(|s| s.placed(at)).collect(),
-        direct: (em.direct.iter().map(|&(l, p, regs)| (at(l), p, regs))).collect(),
+        direct: (em.direct.iter().map(|&(l, p, s)| (at(l), p, s.map(at)))).collect(),
         lazy: pairs(&em.lazy),
         landings: pairs(&em.landings),
         hot: hot.iter().map(|&(b, l)| (b, at(l))).collect(),

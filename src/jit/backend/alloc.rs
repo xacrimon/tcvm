@@ -324,6 +324,14 @@ impl CodeBlock {
         self.patch(off, |b| tcode::retarget(b, at, target));
     }
 
+    /// Overwrite the branch at byte `off` with a call of `target` (or its
+    /// island) and publish it.
+    pub(crate) fn patch_call(&self, off: usize, target: usize) {
+        let at = self.rx() as usize + off;
+        let target = branch_target(at, target).expect("a branch target out of reach");
+        self.patch(off, |b| *b = tcode::call(at, target));
+    }
+
     /// Overwrite the patch point at byte `off` with a jump to byte `to` of
     /// the block and publish it.
     pub(crate) fn patch_jump(&self, off: usize, to: usize) {

@@ -256,6 +256,60 @@ fn back_edges_follow_loop_entries() {
     });
 }
 
+/// A direct call's branch follows its callee's fast entry: a jump to the
+/// call's stub while there is none, the call again once one is back.
+#[test]
+fn direct_calls_follow_the_callees_fast_entry() {
+    let mut lua = Lua::new();
+    lua.set_jit(true);
+    lua.set_jit_inline(false);
+    lua.load_all();
+    let run = |lua: &mut Lua, src: &str| {
+        let ex = lua
+            .try_enter(|ctx| -> Result<_, LoadError> {
+                let chunk = ctx.load(src, Some("=t"))?;
+                Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+            })
+            .expect("load");
+        lua.finish(&ex).expect("run");
+        lua.enter(|ctx| {
+            let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+            v.get_integer()
+        })
+    };
+    fn g<'gc>(ctx: crate::lua::Context<'gc>) -> crate::env::function::LuaFn<'gc> {
+        let g = ctx
+            .globals()
+            .raw_get(Value::string(LuaString::new(ctx, b"g")));
+        g.get_function().and_then(|f| f.as_lua()).unwrap()
+    }
+    let src = "function g(a, b, c) return a + b + (c or 1) end
+        function f(n) local s = 0 for i = 1, n do s = s + g(i, 1) end return s end
+        return f(10000)";
+    assert_eq!(run(&mut lua, src), Some(50_025_000));
+    lua.enter(|ctx| {
+        let lf = g(ctx);
+        let state = lf.proto.jit.get().unwrap();
+        let mut st = state.borrow_mut(ctx.mutation());
+        assert!(st.callers.iter().any(|c| c.2.is_some()), "a direct call");
+        let k = st.entries.iter().position(|e| e.pc == 0).expect("an entry");
+        let e = st.entries.remove(k);
+        super::retire_entry(ctx, lf, &mut st, &e);
+        st.refused.push(0);
+        assert_eq!(lf.proto.jit_fast.get(), 0);
+    });
+    assert_eq!(run(&mut lua, "return f(10000)"), Some(50_025_000));
+    lua.enter(|ctx| {
+        let lf = g(ctx);
+        assert_eq!(lf.proto.jit_fast.get(), 0);
+        let state = lf.proto.jit.get().unwrap();
+        state.borrow_mut(ctx.mutation()).refused.clear();
+    });
+    assert_eq!(run(&mut lua, "return f(10000)"), Some(50_025_000));
+    lua.enter(|ctx| assert_ne!(g(ctx).proto.jit_fast.get(), 0));
+    assert_eq!(run(&mut lua, "return f(10000)"), Some(50_025_000));
+}
+
 /// Running out of code memory turns the JIT off, rather than failing each
 /// later prototype's compile in turn.
 #[test]

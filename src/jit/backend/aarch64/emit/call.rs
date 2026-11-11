@@ -20,8 +20,9 @@ pub(super) enum Target {
     Own(Label),
     /// A known entry of the prototype's fast entry, by a branch that
     /// `jit::set_fast` repoints (`Emitted::direct`): the prototype's box,
-    /// the branch's first target, and whether it is the register entry.
-    Direct(u64, usize, bool),
+    /// the entry now (none without a fast entry), and a call's stub, which
+    /// enters by the register entry; a tail call enters by the slot one.
+    Direct(u64, Option<usize>, Option<Label>),
     /// The fast entry in x17.
     Reg,
 }
@@ -82,6 +83,9 @@ impl<'a> Em<'a> {
         let target = match self.direct_target(proto, nparams, known) {
             // A typed self-call enters past the entry guards (W4 §2).
             Some(_) if window.is_some() => Target::Own(self.typed_entry.unwrap()),
+            Some(Target::Direct(p, t, _)) if known => {
+                Target::Direct(p, t, Some(self.a.new_label()))
+            }
             Some(t) if known => t,
             _ => {
                 self.a.mov_imm(X17, proto);
@@ -126,7 +130,7 @@ impl<'a> Em<'a> {
             // The region cannot outlive itself (I4).
             Some((p, slots, r)) if p == proto => Some(Target::Own(if regs { r } else { slots })),
             _ => (self.links.direct.iter().find(|d| d.0 == proto)).map(|&(p, _, fast)| {
-                Target::Direct(p, crate::jit::direct_target(fast, regs, nparams), regs)
+                Target::Direct(p, crate::jit::direct_target(fast, regs, nparams), None)
             }),
         }
     }
@@ -137,14 +141,16 @@ impl<'a> Em<'a> {
         match (target, link) {
             (Target::Own(l), true) => self.a.bl(l),
             (Target::Own(l), false) => self.a.b(l),
-            (Target::Direct(proto, t, regs), _) => {
+            (Target::Direct(proto, t, stub), _) => {
+                debug_assert_eq!(link, stub.is_some());
                 let at = self.a.new_label();
                 self.a.bind(at);
-                self.direct.push((at, proto, regs));
-                if link {
-                    self.a.bl_far(t);
-                } else {
-                    self.a.b_far(t);
+                self.direct.push((at, proto, stub));
+                match (stub, t) {
+                    (Some(_), Some(t)) => self.a.bl_far(t),
+                    // Without a fast entry to call (`jit::set_fast`).
+                    (Some(s), None) => self.a.b(s),
+                    (None, t) => self.a.b_far(t.unwrap_or(crate::jit::tail_miss())),
                 }
             }
             (Target::Reg, true) => self.a.blr(X17),
@@ -321,19 +327,22 @@ impl<'a> Em<'a> {
         target: Target,
     ) {
         self.a.bind(deep);
-        // A register call misses with its arguments in the callee's slots.
-        let miss = match known {
-            Some(_) => self.a.new_label(),
-            None => self.resume[self.v.succs(block)[0].index()].miss,
+        // A register call misses with its arguments in the callee's slots:
+        // a direct call's stub, where its branch goes too without a fast
+        // entry.
+        let miss = match (known, target) {
+            (_, Target::Direct(_, _, Some(stub))) => stub,
+            (Some(_), _) => self.a.new_label(),
+            (None, _) => self.resume[self.v.succs(block)[0].index()].miss,
         };
         match target {
             Target::Own(l) => self.a.adr(X17, l),
-            Target::Direct(proto, _, regs) => {
+            Target::Direct(proto, _, stub) => {
                 // The fast entry, or the miss path without one.
                 self.a.mov_imm(X17, proto);
                 self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
                 self.a.cbz(Sz::X, X17, miss);
-                let off = known_offset(regs, known.unwrap_or(0));
+                let off = known_offset(stub.is_some(), known.unwrap_or(0));
                 self.a.add_imm(Sz::X, X17, X17, off as u64);
             }
             Target::Reg => {}

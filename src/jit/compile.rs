@@ -794,7 +794,7 @@ pub(crate) fn compile<'gc>(
         crate::dmm::Gc::as_ptr(region) as u64,
     );
     // The callees repoint the direct calls as their fast entries change.
-    for (off, p, regs) in em.direct {
+    for (off, p, stub) in em.direct {
         let proto = *f
             .protos
             .iter()
@@ -805,7 +805,7 @@ pub(crate) fn compile<'gc>(
         state
             .borrow_mut(ctx.mutation())
             .callers
-            .push((weak, off, regs));
+            .push((weak, off, stub));
     }
     for &(on, groups) in &f.deps {
         match on {

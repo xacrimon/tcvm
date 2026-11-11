@@ -32,9 +32,10 @@ pub(crate) struct Emitted {
     /// The calls, for walks of the frame (H7).
     pub(crate) sites: Vec<SiteOut>,
     /// The direct branches to other regions' known entries, by the callee's
-    /// prototype (its box), which `jit::set_fast` repoints: to the register
-    /// entry for a call passing arguments there, else the slot one.
-    pub(crate) direct: Vec<(u32, u64, bool)>,
+    /// prototype (its box), which `jit::set_fast` repoints: a call's to the
+    /// register entry, with the stub it jumps to while there is none (the
+    /// arguments stored, then its miss path); a tail call's to the slot one.
+    pub(crate) direct: Vec<(u32, u64, Option<u32>)>,
     /// What `Region::invalidate` patches: each place and the branch target
     /// written there, the entry's first (ws2 §5.4).
     pub(crate) lazy: Vec<(u32, u32)>,
