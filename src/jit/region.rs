@@ -258,6 +258,7 @@ pub(crate) struct Region<'gc> {
     pub(crate) exits: Box<[ExitInfo]>,
     /// Under `TCVM_JIT_DEOPT_ALL`, whether each exit fired: the code takes one
     /// that has not; empty otherwise.
+    #[cfg(feature = "tcvm-dev")]
     #[collect(require_static)]
     pub(crate) fired: Box<[Cell<u32>]>,
     /// The snapshots, which exits with equal ones share.
@@ -286,10 +287,10 @@ pub(crate) struct Region<'gc> {
     pub(crate) nest: Box<[u32]>,
     #[collect(require_static)]
     pub(crate) num_spills: u32,
-    /// Bytes of the region's native frame: what aarch64's `exit_common`
-    /// pops (x86-64's frame pointer says where the frame ends).
+    /// Bytes of the region's native frame, which `exit_common` pops (x86-64's
+    /// frame pointer says where the frame ends).
+    #[cfg(target_arch = "aarch64")]
     #[collect(require_static)]
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) frame_size: u32,
     #[collect(require_static)]
     pub(crate) retired: Cell<bool>,

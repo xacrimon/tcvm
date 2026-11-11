@@ -537,6 +537,15 @@ pub(crate) fn compile<'gc>(
     for &(helper, kind) in &lowered.trampolines {
         trampolines.push((helper, jit.trampoline(helper, kind)?));
     }
+    // Allocated now, moved into the region after: the code embeds its address.
+    #[cfg(feature = "tcvm-dev")]
+    let fired: Box<[std::cell::Cell<u32>]> = if opts.deopt_all {
+        (0..lowered.exits.len())
+            .map(|_| std::cell::Cell::new(0))
+            .collect()
+    } else {
+        Box::new([])
+    };
     let links = Links {
         rt: crate::jit::layout::rt_word(ctx) as u64,
         metrics: crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64,
@@ -549,16 +558,9 @@ pub(crate) fn compile<'gc>(
             .iter()
             .map(|&p| (p.ptr.as_ptr() as u64, p.num_params, p.jit_fast.get()))
             .collect(),
+        #[cfg(feature = "tcvm-dev")]
+        fired: opts.deopt_all.then_some(fired.as_ptr() as usize),
     };
-    // Allocated now, moved into the region after: the code embeds its address.
-    let fired: Box<[std::cell::Cell<u32>]> = if opts.deopt_all {
-        (0..lowered.exits.len())
-            .map(|_| std::cell::Cell::new(0))
-            .collect()
-    } else {
-        Box::new([])
-    };
-    let fired_at = opts.deopt_all.then_some(fired.as_ptr() as usize);
     let fast = enterable.then_some(FastEntry {
         max_stack: closure.proto.max_stack_size,
         num_params: closure.proto.num_params,
@@ -568,8 +570,8 @@ pub(crate) fn compile<'gc>(
     let trace = config.dev.dump.asm;
     #[cfg(not(feature = "tcvm-dev"))]
     let trace = false;
-    let mut em = target::emit::emit(&lowered, out, links, fired_at, fast, trace)
-        .map_err(CompileError::Backend)?;
+    let mut em =
+        target::emit::emit(&lowered, out, links, fast, trace).map_err(CompileError::Backend)?;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc.reserve(em.asm.max_len())?;
     let start = block.rx();
@@ -766,6 +768,7 @@ pub(crate) fn compile<'gc>(
             pool: f.pool.clone().into_boxed_slice(),
             shapes: f.shapes.clone().into_boxed_slice(),
             exits: exits.into_boxed_slice(),
+            #[cfg(feature = "tcvm-dev")]
             fired,
             snaps: snaps.into_boxed_slice(),
             consts: consts.into_boxed_slice(),
@@ -778,6 +781,7 @@ pub(crate) fn compile<'gc>(
             window: lowered.window.unwrap_or(0),
             nest: nest.into_boxed_slice(),
             num_spills: em.num_spills,
+            #[cfg(target_arch = "aarch64")]
             frame_size: em.frame_size,
             retired: std::cell::Cell::new(false),
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
