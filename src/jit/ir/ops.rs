@@ -528,8 +528,6 @@ impl ExitTag {
     }
 }
 
-// Some operations are lowered but not produced by the builder yet.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Op {
     // --- constants: pure, no operands --------------------------------------
@@ -653,9 +651,6 @@ pub(crate) enum Op {
     LToF,
     /// Exits when outside i32.
     LToI,
-    /// The f64 of an i64 within ±2^53, which converts exactly; exits
-    /// otherwise.
-    LToFExact,
 
     // --- f64 ------------------------------------------------------------------
     FAdd,
@@ -1010,8 +1005,9 @@ impl Op {
             Store(_) => e(Flags::empty(), Mem::empty(), Mem::SLOT),
             Guard(_) | GuardTrue | GuardFalse | GuardMiss | GuardSame | GuardProto(_) | IAdd
             | ISub | IMul | INeg | IShl | IShr | IDivFloor | IModFloor | IRem | LDivFloor
-            | LModFloor | LRem | LToI | LToFExact | FToIExact | FToLExact | ToF64(_) | ToPos(_)
-            | StrByteAt => Effects::flags(DEOPT),
+            | LModFloor | LRem | LToI | FToIExact | FToLExact | ToF64(_) | ToPos(_) | StrByteAt => {
+                Effects::flags(DEOPT)
+            }
             GuardNoFlag(_) => e(DEOPT, Mem::FRAME, Mem::empty()),
             GuardShape(_) | GuardShapeIn(_) => e(DEOPT, Mem::SHAPE, Mem::empty()),
             GcCheck => e(DEOPT, Mem::GC, Mem::empty()),
@@ -1204,8 +1200,8 @@ impl Op {
             IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | INeg | IAnd | IOr | IXor | INot
             | IShl | IShr | IDivFloor | IModFloor | IRem | IAsr | IUMulShr(_) | LToI
             | FToIExact => Ty::I32,
-            IToF | LToF | LToFExact | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor
-            | FCeil | FIDiv | ToF64(_) => Ty::F64,
+            IToF | LToF | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor | FCeil
+            | FIDiv | ToF64(_) => Ty::F64,
             StrLenOf | StrByteAt | ToPos(_) => Ty::I32,
             IToL | FToL | FToLExact | LAdd | LSub | LMul | LUDiv | LNeg | LAnd | LOr | LXor
             | LNot | LShl | LShr | LDivFloor | LModFloor | LRem | LAsr => Ty::I64,

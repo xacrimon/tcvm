@@ -375,7 +375,7 @@ fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
         INeg | INot | IToF | IToL => &[I32],
         LAdd | LSub | LMul | LUDiv | LAnd | LOr | LXor | LShl | LShr | LDivFloor | LModFloor
         | LRem | LAsr | LCmp(_) => &[I64, I64],
-        LNeg | LNot | LToF | LToI | LToFExact => &[I64],
+        LNeg | LNot | LToF | LToI => &[I64],
         StrLt | StrLe => &[Ptr, Ptr],
         StrByteAt => &[Ptr, I32],
         IFCmp(_) => &[I64, F64],

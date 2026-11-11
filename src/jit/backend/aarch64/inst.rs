@@ -202,10 +202,6 @@ pub(crate) enum MInst {
         nonzero: bool,
         exit: u32,
     },
-    /// `[def d (float), use n, snap..]`: the f64 of an i64 within ±2^53.
-    LToFExact {
-        exit: u32,
-    },
     /// `[def d (early), use a, use b, temp x5]`: whether string payload `a`
     /// orders before `b` (`le`: not after) by bytes.
     StrCmp {
@@ -426,7 +422,6 @@ impl MInst {
             | Rem { exit, .. }
             | StrByteAt { exit }
             | ToPos { exit, .. }
-            | LToFExact { exit }
             | ToF64 { exit, .. }
             | Guard { exit, .. }
             | GuardLanding { exit, .. }
