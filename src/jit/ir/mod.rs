@@ -725,7 +725,6 @@ impl<'gc> Func<'gc> {
         inst
     }
 
-    /// `op`'s result type from its operands' (only the first three matter).
     /// The index of the set of `shapes` indices `set`, interned.
     pub(crate) fn intern_shape_set(&mut self, set: &[u32]) -> u32 {
         let mut v = set.to_vec();
@@ -740,6 +739,7 @@ impl<'gc> Func<'gc> {
         }
     }
 
+    /// `op`'s result type from its operands' (only the first three matter).
     pub(crate) fn result_ty(&self, op: Op, args: &[Val]) -> Ty {
         let mut tys = [Ty::ANY; 3];
         let n = args.len().min(3);

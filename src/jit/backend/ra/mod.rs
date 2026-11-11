@@ -708,9 +708,8 @@ impl Ra {
         2 * self.last[b as usize] + 2
     }
 
-    /// The linear order (blocks as numbered: `order.rs` lays out the
-    /// allocator's order), its loops (`VCode::loop_of`), and the static
-    /// frequencies.
+    /// The linear order (`order.rs`'s `emit`, over blocks numbered by its
+    /// `order`), its loops (`VCode::loop_of`), and the static frequencies.
     fn layout<I: TargetInst>(
         &mut self,
         f: &VCode<I>,

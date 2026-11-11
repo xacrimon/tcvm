@@ -911,7 +911,6 @@ handler! {
         next!()
     }
 
-    /// A loop header: count an iteration.
     /// A loop's entry patch site: back edges count, not entries.
     op fn op_loop {
         next!()

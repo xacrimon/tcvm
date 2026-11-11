@@ -8,12 +8,13 @@ use std::fmt;
 pub(crate) enum Rep {
     /// The boxed 64-bit `Value` word.
     Val,
-    /// A small integer, sign-extended in an x register.
+    /// A small integer in a register's low 32 bits; the upper half is
+    /// undefined (an unboxed value shares the boxed value's register).
     I32,
-    /// A full integer in an x register.
+    /// A full integer in a 64-bit register.
     I64,
     F64,
-    /// A boolean in a w register (0 or 1).
+    /// A boolean in a register's low 32 bits (0 or 1).
     B1,
     /// A raw pointer (a table, a shape, a class).
     Ptr,

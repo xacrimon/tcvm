@@ -1,22 +1,24 @@
-//! Block layout. The allocator works in an order where every dominator of a
-//! block precedes it and each loop's blocks are contiguous, which plain reverse
-//! postorder does not give (nothing stops it from placing a block outside a
-//! loop between two of the loop's blocks): each loop collapses to its header,
-//! the collapsed graph is laid out in reverse postorder, and each loop's own
-//! layout is spliced in where its header landed. Its live ranges are intervals
-//! of that order, so every block stays where it falls, cold arms included. The
-//! encoder emits blocks that end in a deopt (at most once per entry) after the
-//! rest, then cold arms, so loop bodies fall through, and rotates hot loops so
-//! the back edge is a branch out of the loop inverted (`emit::rotate_loops`).
-//! Irreducible graphs never get here (`cfg.rs` refuses them).
+//! Block layout. `order` puts every dominator of a block before it and keeps
+//! each loop's blocks contiguous, which plain reverse postorder does not give
+//! (nothing stops it from placing a block outside a loop between two of the
+//! loop's blocks): each loop collapses to its header, the collapsed graph is
+//! laid out in reverse postorder, and each loop's own layout is spliced in
+//! where its header landed. VCode blocks are numbered by `order`.
+//!
+//! `emit` keeps `order` for the hot blocks and moves the blocks that end in a
+//! deopt (run at most once per entry), then the cold arms, after them, so loop
+//! bodies fall through. The allocator and the encoder both take `emit`: live
+//! ranges are intervals of it, and each loop's hot blocks are contiguous in
+//! it. The encoder also rotates hot loops so the back edge is a branch out of
+//! the loop inverted (`emit::rotate_loops`). Irreducible graphs never get here
+//! (`cfg.rs` refuses them).
 
 use crate::jit::ir::ops::Op;
 use crate::jit::ir::{Block, CfgInfo, Func};
 
 pub(crate) struct Layout {
-    /// The allocator's order.
     pub(crate) order: Vec<Block>,
-    /// The encoder's, as indices into `order`.
+    /// The allocator's and the encoder's order, as indices into `order`.
     pub(crate) emit: Vec<u32>,
     /// How many of `emit` come before the first block ending in a deopt or
     /// cold.
