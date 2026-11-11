@@ -735,10 +735,6 @@ impl Select for Lower<'_, '_> {
                 let (ops, clob) = self.divide(res.unwrap(), &args, false);
                 self.push_exit(i, |exit| MInst::Rem { sz, nonzero, exit }, ops, clob);
             }
-            Op::LToFExact => {
-                let ops = vec![self.def(res.unwrap()), self.use_(args[0])];
-                self.push_exit(i, |exit| MInst::LToFExact { exit }, ops, none);
-            }
             Op::StrLt | Op::StrLe => {
                 let d = Operand::reg_def_at_start(self.vr(res.unwrap()));
                 let mut ops = vec![d, self.use_(args[0]), self.use_(args[1])];

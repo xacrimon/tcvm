@@ -521,16 +521,6 @@ impl<'a> Em<'a> {
                     self.a.mov(d, S0);
                 }
             }
-            LToFExact { exit } => {
-                let (d, n) = (self.fr(i, 0), self.r(i, 1));
-                // `n + 2^53` below 2^54, unsigned: -2^53 <= n < 2^53.
-                self.a.mov_imm(S0, 1 << 53);
-                self.a.alu(Arith::Add, Sz::Q, S0, n);
-                self.a.shift_imm(Shift::Shr, Sz::Q, S0, 54);
-                let l = self.exit(exit);
-                self.a.jcc(Cond::Ne, l);
-                self.a.cvt_from_int(Sz::Q, d, n);
-            }
             StrCmp { le } => {
                 use crate::env::string::LuaString;
                 let (d, a, b) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));

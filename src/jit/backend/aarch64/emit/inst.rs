@@ -559,15 +559,6 @@ impl<'a> Em<'a> {
                 self.a.sdiv(sz, X16, n, m);
                 self.a.msub(sz, d, X16, m, n);
             }
-            LToFExact { exit } => {
-                let (d, n) = (self.fr(i, 0), self.r(i, 1));
-                // 10 or more leading bits equal to the sign: |n| <= 2^53.
-                self.a.cls(X16, n);
-                self.a.cmp_imm(Sz::X, X16, 10);
-                let l = self.exit(exit);
-                self.a.b_cond(Cond::Lo, l);
-                self.a.scvtf(Sz::X, d, n);
-            }
             StrCmp { le } => {
                 use crate::env::string::LuaString;
                 let (d, a, b) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));

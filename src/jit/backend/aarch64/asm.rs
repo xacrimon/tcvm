@@ -603,11 +603,6 @@ impl Asm {
         self.madd(sz, d, n, m, ZR);
     }
 
-    /// `cls xd, xn`: the leading bits equal to the sign bit, not counting it.
-    pub(crate) fn cls(&mut self, d: Gpr, n: Gpr) {
-        self.emit(0xDAC0_1400 | r(n) << 5 | r(d));
-    }
-
     /// `smull xd, wn, wm`: the full 64-bit product of two `w` registers.
     pub(crate) fn smull(&mut self, d: Gpr, n: Gpr, m: Gpr) {
         self.emit(0x9B20_7C00 | r(m) << 16 | r(n) << 5 | r(d));
