@@ -271,7 +271,7 @@ pub(crate) struct CodeBlock {
     rx: NonNull<u8>,
     rw: NonNull<u8>,
     len_units: u16,
-    unwind: Option<crate::jit::backend::target::unwind::Fde>,
+    unwind: Option<crate::jit::backend::unwind::Fde>,
 }
 
 impl CodeBlock {
@@ -310,7 +310,7 @@ impl CodeBlock {
     /// Tell the unwinder the block's calls are made with a frame of
     /// `frame` bytes open (`unwind::Fde`).
     pub(crate) fn describe_frame(&mut self, frame: u32) {
-        self.unwind = Some(crate::jit::backend::target::unwind::Fde::register(
+        self.unwind = Some(crate::jit::backend::unwind::Fde::register(
             self.rx() as usize,
             self.len(),
             frame,

@@ -1,154 +1,25 @@
-//! IR to aarch64 `MInst`s (10.3): one VCode block per IR block, compares
-//! fused into the branch, guard, select or set that is their only use,
-//! small immediates folded, refining guards and i32 unboxes aliased to their
-//! operand's register, and snapshot values attached as `Any` uses.
+//! aarch64 instruction selection (`backend::lower`): compares fused into
+//! the branch, guard, select or set that is their only use, small
+//! immediates folded, and each IR instruction's `MInst`s.
 
-use crate::env::value::Value;
+use crate::jit::FastMap;
 use crate::jit::backend::aarch64::abi::{allocatable, caller_saved, preg_float, preg_int};
-use crate::jit::backend::aarch64::asm::{Asm, Cond, Shift, Sz, logical_imm};
-use crate::jit::backend::aarch64::emit::is_single_test;
-use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, Known, MInst, Test};
-use crate::jit::backend::reg::{Block as RBlock, Operand, PRegSet, RegClass, VReg};
-use crate::jit::backend::vcode::{Remat, VCode};
-use crate::jit::ir::ops::{Cc, ExitTag, NO_PROTO, Op};
+use crate::jit::backend::aarch64::asm::{Cond, Shift, Sz, logical_imm};
+use crate::jit::backend::aarch64::inst::{AluOp, ENTRY_FAIL, FOp, FUnOp, MInst, Test};
+use crate::jit::backend::aarch64::types::is_single_test;
+use crate::jit::backend::lower::{Known, Lower, Select, Tramp};
+use crate::jit::backend::reg::{Operand, PRegSet, RegClass, VReg};
+use crate::jit::backend::vcode::Remat;
+use crate::jit::ir::ops::{Cc, ExitTag, HelperId, NO_PROTO, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
-use crate::jit::ir::{Block, ExitKind, Func, Inst, NO_SNAP, Val};
-use crate::jit::region::SRep;
+use crate::jit::ir::{Block, Inst, NO_SNAP, Val};
 
-/// An exit of the region before allocation: its snapshot's entries, those
-/// with a value in a register as operands of the exiting instruction.
-pub(crate) struct LExit {
-    pub(crate) pc: u32,
-    /// The inlined frames the exit rebuilds, outermost first (E1).
-    pub(crate) frames: Vec<crate::jit::region::SnapFrame>,
-    /// The pc whose feedback the exit records, when not `pc` (E2).
-    pub(crate) site: Option<crate::jit::ir::ExitSite>,
-    /// The snapshot's inlined frame, or `NO_FRAME`.
-    pub(crate) frame: u32,
-    pub(crate) kind: ExitKind,
-    pub(crate) tag: ExitTag,
-    /// `(register, rep, source)`.
-    pub(crate) entries: Vec<(u8, SRep, Src)>,
-    /// A moved exit's blame entries, by the blamed instruction's registers.
-    pub(crate) blame: Vec<(u8, SRep, Src)>,
-    /// The VCode instruction that exits, once lowered.
-    pub(crate) inst: Option<usize>,
-    /// Whether `TCVM_JIT_DEOPT_ALL` may take it where it is first reached:
-    /// not a test that a helper that writes failed (and did nothing), as
-    /// the exit's frame would do the helper's work again.
-    pub(crate) forced: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Src {
-    /// The `k`th snapshot operand of the exiting instruction.
-    Operand(u16),
-    /// A raw word.
-    Const(u64),
-    /// At an exit: the frame slot of this register (a home load's).
-    Slot(u8),
-}
-
-/// A call's site (C1): the values its snapshot names, which live in the
-/// frame's spill slots across it, as operands of the call, and the
-/// registers whose home slots hold theirs (`Func::call_homes`).
-pub(crate) struct LSite {
-    /// `(register, rep, source)`.
-    pub(crate) entries: Vec<(u8, SRep, Src)>,
-    pub(crate) homes: crate::jit::build::cfg::RegSet,
-    /// The inlined frames the call is made from, outermost first, which the
-    /// frame walk shows (W3 §4).
-    pub(crate) frames: Vec<crate::jit::region::SnapFrame>,
-}
-
-pub(crate) struct Lowered {
-    pub(crate) vcode: VCode<MInst>,
-    pub(crate) exits: Vec<LExit>,
-    /// The calls' sites, by their resume block's VCode block.
-    pub(crate) sites: Vec<(usize, LSite)>,
-    /// The first operand index of each instruction's snapshot uses.
-    pub(crate) snap_ops: Vec<u32>,
-    /// The registers the entry guards test.
-    pub(crate) entry_regs: Vec<u8>,
-    /// `RegionMeta::params`: an entry guard's failure stores them, as only
-    /// a caller using slots wrote them there.
-    pub(crate) params: u8,
-    /// `Func::shape_sets` as the shapes' addresses.
-    pub(crate) shape_sets: Vec<Vec<u64>>,
-    /// The region has dependencies: its entry is patchable (ws2 §5.4).
-    pub(crate) invalidable: bool,
-    /// The VCode blocks in the order the encoder lays them out.
-    pub(crate) emit_order: Vec<u32>,
-    /// How many of `emit_order` are hot: the rest end in a deopt or are
-    /// cold.
-    pub(crate) hot_blocks: usize,
-    /// Each loop's first and last VCode block (its blocks lie between, the
-    /// header first), innermost loops first.
-    pub(crate) loops: Vec<(u32, u32)>,
-    /// The IR block of each VCode block (the asm dump's names).
-    pub(crate) ir_blocks: Vec<u32>,
-    /// The entry guards, all on parameters, as tests the fast entry makes
-    /// before the entry block (`x0`.. and the set), which self-calls passing
-    /// them enter (W4 §2); none in the block's code.
-    pub(crate) prefix_guards: bool,
-    pub(crate) entry_tests: Vec<(u8, TypeSet)>,
-    /// `Func::window`, when past the frame's own window: every entry makes
-    /// sure of it, once, before the guards (W4).
-    pub(crate) window: Option<u16>,
-}
-
-struct Lower<'a, 'gc> {
-    f: &'a Func<'gc>,
-    v: VCode<MInst>,
-    vreg: Vec<Option<VReg>>,
-    /// Values computed by their single user instead of at their definition.
-    fused: Vec<bool>,
-    /// Values lowering keeps in a d register as their float's word
-    /// (`find_float_words`).
-    in_d: Vec<bool>,
-    uses: Vec<u32>,
-    exits: Vec<LExit>,
-    sites: Vec<(usize, LSite)>,
-    snap_ops: Vec<u32>,
-    entry_regs: Vec<u8>,
-    block_of: Vec<u32>,
-    pc_base: usize,
-    /// Stores a known call writes itself, and its callee (D2); the
-    /// negation of an `abs`.
-    absorbed: Vec<bool>,
+/// The selection's own state.
+#[derive(Default)]
+pub(crate) struct Isel {
     /// Selects that are an `abs` (`x < 0 ? -x : x`): the negation, whose
     /// exit an i32's takes (`find_abs`).
-    abs_of: crate::jit::FastMap<Inst, Inst>,
-    known: crate::jit::FastMap<Inst, Known>,
-    /// The frame's closure, defined in the entry block when the region
-    /// reads its upvalues.
-    closure: Option<VReg>,
-    /// The parameters entries pass in registers, by index (`Params`).
-    params: Vec<VReg>,
-    /// The region's prototype (its box) when a compiled caller can enter
-    /// it, and the set each parameter's entry guard admits.
-    own: Option<u64>,
-    entry_sets: Vec<TypeSet>,
-    prefix_guards: bool,
-    entry_tests: Vec<(u8, TypeSet)>,
-}
-
-fn rep_class(rep: Rep) -> RegClass {
-    if rep == Rep::F64 {
-        RegClass::Float
-    } else {
-        RegClass::Int
-    }
-}
-
-fn srep(rep: Rep) -> SRep {
-    match rep {
-        Rep::Val | Rep::Ptr => SRep::Val,
-        Rep::I32 => SRep::I32,
-        Rep::I64 => SRep::I64,
-        Rep::F64 => SRep::F64,
-        Rep::B1 => SRep::B1,
-    }
+    abs_of: FastMap<Inst, Inst>,
 }
 
 pub(super) fn int_cond(cc: Cc) -> Cond {
@@ -177,240 +48,18 @@ pub(super) fn float_cond(cc: Cc) -> Cond {
     }
 }
 
-/// The address of `Code[pc]` of the prototype being compiled; `frame` its
-/// frame's window, which every entry has.
-pub(crate) fn lower<'gc>(
-    f: &Func<'gc>,
-    code_base: usize,
-    own: Option<u64>,
-    frame: u16,
-) -> Result<Lowered, String> {
-    let cfg = f.cfg();
-    let crate::jit::backend::order::Layout {
-        order,
-        emit: emit_order,
-        hot: hot_blocks,
-        loops,
-        loop_of,
-        loop_parent,
-    } = crate::jit::backend::order::layout(f);
-    let order = &order;
-    let mut block_of = vec![u32::MAX; f.blocks.len()];
-    for (k, b) in order.iter().enumerate() {
-        block_of[b.idx()] = k as u32;
-    }
-    let uses = f.use_counts();
-    let mut lw = Lower {
-        f,
-        v: VCode::new(),
-        vreg: vec![None; f.vals.len()],
-        fused: vec![false; f.vals.len()],
-        in_d: vec![false; f.vals.len()],
-        uses,
-        exits: Vec::new(),
-        sites: Vec::new(),
-        snap_ops: Vec::new(),
-        entry_regs: Vec::new(),
-        block_of,
-        pc_base: code_base,
-        absorbed: vec![false; f.insts.len()],
-        abs_of: Default::default(),
-        known: Default::default(),
-        closure: None,
-        params: Vec::new(),
-        own,
-        entry_sets: vec![TypeSet::ANY; f.meta.params as usize],
-        prefix_guards: false,
-        entry_tests: Vec::new(),
-    };
-    // The entry's parameters and their guards lead its block (speculation
-    // puts them there); in a region a compiled caller enters, the fast
-    // entry tests them before the block, unless an entry guard comes later
-    // or tests something else.
-    let entry_insts = f.insts_of(f.entry);
-    let entry_guard = |i: Inst| {
-        matches!(f.op(i), Op::Guard(_))
-            && f.insts[i.idx()].tag == ExitTag::Entry
-            && matches!(f.def_op(f.args(i)[0]), Some(Op::Param(_)))
-    };
-    let lead = (entry_insts.iter())
-        .position(|&i| !matches!(f.op(i), Op::Param(_)) && !entry_guard(i))
-        .unwrap_or(entry_insts.len());
-    lw.prefix_guards = own.is_some()
-        && !(f.insts.iter().enumerate()).any(|(k, d)| {
-            d.tag == ExitTag::Entry
-                && matches!(d.op, Op::Guard(_))
-                && !entry_insts[..lead].contains(&Inst(k as u32))
-        });
-    for &i in &entry_insts[..lead] {
-        if let Op::Guard(set) = f.op(i)
-            && let Some(Op::Param(r)) = f.def_op(f.args(i)[0])
-        {
-            lw.entry_sets[r as usize] &= set;
-        }
-    }
-    let closure_at = closure_block(f, &cfg, order);
-    lw.find_fusions(order);
-    lw.find_abs(order);
-    lw.find_multiply_adds(order);
-    lw.find_known_callees(order);
-    lw.find_register_returns(order);
-    lw.find_float_words(order);
-    let mut params: Vec<VReg> = Vec::new();
-    let mut succs: Vec<RBlock> = Vec::new();
-    let mut args: Vec<VReg> = Vec::new();
-    let mut nargs: Vec<u32> = Vec::new();
-    for &b in order {
-        let start = lw.v.insts.len() as u32;
-        params.clear();
-        for &p in f.params(b) {
-            params.push(lw.vr(p));
-        }
-        if b == f.entry {
-            lw.push(MInst::Prologue, &[], PRegSet::empty());
-            lw.entry_params();
-        }
-        // A resume block's first instruction is where a fast callee returns.
-        let mut closure_due = closure_at == Some(b);
-        if closure_due && !f.blocks[b.idx()].resume {
-            lw.frame_closure();
-            closure_due = false;
-        }
-        succs.clear();
-        args.clear();
-        nargs.clear();
-        for &i in f.insts_of(b) {
-            lw.lower_inst(i)?;
-            if std::mem::take(&mut closure_due) {
-                lw.frame_closure();
-            }
-            if f.op(i).is_terminator() {
-                // A call's resume block takes its values from the return.
-                let call = matches!(f.op(i), Op::Call { .. } | Op::CallMm { .. });
-                for e in f.edges(i) {
-                    succs.push(RBlock::new(lw.block_of[e.target.idx()] as usize));
-                    let a = if call { &[][..] } else { f.vl(e.args) };
-                    for &x in a {
-                        args.push(lw.vr(x));
-                    }
-                    nargs.push(a.len() as u32);
-                }
-            }
-        }
-        let end = lw.v.insts.len() as u32;
-        let preds = cfg
-            .preds(b)
-            .iter()
-            .map(|p| RBlock::new(lw.block_of[p.idx()] as usize));
-        lw.v.push_block(
-            start,
-            end,
-            &succs,
-            preds,
-            params.iter().copied(),
-            &args,
-            &nargs,
-            f.blocks[b.idx()].resume,
-        );
-    }
-    lw.v.entry = RBlock::new(0);
-    lw.v.loop_of = loop_of;
-    lw.v.loop_parent = loop_parent;
-    Ok(Lowered {
-        vcode: lw.v,
-        exits: lw.exits,
-        sites: lw.sites,
-        snap_ops: lw.snap_ops,
-        entry_regs: lw.entry_regs,
-        params: f.meta.params,
-        shape_sets: f
-            .shape_sets
-            .iter()
-            .map(|set| {
-                set.iter()
-                    .map(|&k| f.shapes[k as usize].as_word())
-                    .collect()
-            })
-            .collect(),
-        invalidable: !f.deps.is_empty(),
-        emit_order,
-        hot_blocks,
-        loops,
-        ir_blocks: order.iter().map(|b| b.0).collect(),
-        prefix_guards: lw.prefix_guards,
-        entry_tests: lw.entry_tests,
-        window: (f.window > frame).then_some(f.window),
-    })
-}
-
-/// Where the frame's closure is loaded for the upvalue reads (W4 §3): the
-/// nearest block dominating them all, or the entry when that lies in a loop.
-fn closure_block(f: &Func<'_>, cfg: &crate::jit::ir::CfgInfo, order: &[Block]) -> Option<Block> {
-    let mut at: Option<Block> = None;
-    for &b in order {
-        let reads = f
-            .insts_of(b)
-            .iter()
-            .any(|&i| matches!(f.op(i), Op::UpvalValue(_) | Op::UpvalCell(_) | Op::FrameFn));
-        if !reads {
-            continue;
-        }
-        let mut a = at.unwrap_or(b);
-        while !cfg.dominates(a, b) {
-            a = cfg.idom[a.idx()].expect("a dominator");
-        }
-        at = Some(a);
-    }
-    let at = at?;
-    let in_loop = order.iter().any(|&p| {
-        f.succs(p)
-            .any(|h| cfg.dominates(h, p) && cfg.dominates(h, at))
-    });
-    Some(if in_loop { f.entry } else { at })
-}
-
-impl<'a, 'gc> Lower<'a, 'gc> {
-    /// `R[r] = v`.
-    fn store_slot(&mut self, r: u8, v: Val) {
-        let u = self.stored(v);
-        self.push(MInst::StoreSlot(r), &[u], PRegSet::empty());
+impl Select for Lower<'_, '_> {
+    /// Compares fused into their users, `abs` selects, and products a
+    /// `madd` or `msub` takes.
+    fn find_patterns(&mut self, order: &[Block]) {
+        self.find_fusions(order);
+        self.find_abs(order);
+        self.find_multiply_adds(order);
     }
 
-    /// A stored value's operand: a float box stores its float's d register,
-    /// whether or not other uses compute the box.
-    fn stored(&mut self, v: Val) -> Operand {
-        let f = self.f;
-        match f.def_inst(v) {
-            Some(i) if f.op(i) == Op::Box && f.ty(f.args(i)[0]).rep == Rep::F64 => {
-                self.use_(f.args(i)[0])
-            }
-            _ => self.use_(v),
-        }
-    }
-
-    /// Every parameter entries pass in registers, used or not: an entry
-    /// guard's failure stores them all for the interpreter.
-    fn entry_params(&mut self) {
-        let f = self.f;
-        if f.meta.params == 0 {
-            return;
-        }
-        let regs: Vec<VReg> = (0..f.meta.params)
-            .map(|_| self.v.new_vreg(RegClass::Int))
-            .collect();
-        for &i in f.insts_of(f.entry) {
-            if let Op::Param(k) = f.op(i) {
-                self.vreg[f.result(i).idx()] = Some(regs[k as usize]);
-            }
-        }
-        self.params = regs;
-        if self.params.is_empty() {
-            return;
-        }
-        let ops: Vec<Operand> = (self.params.iter().enumerate())
-            .map(|(k, &r)| Operand::reg_fixed_def(r, preg_int(k as u8)))
-            .collect();
-        self.push(MInst::Params, &ops, PRegSet::empty());
+    fn entry(&mut self) {
+        self.push(MInst::Prologue, &[], PRegSet::empty());
+        self.entry_params();
     }
 
     fn frame_closure(&mut self) {
@@ -423,781 +72,12 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         self.closure = Some(c);
     }
 
-    /// The vreg of a value, through aliases.
-    fn vr(&mut self, v: Val) -> VReg {
-        let v = self.alias(v);
-        if let Some(r) = self.vreg[v.idx()] {
-            return r;
-        }
-        let r = self.v.new_vreg(self.class(v));
-        self.vreg[v.idx()] = Some(r);
-        r
-    }
-
-    /// The register class of a value `alias` returns.
-    fn class(&self, v: Val) -> RegClass {
-        if self.in_d[v.idx()] {
-            RegClass::Float
-        } else {
-            rep_class(self.f.ty(v).rep)
-        }
-    }
-
-    /// The rep of `v` as its register holds it: `F64` for a word in a d
-    /// register.
-    fn reg_rep(&self, v: Val) -> Rep {
-        match self.class(self.alias(v)) {
-            RegClass::Float => Rep::F64,
-            _ => self.f.ty(v).rep,
-        }
-    }
-
-    /// The value whose register `v` shares: refining guards and i32
-    /// unboxes/narrowings change no bits, nor do f64 boxes and unboxes of a
-    /// word in a d register (`in_d`).
-    fn alias(&self, mut v: Val) -> Val {
-        while let Some(i) = self.f.def_inst(v) {
-            match self.f.op(i) {
-                Op::Guard(_) | Op::Refine(_) => v = self.f.args(i)[0],
-                Op::Unbox(Rep::I32) => v = self.f.args(i)[0],
-                Op::LToI => v = self.f.args(i)[0],
-                Op::Box if self.in_d[v.idx()] => v = self.f.args(i)[0],
-                Op::Unbox(Rep::F64) => {
-                    let x = self.alias(self.f.args(i)[0]);
-                    if self.class(x) != RegClass::Float {
-                        break;
-                    }
-                    v = x;
-                }
-                _ => break,
-            }
-        }
-        v
-    }
-
-    /// The slot of the home load `v` shares a register with.
-    fn home_load(&self, v: Val) -> Option<u8> {
-        match self.f.def_op(self.alias(v)) {
-            Some(Op::Home(r)) => Some(r),
-            _ => None,
-        }
-    }
-
-    /// A constant: defined where the IR puts it, computed again by the
-    /// allocator wherever that is cheaper than keeping it.
-    fn constant(&mut self, r: Val, k: Remat) {
-        let d = self.def(r);
-        self.v.remat[d.vreg().vreg()] = k;
-        let inst = match k {
-            Remat::Int(v) => MInst::MovImm(v),
-            Remat::Float(b) => MInst::FImm(b),
-            Remat::Slot(r) => MInst::LoadSlot(r),
-            Remat::None | Remat::AndImm { .. } => unreachable!(),
-        };
-        self.push(inst, &[d], PRegSet::empty());
-    }
-
-    fn push(&mut self, inst: MInst, ops: &[Operand], clob: PRegSet) -> usize {
-        let i = self.v.push(inst, ops, clob);
-        self.snap_ops.push(ops.len() as u32);
-        i.index()
-    }
-
-    /// Calls of a constant Lua closure without varargs (D2) or native (I1),
-    /// whose store to the call's slot nothing between reads, and of a Lua
-    /// closure of a prototype a guard proved.
-    fn find_known_callees(&mut self, order: &[Block]) {
-        use crate::jit::ir::ops::Mem;
-        for &b in order {
-            let Some(t) = self.f.terminator(b) else {
-                continue;
-            };
-            let Op::Call { a, proto, .. } = self.f.op(t) else {
-                continue;
-            };
-            if proto != NO_PROTO {
-                let p = self.f.protos[proto as usize];
-                self.known.insert(
-                    t,
-                    Known::Lua {
-                        closure: None,
-                        proto: p.ptr.as_ptr() as u64,
-                        nparams: p.num_params,
-                    },
-                );
-            }
-            for &j in self.f.insts_of(b).iter().rev().skip(1) {
-                let op = self.f.op(j);
-                match op {
-                    Op::Store(r) if r == a => {
-                        let Some(Op::KObj(p)) = self.f.def_op(self.f.args(j)[0]) else {
-                            break;
-                        };
-                        use crate::env::function::FunctionKind;
-                        let v = self.f.pool[p as usize];
-                        let known = match v.get_function().map(|f| f.inner().as_ref()) {
-                            // The prototype word the fast path loads.
-                            Some(FunctionKind::Lua(c)) if !c.is_vararg => Some(Known::Lua {
-                                closure: Some(v.to_raw()),
-                                proto: c.proto.ptr.as_ptr() as u64,
-                                nparams: c.num_params,
-                            }),
-                            Some(FunctionKind::Native(nc)) => {
-                                Some(Known::Native(nc as *const _ as u64))
-                            }
-                            _ => None,
-                        };
-                        if let Some(k) = known {
-                            // The constant is then made for nothing else.
-                            self.absorbed[j.idx()] = true;
-                            self.uses[self.f.args(j)[0].idx()] -= 1;
-                            self.known.insert(t, k);
-                        }
-                        break;
-                    }
-                    Op::Store(_) => {}
-                    op if op.effects().reads.intersects(Mem::SLOT)
-                        || op.effects().writes.intersects(Mem::SLOT) =>
-                    {
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    /// Products a sum or difference in their block alone uses, which then
-    /// computes them with `madd` or `msub`.
-    fn find_multiply_adds(&mut self, order: &[Block]) {
-        let f = self.f;
-        for &b in order {
-            for &i in f.insts_of(b) {
-                let mul = match f.op(i) {
-                    Op::IAddNo | Op::ISubNo => Op::IMulNo,
-                    Op::LAdd | Op::LSub => Op::LMul,
-                    _ => continue,
-                };
-                let sub = matches!(f.op(i), Op::ISubNo | Op::LSub);
-                let args = f.args(i);
-                for (k, &a) in args.iter().enumerate().rev() {
-                    let other = args[1 - k];
-                    if (sub && k == 0) || self.imm12(other).is_some() || self.fused[a.idx()] {
-                        continue;
-                    }
-                    if let Some(d) = f.def_inst(a)
-                        && f.op(d) == mul
-                        && f.insts[d.idx()].block == b
-                        && self.uses[a.idx()] == 1
-                    {
-                        self.fused[a.idx()] = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /// The product a sum or difference computes with it, and its other operand.
-    fn fused_product(&self, args: &[Val]) -> Option<(Val, Val, Val)> {
-        let f = self.f;
-        (0..2).rev().find_map(|k| {
-            let a = args[k];
-            let d = f.def_inst(a)?;
-            (self.fused[a.idx()] && matches!(f.op(d), Op::IMulNo | Op::LMul))
-                .then(|| (f.args(d)[0], f.args(d)[1], args[1 - k]))
-        })
-    }
-
-    /// A return of one result passes it in x0 alone (W4 §4): its store to
-    /// the result slot goes, when nothing between them can exit or read the
-    /// slot. A caller reads it from x0, `level_land` stores it for the
-    /// interpreter.
-    fn find_register_returns(&mut self, order: &[Block]) {
-        use crate::jit::ir::ops::Mem;
-        for &b in order {
-            let Some(t) = self.f.terminator(b) else {
-                continue;
-            };
-            let Op::Return { a, n: 1 } = self.f.op(t) else {
-                continue;
-            };
-            for &j in self.f.insts_of(b).iter().rev().skip(1) {
-                if self.f.insts[j.idx()].snap != crate::jit::ir::NO_SNAP {
-                    break;
-                }
-                match self.f.op(j) {
-                    Op::Store(r) if r == a => {
-                        if self.in_x0(self.f.args(j)[0]) {
-                            self.absorbed[j.idx()] = true;
-                        }
-                        break;
-                    }
-                    op if op.effects().reads.intersects(Mem::SLOT)
-                        || op.effects().writes.intersects(Mem::SLOT) =>
-                    {
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    /// The value return `i` passes in x0: what its block stored to `R[a]`,
-    /// if a register has it.
-    fn returned(&self, i: Inst) -> Option<Val> {
-        let f = self.f;
-        let Op::Return { a, n } = f.op(i) else {
-            return None;
-        };
-        let b = f.insts[i.idx()].block;
-        let mut stored = None;
-        for &j in f.insts_of(b).iter().rev().skip(1) {
-            match f.op(j) {
-                Op::Store(r) if r == a => {
-                    stored = Some(f.args(j)[0]);
-                    break;
-                }
-                op if op.effects().writes.contains(crate::jit::ir::ops::Mem::SLOT) => break,
-                _ => {}
-            }
-        }
-        stored.filter(|&v| n > 0 && self.in_x0(v))
-    }
-
-    /// The values whose float's word lowering keeps in a d register
-    /// (`in_d`): f64 boxes and loads of floats that only stores, snapshots
-    /// and f64 unboxes use. Such a load loads into the d register, its
-    /// unboxes and a box's share the register (`alias`), and stores store
-    /// it, all where the IR has them (`opt::snaps` follows reads through
-    /// boxes and unboxes).
-    fn find_float_words(&mut self, order: &[Block]) {
-        let f = self.f;
-        // Per alias root: the uses that need the word in an x register,
-        // and whether an f64 unbox reads it.
-        let mut gpr = vec![0u32; f.vals.len()];
-        let mut unboxed = vec![false; f.vals.len()];
-        for &b in order {
-            for &i in f.insts_of(b) {
-                let op = f.op(i);
-                if self.absorbed[i.idx()]
-                    || (f.insts[i.idx()].rn == 1
-                        && op.is_pure()
-                        && self.uses[f.result(i).idx()] == 0
-                        && !self.fused[f.result(i).idx()])
-                {
-                    continue;
-                }
-                let args = f.args(i);
-                // The operands only an x register serves; the others are
-                // stored values, and snapshot entries take either too.
-                let xs = match op {
-                    Op::Unbox(Rep::F64) => {
-                        unboxed[self.alias(args[0]).idx()] = true;
-                        &[][..]
-                    }
-                    Op::Refine(_) | Op::Store(_) => &[],
-                    Op::TabStore { .. } | Op::CellStore => &args[..1],
-                    Op::ArrStore => &args[..2],
-                    Op::Call { nargs, .. }
-                        if nargs != u8::MAX
-                            && !matches!(self.known.get(&i), Some(Known::Lua { .. })) =>
-                    {
-                        &[]
-                    }
-                    _ => args,
-                };
-                for &a in xs {
-                    gpr[self.alias(a).idx()] += 1;
-                }
-                if let Some(v) = self.returned(i) {
-                    gpr[self.alias(v).idx()] += 1;
-                }
-                for e in f.edges(i) {
-                    for &a in f.vl(e.args) {
-                        gpr[self.alias(a).idx()] += 1;
-                    }
-                }
-            }
-        }
-        for (k, d) in f.vals.iter().enumerate() {
-            let Some(i) = f.def_inst(Val(k as u32)) else {
-                continue;
-            };
-            self.in_d[k] = gpr[k] == 0
-                && match f.op(i) {
-                    Op::Box => f.ty(f.args(i)[0]).rep == Rep::F64,
-                    Op::Load(_)
-                    | Op::Home(_)
-                    | Op::TabLoad { .. }
-                    | Op::ArrLoad
-                    | Op::CellLoad
-                    | Op::UpvalValue(_)
-                    | Op::UpvalValueOf(_) => unboxed[k] && d.ty.set == TypeSet::FLOAT,
-                    _ => false,
-                };
-        }
-    }
-
-    /// Whether a value stored as a result can be returned in x0: a boxed
-    /// value (a float's box is then computed there, not stored and loaded).
-    fn in_x0(&self, v: Val) -> bool {
-        self.f.ty(v).rep == Rep::Val
-    }
-
-    /// Mark compares that only branches, guards and selects use, each
-    /// computing the compare itself: flags feed a branch directly (`cmp`
-    /// and `b.cond` fuse), where a boolean costs a `cset` and a test of it.
-    fn find_fusions(&mut self, order: &[Block]) {
-        let f = self.f;
-        let mut tested = vec![0u32; f.vals.len()];
-        for &b in order {
-            for &i in f.insts_of(b) {
-                let op = f.op(i);
-                if !matches!(op, Op::Br | Op::GuardTrue | Op::GuardFalse | Op::Select) {
-                    continue;
-                }
-                let c = f.args(i)[0];
-                let Some(di) = f.def_inst(c) else {
-                    continue;
-                };
-                let fusable = match f.op(di) {
-                    Op::ICmp(_)
-                    | Op::LCmp(_)
-                    | Op::FCmp(_)
-                    | Op::IsFalsy
-                    | Op::SameBits
-                    | Op::ShapeIs(_)
-                    | Op::ShapeIn(_)
-                    | Op::HasFlag(_)
-                    | Op::NumMtSet
-                    | Op::TypeMtIs { .. }
-                    | Op::FnFixedLua
-                    | Op::FnNative
-                    | Op::FnFits
-                    | Op::TabHasRoom(_)
-                    | Op::TabNoKeys(_)
-                    | Op::TabHasMm(_) => true,
-                    // A select takes flags: no test that branches.
-                    Op::IsType(set) => op != Op::Select || is_single_test(set),
-                    _ => false,
-                };
-                debug_assert!(!fusable || f.op(di).folds());
-                let mut n = 0;
-                f.for_each_use(i, |v| n += (v == c) as u32);
-                if fusable && n == 1 {
-                    tested[c.idx()] += 1;
-                }
-            }
-        }
-        for (v, &n) in tested.iter().enumerate() {
-            if n > 0 && n == self.uses[v] {
-                self.fused[v] = true;
-            }
-        }
-        // A one-bit `and` that only fused tests against zero use: they test
-        // the bit (`tbz`), and it is not computed.
-        let mut bit_tests = vec![0u32; f.vals.len()];
-        for v in 0..f.vals.len() {
-            if !self.fused[v] {
-                continue;
-            }
-            if let Some(Op::ICmp(Cc::Eq | Cc::Ne)) = f.def_op(Val(v as u32)) {
-                let args = f.args(f.def_inst(Val(v as u32)).unwrap());
-                if self.imm12(args[1]) == Some(0) && self.bit_of(args[0]).is_some() {
-                    bit_tests[args[0].idx()] += 1;
-                }
-            }
-        }
-        for (v, &n) in bit_tests.iter().enumerate() {
-            if n > 0 && n == self.uses[v] {
-                self.fused[v] = true;
-            }
-        }
-    }
-
-    /// Selects `x < 0 ? -x : x` whose negation only they use, in their
-    /// block with nothing but pure instructions between: `cmp; cneg` (an
-    /// i32's exit on `MIN` moves to the select, which no effect separates
-    /// it from).
-    fn find_abs(&mut self, order: &[Block]) {
-        let f = self.f;
-        for &b in order {
-            let insts = f.insts_of(b);
-            for (k, &s) in insts.iter().enumerate() {
-                if f.op(s) != Op::Select {
-                    continue;
-                }
-                let (c, neg, x) = (f.args(s)[0], f.args(s)[1], f.args(s)[2]);
-                let below = match f.def_op(c) {
-                    Some(Op::ICmp(Cc::Lt)) => Op::INeg,
-                    Some(Op::LCmp(Cc::Lt)) => Op::LNeg,
-                    _ => continue,
-                };
-                let ca = f.args(f.def_inst(c).unwrap());
-                let zero = matches!(f.def_op(ca[1]), Some(Op::KI32(0) | Op::KI64(0)));
-                let Some(n) = f.def_inst(neg) else {
-                    continue;
-                };
-                let Some(at) = insts[..k].iter().position(|&j| j == n) else {
-                    continue;
-                };
-                if ca[0] != x
-                    || !zero
-                    || f.op(n) != below
-                    || f.args(n)[0] != x
-                    || self.uses[neg.idx()] != 1
-                    || !insts[at + 1..k].iter().all(|&j| f.op(j).is_pure())
-                {
-                    continue;
-                }
-                self.absorbed[n.idx()] = true;
-                self.abs_of.insert(s, n);
-            }
-        }
-    }
-
-    /// `v` as `x & (1 << k)`: `x` and `k`.
-    fn bit_of(&self, v: Val) -> Option<(Val, u8)> {
-        let d = self.f.def_inst(v)?;
-        if self.f.op(d) != Op::IAnd {
-            return None;
-        }
-        let args = self.f.args(d);
-        (0..2).find_map(|k| match self.f.def_op(args[k]) {
-            Some(Op::KI32(m)) if m > 0 && (m & (m - 1)) == 0 => {
-                Some((args[1 - k], m.trailing_zeros() as u8))
-            }
-            _ => None,
-        })
-    }
-
-    /// The test and operands computing B1 `c`.
-    fn test_of(&mut self, c: Val) -> (Test, Cond, Vec<Val>) {
-        let i = self.f.def_inst(c).expect("a fused compare");
-        let args = self.f.args(i).to_vec();
-        match self.f.op(i) {
-            Op::ICmp(cc @ (Cc::Eq | Cc::Ne))
-                if self.imm12(args[1]) == Some(0)
-                    && self.fused[args[0].idx()]
-                    && self.bit_of(args[0]).is_some() =>
-            {
-                let (x, k) = self.bit_of(args[0]).expect("a fused bit");
-                (Test::Bit(k), int_cond(cc), vec![x])
-            }
-            Op::ICmp(cc) => {
-                if let Some(k) = self.imm12(args[1]) {
-                    (
-                        Test::I32 {
-                            imm: Some(k as i32),
-                        },
-                        int_cond(cc),
-                        vec![args[0]],
-                    )
-                } else if let Some(k) = self.imm12(args[0]) {
-                    (
-                        Test::I32 {
-                            imm: Some(k as i32),
-                        },
-                        int_cond(cc.swap()),
-                        vec![args[1]],
-                    )
-                } else {
-                    (Test::I32 { imm: None }, int_cond(cc), args)
-                }
-            }
-            Op::LCmp(cc) => {
-                if let Some(k) = self.imm12(args[1]) {
-                    (Test::X { imm: Some(k) }, int_cond(cc), vec![args[0]])
-                } else {
-                    (Test::X { imm: None }, int_cond(cc), args)
-                }
-            }
-            Op::FCmp(cc) => {
-                // `#0.0` compares as -0.0 does.
-                let zero = |v: Val| matches!(self.f.def_op(v), Some(Op::KF64(b)) if f64::from_bits(b) == 0.0);
-                if zero(args[1]) {
-                    (Test::F64 { zero: true }, float_cond(cc), vec![args[0]])
-                } else if zero(args[0]) {
-                    (
-                        Test::F64 { zero: true },
-                        float_cond(cc.swap()),
-                        vec![args[1]],
-                    )
-                } else {
-                    (Test::F64 { zero: false }, float_cond(cc), args)
-                }
-            }
-            Op::SameBits => (Test::X { imm: None }, Cond::Eq, args),
-            Op::IsType(set) => (Test::Type(set, args.len() > 1), Cond::Eq, args),
-            Op::IsFalsy => (Test::Falsy(args.len() > 1), Cond::Lo, args),
-            Op::ShapeIs(k) => (
-                Test::Shape(self.f.shapes[k as usize].as_word()),
-                Cond::Eq,
-                args,
-            ),
-            Op::ShapeIn(k) => (Test::ShapeIn(k), Cond::Eq, args),
-            Op::HasFlag(mask) => (Test::HasFlag(mask), Cond::Ne, args),
-            Op::NumMtSet => (Test::NumMtSet, Cond::Ne, args),
-            Op::TypeMtIs { slot, word } => (Test::TypeMtIs { slot, word }, Cond::Eq, args),
-            Op::FnFixedLua => (Test::FnFixedLua, Cond::Eq, args),
-            Op::FnNative => (Test::FnNative, Cond::Hi, args),
-            Op::FnFits => (Test::FnFits, Cond::Ls, args),
-            Op::TabHasRoom(loc) => (Test::TabHasRoom(loc), Cond::Hi, args),
-            Op::TabNoKeys(parts) => (Test::TabNoKeys(parts), Cond::Eq, args),
-            Op::TabHasMm(k) => (Test::MmBit(k), Cond::Ne, args),
-            op => panic!("test_of {op:?}"),
-        }
-    }
-
-    fn konst_int(&self, v: Val) -> Option<i64> {
-        match self.f.def_op(v)? {
-            Op::KI32(n) => Some(n as i64),
-            Op::KI64(n) => Some(n),
-            _ => None,
-        }
-    }
-
-    /// An integer constant usable as a compare immediate (negative ones
-    /// become `cmn`).
-    fn imm12(&self, v: Val) -> Option<i64> {
-        let n = match self.f.def_op(v)? {
-            Op::KI32(n) => n as i64,
-            Op::KI64(n) => n,
-            _ => return None,
-        };
-        (n.unsigned_abs() < 4096).then_some(n)
-    }
-
-    fn use_(&mut self, v: Val) -> Operand {
-        Operand::reg_use(self.vr(v))
-    }
-
-    fn def(&mut self, v: Val) -> Operand {
-        Operand::reg_def(self.vr(v))
-    }
-
-    /// Snapshot operands and the exit record of an exiting IR instruction.
-    fn exit_of(&mut self, i: Inst) -> (u32, Vec<Operand>) {
-        let d = &self.f.insts[i.idx()];
-        debug_assert!(d.snap != NO_SNAP, "{:?} exits without a snapshot", d.op);
-        let s = self.f.snaps[d.snap as usize];
-        let f = self.f;
-        let mut ops: Vec<Operand> = Vec::new();
-        let mut seen: Vec<(VReg, u16)> = Vec::new();
-        let mut entries = Vec::new();
-        for &(r, v) in f.entries(d.snap) {
-            // A call's kept value, in a snapshot an exit shares.
-            if r == crate::jit::ir::KEPT {
-                continue;
-            }
-            let (rep, src) = self.exit_src(v, &mut ops, &mut seen);
-            // A home load's slot holds its own register already.
-            if src != Src::Slot(r) {
-                entries.push((r, rep, src));
-            }
-        }
-        let mut blame = Vec::new();
-        for &(r, v) in f.blame_entries(i) {
-            let (rep, src) = self.exit_src(v, &mut ops, &mut seen);
-            blame.push((r, rep, src));
-        }
-        let pc = s.pc;
-        let kind = s.kind;
-        let tag = d.tag;
-        let frames = self.snap_frames(s.frame);
-        let store_failed = d.op == Op::GuardFalse
-            && f.def_inst(f.args(i)[0]).is_some_and(|c| {
-                f.op(c) == Op::SameBits
-                    && f.args(c).iter().any(
-                        |&a| matches!(f.def_op(a), Some(Op::Helper(h)) if h.sig().effects.writes()),
-                    )
-            });
-        self.exits.push(LExit {
-            pc,
-            frames,
-            site: (d.blame != NO_SNAP).then(|| self.f.exit_site(i)),
-            frame: s.frame,
-            kind,
-            tag,
-            entries,
-            blame,
-            inst: None,
-            forced: !store_failed,
-        });
-        (self.exits.len() as u32 - 1, ops)
-    }
-
-    /// Where an exit finds `v`: a constant, a home load's slot, or `v`'s
-    /// register as one of the exit's operands `ops` (`seen`: those in).
-    fn exit_src(
-        &mut self,
-        v: Val,
-        ops: &mut Vec<Operand>,
-        seen: &mut Vec<(VReg, u16)>,
-    ) -> (SRep, Src) {
-        // Boxes in snapshots are the exit's work.
-        let v = match self.f.def_op(v) {
-            Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
-            _ => v,
-        };
-        if let Some(k) = self.const_word(v) {
-            return (SRep::Val, Src::Const(k));
-        }
-        let rep = srep(self.reg_rep(v));
-        if let Some(s) = self.home_load(v) {
-            return (rep, Src::Slot(s));
-        }
-        let vr = self.vr(v);
-        let k = match seen.iter().find(|(x, _)| *x == vr) {
-            Some(&(_, k)) => k,
-            None => {
-                let k = ops.len() as u16;
-                // Late: the instruction may write its result or call
-                // before it exits, and the value must survive that.
-                ops.push(Operand::new(
-                    vr,
-                    crate::jit::backend::reg::OperandConstraint::Any,
-                    crate::jit::backend::reg::OperandKind::Use,
-                    crate::jit::backend::reg::OperandPos::Late,
-                ));
-                seen.push((vr, k));
-                k
-            }
-        };
-        (rep, Src::Operand(k))
-    }
-
-    /// The boxed word of a constant value.
-    fn const_word(&self, v: Val) -> Option<u64> {
-        match self.f.def_op(v)? {
-            Op::KVal(b) => Some(b),
-            // A pointer constant in a blame stands for the object.
-            Op::KObj(p) | Op::KPtr(p) => Some(self.f.pool[p as usize].to_raw()),
-            Op::KI32(n) => Some(Value::small(n).to_raw()),
-            Op::KF64(b) => Some(Value::float(f64::from_bits(b)).to_raw()),
-            Op::KB1(c) => Some(Value::boolean(c).to_raw()),
-            Op::KI64(n) if i32::try_from(n).is_ok() => Some(Value::small(n as i32).to_raw()),
-            _ => None,
-        }
-    }
-
-    /// Push a call: `ops`, then its snapshot's values as uses in stack slots,
-    /// which the collector traces while the call runs (H11).
-    /// The inlined frames up to `frame`, outermost first.
-    fn snap_frames(&self, mut frame: u32) -> Vec<crate::jit::region::SnapFrame> {
-        let mut frames = Vec::new();
-        while frame != crate::jit::ir::NO_FRAME {
-            let x = self.f.inline_frames[frame as usize];
-            frames.push(crate::jit::region::SnapFrame {
-                func: x.func,
-                a: x.a,
-                c: x.c,
-                delta: if x.replaces { 0 } else { x.a as u16 + 4 },
-                caller_pc: x.caller_pc,
-                open: x.open,
-            });
-            frame = x.parent;
-        }
-        frames.reverse();
-        frames
-    }
-
-    /// The address of the instruction past `pc` in the code of the frame
-    /// call `i` is made from.
-    fn pc_after(&self, i: Inst, pc: u32) -> usize {
-        let frame = self.f.snaps[self.f.insts[i.idx()].snap as usize].frame;
-        let code = match frame {
-            crate::jit::ir::NO_FRAME => self.pc_base,
-            fr => self.f.inline_frames[fr as usize].code,
-        };
-        code + (pc as usize + 1) * 8
-    }
-
-    fn push_call(&mut self, i: Inst, mk: MInst, mut ops: Vec<Operand>) {
-        let d = &self.f.insts[i.idx()];
-        let d_snap = d.snap;
-        let frames = self.snap_frames(self.f.snaps[d_snap as usize].frame);
-        let mut entries = Vec::new();
-        let mut seen: Vec<(VReg, u16)> = Vec::new();
-        let base = ops.len();
-        let homes = self.f.call_homes.get(&d_snap).copied().unwrap_or_default();
-        for &(r, v) in self.f.entries(d.snap) {
-            let v = match self.f.def_op(v) {
-                Some(Op::Box) => self.f.args(self.f.def_inst(v).unwrap())[0],
-                _ => v,
-            };
-            if let Some(k) = self.const_word(v) {
-                entries.push((r, SRep::Val, Src::Const(k)));
-                continue;
-            }
-            // The slot holds it, and the call keeps it there: a home entry.
-            if let Some(s) = self.home_load(v) {
-                debug_assert!(s == r && homes.contains(r as usize), "v{} spilled", v.0);
-                continue;
-            }
-            let vr = self.vr(v);
-            let k = match seen.iter().find(|(x, _)| *x == vr) {
-                Some(&(_, k)) => k,
-                None => {
-                    let k = (ops.len() - base) as u16;
-                    ops.push(Operand::new(
-                        vr,
-                        crate::jit::backend::reg::OperandConstraint::Stack,
-                        crate::jit::backend::reg::OperandKind::Use,
-                        crate::jit::backend::reg::OperandPos::Late,
-                    ));
-                    seen.push((vr, k));
-                    k
-                }
-            };
-            entries.push((r, srep(self.reg_rep(v)), Src::Operand(k)));
-        }
-        self.v.push(mk, &ops, allocatable());
-        self.snap_ops.push(base as u32);
-        let resume = self.f.edges(i)[0].target;
-        self.sites.push((
-            self.block_of[resume.idx()] as usize,
-            LSite {
-                entries,
-                homes,
-                frames,
-            },
-        ));
-    }
-
-    /// Push an exiting instruction: `ops` then the snapshot uses.
-    fn push_exit(
-        &mut self,
-        i: Inst,
-        mk: impl FnOnce(u32) -> MInst,
-        mut ops: Vec<Operand>,
-        clob: PRegSet,
-    ) {
-        let (exit, sops) = self.exit_of(i);
-        let base = ops.len() as u32;
-        ops.extend(sops);
-        let at = self.v.push(mk(exit), &ops, clob).index();
-        self.snap_ops.push(base);
-        self.exits[exit as usize].inst = Some(at);
-    }
-
     fn lower_inst(&mut self, i: Inst) -> Result<(), String> {
         let f = self.f;
         let op = f.op(i);
         let args: Vec<Val> = f.args(i).to_vec();
         let res = (f.insts[i.idx()].rn == 1).then(|| f.result(i));
-        // Unused pure results and fused compares are not computed here.
-        if let Some(r) = res
-            && (self.fused[r.idx()] || (op.is_pure() && self.uses[r.idx()] == 0))
-        {
-            return Ok(());
-        }
         let none = PRegSet::empty();
-        if self.absorbed[i.idx()] {
-            return Ok(());
-        }
         match op {
             Op::KVal(b) => self.constant(res.unwrap(), Remat::Int(b)),
             Op::KObj(p) => self.constant(res.unwrap(), Remat::Int(f.pool[p as usize].to_raw())),
@@ -1270,6 +150,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                         let d = Operand::reg_fixed_def(self.vr(r), preg_int(0));
                         let u = Operand::reg_fixed_use(self.vr(x), preg_int(1));
                         let clob = none;
+                        let slow = crate::jit::helpers::jit_box_i64 as *const () as usize;
+                        self.needs_trampoline(slow, Tramp::Int);
                         if f.insts[i.idx()].snap != NO_SNAP {
                             self.push_exit(i, |exit| MInst::BoxI64 { exit }, vec![d, u], clob);
                         } else {
@@ -1310,6 +192,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     _ => return Err(format!("unbox to {rep:?}")),
                 }
             }
+            // Tests whose flags no branch, guard or select took: a boolean.
             Op::IsType(_)
             | Op::IsFalsy
             | Op::SameBits
@@ -1317,7 +200,16 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             | Op::ShapeIn(_)
             | Op::ICmp(_)
             | Op::LCmp(_)
-            | Op::FCmp(_) => {
+            | Op::FCmp(_)
+            | Op::HasFlag(_)
+            | Op::NumMtSet
+            | Op::TypeMtIs { .. }
+            | Op::FnFixedLua
+            | Op::FnNative
+            | Op::FnFits
+            | Op::TabHasRoom(_)
+            | Op::TabNoKeys(_)
+            | Op::TabHasMm(_) => {
                 let r = res.unwrap();
                 let (test, cond, targs) = self.test_of(r);
                 let mut ops = vec![self.def(r)];
@@ -1326,8 +218,8 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 }
                 self.push(MInst::Set { test, cond }, &ops, none);
             }
-            Op::Select if self.abs_of.contains_key(&i) => {
-                let n = self.abs_of[&i];
+            Op::Select if self.isel.abs_of.contains_key(&i) => {
+                let n = self.isel.abs_of[&i];
                 let ops = vec![self.def(res.unwrap()), self.use_(args[2])];
                 if f.op(n) == Op::INeg {
                     self.push_exit(n, |exit| MInst::AbsOvf { exit }, ops, none);
@@ -1338,12 +230,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::Select => {
                 let r = res.unwrap();
                 let float = f.ty(r).rep == Rep::F64;
-                let c = args[0];
-                let (test, cond, targs) = if self.fused[c.idx()] {
-                    self.test_of(c)
-                } else {
-                    (Test::B1, Cond::Ne, vec![c])
-                };
+                let (test, cond, targs) = self.cond_of(args[0]);
                 let mut ops = vec![self.def(r), self.use_(args[1]), self.use_(args[2])];
                 for a in targs {
                     ops.push(self.use_(a));
@@ -1393,12 +280,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
             Op::GuardMiss => return Err("an unexpanded guard.miss".into()),
             Op::GuardTrue | Op::GuardFalse => {
-                let c = args[0];
-                let (test, cond, targs) = if self.fused[c.idx()] {
-                    self.test_of(c)
-                } else {
-                    (Test::B1, Cond::Ne, vec![c])
-                };
+                let (test, cond, targs) = self.cond_of(args[0]);
                 let cond = if op == Op::GuardTrue {
                     cond
                 } else {
@@ -1420,27 +302,16 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     none,
                 );
             }
-            Op::GuardNoFlag(mask) => {
-                self.push_exit(i, |exit| MInst::GuardNoFlag { mask, exit }, vec![], none)
-            }
-            // Tests whose flags a branch did not take: a boolean.
-            Op::HasFlag(_)
-            | Op::NumMtSet
-            | Op::TypeMtIs { .. }
-            | Op::FnFixedLua
-            | Op::FnNative
-            | Op::FnFits
-            | Op::TabHasRoom(_)
-            | Op::TabNoKeys(_)
-            | Op::TabHasMm(_) => {
-                let r = res.unwrap();
-                let (test, cond, targs) = self.test_of(r);
-                let mut ops = vec![self.def(r)];
-                for a in targs {
-                    ops.push(self.use_(a));
-                }
-                self.push(MInst::Set { test, cond }, &ops, none);
-            }
+            Op::GuardNoFlag(mask) => self.push_exit(
+                i,
+                |exit| MInst::Guard {
+                    test: Test::HasFlag(mask),
+                    cond: Cond::Eq,
+                    exit,
+                },
+                vec![],
+                none,
+            ),
             Op::ClassMm(k) => {
                 let (d, t) = (self.def(res.unwrap()), self.use_(args[0]));
                 self.push(MInst::ClassMm(k), &[d, t], none);
@@ -1461,11 +332,29 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             Op::GuardShape(k) => {
                 let shape = f.shapes[k as usize].as_word();
                 let t = self.use_(args[0]);
-                self.push_exit(i, |exit| MInst::GuardShape { shape, exit }, vec![t], none);
+                self.push_exit(
+                    i,
+                    |exit| MInst::Guard {
+                        test: Test::Shape(shape),
+                        cond: Cond::Eq,
+                        exit,
+                    },
+                    vec![t],
+                    none,
+                );
             }
             Op::GuardShapeIn(set) => {
                 let t = self.use_(args[0]);
-                self.push_exit(i, |exit| MInst::GuardShapeIn { set, exit }, vec![t], none);
+                self.push_exit(
+                    i,
+                    |exit| MInst::Guard {
+                        test: Test::ShapeIn(set),
+                        cond: Cond::Eq,
+                        exit,
+                    },
+                    vec![t],
+                    none,
+                );
             }
             Op::GuardProto(k) => {
                 let proto = f.protos[k as usize].ptr.as_ptr() as u64;
@@ -1540,12 +429,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 };
             }
             Op::NamedNext => {
-                let d = Operand::new(
-                    self.vr(res.unwrap()),
-                    crate::jit::backend::reg::OperandConstraint::Reg,
-                    crate::jit::backend::reg::OperandKind::Def,
-                    crate::jit::backend::reg::OperandPos::Early,
-                );
+                let d = Operand::reg_def_at_start(self.vr(res.unwrap()));
                 let mut ops = vec![d, self.use_(args[0]), self.use_(args[1])];
                 for _ in 0..3 {
                     ops.push(Operand::reg_temp(self.v.new_vreg(RegClass::Int)));
@@ -1567,18 +451,15 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             }
             Op::ArrNext => {
                 // Both written while the operands are still read.
-                let d = Operand::new(
-                    self.vr(res.unwrap()),
-                    crate::jit::backend::reg::OperandConstraint::Reg,
-                    crate::jit::backend::reg::OperandKind::Def,
-                    crate::jit::backend::reg::OperandPos::Early,
-                );
+                let d = Operand::reg_def_at_start(self.vr(res.unwrap()));
                 let v = Operand::reg_temp(self.v.new_vreg(RegClass::Int));
                 let ops = [d, self.use_(args[0]), self.use_(args[1]), v];
                 self.push(MInst::ArrNext, &ops, none);
             }
             Op::Barrier => {
                 let t = self.use_(args[0]);
+                let slow = crate::jit::helpers::jit_barrier as *const () as usize;
+                self.needs_trampoline(slow, Tramp::Args(2));
                 self.push(MInst::Barrier, &[t], none);
             }
             Op::NumVarargs => {
@@ -1842,6 +723,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     self.use_(args[0]),
                     Operand::reg_temp(self.v.new_vreg(RegClass::Float)),
                 ];
+                if kinds.contains(TypeSet::STR) {
+                    let slow = crate::jit::helpers::jit_str_to_i64 as *const () as usize;
+                    self.needs_trampoline(slow, Tramp::Int);
+                }
                 self.push_exit(i, |exit| MInst::ToPos { exit, kinds }, ops, none);
             }
             Op::IFCmp(cc) => {
@@ -1886,12 +771,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 self.push_exit(i, |exit| MInst::LToFExact { exit }, ops, none);
             }
             Op::StrLt | Op::StrLe => {
-                let d = Operand::new(
-                    self.vr(res.unwrap()),
-                    crate::jit::backend::reg::OperandConstraint::Reg,
-                    crate::jit::backend::reg::OperandKind::Def,
-                    crate::jit::backend::reg::OperandPos::Early,
-                );
+                let d = Operand::reg_def_at_start(self.vr(res.unwrap()));
                 let mut ops = vec![d, self.use_(args[0]), self.use_(args[1])];
                 for _ in 0..5 {
                     ops.push(Operand::reg_temp(self.v.new_vreg(RegClass::Int)));
@@ -1911,6 +791,10 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 // Arms only for the kinds the operand may have.
                 let t = f.ty(args[0]).set;
                 let kinds = if t.is_empty() { set } else { set & t };
+                if kinds.contains(TypeSet::STR) {
+                    let slow = crate::jit::helpers::jit_str_to_f64 as *const () as usize;
+                    self.needs_trampoline(slow, Tramp::Int);
+                }
                 self.push_exit(i, |exit| MInst::ToF64 { exit, kbox, kinds }, ops, none);
             }
             Op::FAdd | Op::FSub | Op::FMul | Op::FDiv => {
@@ -1946,15 +830,11 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 let ops = [self.def(res.unwrap()), self.use_(args[0])];
                 self.push(MInst::FUn(u), &ops, none);
             }
-            Op::Helper(crate::jit::ir::ops::HelperId::FMod) => {
-                let d = Operand::new(
-                    self.vr(res.unwrap()),
-                    crate::jit::backend::reg::OperandConstraint::Reg,
-                    crate::jit::backend::reg::OperandKind::Def,
-                    crate::jit::backend::reg::OperandPos::Early,
-                );
+            Op::Helper(HelperId::FMod) => {
+                let d = Operand::reg_def_at_start(self.vr(res.unwrap()));
                 let q = Operand::reg_temp(self.v.new_vreg(RegClass::Float));
                 let ops = [d, q, self.use_(args[0]), self.use_(args[1])];
+                self.needs_trampoline(crate::jit::helpers::address(HelperId::FMod), Tramp::Float);
                 self.push(MInst::FMod, &ops, none);
             }
             Op::Helper(h) => {
@@ -1995,6 +875,12 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                     ops.push(Operand::reg_fixed_use(self.vr(a), p));
                 }
                 let m = if cold {
+                    let kind = if sig.ret == Some(Rep::F64) {
+                        Tramp::Float
+                    } else {
+                        Tramp::Int
+                    };
+                    self.needs_trampoline(crate::jit::helpers::address(h), kind);
                     MInst::HelperCold(h)
                 } else {
                     MInst::Helper(h)
@@ -2034,12 +920,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
                 if self.f.edges(i)[0].target == self.f.edges(i)[1].target {
                     return Err(format!("i{} branches to one block both ways", i.0));
                 }
-                let c = args[0];
-                let (test, cond, targs) = if self.fused[c.idx()] {
-                    self.test_of(c)
-                } else {
-                    (Test::B1, Cond::Ne, vec![c])
-                };
+                let (test, cond, targs) = self.cond_of(args[0]);
                 let ops: Vec<Operand> = targs.iter().map(|&a| self.use_(a)).collect();
                 self.push(MInst::Br { test, cond }, &ops, none);
             }
@@ -2127,26 +1008,313 @@ impl<'a, 'gc> Lower<'a, 'gc> {
         }
         Ok(())
     }
+}
 
-    /// The `a` and the header slot of the call a resume block resumes,
-    /// from its predecessor's terminator.
-    fn resume_a(&self, i: Inst) -> (u8, u16) {
-        let b = self.f.insts[i.idx()].block;
-        for &p in self.f.cfg().preds(b) {
-            if let Some(t) = self.f.terminator(p) {
-                match self.f.op(t) {
-                    Op::Call { a, .. } => return (a, a as u16),
-                    Op::CallMm { land, hdr, .. } => return (land, hdr as u16),
-                    _ => {}
+impl<'a, 'gc> Lower<'a, 'gc> {
+    /// `R[r] = v`.
+    fn store_slot(&mut self, r: u8, v: Val) {
+        let u = self.stored(v);
+        self.push(MInst::StoreSlot(r), &[u], PRegSet::empty());
+    }
+
+    /// Every parameter entries pass in registers, used or not: an entry
+    /// guard's failure stores them all for the interpreter.
+    fn entry_params(&mut self) {
+        let f = self.f;
+        if f.meta.params == 0 {
+            return;
+        }
+        let regs: Vec<VReg> = (0..f.meta.params)
+            .map(|_| self.v.new_vreg(RegClass::Int))
+            .collect();
+        for &i in f.insts_of(f.entry) {
+            if let Op::Param(k) = f.op(i) {
+                self.vreg[f.result(i).idx()] = Some(regs[k as usize]);
+            }
+        }
+        self.params = regs;
+        if self.params.is_empty() {
+            return;
+        }
+        let ops: Vec<Operand> = (self.params.iter().enumerate())
+            .map(|(k, &r)| Operand::reg_fixed_def(r, preg_int(k as u8)))
+            .collect();
+        self.push(MInst::Params, &ops, PRegSet::empty());
+    }
+
+    /// A constant: defined where the IR puts it, computed again by the
+    /// allocator wherever that is cheaper than keeping it.
+    fn constant(&mut self, r: Val, k: Remat) {
+        let d = self.def(r);
+        self.v.remat[d.vreg().vreg()] = k;
+        let inst = match k {
+            Remat::Int(v) => MInst::MovImm(v),
+            Remat::Float(b) => MInst::FImm(b),
+            Remat::Slot(r) => MInst::LoadSlot(r),
+            Remat::None | Remat::AndImm { .. } => unreachable!(),
+        };
+        self.push(inst, &[d], PRegSet::empty());
+    }
+
+    /// Products a sum or difference in their block alone uses, which then
+    /// computes them with `madd` or `msub`.
+    fn find_multiply_adds(&mut self, order: &[Block]) {
+        let f = self.f;
+        for &b in order {
+            for &i in f.insts_of(b) {
+                let mul = match f.op(i) {
+                    Op::IAddNo | Op::ISubNo => Op::IMulNo,
+                    Op::LAdd | Op::LSub => Op::LMul,
+                    _ => continue,
+                };
+                let sub = matches!(f.op(i), Op::ISubNo | Op::LSub);
+                let args = f.args(i);
+                for (k, &a) in args.iter().enumerate().rev() {
+                    let other = args[1 - k];
+                    if (sub && k == 0) || self.imm12(other).is_some() || self.fused[a.idx()] {
+                        continue;
+                    }
+                    if let Some(d) = f.def_inst(a)
+                        && f.op(d) == mul
+                        && f.insts[d.idx()].block == b
+                        && self.uses[a.idx()] == 1
+                    {
+                        self.fused[a.idx()] = true;
+                        break;
+                    }
                 }
             }
         }
-        (0, 0)
+    }
+
+    /// The product a sum or difference computes with it, and its other operand.
+    fn fused_product(&self, args: &[Val]) -> Option<(Val, Val, Val)> {
+        let f = self.f;
+        (0..2).rev().find_map(|k| {
+            let a = args[k];
+            let d = f.def_inst(a)?;
+            (self.fused[a.idx()] && matches!(f.op(d), Op::IMulNo | Op::LMul))
+                .then(|| (f.args(d)[0], f.args(d)[1], args[1 - k]))
+        })
+    }
+
+    /// Mark compares that only branches, guards and selects use, each
+    /// computing the compare itself: flags feed a branch directly (`cmp`
+    /// and `b.cond` fuse), where a boolean costs a `cset` and a test of it.
+    fn find_fusions(&mut self, order: &[Block]) {
+        let f = self.f;
+        let mut tested = vec![0u32; f.vals.len()];
+        for &b in order {
+            for &i in f.insts_of(b) {
+                let op = f.op(i);
+                if !matches!(op, Op::Br | Op::GuardTrue | Op::GuardFalse | Op::Select) {
+                    continue;
+                }
+                let c = f.args(i)[0];
+                let Some(di) = f.def_inst(c) else {
+                    continue;
+                };
+                let fusable = match f.op(di) {
+                    Op::ICmp(_)
+                    | Op::LCmp(_)
+                    | Op::FCmp(_)
+                    | Op::IsFalsy
+                    | Op::SameBits
+                    | Op::ShapeIs(_)
+                    | Op::ShapeIn(_)
+                    | Op::HasFlag(_)
+                    | Op::NumMtSet
+                    | Op::TypeMtIs { .. }
+                    | Op::FnFixedLua
+                    | Op::FnNative
+                    | Op::FnFits
+                    | Op::TabHasRoom(_)
+                    | Op::TabNoKeys(_)
+                    | Op::TabHasMm(_) => true,
+                    // A select takes flags: no test that branches.
+                    Op::IsType(set) => op != Op::Select || is_single_test(set),
+                    _ => false,
+                };
+                debug_assert!(!fusable || f.op(di).folds());
+                let mut n = 0;
+                f.for_each_use(i, |v| n += (v == c) as u32);
+                if fusable && n == 1 {
+                    tested[c.idx()] += 1;
+                }
+            }
+        }
+        for (v, &n) in tested.iter().enumerate() {
+            if n > 0 && n == self.uses[v] {
+                self.fused[v] = true;
+            }
+        }
+        // A one-bit `and` that only fused tests against zero use: they test
+        // the bit (`tbz`), and it is not computed.
+        let mut bit_tests = vec![0u32; f.vals.len()];
+        for v in 0..f.vals.len() {
+            if !self.fused[v] {
+                continue;
+            }
+            if let Some(Op::ICmp(Cc::Eq | Cc::Ne)) = f.def_op(Val(v as u32)) {
+                let args = f.args(f.def_inst(Val(v as u32)).unwrap());
+                if self.imm12(args[1]) == Some(0) && self.bit_of(args[0]).is_some() {
+                    bit_tests[args[0].idx()] += 1;
+                }
+            }
+        }
+        for (v, &n) in bit_tests.iter().enumerate() {
+            if n > 0 && n == self.uses[v] {
+                self.fused[v] = true;
+            }
+        }
+    }
+
+    /// Selects `x < 0 ? -x : x` whose negation only they use, in their
+    /// block with nothing but pure instructions between: `cmp; cneg` (an
+    /// i32's exit on `MIN` moves to the select, which no effect separates
+    /// it from).
+    fn find_abs(&mut self, order: &[Block]) {
+        let f = self.f;
+        for &b in order {
+            let insts = f.insts_of(b);
+            for (k, &s) in insts.iter().enumerate() {
+                if f.op(s) != Op::Select {
+                    continue;
+                }
+                let (c, neg, x) = (f.args(s)[0], f.args(s)[1], f.args(s)[2]);
+                let below = match f.def_op(c) {
+                    Some(Op::ICmp(Cc::Lt)) => Op::INeg,
+                    Some(Op::LCmp(Cc::Lt)) => Op::LNeg,
+                    _ => continue,
+                };
+                let ca = f.args(f.def_inst(c).unwrap());
+                let zero = matches!(f.def_op(ca[1]), Some(Op::KI32(0) | Op::KI64(0)));
+                let Some(n) = f.def_inst(neg) else {
+                    continue;
+                };
+                let Some(at) = insts[..k].iter().position(|&j| j == n) else {
+                    continue;
+                };
+                if ca[0] != x
+                    || !zero
+                    || f.op(n) != below
+                    || f.args(n)[0] != x
+                    || self.uses[neg.idx()] != 1
+                    || !insts[at + 1..k].iter().all(|&j| f.op(j).is_pure())
+                {
+                    continue;
+                }
+                self.absorbed[n.idx()] = true;
+                self.isel.abs_of.insert(s, n);
+            }
+        }
+    }
+
+    /// `v` as `x & (1 << k)`: `x` and `k`.
+    fn bit_of(&self, v: Val) -> Option<(Val, u8)> {
+        let d = self.f.def_inst(v)?;
+        if self.f.op(d) != Op::IAnd {
+            return None;
+        }
+        let args = self.f.args(d);
+        (0..2).find_map(|k| match self.f.def_op(args[k]) {
+            Some(Op::KI32(m)) if m > 0 && (m & (m - 1)) == 0 => {
+                Some((args[1 - k], m.trailing_zeros() as u8))
+            }
+            _ => None,
+        })
+    }
+
+    /// The test and operands computing B1 `c`.
+    fn test_of(&mut self, c: Val) -> (Test, Cond, Vec<Val>) {
+        let i = self.f.def_inst(c).expect("a fused compare");
+        let args = self.f.args(i).to_vec();
+        match self.f.op(i) {
+            Op::ICmp(cc @ (Cc::Eq | Cc::Ne))
+                if self.imm12(args[1]) == Some(0)
+                    && self.fused[args[0].idx()]
+                    && self.bit_of(args[0]).is_some() =>
+            {
+                let (x, k) = self.bit_of(args[0]).expect("a fused bit");
+                (Test::Bit(k), int_cond(cc), vec![x])
+            }
+            Op::ICmp(cc) => {
+                if let Some(k) = self.imm12(args[1]) {
+                    (
+                        Test::I32 {
+                            imm: Some(k as i32),
+                        },
+                        int_cond(cc),
+                        vec![args[0]],
+                    )
+                } else if let Some(k) = self.imm12(args[0]) {
+                    (
+                        Test::I32 {
+                            imm: Some(k as i32),
+                        },
+                        int_cond(cc.swap()),
+                        vec![args[1]],
+                    )
+                } else {
+                    (Test::I32 { imm: None }, int_cond(cc), args)
+                }
+            }
+            Op::LCmp(cc) => {
+                if let Some(k) = self.imm12(args[1]) {
+                    (Test::X { imm: Some(k) }, int_cond(cc), vec![args[0]])
+                } else {
+                    (Test::X { imm: None }, int_cond(cc), args)
+                }
+            }
+            Op::FCmp(cc) => {
+                // `#0.0` compares as -0.0 does.
+                let zero = |v: Val| matches!(self.f.def_op(v), Some(Op::KF64(b)) if f64::from_bits(b) == 0.0);
+                if zero(args[1]) {
+                    (Test::F64 { zero: true }, float_cond(cc), vec![args[0]])
+                } else if zero(args[0]) {
+                    (
+                        Test::F64 { zero: true },
+                        float_cond(cc.swap()),
+                        vec![args[1]],
+                    )
+                } else {
+                    (Test::F64 { zero: false }, float_cond(cc), args)
+                }
+            }
+            Op::SameBits => (Test::X { imm: None }, Cond::Eq, args),
+            Op::IsType(set) => (Test::Type(set, args.len() > 1), Cond::Eq, args),
+            Op::IsFalsy => (Test::Falsy(args.len() > 1), Cond::Lo, args),
+            Op::ShapeIs(k) => (
+                Test::Shape(self.f.shapes[k as usize].as_word()),
+                Cond::Eq,
+                args,
+            ),
+            Op::ShapeIn(k) => (Test::ShapeIn(k), Cond::Eq, args),
+            Op::HasFlag(mask) => (Test::HasFlag(mask), Cond::Ne, args),
+            Op::NumMtSet => (Test::NumMtSet, Cond::Ne, args),
+            Op::TypeMtIs { slot, word } => (Test::TypeMtIs { slot, word }, Cond::Eq, args),
+            Op::FnFixedLua => (Test::FnFixedLua, Cond::Eq, args),
+            Op::FnNative => (Test::FnNative, Cond::Hi, args),
+            Op::FnFits => (Test::FnFits, Cond::Ls, args),
+            Op::TabHasRoom(loc) => (Test::TabHasRoom(loc), Cond::Hi, args),
+            Op::TabNoKeys(parts) => (Test::TabNoKeys(parts), Cond::Eq, args),
+            Op::TabHasMm(k) => (Test::MmBit(k), Cond::Ne, args),
+            op => panic!("test_of {op:?}"),
+        }
+    }
+
+    /// The test of B1 `c`: its compare's when fused, else of the boolean.
+    fn cond_of(&mut self, c: Val) -> (Test, Cond, Vec<Val>) {
+        if self.fused[c.idx()] {
+            self.test_of(c)
+        } else {
+            (Test::B1, Cond::Ne, vec![c])
+        }
+    }
+
+    /// An integer constant usable as a compare immediate (negative ones
+    /// become `cmn`).
+    fn imm12(&self, v: Val) -> Option<i64> {
+        self.konst_int(v).filter(|n| n.unsigned_abs() < 4096)
     }
 }
-
-#[allow(unused)]
-fn unused(_: &Asm) {}
-
-#[allow(unused)]
-const _: TypeSet = TypeSet::ANY;

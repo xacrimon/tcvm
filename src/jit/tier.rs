@@ -17,10 +17,7 @@ use crate::vm::frame;
 
 const PTR_MASK: u64 = (1 << 48) - 1;
 
-/// A compiled frame's spill slots, from its frame pointer: past the frame
-/// record. Its region is found from return addresses into it
-/// (`Region::of_return`).
-pub(crate) const FRAME_SPILLS: usize = 16;
+pub(crate) use crate::jit::backend::target::abi::FRAME_SPILLS;
 
 /// A hash map with a fast, unkeyed hasher, for compile-time tables.
 pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::FixedState>;
@@ -589,8 +586,8 @@ fn set_fast<'gc>(ctx: Context<'gc>, proto: &Prototype<'gc>, st: &mut JitState<'g
 }
 
 /// Where a direct call of a prototype of `nparams` parameters whose fast
-/// entry is `fast` branches (`known_offset`), or without one to a miss
-/// (`abi::direct_miss`).
+/// entry is `fast` branches (the target's `known_offset`), or without one
+/// to a miss (`abi::direct_miss`).
 pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> usize {
     use crate::jit::backend::target::abi::{direct_miss, direct_miss_regs};
     if fast == 0 && regs {
@@ -598,16 +595,8 @@ pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> usize {
     } else if fast == 0 {
         direct_miss as *const () as usize
     } else {
-        fast + known_offset(regs, nparams)
+        fast + crate::jit::backend::target::emit::known_offset(regs, nparams)
     }
-}
-
-/// A fast entry's known entry, from it: past its arity and native stack
-/// checks, and past its parameters' loads from their slots for a call
-/// passing them in registers (W4 §2).
-pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
-    let known = crate::jit::backend::target::emit::KNOWN_ENTRY as usize;
-    known + if regs { 4 * nparams.min(8) as usize } else { 0 }
 }
 
 /// Where the fast call whose return address is `ra` goes when its callee's

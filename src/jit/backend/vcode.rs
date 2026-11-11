@@ -8,10 +8,33 @@ use crate::jit::backend::reg::{
     Block as RBlock, Inst as RInst, InstRange, Operand, PRegSet, RegClass, VReg,
 };
 
-/// What a target's instruction type tells the allocator.
+/// What a target's instruction type tells the allocator and the layout.
 pub(crate) trait TargetInst: Clone {
     #[cfg(feature = "tcvm-dev")]
     fn is_branch(&self) -> bool;
+    fn flow(&self) -> Flow;
+    /// Whether it only defines a value, its operand 0, that the allocator
+    /// may compute again where used (`VCode::remat`): left without an
+    /// allocation it has no code.
+    fn is_remat(&self) -> bool;
+}
+
+/// An instruction as the block layout sees it (`emit::thread_jumps`,
+/// `emit::rotate_loops`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Flow {
+    /// To successor 0.
+    Jump,
+    /// To successor 0 or 1.
+    Branch,
+    /// Leaves through the exit.
+    Deopt(u32),
+    /// A resume block's first instruction; `plain` when it has no code
+    /// past the frame's base.
+    Resume {
+        plain: bool,
+    },
+    Other,
 }
 
 pub(crate) struct VBlock {

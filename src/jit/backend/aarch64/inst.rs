@@ -5,7 +5,8 @@
 //! be in a d register: a float's, which lowering keeps there (`Lower::in_d`).
 
 use crate::jit::backend::aarch64::asm::{Cond, Shift, Sz};
-use crate::jit::backend::vcode::TargetInst;
+use crate::jit::backend::lower::Known;
+use crate::jit::backend::vcode::{Flow, TargetInst};
 use crate::jit::ir::ops::{Cc, HelperId};
 use crate::jit::ir::types::TypeSet;
 
@@ -80,22 +81,6 @@ pub(crate) enum Test {
     TabHasRoom(u32),
     /// The table's hash parts in the mask hold no key (`Eq`): `[t]`.
     TabNoKeys(u8),
-}
-
-/// A call's callee, known at compile time.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Known {
-    /// A closure without varargs of the prototype at `proto` (its box),
-    /// which takes `nparams` (D2): `closure`, a constant the call writes word
-    /// 0 for itself (the closure word on the fast path, the value on the
-    /// slow one), or one a guard proved to be of the prototype.
-    Lua {
-        closure: Option<u64>,
-        proto: u64,
-        nparams: u8,
-    },
-    /// A native: its closure, which `jit_call_native` runs (I1).
-    Native(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -277,11 +262,6 @@ pub(crate) enum MInst {
         set: TypeSet,
         exit: u32,
     },
-    /// `[snap..]`: exit when the frame's header has any of the flags.
-    GuardNoFlag {
-        mask: u8,
-        exit: u32,
-    },
     /// `[def d, use t]`: the metamethod of a bit index from the table's class.
     ClassMm(u8),
     /// `[def d, use i, use f, temp t (float)]`: `IFCmp`.
@@ -306,17 +286,6 @@ pub(crate) enum MInst {
     LoadCell,
     /// `[use c, use v]`: store into an upvalue cell.
     StoreCell,
-    /// `[use t, snap..]`: exit unless the table's shape is `shape`.
-    GuardShape {
-        shape: u64,
-        exit: u32,
-    },
-    /// `[use t, snap..]`: exit unless the table's shape is one of
-    /// `Lowered::shape_sets[set]`.
-    GuardShapeIn {
-        set: u32,
-        exit: u32,
-    },
     /// `[use f, snap..]`: exit unless the value is a Lua closure of the
     /// prototype at `proto` (its box); `fun` when it is known a function.
     GuardProto {
@@ -406,13 +375,13 @@ pub(crate) enum MInst {
         nargs: u8,
         known: Option<(u64, u8)>,
     },
-    /// A resume block's first instruction, where a fast callee's `ret`
-    /// lands: `[def x0, def x1]` up to `wanted` (1 or 2), or the landing
-    /// helper.
-    /// `top` past slot `at` and the operand's count of values (`Op::SetTop`).
+    /// `[use n]`: `top` past slot `at` and `n` values (`Op::SetTop`).
     SetTop {
         at: u8,
     },
+    /// A resume block's first instruction, where a fast callee's `ret`
+    /// lands: `[def x0, def x1]` up to `wanted` (1 or 2), or the landing
+    /// helper.
     Resume {
         wanted: u8,
         c: u8,
@@ -461,9 +430,6 @@ impl MInst {
             | ToF64 { exit, .. }
             | Guard { exit, .. }
             | GuardLanding { exit, .. }
-            | GuardNoFlag { exit, .. }
-            | GuardShape { exit, .. }
-            | GuardShapeIn { exit, .. }
             | GuardProto { exit, .. }
             | GcCheck { exit }
             | LazyExit { exit } => exit,
@@ -471,9 +437,42 @@ impl MInst {
         };
         (e != ENTRY_FAIL).then_some(e)
     }
+
+    /// A `Resume` that reads at most the first result, in its register:
+    /// not the result count or the values behind it.
+    pub(crate) fn plain_resume(&self) -> bool {
+        matches!(
+            self,
+            MInst::Resume { wanted: 1, .. }
+                | MInst::Resume {
+                    wanted: 0,
+                    c: 1,
+                    ..
+                }
+        )
+    }
 }
 
 impl TargetInst for MInst {
+    fn flow(&self) -> Flow {
+        match *self {
+            MInst::Jump => Flow::Jump,
+            MInst::Br { .. } => Flow::Branch,
+            MInst::Deopt { exit } => Flow::Deopt(exit),
+            MInst::Resume { .. } => Flow::Resume {
+                plain: self.plain_resume(),
+            },
+            _ => Flow::Other,
+        }
+    }
+
+    fn is_remat(&self) -> bool {
+        matches!(
+            self,
+            MInst::MovImm(_) | MInst::FImm(_) | MInst::AluImm(..) | MInst::LoadSlot(_)
+        )
+    }
+
     #[cfg(feature = "tcvm-dev")]
     fn is_branch(&self) -> bool {
         matches!(

@@ -9,7 +9,7 @@ use crate::jit::backend::reg::{
     Block as RBlock, Inst, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
     ProgPoint, RegClass, VReg,
 };
-use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
+use crate::jit::backend::vcode::{Flow, Remat, TargetInst, VCode};
 
 #[derive(Clone, Debug)]
 enum T {
@@ -23,6 +23,14 @@ enum T {
 impl TargetInst for T {
     fn is_branch(&self) -> bool {
         matches!(self, T::Jump | T::Br | T::Call)
+    }
+
+    fn flow(&self) -> Flow {
+        Flow::Other
+    }
+
+    fn is_remat(&self) -> bool {
+        false
     }
 }
 

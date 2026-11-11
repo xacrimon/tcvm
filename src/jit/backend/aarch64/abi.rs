@@ -4,6 +4,11 @@
 use crate::jit::backend::aarch64::asm::{Fpr, Gpr};
 use crate::jit::backend::reg::{PReg, PRegSet, RegClass};
 
+/// A compiled frame's spill slots, from its frame pointer: past the frame
+/// record. Its region is found from return addresses into it
+/// (`Region::of_return`).
+pub(crate) const FRAME_SPILLS: usize = 16;
+
 /// Words of the register image `exit_common` writes: x0-x15, x19-x21,
 /// x26-x28, d0-d31, then the region's spill slots from word `IMAGE_SPILLS`.
 pub(crate) const EXIT_REGS: usize = 320;
@@ -197,7 +202,7 @@ pub(crate) unsafe extern "C" fn exit_common() {
         spills = const IMAGE_SPILLS * 8,
         level_ret = const crate::jit::layout::LEVEL_RET,
         level_land = const crate::jit::layout::LEVEL_LAND,
-        frame_spills = const crate::jit::backend::aarch64::emit::FRAME_SPILLS,
+        frame_spills = const FRAME_SPILLS,
         jit_level = sym jit_level,
         jit_exit = sym crate::jit::jit_exit,
     )
@@ -244,6 +249,30 @@ pub(crate) unsafe extern "C" fn jit_level() {
         level_ret = const crate::jit::layout::LEVEL_RET,
         ras = const RAS_STACK,
     )
+}
+
+/// The unwind rules of code running with `sp` at a level's record
+/// (`vm::stack::rec`, `{size}` bytes with the registers at `{x}`): the
+/// caller's frame and callee-saved registers are read from it.
+macro_rules! level_record_cfi {
+    () => {
+        concat!(
+            ".cfi_startproc\n",
+            ".cfi_def_cfa sp, {size}\n",
+            ".cfi_offset x29, -{size}\n",
+            ".cfi_offset x30, -{size} + 8\n",
+            ".cfi_offset x19, -{size} + {x}\n",
+            ".cfi_offset x20, -{size} + {x} + 8\n",
+            ".cfi_offset x21, -{size} + {x} + 16\n",
+            ".cfi_offset x22, -{size} + {x} + 24\n",
+            ".cfi_offset x23, -{size} + {x} + 32\n",
+            ".cfi_offset x24, -{size} + {x} + 40\n",
+            ".cfi_offset x25, -{size} + {x} + 48\n",
+            ".cfi_offset x26, -{size} + {x} + 56\n",
+            ".cfi_offset x27, -{size} + {x} + 64\n",
+            ".cfi_offset x28, -{size} + {x} + 72\n",
+        )
+    };
 }
 
 /// `jit_level` for the bottom level, from `dispatch_entry`: its record keeps
@@ -297,20 +326,7 @@ unsafe extern "C" fn jit_level_full() {
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn level_return() {
     core::arch::naked_asm!(
-        ".cfi_startproc",
-        ".cfi_def_cfa sp, {size}",
-        ".cfi_offset x29, -{size}",
-        ".cfi_offset x30, -{size} + 8",
-        ".cfi_offset x19, -{size} + {x}",
-        ".cfi_offset x20, -{size} + {x} + 8",
-        ".cfi_offset x21, -{size} + {x} + 16",
-        ".cfi_offset x22, -{size} + {x} + 24",
-        ".cfi_offset x23, -{size} + {x} + 32",
-        ".cfi_offset x24, -{size} + {x} + 40",
-        ".cfi_offset x25, -{size} + {x} + 48",
-        ".cfi_offset x26, -{size} + {x} + 56",
-        ".cfi_offset x27, -{size} + {x} + 64",
-        ".cfi_offset x28, -{size} + {x} + 72",
+        level_record_cfi!(),
         "nop",
         "mov x9, sp",
         "ldr x25, [x9, #{x} + 48]",
@@ -450,20 +466,7 @@ pub(crate) fn level_return_addr() -> usize {
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn level_enter() {
     core::arch::naked_asm!(
-        ".cfi_startproc",
-        ".cfi_def_cfa sp, {size}",
-        ".cfi_offset x29, -{size}",
-        ".cfi_offset x30, -{size} + 8",
-        ".cfi_offset x19, -{size} + {x}",
-        ".cfi_offset x20, -{size} + {x} + 8",
-        ".cfi_offset x21, -{size} + {x} + 16",
-        ".cfi_offset x22, -{size} + {x} + 24",
-        ".cfi_offset x23, -{size} + {x} + 32",
-        ".cfi_offset x24, -{size} + {x} + 40",
-        ".cfi_offset x25, -{size} + {x} + 48",
-        ".cfi_offset x26, -{size} + {x} + 56",
-        ".cfi_offset x27, -{size} + {x} + 64",
-        ".cfi_offset x28, -{size} + {x} + 72",
+        level_record_cfi!(),
         "blr x16",
         // A compiled callee returns its one result in x0 alone.
         "cbz x20, 1f",

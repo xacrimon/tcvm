@@ -452,7 +452,8 @@ pub(crate) fn compile<'gc>(
     frame: *const Value<'gc>,
     seen: &[(u8, TypeSet)],
 ) -> Result<crate::dmm::Gc<'gc, crate::jit::region::Region<'gc>>, CompileError> {
-    use crate::jit::backend::target::{abi, emit, lower};
+    use crate::jit::backend::emit::{FastEntry, Links};
+    use crate::jit::backend::target;
     use crate::jit::region::{ExitInfo, Region, encode_snap};
     let config = &ctx.jit().config;
     let opts = Options::of(config);
@@ -475,7 +476,7 @@ pub(crate) fn compile<'gc>(
     // caller's `blr` can enter (5.4).
     let enterable = pc == 0 && !f.meta.loop_entry && !closure.proto.is_vararg;
     let own = enterable.then(|| closure.proto.ptr.as_ptr() as u64);
-    let lowered = lower::lower(
+    let lowered = crate::jit::backend::lower::lower(
         &f,
         closure.code as usize,
         own,
@@ -534,71 +535,16 @@ pub(crate) fn compile<'gc>(
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Regalloc);
     let jit = ctx.jit();
-    use crate::jit::backend::target::emit::Tramp;
-    let tramp = |h: usize, k: Tramp| jit.trampoline(h, k);
-    let mut trampolines: Vec<(usize, usize)> = Vec::new();
-    for inst in &lowered.vcode.insts {
-        use crate::jit::backend::target::inst::MInst;
-        let (a, kind) = match inst {
-            MInst::HelperCold(h) => (
-                crate::jit::helpers::address(*h),
-                if h.sig().ret == Some(crate::jit::ir::types::Rep::F64) {
-                    Tramp::Float
-                } else {
-                    Tramp::Int
-                },
-            ),
-            MInst::FMod => (
-                crate::jit::helpers::address(crate::jit::ir::ops::HelperId::FMod),
-                Tramp::Float,
-            ),
-            MInst::ToF64 { kinds, .. } if kinds.contains(crate::jit::ir::types::TypeSet::STR) => (
-                crate::jit::helpers::jit_str_to_f64 as *const () as usize,
-                Tramp::Int,
-            ),
-            MInst::ToPos { kinds, .. } if kinds.contains(crate::jit::ir::types::TypeSet::STR) => (
-                crate::jit::helpers::jit_str_to_i64 as *const () as usize,
-                Tramp::Int,
-            ),
-            MInst::Barrier => (
-                crate::jit::helpers::jit_barrier as *const () as usize,
-                Tramp::Args(2),
-            ),
-            _ => continue,
-        };
-        if !trampolines.iter().any(|&(x, _)| x == a) {
-            trampolines.push((a, tramp(a, kind)?));
-        }
+    let mut trampolines = Vec::with_capacity(lowered.trampolines.len());
+    for &(helper, kind) in &lowered.trampolines {
+        trampolines.push((helper, jit.trampoline(helper, kind)?));
     }
-    let helpers = emit::Helpers {
-        exit_common: abi::exit_common as *const () as usize,
-        entry_fail: crate::jit::jit_entry_fail as *const () as usize,
-        window: crate::jit::jit_window as *const () as usize,
-        enter: crate::vm::ops::call::enter as *const () as usize,
-        box_i64: tramp(
-            crate::jit::helpers::jit_box_i64 as *const () as usize,
-            Tramp::Int,
-        )?,
-        land: crate::jit::helpers::jit_land as *const () as usize,
-        level: abi::jit_level as *const () as usize,
-        ret_to_native: abi::ret_to_native as *const () as usize,
-        native: abi::native_entry as *const () as usize,
-        coro: [
-            abi::coro_resume as *const () as usize,
-            abi::coro_wrap as *const () as usize,
-            abi::coro_yield as *const () as usize,
-        ],
-        native_act: crate::vm::native::native_act as *const () as usize,
-        dead_entry: crate::jit::jit_dead_entry as *const () as usize,
-        level_enter: abi::level_enter as *const () as usize,
-        fast_miss: abi::direct_miss as *const () as usize,
+    let links = Links {
         rt: crate::jit::layout::rt_word(ctx) as u64,
         metrics: crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64,
         type_mt_cells: std::array::from_fn(|s| {
             crate::jit::layout::rt_read(ctx, crate::jit::layout::type_mt_cell(s as u8)) as u64
         }),
-        level_ret: abi::level_return_addr() as u64,
-        level_land: abi::level_land() as u64,
         trampolines,
         direct: f
             .protos
@@ -615,7 +561,7 @@ pub(crate) fn compile<'gc>(
         Box::new([])
     };
     let fired_at = opts.deopt_all.then_some(fired.as_ptr() as usize);
-    let fast = enterable.then_some(emit::FastEntry {
+    let fast = enterable.then_some(FastEntry {
         max_stack: closure.proto.max_stack_size,
         num_params: closure.proto.num_params,
         proto: closure.proto.ptr.as_ptr() as u64,
@@ -624,60 +570,15 @@ pub(crate) fn compile<'gc>(
     let trace = config.dev.dump.asm;
     #[cfg(not(feature = "tcvm-dev"))]
     let trace = false;
-    let mut em =
-        emit::emit(&lowered, out, helpers, fired_at, fast, trace).map_err(CompileError::Backend)?;
-    let size = em.asm.offset() + em.asm.pool_bytes() + 16;
+    let mut em = target::emit::emit(&lowered, out, links, fired_at, fast, trace)
+        .map_err(CompileError::Backend)?;
     let alloc = ctx.jit().code_alloc();
-    let mut block = alloc.reserve(size)?;
-    let region_word = em.asm.label_offset(em.region_word);
+    let mut block = alloc.reserve(em.asm.max_len())?;
     let start = block.rx();
-    let entry = start.wrapping_add(em.asm.label_offset(em.entry));
-    #[cfg(feature = "tcvm-dev")]
-    let cold_at = em.asm.label_offset(em.cold);
-    #[cfg(feature = "tcvm-dev")]
-    let hot_at: Vec<(u32, usize)> = (em.hot.iter())
-        .map(|&(b, l)| (b, em.asm.label_offset(l)))
-        .collect();
-    let fast_entry = em.fast.map_or(std::ptr::null(), |l| {
-        start.wrapping_add(em.asm.label_offset(l))
-    });
-    // A fast callee's return address is its fast resume's when the resume
-    // block follows the call: one key.
-    let site_keys: Vec<(Vec<(u32, bool)>, u32)> = em
-        .sites
-        .iter()
-        .map(|s| {
-            let mut keys: Vec<(u32, bool)> = s
-                .keys
-                .iter()
-                .map(|&(k, level)| (em.asm.label_offset(k) as u32, level))
-                .collect();
-            keys.sort_unstable();
-            keys.dedup();
-            (keys, em.asm.label_offset(s.miss) as u32)
-        })
-        .collect();
-    let direct: Vec<(u32, u64, bool)> = em
-        .direct
-        .iter()
-        .map(|&(l, p, regs)| (em.asm.label_offset(l) as u32, p, regs))
-        .collect();
-    let landings: Box<[(u32, u32)]> = (em.landings.iter())
-        .map(|&(at, to)| {
-            (
-                em.asm.label_offset(at) as u32,
-                em.asm.label_offset(to) as u32,
-            )
-        })
-        .collect();
-    let lazy: Box<[(u32, u32)]> = (em.lazy.iter())
-        .map(|&(at, to)| {
-            (
-                em.asm.label_offset(at) as u32,
-                em.asm.label_offset(to) as u32,
-            )
-        })
-        .collect();
+    let entry = start.wrapping_add(em.entry as usize);
+    let fast_entry = em
+        .fast
+        .map_or(std::ptr::null(), |at| start.wrapping_add(at as usize));
     let code = em
         .asm
         .finish(start as usize)
@@ -687,32 +588,30 @@ pub(crate) fn compile<'gc>(
     #[cfg(feature = "tcvm-dev")]
     if config.dev.dump.asm {
         eprintln!(
-            "-- jit asm {} pc{pc} at {start:p}, {} bytes, entry +{:#x}, cold +{cold_at:#x}",
+            "-- jit asm {} pc{pc} at {start:p}, {} bytes, entry +{:#x}, cold +{:#x}",
             chunk_name(closure),
             code.len(),
-            entry as usize - start as usize
+            em.entry,
+            em.cold
         );
-        let hot: Vec<String> = hot_at.iter().map(|(b, o)| format!("b{b}+{o:#x}")).collect();
+        let hot: Vec<String> = (em.hot.iter())
+            .map(|(b, o)| format!("b{b}+{o:#x}"))
+            .collect();
         eprintln!("(hot blocks at {})", hot.join(" "));
-        // Each instruction's origin: its VCode instruction's kind.
+        // Each run's origin: its VCode instruction's kind.
         let tags: Vec<(u32, String)> = (em.origins.iter())
             .map(|&(at, o)| {
-                use emit::Origin;
-                let tag = match o {
-                    x if x == Origin::Move as u32 => "move".into(),
-                    x if x == Origin::Remat as u32 => "remat".into(),
-                    x if x == Origin::Entry as u32 => "entry".into(),
-                    x if x == Origin::OutOfLine as u32 => "out-of-line".into(),
-                    x if x == Origin::Stubs as u32 => "stubs".into(),
-                    i => {
-                        let d = format!("{:?}", lowered.vcode.insts[i as usize]);
+                let tag = match crate::jit::backend::emit::Origin::name(o) {
+                    Some(name) => name.into(),
+                    None => {
+                        let d = format!("{:?}", lowered.vcode.insts[o as usize]);
                         d.chars().take_while(|c| c.is_alphanumeric()).collect()
                     }
                 };
                 (at, tag)
             })
             .collect();
-        dump_words(start as usize, &code, &tags);
+        target::code::disassemble(start as usize, &code, &tags);
     }
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Emit);
@@ -826,7 +725,7 @@ pub(crate) fn compile<'gc>(
     }
     // The sites, their snapshots after the exits'.
     let mut sites: Vec<crate::jit::region::Site> = Vec::new();
-    for (site, (keys, miss)) in em.sites.iter_mut().zip(&site_keys) {
+    for site in &mut em.sites {
         for s in &mut site.entries {
             if let crate::jit::region::Loc::Const(c) = s.loc {
                 let w = site.consts[c as usize];
@@ -845,14 +744,18 @@ pub(crate) fn compile<'gc>(
             &site.frames,
             &site.entries,
         );
-        sites.extend(keys.iter().map(|&(key, level)| crate::jit::region::Site {
-            key,
-            snap: at,
-            hdr: site.hdr,
-            pc_after: site.pc_after,
-            level,
-            miss: *miss,
-        }));
+        sites.extend(
+            site.keys
+                .iter()
+                .map(|&(key, level)| crate::jit::region::Site {
+                    key,
+                    snap: at,
+                    hdr: site.hdr,
+                    pc_after: site.pc_after,
+                    level,
+                    miss: site.miss,
+                }),
+        );
     }
     sites.sort_unstable_by_key(|s| s.key);
     let region = crate::dmm::Gc::new(
@@ -881,16 +784,17 @@ pub(crate) fn compile<'gc>(
             retired: std::cell::Cell::new(false),
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
             sites: sites.into_boxed_slice(),
-            lazy,
-            landings,
+            lazy: em.lazy.into_boxed_slice(),
+            landings: em.landings.into_boxed_slice(),
             invalidated: std::cell::Cell::new(false),
         },
     );
-    region
-        .code
-        .patch_u64(region_word, crate::dmm::Gc::as_ptr(region) as u64);
+    region.code.patch_u64(
+        em.region_word as usize,
+        crate::dmm::Gc::as_ptr(region) as u64,
+    );
     // The callees repoint the direct calls as their fast entries change.
-    for (off, p, regs) in direct {
+    for (off, p, regs) in em.direct {
         let proto = *f
             .protos
             .iter()
@@ -922,60 +826,4 @@ pub(crate) fn chunk_name(closure: LuaFn<'_>) -> String {
         String::from_utf8_lossy(closure.proto.source.as_bytes()),
         closure.proto.line_defined
     )
-}
-
-/// With each line tagged `@origin` after a `;` (`tags`: word index, origin,
-/// sorted).
-#[cfg(feature = "tcvm-dev")]
-fn dump_words(base: usize, code: &[u8], tags: &[(u32, String)]) {
-    let words: Vec<u32> = (code.as_chunks::<4>().0.iter())
-        .map(|&c| u32::from_le_bytes(c))
-        .collect();
-    let tag = |line: &str| -> Option<&str> {
-        let off = line.trim_start().split(':').next()?;
-        let w = (usize::from_str_radix(off, 16).ok()? / 4) as u32;
-        let k = tags.partition_point(|t| t.0 <= w).checked_sub(1)?;
-        Some(&tags[k].1)
-    };
-    // Through the system assembler: wrap the words in an object and disassemble it.
-    let dir = std::env::temp_dir().join(format!("tcvm-jit-dump-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let (src, obj) = (dir.join("code.s"), dir.join("code.o"));
-    let mut text = String::from(".text\n");
-    for w in &words {
-        text.push_str(&format!(".inst {w:#010x}\n"));
-    }
-    let ok = std::fs::write(&src, text).is_ok()
-        && std::process::Command::new("clang")
-            .args(["-c", "-arch", "arm64", "-o"])
-            .arg(&obj)
-            .arg(&src)
-            .status()
-            .is_ok_and(|s| s.success());
-    let out = ok
-        .then(|| {
-            std::process::Command::new("objdump")
-                .args(["-d", "--no-show-raw-insn"])
-                .arg(&obj)
-                .output()
-                .ok()
-        })
-        .flatten();
-    match out {
-        Some(o) if o.status.success() => {
-            eprintln!("(offsets from {base:#x})");
-            for line in String::from_utf8_lossy(&o.stdout).lines().skip(6) {
-                match tag(line) {
-                    Some(t) if line.contains(';') => eprintln!("{line} @{t}"),
-                    Some(t) => eprintln!("{line}\t; @{t}"),
-                    None => eprintln!("{line}"),
-                }
-            }
-        }
-        _ => {
-            for (k, w) in words.iter().enumerate() {
-                eprintln!("{:#x}: {w:08x}", base + k * 4);
-            }
-        }
-    }
 }

@@ -122,6 +122,62 @@ pub(crate) unsafe fn sync_icache(rw: *mut u8, rx: *mut u8, len: usize) {
     unsafe { asm!("isb", options(nostack, preserves_flags)) };
 }
 
+/// Print `code`, placed at `base`, disassembled (`TCVM_JIT_DUMP=asm`), each
+/// line tagged `@origin` after a `;` (`tags`: byte offset, origin, sorted).
+#[cfg(feature = "tcvm-dev")]
+pub(crate) fn disassemble(base: usize, code: &[u8], tags: &[(u32, String)]) {
+    let words: Vec<u32> = (code.as_chunks::<4>().0.iter())
+        .map(|&c| u32::from_le_bytes(c))
+        .collect();
+    let tag = |line: &str| -> Option<&str> {
+        let off = line.trim_start().split(':').next()?;
+        let at = usize::from_str_radix(off, 16).ok()? as u32;
+        let k = tags.partition_point(|t| t.0 <= at).checked_sub(1)?;
+        Some(&tags[k].1)
+    };
+    // Through the system assembler: wrap the words in an object and disassemble it.
+    let dir = std::env::temp_dir().join(format!("tcvm-jit-dump-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let (src, obj) = (dir.join("code.s"), dir.join("code.o"));
+    let mut text = String::from(".text\n");
+    for w in &words {
+        text.push_str(&format!(".inst {w:#010x}\n"));
+    }
+    let ok = std::fs::write(&src, text).is_ok()
+        && std::process::Command::new("clang")
+            .args(["-c", "-arch", "arm64", "-o"])
+            .arg(&obj)
+            .arg(&src)
+            .status()
+            .is_ok_and(|s| s.success());
+    let out = ok
+        .then(|| {
+            std::process::Command::new("objdump")
+                .args(["-d", "--no-show-raw-insn"])
+                .arg(&obj)
+                .output()
+                .ok()
+        })
+        .flatten();
+    match out {
+        Some(o) if o.status.success() => {
+            eprintln!("(offsets from {base:#x})");
+            for line in String::from_utf8_lossy(&o.stdout).lines().skip(6) {
+                match tag(line) {
+                    Some(t) if line.contains(';') => eprintln!("{line} @{t}"),
+                    Some(t) => eprintln!("{line}\t; @{t}"),
+                    None => eprintln!("{line}"),
+                }
+            }
+        }
+        _ => {
+            for (k, w) in words.iter().enumerate() {
+                eprintln!("{:#x}: {w:08x}", base + k * 4);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

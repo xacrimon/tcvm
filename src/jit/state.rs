@@ -283,14 +283,14 @@ impl JitRuntime {
     pub(crate) fn trampoline(
         &self,
         helper: usize,
-        kind: crate::jit::backend::target::emit::Tramp,
+        kind: crate::jit::backend::lower::Tramp,
     ) -> Result<usize, crate::jit::compile::CompileError> {
         if let Some(&(_, t)) = self.trampolines.borrow().iter().find(|(h, _)| *h == helper) {
             return Ok(t);
         }
         let (asm, frame) = crate::jit::backend::target::emit::trampoline(helper, kind);
         let alloc = self.code_alloc();
-        let mut block = alloc.reserve(asm.offset() + asm.pool_bytes() + 16)?;
+        let mut block = alloc.reserve(asm.max_len())?;
         let code = asm
             .finish(block.rx() as usize)
             .map_err(|e| crate::jit::compile::CompileError::Backend(format!("assembler: {e:?}")))?;

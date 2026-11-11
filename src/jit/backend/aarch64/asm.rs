@@ -1,9 +1,6 @@
 //! An aarch64 assembler: encodings, labels, a literal pool, and branches to
 //! fixed addresses outside the buffer, resolved once the code's address is
-//! known. Encodings are checked against the system assembler in the tests.
-
-// The encoder also covers instructions later milestones emit.
-#![allow(dead_code)]
+//! known.
 
 /// A general-purpose register, `x0`-`x30`; 31 is `xzr` or `sp` by position.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -59,7 +56,6 @@ pub(crate) enum Cond {
     Lt = 11,
     Gt = 12,
     Le = 13,
-    Al = 14,
 }
 
 impl Cond {
@@ -81,28 +77,6 @@ impl Cond {
             Lt => Ge,
             Gt => Le,
             Le => Gt,
-            Al => panic!("`al` has no inverse"),
-        }
-    }
-
-    pub(crate) fn name(self) -> &'static str {
-        use Cond::*;
-        match self {
-            Eq => "eq",
-            Ne => "ne",
-            Hs => "hs",
-            Lo => "lo",
-            Mi => "mi",
-            Pl => "pl",
-            Vs => "vs",
-            Vc => "vc",
-            Hi => "hi",
-            Ls => "ls",
-            Ge => "ge",
-            Lt => "lt",
-            Gt => "gt",
-            Le => "le",
-            Al => "al",
         }
     }
 }
@@ -211,10 +185,6 @@ impl Asm {
     pub(crate) fn patch_point(&mut self, l: Label) {
         self.bind(l);
         self.patch = Some(self.words.len() as u32);
-    }
-
-    pub(crate) fn is_bound(&self, l: Label) -> bool {
-        self.labels[l.0 as usize] != UNBOUND
     }
 
     /// The bound label's byte offset.
@@ -426,26 +396,6 @@ impl Asm {
         }
     }
 
-    /// `wd = imm` (32-bit).
-    pub(crate) fn mov_imm_w(&mut self, d: Gpr, imm: u32) {
-        let lo = imm as u16;
-        let hi = (imm >> 16) as u16;
-        if hi == 0 {
-            self.movz(Sz::W, d, lo, 0);
-        } else if lo == 0 {
-            self.movz(Sz::W, d, hi, 1);
-        } else if hi == 0xffff {
-            self.movn(Sz::W, d, !lo, 0);
-        } else if lo == 0xffff {
-            self.movn(Sz::W, d, !hi, 1);
-        } else if let Some(enc) = logical_imm(imm as u64, 32) {
-            self.emit(0x3200_03E0 | enc << 10 | r(d));
-        } else {
-            self.movz(Sz::W, d, lo, 0);
-            self.movk(Sz::W, d, hi, 1);
-        }
-    }
-
     /// `ldr xd, =v` from the literal pool.
     pub(crate) fn ldr_lit(&mut self, d: Gpr, v: u64) {
         let l = self.literal(v);
@@ -504,20 +454,8 @@ impl Asm {
         self.rrr_shift(0x0B00_0000, sz, d, n, m, sh, amt);
     }
 
-    pub(crate) fn sub_shift(&mut self, sz: Sz, d: Gpr, n: Gpr, m: Gpr, sh: Shift, amt: u32) {
-        self.rrr_shift(0x4B00_0000, sz, d, n, m, sh, amt);
-    }
-
     pub(crate) fn cmp(&mut self, sz: Sz, n: Gpr, m: Gpr) {
         self.subs(sz, ZR, n, m);
-    }
-
-    pub(crate) fn cmn(&mut self, sz: Sz, n: Gpr, m: Gpr) {
-        self.adds(sz, ZR, n, m);
-    }
-
-    pub(crate) fn cmp_shift(&mut self, sz: Sz, n: Gpr, m: Gpr, sh: Shift, amt: u32) {
-        self.rrr_shift(0x6B00_0000, sz, ZR, n, m, sh, amt);
     }
 
     /// `cmp xn, wm, <ext>` (64-bit compare against an extended register).
@@ -587,20 +525,8 @@ impl Asm {
         self.rrr(0x4A00_0000, sz, d, n, m);
     }
 
-    pub(crate) fn ands(&mut self, sz: Sz, d: Gpr, n: Gpr, m: Gpr) {
-        self.rrr(0x6A00_0000, sz, d, n, m);
-    }
-
-    pub(crate) fn tst(&mut self, sz: Sz, n: Gpr, m: Gpr) {
-        self.ands(sz, ZR, n, m);
-    }
-
     pub(crate) fn orr_shift(&mut self, sz: Sz, d: Gpr, n: Gpr, m: Gpr, sh: Shift, amt: u32) {
         self.rrr_shift(0x2A00_0000, sz, d, n, m, sh, amt);
-    }
-
-    pub(crate) fn eor_shift(&mut self, sz: Sz, d: Gpr, n: Gpr, m: Gpr, sh: Shift, amt: u32) {
-        self.rrr_shift(0x4A00_0000, sz, d, n, m, sh, amt);
     }
 
     /// `mvn d, m` (`orn d, zr, m`).
@@ -692,21 +618,12 @@ impl Asm {
         self.emit(0x9BA0_7C00 | r(m) << 16 | r(n) << 5 | r(d));
     }
 
-    /// `smulh xd, xn, xm`: the high 64 bits of the 128-bit product.
-    pub(crate) fn smulh(&mut self, d: Gpr, n: Gpr, m: Gpr) {
-        self.emit(0x9B40_7C00 | r(m) << 16 | r(n) << 5 | r(d));
-    }
-
     pub(crate) fn csel(&mut self, sz: Sz, d: Gpr, n: Gpr, m: Gpr, c: Cond) {
         self.emit(sz.sf() | 0x1A80_0000 | r(m) << 16 | (c as u32) << 12 | r(n) << 5 | r(d));
     }
 
     pub(crate) fn csinc(&mut self, sz: Sz, d: Gpr, n: Gpr, m: Gpr, c: Cond) {
         self.emit(sz.sf() | 0x1A80_0400 | r(m) << 16 | (c as u32) << 12 | r(n) << 5 | r(d));
-    }
-
-    pub(crate) fn csinv(&mut self, sz: Sz, d: Gpr, n: Gpr, m: Gpr, c: Cond) {
-        self.emit(sz.sf() | 0x5A80_0000 | r(m) << 16 | (c as u32) << 12 | r(n) << 5 | r(d));
     }
 
     pub(crate) fn csneg(&mut self, sz: Sz, d: Gpr, n: Gpr, m: Gpr, c: Cond) {
@@ -722,14 +639,6 @@ impl Asm {
     pub(crate) fn ccmp(&mut self, sz: Sz, n: Gpr, m: Gpr, nzcv: u8, c: Cond) {
         debug_assert!(nzcv < 16);
         self.emit(sz.sf() | 0x7A40_0000 | r(m) << 16 | (c as u32) << 12 | r(n) << 5 | nzcv as u32);
-    }
-
-    /// `ccmp n, #imm5, #nzcv, c`.
-    pub(crate) fn ccmp_imm(&mut self, sz: Sz, n: Gpr, imm: u8, nzcv: u8, c: Cond) {
-        debug_assert!(imm < 32 && nzcv < 16);
-        self.emit(
-            sz.sf() | 0x7A40_0800 | (imm as u32) << 16 | (c as u32) << 12 | r(n) << 5 | nzcv as u32,
-        );
     }
 
     /// `ccmn n, #imm5, #nzcv, c`.
@@ -772,14 +681,6 @@ impl Asm {
         self.sbfm(sz, d, n, s, sz.bits() - 1);
     }
 
-    pub(crate) fn ubfx(&mut self, sz: Sz, d: Gpr, n: Gpr, lsb: u32, width: u32) {
-        self.ubfm(sz, d, n, lsb, lsb + width - 1);
-    }
-
-    pub(crate) fn sbfx(&mut self, sz: Sz, d: Gpr, n: Gpr, lsb: u32, width: u32) {
-        self.sbfm(sz, d, n, lsb, lsb + width - 1);
-    }
-
     /// `sxtw xd, wn`.
     pub(crate) fn sxtw(&mut self, d: Gpr, n: Gpr) {
         self.sbfm(Sz::X, d, n, 0, 31);
@@ -799,10 +700,6 @@ impl Asm {
         }
     }
 
-    pub(crate) fn mem_fits(size: i32, off: i32) -> bool {
-        (off >= 0 && off % size == 0 && off / size < 4096) || (-256..256).contains(&off)
-    }
-
     fn mem_op(&mut self, scaled: u32, unscaled: u32, size: i32, t: u32, n: Gpr, off: i32) {
         let w = Self::mem(scaled, unscaled, size, t, n, off).expect("memory offset out of range");
         self.emit(w);
@@ -820,22 +717,6 @@ impl Asm {
         self.mem_op(0xB940_0000, 0xB840_0000, 4, r(t), n, off);
     }
 
-    pub(crate) fn str_w(&mut self, t: Gpr, n: Gpr, off: i32) {
-        self.mem_op(0xB900_0000, 0xB800_0000, 4, r(t), n, off);
-    }
-
-    pub(crate) fn ldrsw(&mut self, t: Gpr, n: Gpr, off: i32) {
-        self.mem_op(0xB980_0000, 0xB880_0000, 4, r(t), n, off);
-    }
-
-    pub(crate) fn ldrh(&mut self, t: Gpr, n: Gpr, off: i32) {
-        self.mem_op(0x7940_0000, 0x7840_0000, 2, r(t), n, off);
-    }
-
-    pub(crate) fn strh(&mut self, t: Gpr, n: Gpr, off: i32) {
-        self.mem_op(0x7900_0000, 0x7800_0000, 2, r(t), n, off);
-    }
-
     pub(crate) fn ldrb(&mut self, t: Gpr, n: Gpr, off: i32) {
         self.mem_op(0x3940_0000, 0x3840_0000, 1, r(t), n, off);
     }
@@ -843,10 +724,6 @@ impl Asm {
     /// `ldrb wt, [xn, xm]`.
     pub(crate) fn ldrb_reg(&mut self, t: Gpr, n: Gpr, m: Gpr) {
         self.emit(0x3860_6800 | r(m) << 16 | r(n) << 5 | r(t));
-    }
-
-    pub(crate) fn strb(&mut self, t: Gpr, n: Gpr, off: i32) {
-        self.mem_op(0x3900_0000, 0x3800_0000, 1, r(t), n, off);
     }
 
     pub(crate) fn ldr_d(&mut self, t: Fpr, n: Gpr, off: i32) {
@@ -940,14 +817,6 @@ impl Asm {
         self.fff(0x1E60_1800, d, n, m);
     }
 
-    pub(crate) fn fmax(&mut self, d: Fpr, n: Fpr, m: Fpr) {
-        self.fff(0x1E60_4800, d, n, m);
-    }
-
-    pub(crate) fn fmin(&mut self, d: Fpr, n: Fpr, m: Fpr) {
-        self.fff(0x1E60_5800, d, n, m);
-    }
-
     pub(crate) fn fmov(&mut self, d: Fpr, n: Fpr) {
         if d != n {
             self.ff(0x1E60_4000, d, n);
@@ -974,11 +843,6 @@ impl Asm {
     /// Round toward plus infinity.
     pub(crate) fn frintp(&mut self, d: Fpr, n: Fpr) {
         self.ff(0x1E64_C000, d, n);
-    }
-
-    /// Round toward zero.
-    pub(crate) fn frintz(&mut self, d: Fpr, n: Fpr) {
-        self.ff(0x1E65_C000, d, n);
     }
 
     /// `fmsub dd, dn, dm, da`: `a - n * m`, rounded once.
@@ -1064,13 +928,15 @@ impl Asm {
         self.emit(0x1400_0000);
     }
 
-    /// Bytes `finish` adds: the literal pool, aligned.
-    pub(crate) fn pool_bytes(&self) -> usize {
-        if self.literals.is_empty() {
+    /// At most the bytes `finish` hands back: the code and the literal
+    /// pool, aligned.
+    pub(crate) fn max_len(&self) -> usize {
+        let pool = if self.literals.is_empty() {
             0
         } else {
             8 + self.literals.len() * 8
-        }
+        };
+        self.offset() + pool
     }
 
     /// `bl` to a fixed address outside the buffer.
