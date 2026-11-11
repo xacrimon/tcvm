@@ -2420,10 +2420,10 @@ impl Instruction {
 pub const HOT_COUNTERS: usize = 64;
 
 impl Instruction {
-    /// The hot counter a counting instruction decrements: `a` of `FUNC`,
-    /// `LOOP`, `JMP_BACK` and the JIT words, `b` of a `FORLOOP` form and
-    /// `TFORLOOP`. For the slow paths: a handler knows its byte
-    /// (`count_hot!`).
+    /// The hot counter of a counting word: `a` of `FUNC`, `JMP_BACK` and the
+    /// JIT words, `b` of a `FORLOOP` form and `TFORLOOP`. Loops decrement
+    /// theirs at the back edge (`count_hot!`, where a handler knows its
+    /// byte); calls count a function's invocations (`count_invocation!`).
     #[cfg(jit)]
     pub(crate) fn hot_counter(self) -> usize {
         let i = match self.op() {

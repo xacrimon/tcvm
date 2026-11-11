@@ -3,8 +3,8 @@
 use crate::instruction::ArithKind;
 use crate::jit::ir::types::{Rep, Ty, TypeSet};
 
-/// An integer or float comparison. Float compares are ordered: false when
-/// either operand is NaN.
+/// An integer or float comparison. On a NaN operand every float compare is
+/// false except `Ne`, which is true.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Cc {
     Eq,
@@ -205,7 +205,7 @@ pub(crate) enum HelperId {
 
 /// What a `Val` helper returns when the interpreter must run the
 /// instruction: the negative quiet NaN, which no `Value` is (floats are
-/// canonical) and one `movz` makes.
+/// canonical).
 pub(crate) const HELPER_FAIL_VAL: u64 = 0xFFF8_0000_0000_0000;
 
 /// A `Call` or `TailEnter` whose callee's prototype is not known.

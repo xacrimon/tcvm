@@ -23,8 +23,9 @@ pub(crate) const RA_TAG: usize = 1;
 pub(crate) const REG_ARGS: u8 = 8;
 
 /// Words of the register image `exit_common` writes: x0-x15, x19-x21,
-/// x26-x28, d0-d31, then the region's spill slots from word `IMAGE_SPILLS`.
-pub(crate) const EXIT_REGS: usize = 320;
+/// x23-x24, x26-x28, d0-d31, then the region's spill slots from word
+/// `IMAGE_SPILLS`.
+pub(crate) const EXIT_REGS: usize = IMAGE_SPILLS + MAX_SPILLS;
 /// Image word of the first spill slot.
 pub(crate) const IMAGE_SPILLS: usize = 64;
 
@@ -141,7 +142,6 @@ pub(crate) fn image_index(p: PReg) -> u8 {
 
 /// The spill slots a region may have, all copied to the image.
 pub(crate) const MAX_SPILLS: usize = 256;
-const _: () = assert!(IMAGE_SPILLS + MAX_SPILLS <= EXIT_REGS);
 
 /// Entered from a region's exit trampoline with x16 = region | exit << 48 and
 /// the region's frame still open: stores the register image in `image_index`
@@ -184,7 +184,7 @@ pub(crate) unsafe extern "C" fn exit_common() {
         "stp d26, d27, [x17, #400]",
         "stp d28, d29, [x17, #416]",
         "stp d30, d31, [x17, #432]",
-        // The spill slots, [x29 + 24 + 8i], to the image's spill words.
+        // The spill slots, [x29 + 16 + 8i], to the image's spill words.
         "and x9, x16, #0xffffffffffff",
         "ldr w10, [x9, #{num_spills}]",
         "add x11, x29, #{frame_spills}",

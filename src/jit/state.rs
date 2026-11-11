@@ -9,7 +9,8 @@ use crate::instruction::{HOT_COUNTERS, Instruction};
 use crate::jit::backend::target::abi::EXIT_REGS;
 use crate::jit::region::Region;
 
-/// Regions one prototype may hold at once: a function entry and three loops.
+/// Entries one prototype may hold at once; past it `install` retires a loop
+/// entry, never the function entry.
 pub(crate) const MAX_ENTRIES: usize = 4;
 /// Regions a prototype may ever compile.
 pub(crate) const MAX_COMPILES: u8 = 16;

@@ -13,8 +13,8 @@ use crate::jit::opt;
 use crate::jit::opt::speculate::EntryKinds;
 use crate::lua::Context;
 
-/// Why a compile failed: always an internal limit, never a semantic decline; it
-/// counts as a strike.
+/// Why a compile failed. A first compile's failure counts as a strike, except
+/// `Useless` and `OutOfCode`; a recompile's blacklists its entry.
 #[derive(Debug)]
 pub(crate) enum CompileError {
     Irreducible,

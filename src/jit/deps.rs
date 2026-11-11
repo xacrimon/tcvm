@@ -1,4 +1,4 @@
-//! Dependencies of compiled code on runtime state (ws2 §5.3, V8's
+//! Dependencies of compiled code on runtime state (as V8's
 //! `DependentCode`): an object a region assumed something of lists the
 //! region, weakly, with the groups of facts it assumed; a change to one of
 //! them invalidates the regions listed for it (`Region::invalidate`).

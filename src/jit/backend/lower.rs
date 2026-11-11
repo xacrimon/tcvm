@@ -115,7 +115,7 @@ pub(crate) struct Lowered {
     pub(crate) shape_sets: Vec<Vec<u64>>,
     /// The region has dependencies: its entry is patchable.
     pub(crate) invalidable: bool,
-    /// The VCode blocks in the order the encoder lays them out.
+    /// The VCode blocks in the order the allocator and the encoder take them.
     pub(crate) emit_order: Vec<u32>,
     /// How many of `emit_order` are hot: the rest end in a deopt or are
     /// cold.
