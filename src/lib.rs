@@ -26,6 +26,6 @@ pub mod vm;
 pub use compiler::format::format_prototype;
 pub use lua::{
     Context, Executor, ExecutorMode, Fetchable, FromMultiValue, FromValue, IntoMultiValue,
-    IntoValue, LoadError, Lua, RuntimeError, Stashable, StashedError, StashedExecutor,
+    IntoValue, LoadError, Lua, RuntimeError, SendLua, Stashable, StashedError, StashedExecutor,
     StashedFunction, StashedTable, StashedThread, StashedValue, StepResult, SyntaxError, TypeError,
 };

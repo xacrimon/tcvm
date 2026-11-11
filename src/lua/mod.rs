@@ -115,6 +115,19 @@ pub struct Lua {
     stress: Option<(usize, std::cell::Cell<u32>)>,
 }
 
+/// A [`Lua`] that may move to another thread: [`Lua::into_send`], then
+/// [`into_inner`](Self::into_inner) there.
+pub struct SendLua(Lua);
+
+// SAFETY: `Lua::into_send`'s contract.
+unsafe impl Send for SendLua {}
+
+impl SendLua {
+    pub fn into_inner(self) -> Lua {
+        self.0
+    }
+}
+
 impl Default for Lua {
     fn default() -> Self {
         Self::new()
@@ -122,6 +135,18 @@ impl Default for Lua {
 }
 
 impl Lua {
+    /// Wrap `self` to move it to another thread.
+    ///
+    /// # Safety
+    /// Nothing that stays on this thread shares state that is not thread-safe
+    /// with the `Lua`: no stash handle of it (`Stashed*`, which are `!Send`)
+    /// and no clone of an async native's `Cx` lives on, and no `Rc`, `Cell`
+    /// or other `!Send` value held by a userdata payload or an async native's
+    /// future is shared with this thread.
+    pub unsafe fn into_send(self) -> SendLua {
+        SendLua(self)
+    }
+
     pub fn new() -> Self {
         let arena = Arena::<Rootable![State<'_>]>::new(|mc: &Mutation<'_>| {
             let root_shapes = INLINE_CAPS.map(|cap| Shape::root_empty(mc, cap));

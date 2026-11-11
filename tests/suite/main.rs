@@ -66,6 +66,7 @@ mod os_date;
 mod os_exit;
 mod pcall;
 mod return_multires;
+mod send_lua;
 mod shapes;
 mod stack_overflow;
 mod stmt_temp_reclaim;
