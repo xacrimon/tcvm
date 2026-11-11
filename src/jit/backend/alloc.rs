@@ -1,11 +1,11 @@
-//! Code memory in 64 KiB segments, each dual-mapped once and sub-allocated in
-//! 64-byte units by a bitmap in the segment's own first units. A block's
-//! writable address masks back to its segment's header, so a `CodeBlock`
-//! frees itself without a pointer to the allocator; the allocator outlives
-//! every block (regions hold an `Rc` of it). The executable alias is
-//! aligned too, and a second bitmap marks where blocks start, so an address
-//! in a block finds the block's first word (`block_start`), where a region
-//! keeps its pointer.
+//! Code memory in 64 KiB segments, each mapped once (`code::map_in`) and
+//! sub-allocated in 64-byte units by a bitmap in the segment's own first
+//! units. A block's writable address masks back to its segment's header, so
+//! a `CodeBlock` frees itself without a pointer to the allocator; the
+//! allocator outlives every block (regions hold an `Rc` of it). The
+//! executable alias is aligned too, and a second bitmap marks where blocks
+//! start, so an address in a block finds the block's first word
+//! (`block_start`), where a region keeps its pointer.
 //!
 //! Every segment's executable alias is a slot of the process's one code
 //! range (`Range`), shared by every `Lua`: code reaches other code with
@@ -19,7 +19,7 @@ use std::io;
 use std::ptr::NonNull;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::jit::backend::code::{map_in, reserve as reserve_space, unmap_out};
+use crate::jit::backend::code::{map_in, reserve as reserve_space, unmap};
 use crate::jit::backend::target::code::{self as tcode, sync_icache};
 
 pub(crate) const SEG_SIZE: usize = 64 * 1024;
@@ -129,8 +129,7 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.rw.as_ptr().cast(), SEG_SIZE) };
-        unmap_out(self.rx, SEG_SIZE);
+        unmap(self.rw, self.rx, SEG_SIZE);
         if let Some(r) = range().as_mut() {
             r.give(self.rx.as_ptr() as usize);
         }

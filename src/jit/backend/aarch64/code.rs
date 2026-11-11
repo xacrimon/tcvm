@@ -181,7 +181,7 @@ pub(crate) fn disassemble(base: usize, code: &[u8], tags: &[(u32, String)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jit::backend::code::{in_reach, map_in, reserve, unmap_out};
+    use crate::jit::backend::code::{in_reach, map_in, reserve, unmap};
 
     #[test]
     fn maps_in_a_reservation_and_runs() {
@@ -202,9 +202,8 @@ mod tests {
             sync_icache(rw.as_ptr(), rx.as_ptr(), 8);
             let f: extern "C" fn() -> u64 = std::mem::transmute(rx.as_ptr());
             assert_eq!(f(), 42);
-            libc::munmap(rw.as_ptr().cast(), SIZE);
         }
-        unmap_out(rx, SIZE);
+        unmap(rw, rx, SIZE);
         unsafe { libc::munmap(rx.as_ptr().cast(), SIZE) };
     }
 }

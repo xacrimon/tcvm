@@ -1,6 +1,5 @@
 //! The target's side of code memory (`backend::alloc`): branch reach and
-//! encodings for patching and islands. The processor keeps its instruction
-//! cache coherent with stores, through either alias of a page.
+//! encodings for patching and islands.
 
 /// Reach of direct branches: code in `[a, a + len)` reaches every target in
 /// `[lo, hi)` when `a + len - lo <= REACH` and `hi - a <= REACH` (`rel32`
@@ -58,33 +57,9 @@ pub(crate) fn ret_imm(imm: u16) -> [u8; 8] {
     b
 }
 
-/// Nothing to do: the processor tracks code writes by physical address. A
-/// user-mode emulator (Rosetta, QEMU) translates the executable alias and
-/// does not see a write through the other one: under `TCVM_JIT_EMULATED=1`
-/// (`tcvm-dev`) it is told by a change of the pages' protection and back,
-/// which never takes the execute permission away (other threads run the
-/// islands' page).
-pub(crate) unsafe fn sync_icache(_rw: *mut u8, rx: *mut u8, len: usize) {
-    #[cfg(feature = "tcvm-dev")]
-    {
-        static EMULATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = EMULATED
-            .get_or_init(|| std::env::var_os("TCVM_JIT_EMULATED").is_some_and(|v| v != "0"));
-        if *on {
-            const PAGE: usize = 4096;
-            const RX: i32 = libc::PROT_READ | libc::PROT_EXEC;
-            let start = rx as usize & !(PAGE - 1);
-            let len = (rx as usize + len).next_multiple_of(PAGE) - start;
-            // SAFETY: pages of the executable alias.
-            unsafe {
-                libc::mprotect(start as *mut _, len, RX | libc::PROT_WRITE);
-                libc::mprotect(start as *mut _, len, RX);
-            }
-        }
-    }
-    #[cfg(not(feature = "tcvm-dev"))]
-    let _ = (rx, len);
-}
+/// Nothing to do: code is written and fetched at one address, and the
+/// processor keeps its instruction cache coherent with stores.
+pub(crate) unsafe fn sync_icache(_rw: *mut u8, _rx: *mut u8, _len: usize) {}
 
 /// Print `code`, placed at `base`, disassembled (`TCVM_JIT_DUMP=asm`), each
 /// line tagged `@origin` after a `;` (`tags`: byte offset, origin, sorted).
@@ -130,7 +105,7 @@ pub(crate) fn disassemble(base: usize, code: &[u8], tags: &[(u32, String)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jit::backend::code::{in_reach, map_in, reserve, unmap_out};
+    use crate::jit::backend::code::{in_reach, map_in, reserve, unmap};
 
     #[test]
     fn maps_in_a_reservation_and_runs() {
@@ -145,15 +120,15 @@ mod tests {
             Err(_) => reserve(SIZE, SIZE, false, false).expect("reserve"),
         };
         let rw = map_in(rx, SIZE).expect("map");
-        assert_eq!(rw.as_ptr() as usize % SIZE, 0);
-        unsafe {
-            std::ptr::copy_nonoverlapping(ret_imm(42).as_ptr(), rw.as_ptr(), 8);
-            sync_icache(rw.as_ptr(), rx.as_ptr(), 8);
-            let f: extern "C" fn() -> u64 = std::mem::transmute(rx.as_ptr());
-            assert_eq!(f(), 42);
-            libc::munmap(rw.as_ptr().cast(), SIZE);
+        assert_eq!(rw, rx);
+        for imm in [42, 43] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(ret_imm(imm).as_ptr(), rw.as_ptr(), 8);
+                let f: extern "C" fn() -> u64 = std::mem::transmute(rx.as_ptr());
+                assert_eq!(f(), imm as u64);
+            }
         }
-        unmap_out(rx, SIZE);
+        unmap(rw, rx, SIZE);
         unsafe { libc::munmap(rx.as_ptr().cast(), SIZE) };
     }
 

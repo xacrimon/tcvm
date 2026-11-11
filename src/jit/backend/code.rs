@@ -1,6 +1,9 @@
-//! Executable memory: every page mapped twice, a read/write alias the JIT
-//! writes through and a read/execute alias the CPU fetches from, so no page
-//! is ever both. The executable aliases go into one reservation per process
+//! Executable memory. On aarch64 every page is mapped twice, a read/write
+//! alias the JIT writes through and a read/execute alias the CPU fetches
+//! from, so no page is ever both. On x86-64 a page is mapped once,
+//! read/write/execute: user-mode emulators (Rosetta, QEMU) watch translated
+//! code at the address it runs from and miss writes through another alias.
+//! The executable addresses go into one reservation per process
 //! (`alloc`'s code range), placed within direct-branch reach of tcvm's text
 //! when there is room, so regions branch to handlers and helpers directly;
 //! a range out of reach branches to them through islands.
@@ -109,7 +112,7 @@ fn candidates(size: usize, align: usize) -> impl Iterator<Item = usize> {
         .filter(move |&a| a != 0 && in_reach(a, size))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe extern "C" {
     fn mach_vm_remap(
         target_task: libc::vm_map_t,
@@ -271,7 +274,7 @@ fn reserve_at(at: Place, size: usize, align: usize) -> Option<NonNull<u8>> {
 /// Map `size` bytes twice: a read/write alias anywhere, aligned to `size`,
 /// and a read/execute alias over `rx`, a slot of a reservation. Returns
 /// the read/write alias.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(deprecated)]
 pub(crate) fn map_in(rx: NonNull<u8>, size: usize) -> io::Result<NonNull<u8>> {
     let task = unsafe { libc::mach_task_self() };
@@ -338,7 +341,7 @@ pub(crate) fn map_in(rx: NonNull<u8>, size: usize) -> io::Result<NonNull<u8>> {
 
 /// Linux: two `MAP_SHARED` views of one `memfd`, the executable one over the
 /// slot with `MAP_FIXED`.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 pub(crate) fn map_in(rx: NonNull<u8>, size: usize) -> io::Result<NonNull<u8>> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -376,10 +379,57 @@ pub(crate) fn map_in(rx: NonNull<u8>, size: usize) -> io::Result<NonNull<u8>> {
     Ok(rw)
 }
 
+/// x86-64: the slot `rx` read/write/execute. Returns `rx`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn map_in(rx: NonNull<u8>, size: usize) -> io::Result<NonNull<u8>> {
+    let prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+    if unsafe { libc::mprotect(rx.as_ptr().cast(), size, prot) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(rx)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[allow(deprecated)]
+pub(crate) fn map_in(rx: NonNull<u8>, size: usize) -> io::Result<NonNull<u8>> {
+    let rwx = libc::VM_PROT_READ | libc::VM_PROT_WRITE | libc::VM_PROT_EXECUTE;
+    let mut addr = rx.as_ptr() as libc::mach_vm_address_t;
+    let kr = unsafe {
+        libc::mach_vm_map(
+            libc::mach_task_self(),
+            &mut addr,
+            size as libc::mach_vm_size_t,
+            0,
+            libc::VM_FLAGS_FIXED | libc::VM_FLAGS_OVERWRITE,
+            0,
+            0,
+            0,
+            rwx,
+            rwx,
+            VM_INHERIT_NONE,
+        )
+    };
+    if kr != libc::KERN_SUCCESS {
+        return Err(io::Error::other(format!("mach_vm_map failed: {kr}")));
+    }
+    Ok(rx)
+}
+
+/// Unmap what `map_in` mapped, putting the slot back into its reservation.
+pub(crate) fn unmap(rw: NonNull<u8>, rx: NonNull<u8>, size: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        libc::munmap(rw.as_ptr().cast(), size)
+    };
+    #[cfg(target_arch = "x86_64")]
+    let _ = rw;
+    unmap_out(rx, size);
+}
+
 /// Put a slot `map_in` mapped back into its reservation: reserved address
 /// space nothing else is given.
 #[allow(deprecated)]
-pub(crate) fn unmap_out(rx: NonNull<u8>, size: usize) {
+fn unmap_out(rx: NonNull<u8>, size: usize) {
     #[cfg(target_os = "macos")]
     {
         let mut addr = rx.as_ptr() as libc::mach_vm_address_t;

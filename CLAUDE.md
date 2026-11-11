@@ -7,7 +7,7 @@ TCVM is a Lua 5.5 implementation in Rust: parser, compiler, direct-threaded inte
 - Differential runs: `lua x.lua` vs `target/release/tcvm-cli -f x.lua`, `luac -l -p x.lua` vs `tcvm-cli -l -f x.lua`. `tools/difflua.sh` does the same with every JIT region compiled at its first count.
 - macOS has no `timeout`: cap runs with `perl -e 'alarm 20; exec @ARGV' …`, and confirm a check produced output before reading silence as success.
 - Tests never shell out to `lua`. Derive expected output locally, then hardcode it in assertions or insta snapshots.
-- x86-64 runs in Docker (`--platform linux/amd64`, the image `rust:1-bookworm`). Its emulator does not see code rewritten through the writable alias: set `TCVM_JIT_EMULATED=1` (a `tcvm-dev` build) or recompiled and patched code runs stale.
+- x86-64 runs in Docker (`--platform linux/amd64`, the image `rust:1-bookworm`).
 - Some differences from PUC Lua are deliberate (yielding across natives and message handlers, main-thread yield to the host, `%.14g` float tostring, buffered non-flushing `print`, text-only chunks, 0x7fffff00 string cap, `global` always reserved, PCG `math.random`). Don't report or "fix" them.
 
 ## Build and test
@@ -39,7 +39,7 @@ Tests: `tests/suite/*.rs` (runtime), `test-files/*.lua` (snapshots), `src/compil
 Use rust-analyzer for anything the module docs don't answer; don't rely on this file for details.
 
 ## JIT knobs (env, `tcvm-dev` builds)
-`TCVM_JIT=off` (every build), `TCVM_JIT_HOT_CALL=N`/`TCVM_JIT_HOT_LOOP=N` (1 = compile at first count), `TCVM_JIT_DEOPT_ALL=1`, `TCVM_JIT_INLINE=0`, `TCVM_JIT_DUMP=ir,opt,vcode,ra,asm`, `TCVM_JIT_LOG=1`, `TCVM_JIT_CHECK=1`, `TCVM_JIT_TIME=1`, `TCVM_JIT_ONLY=…`, `TCVM_JIT_FAR=1`, `TCVM_JIT_EMULATED=1` (x86-64 under an emulator), `TCVM_JIT_RA_CAPTURE=dir`, `TCVM_GC_STRESS=N`, `TCVM_HASH_SEED=N` (fixed string hash seed: `pairs` orders repeat run to run). The Bash tool runs zsh: `env $m` with several variables in `$m` sets only the first, so use `env ${=m}`.
+`TCVM_JIT=off` (every build), `TCVM_JIT_HOT_CALL=N`/`TCVM_JIT_HOT_LOOP=N` (1 = compile at first count), `TCVM_JIT_DEOPT_ALL=1`, `TCVM_JIT_INLINE=0`, `TCVM_JIT_DUMP=ir,opt,vcode,ra,asm`, `TCVM_JIT_LOG=1`, `TCVM_JIT_CHECK=1`, `TCVM_JIT_TIME=1`, `TCVM_JIT_ONLY=…`, `TCVM_JIT_FAR=1`, `TCVM_JIT_RA_CAPTURE=dir`, `TCVM_GC_STRESS=N`, `TCVM_HASH_SEED=N` (fixed string hash seed: `pairs` orders repeat run to run). The Bash tool runs zsh: `env $m` with several variables in `$m` sets only the first, so use `env ${=m}`.
 
 ## Working style
 - Planning or brainstorming: ask clarifying questions one at a time; don't create tasks, spawn subagents, or write plan files until explicitly approved.
