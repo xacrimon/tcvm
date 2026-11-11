@@ -104,6 +104,18 @@ pub(crate) fn preg_float(r: Xmm) -> PReg {
     PReg::new(r.0 as usize, RegClass::Float)
 }
 
+/// `p`'s name in the dumps.
+#[cfg(feature = "tcvm-dev")]
+pub(crate) fn reg_name(p: PReg) -> String {
+    const INT: [&str; 8] = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"];
+    match (p.class(), p.hw_enc()) {
+        (RegClass::Int, n @ 0..8) => INT[n].into(),
+        (RegClass::Int, n) => format!("r{n}"),
+        (RegClass::Float, n) => format!("xmm{n}"),
+        (RegClass::Vector, _) => unreachable!(),
+    }
+}
+
 /// The register image slot `exit_common` stores a register in.
 pub(crate) fn image_index(p: PReg) -> u8 {
     let n = p.hw_enc() as u8;

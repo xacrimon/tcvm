@@ -1049,15 +1049,7 @@ impl Ctx {
         };
         let loc = |l: Loc| match l {
             Loc::None => "?".to_string(),
-            Loc::Reg(r) => format!(
-                "{}{}",
-                if r.class() == RegClass::Float {
-                    'd'
-                } else {
-                    'x'
-                },
-                r.hw_enc()
-            ),
+            Loc::Reg(r) => crate::jit::backend::target::abi::reg_name(r),
             Loc::Stack => "stack".to_string(),
             Loc::Remat => "remat".to_string(),
         };

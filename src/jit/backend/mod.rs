@@ -16,13 +16,13 @@
 //!   registers calls pass arguments in (`REG_ARGS`), the exit's register
 //!   image (`EXIT_REGS`, `IMAGE_SPILLS`, `image_index`), the frame's spill
 //!   slots (`spill_addr`), a return address's tag (`RA_TAG`),
-//!   `stack_pointer`, and the stubs
+//!   `stack_pointer`, register names for the dumps (`reg_name`), and the stubs
 //!   between compiled code, the interpreter's handlers and levels
 //!   (`dispatch_entry`, `level_jump`, `level_land`, `level_return_addr`,
 //!   `ret_to_native`, `ret_shim`, `direct_miss`).
 //! - `target::code`: branch reach and the encodings code memory patches
 //!   (`REACH`, `RANGE_SIZES`, `reaches`, `BRANCH`, `retarget`, `call`, `JUMP`,
-//!   `jump`, `ISLAND`, `island`), `sync_icache`, and `disassemble` for the
+//!   `jump`, `ISLAND`, `island`), `sync_icache`, and `objdump` for the
 //!   dumps.
 //! - `target::unwind`: the DWARF registers and rules of `unwind::Fde`
 //!   (`CODE_ALIGN`, `RETURN_COLUMN`, `entry_rules`, `frame_rules`).

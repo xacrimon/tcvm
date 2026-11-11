@@ -465,3 +465,36 @@ fn unmap_out(rx: NonNull<u8>, size: usize) {
         assert!(p != libc::MAP_FAILED, "re-reserving a code slot");
     }
 }
+
+/// Print `code`, placed at `base`, disassembled by the target's `objdump`
+/// (`TCVM_JIT_DUMP=asm`), each line tagged `@origin` after a `;` (`tags`:
+/// byte offset, origin, sorted); as hex bytes when that fails.
+#[cfg(feature = "tcvm-dev")]
+pub(crate) fn disassemble(base: usize, code: &[u8], tags: &[(u32, String)]) {
+    let tag = |line: &str| -> Option<&str> {
+        let off = line.trim_start().split(':').next()?;
+        let at = usize::from_str_radix(off, 16).ok()? as u32;
+        let k = tags.partition_point(|t| t.0 <= at).checked_sub(1)?;
+        Some(&tags[k].1)
+    };
+    let dir = std::env::temp_dir().join(format!("tcvm-jit-dump-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    match crate::jit::backend::target::code::objdump(&dir, code) {
+        Some((o, header)) if o.status.success() => {
+            eprintln!("(offsets from {base:#x})");
+            for line in String::from_utf8_lossy(&o.stdout).lines().skip(header) {
+                match tag(line) {
+                    Some(t) if line.contains(';') => eprintln!("{line} @{t}"),
+                    Some(t) => eprintln!("{line}\t; @{t}"),
+                    None => eprintln!("{line}"),
+                }
+            }
+        }
+        _ => {
+            for (k, c) in code.chunks(16).enumerate() {
+                let hex: Vec<String> = c.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("{:#x}: {}", base + k * 16, hex.join(" "));
+            }
+        }
+    }
+}

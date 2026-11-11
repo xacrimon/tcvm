@@ -68,45 +68,19 @@ pub(crate) fn ret_imm(imm: u16) -> [u8; 8] {
 /// processor keeps its instruction cache coherent with stores.
 pub(crate) unsafe fn sync_icache(_rw: *mut u8, _rx: *mut u8, _len: usize) {}
 
-/// Print `code`, placed at `base`, disassembled (`TCVM_JIT_DUMP=asm`), each
-/// line tagged `@origin` after a `;` (`tags`: byte offset, origin, sorted).
+/// GNU `objdump`'s listing of `code` (a raw image in `dir`), and its header
+/// lines.
 #[cfg(feature = "tcvm-dev")]
-pub(crate) fn disassemble(base: usize, code: &[u8], tags: &[(u32, String)]) {
-    let tag = |line: &str| -> Option<&str> {
-        let off = line.trim_start().split(':').next()?;
-        let at = usize::from_str_radix(off, 16).ok()? as u32;
-        let k = tags.partition_point(|t| t.0 <= at).checked_sub(1)?;
-        Some(&tags[k].1)
-    };
-    // Through binutils: the bytes as a raw image.
-    let dir = std::env::temp_dir().join(format!("tcvm-jit-dump-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+pub(crate) fn objdump(dir: &std::path::Path, code: &[u8]) -> Option<(std::process::Output, usize)> {
     let bin = dir.join("code.bin");
-    let out = std::fs::write(&bin, code).ok().and_then(|()| {
-        std::process::Command::new("objdump")
-            .args(["-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel"])
-            .arg("--no-show-raw-insn")
-            .arg(&bin)
-            .output()
-            .ok()
-    });
-    match out {
-        Some(o) if o.status.success() => {
-            eprintln!("(offsets from {base:#x})");
-            for line in String::from_utf8_lossy(&o.stdout).lines().skip(7) {
-                match tag(line) {
-                    Some(t) => eprintln!("{line}\t; @{t}"),
-                    None => eprintln!("{line}"),
-                }
-            }
-        }
-        _ => {
-            for (k, c) in code.chunks(16).enumerate() {
-                let hex: Vec<String> = c.iter().map(|b| format!("{b:02x}")).collect();
-                eprintln!("{:#x}: {}", base + k * 16, hex.join(" "));
-            }
-        }
-    }
+    std::fs::write(&bin, code).ok()?;
+    let out = std::process::Command::new("objdump")
+        .args(["-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel"])
+        .arg("--no-show-raw-insn")
+        .arg(&bin)
+        .output()
+        .ok()?;
+    Some((out, 7))
 }
 
 #[cfg(test)]

@@ -197,15 +197,7 @@ impl<I: TargetInst + std::fmt::Debug> VCode<I> {
         use crate::jit::backend::ra::{Edit, InstOrEdit};
         use crate::jit::backend::reg::{Allocation, AllocationKind};
         let loc = |a: Allocation| match a.kind() {
-            AllocationKind::Reg => {
-                let r = a.as_reg().unwrap();
-                let c = match r.class() {
-                    RegClass::Int => 'x',
-                    RegClass::Float => 'd',
-                    RegClass::Vector => 'q',
-                };
-                format!("{c}{}", r.hw_enc())
-            }
+            AllocationKind::Reg => crate::jit::backend::target::abi::reg_name(a.as_reg().unwrap()),
             AllocationKind::Stack => format!("[s{}]", a.as_stack().unwrap().index()),
             AllocationKind::None => "-".into(),
         };
