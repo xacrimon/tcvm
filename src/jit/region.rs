@@ -286,8 +286,10 @@ pub(crate) struct Region<'gc> {
     pub(crate) nest: Box<[u32]>,
     #[collect(require_static)]
     pub(crate) num_spills: u32,
-    /// Bytes of the region's native frame, which `exit_common` pops.
+    /// Bytes of the region's native frame: what aarch64's `exit_common`
+    /// pops (x86-64's frame pointer says where the frame ends).
     #[collect(require_static)]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) frame_size: u32,
     #[collect(require_static)]
     pub(crate) retired: Cell<bool>,
@@ -379,6 +381,7 @@ pub(crate) mod layout {
     use super::Region;
 
     pub(crate) const NUM_SPILLS: usize = std::mem::offset_of!(Region<'static>, num_spills);
+    #[cfg(target_arch = "aarch64")]
     pub(crate) const FRAME_SIZE: usize = std::mem::offset_of!(Region<'static>, frame_size);
 }
 

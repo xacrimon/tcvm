@@ -2299,12 +2299,15 @@ pub(super) fn real_call(
 ) -> (Vec<Val>, Block) {
     // The arguments in the callee's slots (up to `top`: those before the
     // ones a call or VARARG landed there), and the captured registers, which
-    // it may read through their cells. A fixed count's first eight are the
+    // it may read through their cells. A fixed count's first `REG_ARGS` are the
     // call's operands instead: in registers to a known Lua callee, stored
     // by the lowering for any other (W4 §2).
     let mut stored: Vec<usize> = b.cfg.captured.iter().collect();
     let (end, in_regs) = if nb != 0 {
-        (a as usize + 4 + nb as usize - 1, (nb as usize - 1).min(8))
+        (
+            a as usize + 4 + nb as usize - 1,
+            (nb as usize - 1).min(crate::jit::REG_ARGS as usize),
+        )
     } else {
         (b.cfg.nregs, 0)
     };

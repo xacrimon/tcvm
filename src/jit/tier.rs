@@ -17,7 +17,7 @@ use crate::vm::frame;
 
 const PTR_MASK: u64 = (1 << 48) - 1;
 
-pub(crate) use crate::jit::backend::target::abi::FRAME_SPILLS;
+pub(crate) use crate::jit::backend::target::abi::{RA_TAG, REG_ARGS, spill_addr};
 
 /// A hash map with a fast, unkeyed hasher, for compile-time tables.
 pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::FixedState>;
@@ -113,9 +113,9 @@ handler! {
             // SAFETY: the level `exit_common` runs in has its record there.
             unsafe {
                 let lr = (*rec).lr;
-                let off = (lr & !1).wrapping_sub(start);
+                let off = (lr & !RA_TAG).wrapping_sub(start);
                 if let Some(&(_, to)) = region.landings.iter().find(|l| l.0 as usize == off) {
-                    (*rec).lr = (start + to as usize) | (lr & 1);
+                    (*rec).lr = (start + to as usize) | (lr & RA_TAG);
                 }
             }
         }

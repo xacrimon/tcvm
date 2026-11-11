@@ -408,7 +408,11 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let meta = RegionMeta {
             entry_pc,
             loop_entry,
-            params: if function { proto.num_params.min(8) } else { 0 },
+            params: if function {
+                proto.num_params.min(crate::jit::REG_ARGS)
+            } else {
+                0
+            },
         };
         let mut f = Func::new(meta);
         f.captured = cfg.captured;

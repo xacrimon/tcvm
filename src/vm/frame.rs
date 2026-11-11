@@ -519,7 +519,12 @@ impl<'gc> Walk<'gc> {
             self.cross = false;
             // SAFETY: the thread's records chain from `ts.record`.
             let r = unsafe { &*(self.rec as *const EntryRecord) };
-            self.compiled = Some((r.fp, r.lr & !1, r.x[3] as *mut Value<'gc>, true));
+            self.compiled = Some((
+                r.fp,
+                r.lr & !crate::jit::RA_TAG,
+                r.base() as *mut Value<'gc>,
+                true,
+            ));
             self.rec = r.prev;
             self.level = r.prev;
         }
@@ -547,7 +552,7 @@ impl<'gc> Walk<'gc> {
             };
             let lr = *((fp + 8) as *const usize);
             let next = (lr != crate::vm::stack::level_land())
-                .then(|| (*(fp as *const usize), lr & !1, base, false));
+                .then(|| (*(fp as *const usize), lr & !crate::jit::RA_TAG, base, false));
             (f, next)
         };
         self.compiled = next;
@@ -634,7 +639,7 @@ impl<'gc> Walk<'gc> {
                 let e = snap.entry(reg).expect("an entry for a dynamic callee");
                 let w = match e.loc {
                     Loc::Spill(i) => unsafe {
-                        *((fp + crate::jit::FRAME_SPILLS + 8 * i as usize) as *const u64)
+                        *(crate::jit::spill_addr(fp, i as usize) as *const u64)
                     },
                     Loc::Slot(r) => unsafe { *(f0.base.add(r as usize) as *const u64) },
                     loc => crate::jit::const_word(region, loc),

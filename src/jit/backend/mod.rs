@@ -13,8 +13,10 @@
 //! - `target::types`: `test_words`, the words its type tests compare with.
 //! - `target::asm`: `Asm`, with `max_len` and `finish`.
 //! - `target::abi`: the allocator's registers (`ra_env`, `allocatable`), the
-//!   exit's register image (`EXIT_REGS`, `IMAGE_SPILLS`, `image_index`), the
-//!   frame's spill slots (`FRAME_SPILLS`), `stack_pointer`, and the stubs
+//!   registers calls pass arguments in (`REG_ARGS`), the exit's register
+//!   image (`EXIT_REGS`, `IMAGE_SPILLS`, `image_index`), the frame's spill
+//!   slots (`spill_addr`), a return address's tag (`RA_TAG`),
+//!   `stack_pointer`, and the stubs
 //!   between compiled code, the interpreter's handlers and levels
 //!   (`dispatch_entry`, `level_jump`, `level_land`, `level_return_addr`,
 //!   `ret_to_native`, `ret_shim`, `direct_miss`, `direct_miss_regs`).
@@ -40,6 +42,10 @@ cfg_select! {
     target_arch = "aarch64" => {
         pub(crate) mod aarch64;
         pub(crate) use aarch64 as target;
+    }
+    target_arch = "x86_64" => {
+        pub(crate) mod x86_64;
+        pub(crate) use x86_64 as target;
     }
 }
 

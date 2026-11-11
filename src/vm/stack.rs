@@ -174,7 +174,7 @@ impl Drop for ThreadStack {
 /// returns to them through `ret_to_native`. Pushed on the native stack by
 /// `abi::jit_level`, which handlers then run below; the bottom level's is
 /// `dispatch_entry`'s.
-#[cfg(jit)]
+#[cfg(all(jit, target_arch = "aarch64"))]
 #[repr(C)]
 pub(crate) struct EntryRecord {
     /// The frame record of the code that started the level: its frame
@@ -196,7 +196,36 @@ pub(crate) struct EntryRecord {
     pub(crate) d: [u64; 8],
 }
 
+/// The same on x86-64, where the frame record is what `call` and `push
+/// rbp` leave: on top.
+#[cfg(all(jit, target_arch = "x86_64"))]
+#[repr(C)]
+pub(crate) struct EntryRecord {
+    /// `BASE` of the compiled code that started the level, and the runtime.
+    base: usize,
+    rt: usize,
+    /// The record of the level below, 0 for the bottom level's.
+    pub(crate) prev: usize,
+    /// The base of the level's first frame: frames below it are the
+    /// compiled caller's. 0 for the bottom level.
+    pub(crate) first: usize,
+    /// The frame record of the code that started the level.
+    pub(crate) fp: usize,
+    pub(crate) lr: usize,
+}
+
 #[cfg(jit)]
+impl EntryRecord {
+    /// `BASE` of the compiled code that started the level.
+    pub(crate) fn base(&self) -> usize {
+        cfg_select! {
+            target_arch = "aarch64" => self.x[3],
+            _ => self.base,
+        }
+    }
+}
+
+#[cfg(all(jit, target_arch = "aarch64"))]
 pub(crate) mod rec {
     use std::mem::offset_of;
 
@@ -207,6 +236,20 @@ pub(crate) mod rec {
     pub(crate) const X: usize = offset_of!(EntryRecord, x);
     pub(crate) const D: usize = offset_of!(EntryRecord, d);
     const _: () = assert!(SIZE == 192 && PREV == 16 && X == 48 && D == 128);
+}
+
+#[cfg(all(jit, target_arch = "x86_64"))]
+pub(crate) mod rec {
+    use std::mem::offset_of;
+
+    use super::EntryRecord;
+    pub(crate) const SIZE: usize = size_of::<EntryRecord>();
+    pub(crate) const BASE: usize = offset_of!(EntryRecord, base);
+    pub(crate) const RT: usize = offset_of!(EntryRecord, rt);
+    pub(crate) const PREV: usize = offset_of!(EntryRecord, prev);
+    pub(crate) const FIRST: usize = offset_of!(EntryRecord, first);
+    // The stubs push the frame record and keep the stack 16-aligned.
+    const _: () = assert!(SIZE.is_multiple_of(16) && offset_of!(EntryRecord, fp) == SIZE - 16);
 }
 
 /// The return address of a compiled frame dispatch entered

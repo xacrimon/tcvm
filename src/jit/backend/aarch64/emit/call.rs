@@ -722,14 +722,13 @@ impl<'a> Em<'a> {
                 self.a.cbz(Sz::X, INSN, first);
                 self.a.str(Gpr(0), PC, 0);
                 self.a.bind(first);
-                // Land through the helper: (rt, thread, base, a, values, nret, c).
-                self.a.ldr_lit(Gpr(0), self.links.rt);
-                self.a.mov(Gpr(1), THREAD);
-                self.a.mov(Gpr(4), PC);
-                self.a.mov(Gpr(5), INSN);
-                self.a.mov(Gpr(2), BASE);
-                self.a.movz(Sz::X, Gpr(3), a as u16, 0);
-                self.a.movz(Sz::X, Gpr(6), c as u16, 0);
+                // Land through the helper: (thread, base, a, values, nret, c).
+                self.a.mov(Gpr(0), THREAD);
+                self.a.mov(Gpr(3), PC);
+                self.a.mov(Gpr(4), INSN);
+                self.a.mov(Gpr(1), BASE);
+                self.a.movz(Sz::X, Gpr(2), a as u16, 0);
+                self.a.movz(Sz::X, Gpr(5), c as u16, 0);
                 self.a.bl_far(addr!(crate::jit::helpers::jit_land));
                 self.a.bind(done);
             }

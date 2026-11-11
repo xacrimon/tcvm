@@ -1034,9 +1034,9 @@ fn replacing_tail_call(b: &mut Builder<'_, '_>, a: u8, nargs: u8, callee: Val, p
         })
         .collect();
     close_frame(b);
-    // The first eight are the call's operands (W4 §2), the rest go to the
+    // The first `REG_ARGS` are the call's operands (W4 §2), the rest go to the
     // callee's slots, the body's from its base.
-    let in_regs = (nargs as usize).min(8);
+    let in_regs = (nargs as usize).min(crate::jit::REG_ARGS as usize);
     for (k, &v) in vals.iter().enumerate().skip(in_regs) {
         b.push(Op::Store((base + k) as u8), &[v]);
     }

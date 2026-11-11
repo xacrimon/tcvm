@@ -9,6 +9,19 @@ use crate::jit::backend::reg::{PReg, PRegSet, RegClass};
 /// (`Region::of_return`).
 pub(crate) const FRAME_SPILLS: usize = 16;
 
+/// The address of spill slot `i` of the compiled frame whose frame pointer
+/// is `fp`.
+#[inline]
+pub(crate) fn spill_addr(fp: usize, i: usize) -> usize {
+    fp + FRAME_SPILLS + 8 * i
+}
+
+/// The bit of a return address that marks a return by branch (`RAS_STACK`).
+pub(crate) const RA_TAG: usize = 1;
+
+/// How many arguments a call passes in registers, x0 up.
+pub(crate) const REG_ARGS: u8 = 8;
+
 /// Words of the register image `exit_common` writes: x0-x15, x19-x21,
 /// x26-x28, d0-d31, then the region's spill slots from word `IMAGE_SPILLS`.
 pub(crate) const EXIT_REGS: usize = 320;

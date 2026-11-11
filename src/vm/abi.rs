@@ -528,7 +528,15 @@ macro_rules! handler_impl {
         }
     }};
     (@jump $h:ident, $i:ident, $p:ident, $b:ident, $rt:ident, [], $c:expr) => {{
-        become $h($i, $p, $b, $rt, $c)
+        cfg_select! {
+            jit => {
+                $rt.jit().jump_target.set($h as usize);
+                become $crate::jit::backend::target::abi::level_jump($i, $p, $b, $rt, $c)
+            }
+            _ => {
+                become $h($i, $p, $b, $rt, $c)
+            }
+        }
     }};
 
     (@kind_body op, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident) => {

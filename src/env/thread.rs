@@ -117,7 +117,7 @@ pub struct ThreadState<'gc> {
     /// Fast calls with the stack pointer below this branch with a tagged
     /// return address instead of `blr` (5.4): this level's return address
     /// stack is full from here.
-    #[cfg(jit)]
+    #[cfg(all(jit, target_arch = "aarch64"))]
     pub(crate) native_deep: usize,
     /// The frame pointer and return address of the compiled code a native
     /// runs for through `jit_call_native` (I1): its frame's caller while
@@ -328,7 +328,7 @@ impl<'gc> ThreadState<'gc> {
         for e in snap.entries() {
             match (e.loc, e.rep) {
                 (Loc::Spill(i), SRep::Val) => {
-                    let p = (fp + crate::jit::FRAME_SPILLS + 8 * i as usize) as *const Value<'gc>;
+                    let p = crate::jit::spill_addr(fp, i as usize) as *const Value<'gc>;
                     cc.trace(unsafe { &*p });
                 }
                 (Loc::Slot(r), _) => homes.insert(r as usize),
@@ -625,7 +625,7 @@ impl<'gc> Thread<'gc> {
             record: 0,
             #[cfg(jit)]
             native_limit: 0,
-            #[cfg(jit)]
+            #[cfg(all(jit, target_arch = "aarch64"))]
             native_deep: 0,
             #[cfg(jit)]
             shim: [0; 2],

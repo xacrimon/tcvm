@@ -856,7 +856,6 @@ pub(crate) extern "C" fn jit_box_i64(rt: *const State<'static>, v: i64) -> u64 {
 /// Land a call's `nret` results at `values` into `R[a..]`: `c - 1` of them,
 /// or all with `top` set for MULTRET (`c == 0`).
 pub(crate) extern "C" fn jit_land(
-    _rt: *const State<'static>,
     thread: *mut ThreadState<'static>,
     base: *mut Value<'static>,
     a: usize,

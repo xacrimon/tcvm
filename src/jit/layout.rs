@@ -20,8 +20,14 @@ pub(crate) const EXIT_REGS: usize = JIT + offset_of!(JitRuntime, exit_regs);
 pub(crate) const RECORD: usize = offset_of!(crate::env::thread::ThreadState<'static>, record);
 pub(crate) const NATIVE_LIMIT: usize =
     offset_of!(crate::env::thread::ThreadState<'static>, native_limit);
+#[cfg(target_arch = "aarch64")]
 pub(crate) const NATIVE_DEEP: usize =
     offset_of!(crate::env::thread::ThreadState<'static>, native_deep);
+/// The running thread's pointer, from `rt`: where x86-64, whose handlers
+/// take no `thread`, finds it.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const RT_THREAD: usize =
+    offset_of!(State<'static>, rt) + offset_of!(Runtime<'static>, thread);
 /// `ThreadState::shim`, from the `thread` register.
 pub(crate) const SHIM: usize = offset_of!(crate::env::thread::ThreadState<'static>, shim);
 /// `JitRuntime::level_ret`, `level_land` and `jump_target`, from `rt`.
