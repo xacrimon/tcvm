@@ -188,6 +188,8 @@ for reasons that are no bugs.
 - `driver.rs`: how a unit's function is called, and with which values. A call goes through
   `call`, which points at `f` or an adapter (`via_tail`, `via_va`, `via_pcall`, `via_co`,
   `via_cs`); an adapter must return `f`'s results and raise its errors unchanged.
+  After the warm-up some calls pass `twin(v, k)`: a value equal to another argument but not the
+  same object.
 - `src/prelude.lua`: the value pool and the output functions, at the head of every program.
 
 Programs are a function of their seed, so a change to the generator changes what every seed

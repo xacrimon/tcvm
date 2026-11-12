@@ -262,7 +262,7 @@ impl Gen {
         match k {
             Kind::Arg => self.arg(),
             Kind::Any => self.any(d),
-            Kind::Bool => match self.r.below(if leaf { 2 } else { 9 }) {
+            Kind::Bool => match self.r.below(if leaf { 2 } else { 10 }) {
                 0 => self.r.pick(&[Expr::True, Expr::False]).clone(),
                 1 => self.var_of(Kind::Bool).unwrap_or(Expr::True),
                 2 | 3 => {
@@ -290,7 +290,9 @@ impl Gen {
                     let t = str(self.r.pick(&["integer", "float"]));
                     bin("==", call("math.type", vec![self.any(d1)]), t)
                 }
-                _ => call("rawequal", vec![self.any(d1), self.any(d1)]),
+                8 => call("rawequal", vec![self.any(d1), self.any(d1)]),
+                // Values of any two kinds: equality never raises.
+                _ => bin(self.r.pick(&["==", "~="]), self.any(d1), self.any(d1)),
             },
             Kind::Int => match self.r.below(if leaf { 3 } else { 12 }) {
                 0 | 1 => self.int_lit(),

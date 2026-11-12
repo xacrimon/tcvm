@@ -55,6 +55,23 @@ local function hk(v)
   for i = 1, #s do h = (h * 31 + s:byte(i)) & 0xffffffff end
   return h
 end
+-- A value equal to `v` that is another object: a computed copy, or with `k` > 0 the number of
+-- the other subtype where it is exact (`k` = 2: only where a float's text is the same in tcvm).
+local function twin(v, k)
+  local t = math.type(v)
+  if t == "integer" then
+    local f = v + 0.0
+    if k > 0 and f == v and (k == 1 or -1e14 < v and v < 1e14) then return f end
+    return v + 0
+  elseif t == "float" then
+    local i = math.tointeger(v)
+    if k > 0 and i then return i end
+    return v * 1.0
+  elseif type(v) == "string" then
+    return (v .. "#"):sub(1, -2)
+  end
+  return v
+end
 -- Loops that are not bounded by their text spend fuel; a call gets a fixed amount.
 local FUEL = 0
 local function tick()
