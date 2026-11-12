@@ -379,7 +379,7 @@ impl<'gc> Frame<'gc> {
     /// Whether the continuation is `h`.
     #[inline]
     pub(crate) fn returns_through(&self, h: Handler) -> bool {
-        self.ret & !flag::MASK == h as usize as u64
+        self.ret & !flag::MASK == crate::vm::abi::handler_bits(h)
     }
 
     /// The Lua frame's closure.

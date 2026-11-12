@@ -328,6 +328,7 @@ pub(crate) mod sw {
     #[cfg(target_arch = "x86_64")]
     pub(crate) const FP: usize = std::mem::offset_of!(super::SwitchPoint, fp);
     /// `ThreadState::sw` from a thread pointer.
+    #[cfg(nightly)]
     pub(crate) const THREAD: usize =
         std::mem::offset_of!(crate::env::thread::ThreadState<'static>, sw);
 }
@@ -440,7 +441,7 @@ pub(crate) unsafe extern "C" fn stack_switch(
 /// The switch out of a handler (`switch_out!`): the running thread `from`
 /// (in the `insn` slot) waits at its switch point to continue in the
 /// handler in the `pc` slot, and `to` (in the `closure` slot) runs.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(nightly, target_arch = "aarch64"))]
 #[unsafe(naked)]
 pub(crate) extern "rust-preserve-none" fn switch_handler<'gc>(
     _from: crate::vm::abi::Slot,
@@ -467,7 +468,7 @@ pub(crate) extern "rust-preserve-none" fn switch_handler<'gc>(
     )
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(nightly, target_arch = "x86_64"))]
 #[unsafe(naked)]
 pub(crate) extern "rust-preserve-none" fn switch_handler<'gc>(
     _from: crate::vm::abi::Slot,
