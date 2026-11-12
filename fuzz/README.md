@@ -194,6 +194,11 @@ for reasons that are no bugs.
   by the manual's sections (patterns, formats, `pack`, `utf8`, lexical forms, vararg tables,
   `_ENV`, `load`, to-be-closed variables, `goto`, `xpcall`, coroutines, inheritance, the table
   library, numeric edges).
+- `scenario.rs`: units of a few hundred lines made of parts that are programs of their own (a
+  class hierarchy, a tokenizer with a parser and an evaluator, a coroutine scheduler, a stack VM,
+  a serializer, a vector type, memoized recursion, an LRU cache, an event bus), each with its own
+  variations and wired so that one part's results feed the next. A part's entry is
+  `P_run(n, s)`; a new part keeps to what reference Lua agrees on, as a strict template does.
 - `driver.rs`: how a unit's function is called, and with which values. A call goes through
   `call`, which points at `f` or an adapter (`via_tail`, `via_va`, `via_pcall`, `via_co`,
   `via_cs`, `via_dirty`); an adapter must return `f`'s results and raise its errors unchanged.

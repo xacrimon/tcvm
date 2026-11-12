@@ -21,6 +21,7 @@
 
 mod driver;
 mod expr;
+mod scenario;
 mod stmt;
 mod templates;
 
@@ -281,6 +282,16 @@ impl Gen {
         self.yields = false;
         self.vararg = false;
         self.budget = self.r.range(4, 28) as i32;
+        // A few hundred lines of parts that are programs of their own, wired together.
+        if only == Some("scenario") || only.is_none() && self.r.chance(0.08) {
+            let (kind, code) = self.scenario_unit(&tag);
+            return Unit {
+                tag,
+                kind,
+                strict: self.strict,
+                code,
+            };
+        }
         // The hand-written shapes: small functions that each aim at one thing the JIT
         // speculates on. Not strict: they take lengths and write floats freely.
         let pick = self.r.f64();
