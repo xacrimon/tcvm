@@ -214,6 +214,21 @@ impl Gen {
         vec![s]
     }
 
+    /// Locals that go out of scope at once: the slots they held keep values other than nil
+    /// for what is put there next.
+    pub(super) fn junk(&mut self) -> String {
+        let n = self.r.range(3, 10) as usize;
+        let names: Vec<String> = (1..=n).map(|i| format!("j{i}")).collect();
+        let vals: Vec<&str> = (0..n)
+            .map(|_| {
+                *self
+                    .r
+                    .pick(&["1", "2.5", "\"s\"", "true", "MT", "-7", "{}", "V"])
+            })
+            .collect();
+        format!("do local {} = {} end", names.join(", "), vals.join(", "))
+    }
+
     /// A body that runs with the loop state `conts` adds; the `goto` label it used, last.
     fn loop_body(&mut self, cont: bool, head: Block, n: usize, d: u32) -> Block {
         self.loops += 1;
@@ -739,7 +754,8 @@ impl Gen {
         let w: Vec<u32> = (FORMS.iter())
             .map(|&(form, _)| {
                 let ok = match form {
-                    "local" | "assign" | "store" | "call" | "probe" | "global" | "multi" => true,
+                    "local" | "assign" | "store" | "call" | "probe" | "global" | "multi"
+                    | "junk" => true,
                     "goto" => matches!(self.conts.last(), Some(Some(_))),
                     "break" => self.loops > 0,
                     "coroutine" => nested || self.yields,
@@ -793,6 +809,7 @@ impl Gen {
                 vec![assign(g, self.any(2))]
             }
             "multi" => self.multi_stmt(1),
+            "junk" => vec![Stmt::Raw(self.junk())],
             "return" => vec![Stmt::If(
                 vec![(self.cond(2), vec![Stmt::Return(self.args(1, 2))])],
                 None,

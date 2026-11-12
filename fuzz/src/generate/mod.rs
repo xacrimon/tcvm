@@ -137,6 +137,7 @@ const FORMS: &[(&str, u32)] = &[
     ("vararg", 2),
     ("goto", 2),
     ("break", 2),
+    ("junk", 2),
 ];
 
 pub struct Gen {
@@ -292,7 +293,10 @@ impl Gen {
                     code,
                 };
             }
-            let (kind, body, wf) = self.template(only);
+            let (kind, mut body, wf) = self.template(only);
+            if self.r.chance(0.25) {
+                body = format!("{}\n{body}", self.junk());
+            }
             self.strict = templates::is_strict(kind);
             let wf = wf.map(|w| w.map(|f| self.fam(f)));
             let mut code = std::mem::take(&mut self.pre);
