@@ -26,7 +26,7 @@ The `tcvm-dev` feature holds everything that exists for development only: the IR
 allocation checker, dumps, timing, the test modes and every `TCVM_*` knob but `TCVM_JIT=off`, plus
 the `Lua` test hooks (`set_jit_inline`, `stop_gc_stress`, `jit_internal_errors`). A plain release
 build has none of it; the tools under `tools/` need the dev build.
-Workspace: `tcvm` (root), `derive/` (`#[derive(Collect)]`), `cli/` (`tcvm-cli`). Toolchain is pinned nightly (`rust-toolchain.toml`, the nightly 1.100 branched from), edition 2024; nightly features are listed in `src/lib.rs`.
+Workspace: `tcvm` (root), `derive/` (`#[derive(Collect)]`), `cli/` (`tcvm-cli`), `fuzz/` (`tcvm-fuzz`). Toolchain is pinned nightly (`rust-toolchain.toml`, the nightly 1.100 branched from), edition 2024; nightly features are listed in `src/lib.rs`.
 
 Tests: `tests/suite/*.rs` (runtime), `test-files/*.lua` (snapshots), `src/compiler/snapshots`, `cli/tests`. Fix a behavior bug together with a regression test. Never reach the tested path through a limitation that planned work removes; force it explicitly (e.g. `Lua::set_jit_inline(false)`).
 
@@ -37,12 +37,13 @@ Tests: `tests/suite/*.rs` (runtime), `test-files/*.lua` (snapshots), `src/compil
 - `src/dmm`: GC. `Gc<'gc, T>` with invariant lifetimes, `Collect` trait, barriers, non-moving Immix heap (`heap.rs`).
 - `src/jit`: method JIT. Regions start at function entry or a hot loop, run through IR → `opt/` → `backend/` (own register allocator; targets `aarch64/` and `x86_64/`, each exporting what `backend/mod.rs` lists).
 - `src/builtin`: standard library. `src/lua`: embedding API and executor.
-- `tools/`: perf and differential scripts (`gate.sh`, `opcost.py`, `ljr.py`, `corpus/`, `fuzz/`: the JIT differential fuzzer, start at `fuzz/run.py --help`).
+- `tools/`: perf and differential scripts (`gate.sh`, `opcost.py`, `ljr.py`, `corpus/`).
+- `fuzz/`: `tcvm-fuzz`, the differential fuzzer: generated programs under the JIT's configurations against JIT-off, and JIT-off against reference `lua`. `cargo run --release -p tcvm-fuzz -- --help`; `run` fuzzes until stopped and resumes, `triage` lists what a run found, `reduce` shrinks a finding, `cover` shows which opcodes the programs reach. The module docs of `fuzz/src/generate/mod.rs` and `fuzz/src/oracle.rs` say what a program may do and what is compared.
 
 Use rust-analyzer for anything the module docs don't answer; don't rely on this file for details.
 
 ## JIT knobs (env, `tcvm-dev` builds)
-`TCVM_JIT=off` (every build), `TCVM_JIT_HOT_CALL=N`/`TCVM_JIT_HOT_LOOP=N` (1 = compile at first count), `TCVM_JIT_DEOPT_ALL=1`, `TCVM_JIT_INLINE=0`, `TCVM_JIT_DUMP=ir,opt,vcode,ra,asm`, `TCVM_JIT_LOG=1`, `TCVM_JIT_CHECK=1`, `TCVM_JIT_TIME=1`, `TCVM_JIT_ONLY=…`, `TCVM_JIT_FAR=1`, `TCVM_JIT_RA_CAPTURE=dir`, `TCVM_GC_STRESS=N`, `TCVM_HASH_SEED=N` (fixed string hash seed: `pairs` orders repeat run to run). The Bash tool runs zsh: `env $m` with several variables in `$m` sets only the first, so use `env ${=m}`.
+`TCVM_JIT=off` (every build), `TCVM_JIT_HOT_CALL=N`/`TCVM_JIT_HOT_LOOP=N` (1 = compile at first count), `TCVM_JIT_DEOPT_ALL=1`, `TCVM_JIT_INLINE=0`, `TCVM_JIT_DUMP=ir,opt,vcode,ra,asm`, `TCVM_JIT_LOG=1`, `TCVM_JIT_CHECK=1`, `TCVM_JIT_TIME=1`, `TCVM_JIT_ONLY=…`, `TCVM_JIT_FAR=1`, `TCVM_JIT_RA_CAPTURE=dir`, `TCVM_GC_STRESS=N`, `TCVM_HASH_SEED=N` (fixed string hash seed: `pairs` orders repeat run to run). `TCVM_STATS=FILE` writes what the run reached when it ends: interpreter dispatches per opcode and JIT events (compiles, failures, exits by tag, passes that changed something). The Bash tool runs zsh: `env $m` with several variables in `$m` sets only the first, so use `env ${=m}`.
 
 ## Working style
 - Planning or brainstorming: ask clarifying questions one at a time; don't create tasks, spawn subagents, or write plan files until explicitly approved.
