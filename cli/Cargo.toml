@@ -8,12 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["nightly"]
+default = ["nightly", "jit"]
 nightly = ["tcvm/nightly"]
+jit = ["tcvm/jit"]
 tcvm-dev = ["tcvm/tcvm-dev"]
 
 [dependencies]
-tcvm = { path = "..", default-features = false, features = ["lib-all", "jit"] }
+tcvm = { path = "..", default-features = false, features = ["lib-all"] }
 clap = { version = "4.6.1", features = ["derive"] }
 
 [dev-dependencies]
