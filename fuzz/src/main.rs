@@ -30,7 +30,8 @@ struct Args {
 
 #[derive(clap::Args, Clone)]
 struct Common {
-    /// tcvm-cli binaries to fuzz, each compared with itself only [default: target/release/tcvm-cli]
+    /// tcvm-cli binaries to fuzz, each compared with itself only [default: rel=target/release/tcvm-cli,
+    /// and dbg=target/dbg/release/tcvm-cli where it is built]
     #[arg(long = "bin", value_name = "[NAME=]PATH")]
     bins: Vec<String>,
     /// Where programs and results go [default: target/fuzz]
@@ -84,7 +85,7 @@ enum Cmd {
         /// `internal`: MODE's JIT log has a compiler error. `crash`: MODE dies of a signal
         #[arg(long, value_parser = ["ref", "diverges", "internal", "crash"])]
         what: String,
-        /// The configuration, as a finding names it (`hot`, `hc4,hl20,check`, …)
+        /// The configuration, as a finding names it (`hot`, `hc4,hl20,check`, `dbg:hot`, …)
         #[arg(long, default_value = "hot")]
         mode: String,
         /// Text the differing line, the JIT log's error, or a crash's stderr must contain
@@ -127,9 +128,18 @@ impl Config {
             .unwrap_or_else(|| Path::new(REPO).join("target/fuzz"));
         std::fs::create_dir_all(out.join("prog")).expect("the output directory");
         let out = out.canonicalize().expect("the output directory");
-        let default = format!("{REPO}/target/release/tcvm-cli");
         let specs = if c.bins.is_empty() {
-            vec![default]
+            let mut d = vec![format!("rel={REPO}/target/release/tcvm-cli")];
+            // Debug assertions check invariants a release build compiles out.
+            let dbg = format!("{REPO}/target/dbg/release/tcvm-cli");
+            if Path::new(&dbg).exists() {
+                d.push(format!("dbg={dbg}"));
+            } else {
+                eprintln!(
+                    "tcvm-fuzz: no {dbg}, fuzzing the release build only (README: Several binaries)"
+                );
+            }
+            d
         } else {
             c.bins.clone()
         };
@@ -350,10 +360,17 @@ fn hash_seed(seed: u64) -> (String, String) {
 }
 
 fn cmd_reduce(program: &str, what: &str, mode: &str, grep: Option<&str>, lua: &str, cfg: &Config) {
+    // `dbg:hot`: the configuration of one binary, as a finding names it.
+    let (bin, mode) = match mode.split_once(':') {
+        Some((n, m)) => match cfg.bins.iter().find(|(b, _)| b == n) {
+            Some((_, p)) => (p, m),
+            None => die(&format!("no binary {n}")),
+        },
+        None => (&cfg.bins[0].1, mode),
+    };
     let mode = oracle::mode_named(mode).unwrap_or_else(|| die(&format!("no mode {mode}")));
     let seed: Option<u64> = program.parse().ok();
     let dir = cfg.out.join("prog");
-    let (_, bin) = &cfg.bins[0];
     let base = [
         ("TCVM_JIT_LOG".to_string(), "1".to_string()),
         hash_seed(seed.unwrap_or(0)),
