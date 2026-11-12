@@ -37,7 +37,12 @@ impl Run {
 /// SIGALRM past `secs`.
 pub fn run(argv: &[&str], dir: &Path, env: &[(String, String)], secs: u32) -> Run {
     let mut cmd = Command::new(argv[0]);
-    cmd.args(&argv[1..]).current_dir(dir).stdin(Stdio::null());
+    // Own process group: a terminal Ctrl-C reaches only the fuzzer, so the runs in flight
+    // finish instead of being recorded as SIGINT crashes.
+    cmd.args(&argv[1..])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .process_group(0);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("TCVM_") {
             cmd.env_remove(k);
