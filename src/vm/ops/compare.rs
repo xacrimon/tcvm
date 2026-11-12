@@ -104,7 +104,7 @@ macro_rules! cmp_handler {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             op fn $name {
                 let (a, b) = (&reg![insn.a()], &reg![insn.b()]);
-                let r = if crate::hint::likely(a.is_float() && b.is_float()) {
+                let r = if crate::utils::hint::likely(a.is_float() && b.is_float()) {
                     if insn.op() != Op::$g {
                         adapt!(Option::None)
                     }

@@ -443,8 +443,8 @@ handler! {
         ts.top_base = w;
         ts.top = win + nargs;
         let out = invoke(rt, ts, nc, win);
-        if crate::hint::likely(out.is_return()) {
-            if crate::hint::unlikely(rt.gc_due()) {
+        if crate::utils::hint::likely(out.is_return()) {
+            if crate::utils::hint::unlikely(rt.gc_due()) {
                 park(rt, Park::Gc);
             }
             let nret = thread!().top - win;
@@ -470,8 +470,8 @@ handler! {
         ts.top_base = w;
         ts.top = win + nargs;
         let out = invoke(rt, ts, nc, win);
-        if crate::hint::likely(out.is_return()) {
-            if crate::hint::unlikely(rt.gc_due()) {
+        if crate::utils::hint::likely(out.is_return()) {
+            if crate::utils::hint::unlikely(rt.gc_due()) {
                 park(rt, Park::Gc);
             }
             let nret = thread!().top - win;
@@ -501,8 +501,8 @@ handler! {
         ts.top_pc = pc;
         ts.top = win + nargs;
         let out = invoke(rt, ts, nc, win);
-        if crate::hint::likely(out.is_return()) {
-            if crate::hint::unlikely(rt.gc_due()) {
+        if crate::utils::hint::likely(out.is_return()) {
+            if crate::utils::hint::unlikely(rt.gc_due()) {
                 park(rt, Park::Gc);
             }
             let ts = thread!();
@@ -537,7 +537,7 @@ handler! {
         let out = NativeOut::from_raw(insn.raw());
         let ts = thread!();
         let hdr = ts.slot_index(pc as *const Value<'gc>);
-        if crate::hint::likely(out.tag() == tag::CALL_THEN) {
+        if crate::utils::hint::likely(out.tag() == tag::CALL_THEN) {
             let nc = unsafe { frame::native_closure(ts.slot_ptr(hdr + HDR)) };
             let (callee, nargs) = stage_call(ts, hdr, nc, out);
             tail!(
@@ -567,7 +567,7 @@ handler! {
         // A single store: the continuation reads `top` alone.
         unsafe { std::ptr::write_volatile(&mut ts.top, wi + nh.at + nret) };
         ts.top_base = win;
-        if crate::hint::unlikely(nh.ok != ok::CONT) {
+        if crate::utils::hint::unlikely(nh.ok != ok::CONT) {
             let j = native_continue(rt, thread_ptr!(), wi);
             jump!(j)
         }
@@ -578,15 +578,15 @@ handler! {
         if out.tag() != tag::ERROR && ts.native_overflowed() {
             out = NativeOut::error(native_overflow(rt));
         }
-        if crate::hint::likely(out.is_return()) {
-            if crate::hint::unlikely(rt.gc_due()) {
+        if crate::utils::hint::likely(out.is_return()) {
+            if crate::utils::hint::unlikely(rt.gc_due()) {
                 park(rt, Park::Gc);
             }
             let nret = thread!().top - wi;
             let ret = unsafe { frame::ret(win) };
             tail!(ret, pc = win as *const Instruction, insn = Slot::nret(nret), base = win)
         }
-        if crate::hint::likely(out.tag() == tag::CALL_THEN) {
+        if crate::utils::hint::likely(out.tag() == tag::CALL_THEN) {
             let (callee, nargs) = stage_call(ts, wi - HDR, nc, out);
             tail!(
                 crate::vm::ops::call::enter,
@@ -763,7 +763,7 @@ pub(crate) fn drive<'gc>(
         let nc = unsafe { frame::native_closure(win_ptr) };
         match out.tag() {
             tag::RETURN => {
-                if crate::hint::unlikely(ctx.gc_due()) {
+                if crate::utils::hint::unlikely(ctx.gc_due()) {
                     t.top_base = win_ptr;
                     park(ctx, Park::Gc);
                 }

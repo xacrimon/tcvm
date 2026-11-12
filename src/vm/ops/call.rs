@@ -122,7 +122,7 @@ macro_rules! count_invocation {
                 let n = unsafe { &*$f.feedback.sub(1) };
                 let c = n.get().wrapping_add(1);
                 n.set(c);
-                if crate::hint::unlikely(c & $rt.call_mask() == 0) {
+                if crate::utils::hint::unlikely(c & $rt.call_mask() == 0) {
                     tail!(
                         crate::jit::jit_hot,
                         insn = $crate::vm::abi::Slot::insn($word)
@@ -149,7 +149,7 @@ macro_rules! note_callee {
         let slot = unsafe { $closure.feedback.add($insn.d() as usize + 1) };
         // Both words in one load pair.
         let (seen, count) = unsafe { ((*slot).get(), (*slot.add(1)).get()) };
-        if crate::hint::unlikely(seen != $fv.to_raw()) {
+        if crate::utils::hint::unlikely(seen != $fv.to_raw()) {
             // Bit 0 marks a word that stays (`MEGAMORPHIC`, a `proto_slot`):
             // a function value's payload is aligned.
             if seen & 1 == 0 {
@@ -177,12 +177,12 @@ macro_rules! call_body {
             FunctionKind::Lua(p) => {
                 let hdr = unsafe { $base.add(a as usize) };
                 let nb = unsafe { hdr.add(HDR) };
-                if crate::hint::unlikely(
+                if crate::utils::hint::unlikely(
                     unsafe { nb.add(p.max_stack_size as usize) }.cast_const() > thread!().stack_end,
                 ) {
                     tail!(call_grow)
                 }
-                if crate::hint::unlikely(b as u16 <= p.fixed_arity) {
+                if crate::utils::hint::unlikely(b as u16 <= p.fixed_arity) {
                     tail!(call_fixup)
                 }
                 let callee = unsafe { LuaFn::from_function_unchecked(f) };
@@ -357,12 +357,12 @@ handler! {
             FunctionKind::Lua(p) => {
                 let callee = unsafe { LuaFn::from_function_unchecked(f) };
                 let nb = unsafe { hdr.add(HDR) };
-                if crate::hint::unlikely(
+                if crate::utils::hint::unlikely(
                     unsafe { nb.add(p.max_stack_size as usize) }.cast_const() > thread!().stack_end,
                 ) {
                     tail!(enter_grow)
                 }
-                if crate::hint::unlikely(nargs < p.fixed_arity as usize) {
+                if crate::utils::hint::unlikely(nargs < p.fixed_arity as usize) {
                     tail!(enter_fixup)
                 }
                 unsafe { hdr.cast::<u64>().write(lua_func_word(callee, 0)) };
@@ -437,7 +437,7 @@ handler! {
                 let ts = thread!();
                 let flags = unsafe { frame::flags(base) };
                 let fits = unsafe { base.add(p.max_stack_size as usize) }.cast_const() <= ts.stack_end;
-                if crate::hint::likely(flags & (flag::HAS_OPEN | flag::HAS_TBC) == 0 && !p.is_vararg && fits) {
+                if crate::utils::hint::likely(flags & (flag::HAS_OPEN | flag::HAS_TBC) == 0 && !p.is_vararg && fits) {
                     let callee = unsafe { LuaFn::from_function_unchecked(f) };
                     let src = unsafe { base.add(a as usize + HDR) };
                     let nargs = call_nargs(ts, b, ts.slot_index(src));
@@ -525,7 +525,7 @@ handler! {
     /// the fast path; `return_close` otherwise.
     op fn op_return {
         let (a, b) = insn.ab();
-        if crate::hint::unlikely(unsafe { frame::flags(base) } != 0) {
+        if crate::utils::hint::unlikely(unsafe { frame::flags(base) } != 0) {
             tail!(return_close)
         }
         let vals = unsafe { base.add(a as usize) };
