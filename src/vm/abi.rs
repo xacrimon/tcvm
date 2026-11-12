@@ -85,43 +85,131 @@ impl Slot {
 /// Why the dispatch chain returned to the trampoline: the thread's entry
 /// frame returned, or an error nothing caught ended it. Everything else that
 /// needs the host parks the thread instead (`vm::stack::park`).
+#[cfg(nightly)]
 pub(crate) enum Exit {
     End,
 }
 
-/// A dispatch target. Every one carries `#[rustc_align(32)]`: an unaligned
-/// entry starves the fetch unit for the whole handler.
+/// Without `become`, every target returns to the trampoline
+/// (`dispatch::call_handler`) with the next target and its slots; `End` has
+/// none.
+#[cfg(not(nightly))]
+pub(crate) struct Exit {
+    pub(crate) next: Option<Handler>,
+    pub(crate) insn: Slot,
+    pub(crate) pc: *const Instruction,
+    pub(crate) base: *mut Value<'static>,
+    pub(crate) closure: Slot,
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) thread: *mut ThreadState<'static>,
+}
+
+#[cfg(not(nightly))]
+impl Exit {
+    #[allow(non_upper_case_globals)]
+    pub(crate) const End: Exit = Exit {
+        next: None,
+        insn: Slot(0),
+        pc: std::ptr::null(),
+        base: std::ptr::null_mut(),
+        closure: Slot(0),
+        #[cfg(target_arch = "aarch64")]
+        thread: std::ptr::null_mut(),
+    };
+
+    /// The step that calls `next` with these slots.
+    #[inline(always)]
+    pub(crate) fn to<'gc>(
+        next: Handler,
+        insn: Slot,
+        pc: *const Instruction,
+        base: *mut Value<'gc>,
+        _rt: Context<'gc>,
+        closure: Slot,
+        #[cfg(target_arch = "aarch64")] thread: *mut ThreadState<'gc>,
+    ) -> Exit {
+        Exit {
+            next: Some(next),
+            insn,
+            pc,
+            base: base.cast(),
+            closure,
+            #[cfg(target_arch = "aarch64")]
+            thread: thread.cast(),
+        }
+    }
+}
+
+/// `$item`, a handler or the handler type, in the handler ABI: preserve-none
+/// with `nightly`, Rust's otherwise.
+#[cfg(nightly)]
+macro_rules! handler_abi {
+    (for<$l:lifetime> fn $($t:tt)*) => { for<$l> extern "rust-preserve-none" fn $($t)* };
+    ($(#[$m:meta])* $v:vis fn $($t:tt)*) => { $(#[$m])* $v extern "rust-preserve-none" fn $($t)* };
+}
+
+#[cfg(not(nightly))]
+macro_rules! handler_abi {
+    (for<$l:lifetime> fn $($t:tt)*) => { for<$l> fn $($t)* };
+    ($(#[$m:meta])* $v:vis fn $($t:tt)*) => { $(#[$m])* $v fn $($t)* };
+}
+
+/// Tail-call the target `$f` with these slots.
+#[cfg(nightly)]
+macro_rules! go {
+    ($f:expr, $($a:expr),* $(,)?) => { become $f($($a),*) };
+}
+
+#[cfg(not(nightly))]
+macro_rules! go {
+    ($f:expr, $($a:expr),* $(,)?) => { return $crate::vm::abi::Exit::to($f, $($a),*) };
+}
+
+/// A dispatch target. With `nightly` every one carries `#[rustc_align(32)]`:
+/// an unaligned entry starves the fetch unit for the whole handler.
 #[cfg(target_arch = "aarch64")]
-pub(crate) type Handler = for<'gc> extern "rust-preserve-none" fn(
-    insn: Slot,
-    pc: *const Instruction,
-    base: *mut Value<'gc>,
-    rt: Context<'gc>,
-    closure: Slot,
-    thread: *mut ThreadState<'gc>,
-) -> Exit;
+pub(crate) type Handler = handler_abi!(
+    for<'gc> fn(
+        insn: Slot,
+        pc: *const Instruction,
+        base: *mut Value<'gc>,
+        rt: Context<'gc>,
+        closure: Slot,
+        thread: *mut ThreadState<'gc>,
+    ) -> Exit
+);
 
 #[cfg(not(target_arch = "aarch64"))]
-pub(crate) type Handler = for<'gc> extern "rust-preserve-none" fn(
-    insn: Slot,
-    pc: *const Instruction,
-    base: *mut Value<'gc>,
-    rt: Context<'gc>,
-    closure: Slot,
-) -> Exit;
+pub(crate) type Handler = handler_abi!(
+    for<'gc> fn(
+        insn: Slot,
+        pc: *const Instruction,
+        base: *mut Value<'gc>,
+        rt: Context<'gc>,
+        closure: Slot,
+    ) -> Exit
+);
 
-/// Handler addresses as header words: 32-byte aligned, so the low five bits
-/// hold frame flags (`frame::flag`).
+/// Handler addresses as header words, the low five bits holding frame flags
+/// (`frame::flag`): 32-byte aligned with `nightly`, shifted up otherwise
+/// (user-space addresses stay below 2^59).
 #[inline(always)]
 pub(crate) fn handler_bits(h: Handler) -> u64 {
-    h as usize as u64
+    cfg_select! {
+        nightly => h as usize as u64,
+        _ => (h as usize as u64) << 5,
+    }
 }
 
 /// # Safety
 /// `bits` came from [`handler_bits`], flag bits allowed.
 #[inline(always)]
 pub(crate) unsafe fn handler_from_bits(bits: u64) -> Handler {
-    unsafe { std::mem::transmute::<usize, Handler>((bits & !0x1f) as usize) }
+    let addr = cfg_select! {
+        nightly => bits & !0x1f,
+        _ => bits >> 5,
+    };
+    unsafe { std::mem::transmute::<usize, Handler>(addr as usize) }
 }
 
 /// Where a cold Rust routine (unwinder, native driver, coroutine switch)
@@ -187,11 +275,12 @@ macro_rules! handler_impl {
 
     (@one $kind:ident [$d:tt] [$insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident]
      [$($th:ident)?] $(#[$m:meta])* $name:ident $body:block) => {
+        $crate::vm::abi::handler_abi! {
         $(#[$m])*
         #[inline(never)]
-        #[rustc_align(32)]
+        #[cfg_attr(nightly, rustc_align(32))]
         #[allow(unused_variables, unused_mut, unused_assignments, unused_macros, unreachable_code, unused_unsafe, clippy::macro_metavars_in_unsafe)]
-        pub(crate) extern "rust-preserve-none" fn $name<'gc>(
+        pub(crate) fn $name<'gc>(
             __insn: $crate::vm::abi::Slot,
             __pc: *const $crate::instruction::Instruction,
             __base: *mut $crate::env::value::Value<'gc>,
@@ -208,6 +297,7 @@ macro_rules! handler_impl {
             $crate::vm::abi::handler_impl!(@slots [$d] $kind, $insn, $closure);
             $crate::vm::abi::handler_impl!(@body [$d] $kind, $insn, $pc, $base, $rt, $closure, $thread, $nret, $values, [$($th)?]);
             $body
+        }
         }
     };
 
@@ -331,32 +421,32 @@ macro_rules! handler_impl {
                 let __w: $crate::instruction::Instruction = unsafe { *$pc };
                 $pc = unsafe { $pc.add(1) };
                 let __h = $rt.handler(__w.opcode());
-                become __h($crate::vm::abi::Slot::insn(__w), $pc, $base, $rt, closure_slot!() $(, $th)?)
+                $crate::vm::abi::go!(__h, $crate::vm::abi::Slot::insn(__w), $pc, $base, $rt, closure_slot!() $(, $th)?)
             }};
         }
 
         /// Tail-call another target with these slots, some replaced.
         macro_rules! tail {
             ($d f:expr) => {
-                become $d f(insn_slot!(), $pc, $base, $rt, closure_slot!() $(, $th)?)
+                $crate::vm::abi::go!($d f, insn_slot!(), $pc, $base, $rt, closure_slot!() $(, $th)?)
             };
             ($d f:expr, insn = $d i:expr) => {
-                become $d f($d i, $pc, $base, $rt, closure_slot!() $(, $th)?)
+                $crate::vm::abi::go!($d f, $d i, $pc, $base, $rt, closure_slot!() $(, $th)?)
             };
             ($d f:expr, closure = $d c:expr) => {
-                become $d f(insn_slot!(), $pc, $base, $rt, $d c $(, $th)?)
+                $crate::vm::abi::go!($d f, insn_slot!(), $pc, $base, $rt, $d c $(, $th)?)
             };
             ($d f:expr, insn = $d i:expr, closure = $d c:expr) => {
-                become $d f($d i, $pc, $base, $rt, $d c $(, $th)?)
+                $crate::vm::abi::go!($d f, $d i, $pc, $base, $rt, $d c $(, $th)?)
             };
             ($d f:expr, pc = $d p:expr, insn = $d i:expr) => {
-                become $d f($d i, $d p, $base, $rt, closure_slot!() $(, $th)?)
+                $crate::vm::abi::go!($d f, $d i, $d p, $base, $rt, closure_slot!() $(, $th)?)
             };
             ($d f:expr, pc = $d p:expr, insn = $d i:expr, closure = $d c:expr) => {
-                become $d f($d i, $d p, $base, $rt, $d c $(, $th)?)
+                $crate::vm::abi::go!($d f, $d i, $d p, $base, $rt, $d c $(, $th)?)
             };
             ($d f:expr, pc = $d p:expr, insn = $d i:expr, base = $d b:expr) => {
-                become $d f($d i, $d p, $d b, $rt, closure_slot!() $(, $th)?)
+                $crate::vm::abi::go!($d f, $d i, $d p, $d b, $rt, closure_slot!() $(, $th)?)
             };
         }
 
@@ -505,7 +595,7 @@ macro_rules! handler_impl {
                     $crate::vm::abi::Jump::Enter { hdr: __h, nargs: __n, base: __b } => {
                         ($crate::vm::ops::call::enter, $crate::vm::abi::Slot::nret(__n), __h as *const _, __b)
                     }
-                    $crate::vm::abi::Jump::Exit($crate::vm::abi::Exit::End) => {
+                    $crate::vm::abi::Jump::Exit(_) => {
                         ($crate::vm::dispatch::exit_end, $crate::vm::abi::Slot::from_raw(0), $pc, $base)
                     }
                 };
@@ -520,10 +610,10 @@ macro_rules! handler_impl {
         cfg_select! {
             jit => {
                 $rt.jit().jump_target.set($h as usize);
-                become $crate::jit::backend::target::abi::level_jump($i, $p, $b, $rt, $c, $th)
+                $crate::vm::abi::go!($crate::jit::backend::target::abi::level_jump, $i, $p, $b, $rt, $c, $th)
             }
             _ => {
-                become $h($i, $p, $b, $rt, $c, $th)
+                $crate::vm::abi::go!($h, $i, $p, $b, $rt, $c, $th)
             }
         }
     }};
@@ -531,10 +621,10 @@ macro_rules! handler_impl {
         cfg_select! {
             jit => {
                 $rt.jit().jump_target.set($h as usize);
-                become $crate::jit::backend::target::abi::level_jump($i, $p, $b, $rt, $c)
+                $crate::vm::abi::go!($crate::jit::backend::target::abi::level_jump, $i, $p, $b, $rt, $c)
             }
             _ => {
-                become $h($i, $p, $b, $rt, $c)
+                $crate::vm::abi::go!($h, $i, $p, $b, $rt, $c)
             }
         }
     }};
@@ -601,7 +691,7 @@ macro_rules! handler_impl {
     (@kind_body [$d:tt] $kind:ident, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident) => {};
 }
 
-pub(crate) use {handler, handler_impl};
+pub(crate) use {go, handler, handler_abi, handler_impl};
 
 /// Debug: the window check behind `reg!` outside opcode handlers, where the
 /// running closure is the frame's.

@@ -14,9 +14,9 @@ use crate::env::function::NativeClosure;
 use crate::env::thread::{ThreadState, ThreadStatus};
 use crate::env::value::Value;
 use crate::env::{LuaString, Stack, Thread};
-use crate::instruction::{Instruction, Op};
+use crate::instruction::Op;
 use crate::lua::Context;
-use crate::vm::abi::{Slot, handler, handler_bits};
+use crate::vm::abi::{handler, handler_bits};
 use crate::vm::close;
 use crate::vm::frame::{self, HDR, NativeHdr, flag};
 use crate::vm::native::{NativeOut, OnOk, cont, native_call, native_catch, native_continue, ok};
@@ -462,14 +462,15 @@ macro_rules! resume_entry {
         // The window is the published frame's, live while it waits.
         ts.top = args + n;
         let b = unsafe { begin_resume($rt, thread_ptr!(), co, args, n, win + $at) };
-        switch_out!(b)
+        switch_out!($rt, b)
     }};
 }
 
 /// Wait at the running thread's switch point to continue in `switch_land`,
 /// and switch to the thread `$to`.
+#[cfg(nightly)]
 macro_rules! switch_out {
-    ($to:expr) => {{
+    ($rt:ident, $to:expr) => {{
         let to: *mut ThreadState<'gc> = $to;
         unsafe {
             if (*to).sw.cont == 0 {
@@ -481,10 +482,24 @@ macro_rules! switch_out {
         switch!(to);
         tail!(
             crate::vm::stack::switch_handler,
-            pc = switch_land as *const Instruction,
-            insn = Slot::from_raw(from as u64),
-            closure = Slot::from_raw(to as u64)
+            pc = switch_land as *const crate::instruction::Instruction,
+            insn = crate::vm::abi::Slot::from_raw(from as u64),
+            closure = crate::vm::abi::Slot::from_raw(to as u64)
         )
+    }};
+}
+
+/// Without a handler-ABI switch, the handler waits in `stack_switch`.
+#[cfg(not(nightly))]
+macro_rules! switch_out {
+    ($rt:ident, $to:expr) => {{
+        let to: *mut ThreadState<'gc> = $to;
+        let from = thread_ptr!();
+        // SAFETY: as for `switch_handler`; this frame holds no reference
+        // into either thread past the switch.
+        unsafe { crate::vm::stack::switch_to($rt, &raw mut (*from).sw, to, 0) };
+        reload_thread!();
+        tail!(switch_land)
     }};
 }
 
@@ -548,7 +563,7 @@ handler! {
         let Some(a) = (unsafe { begin_yield(rt, thread_ptr!(), yb) }) else {
             unreachable!("a coroutine without a resumer")
         };
-        switch_out!(a)
+        switch_out!(rt, a)
     }
 
     /// Where a thread that waited in a handler (`switch_out!`) continues,

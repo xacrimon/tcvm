@@ -246,10 +246,36 @@ fn call_handler<'gc>(
         jit => unsafe {
             crate::jit::backend::target::abi::dispatch_entry(insn, pc, base, rt, closure, thread, h)
         },
-        target_arch = "aarch64" => h(insn, pc, base, rt, closure, thread),
+        nightly => cfg_select! {
+            target_arch = "aarch64" => h(insn, pc, base, rt, closure, thread),
+            _ => {
+                let _ = thread;
+                h(insn, pc, base, rt, closure)
+            }
+        },
+        // The trampoline: each target returns the next.
         _ => {
+            #[cfg(not(target_arch = "aarch64"))]
             let _ = thread;
-            h(insn, pc, base, rt, closure)
+            let mut s = Exit::to(
+                h,
+                insn,
+                pc,
+                base,
+                rt,
+                closure,
+                #[cfg(target_arch = "aarch64")]
+                thread,
+            );
+            while let Some(h) = s.next {
+                s = cfg_select! {
+                    target_arch = "aarch64" => {
+                        h(s.insn, s.pc, s.base.cast(), rt, s.closure, s.thread.cast())
+                    }
+                    _ => h(s.insn, s.pc, s.base.cast(), rt, s.closure),
+                };
+            }
+            s
         }
     }
 }
