@@ -809,13 +809,13 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
     /// don't materialise a value.
     fn patch_to(&mut self, list: JumpList, target: usize) {
         self.downgrade_testsets(&list);
-        for idx in list.jumps {
+        for &idx in &list.jumps {
             let offset = target as i32 - (idx as i32 + 1);
             if !self.chunk.tape[idx].set_branch_offset(offset) {
                 self.chunk.too_long = true;
             }
         }
-        if target > self.chunk.last_target {
+        if !list.jumps.is_empty() && target > self.chunk.last_target {
             self.chunk.last_target = target;
         }
     }
@@ -838,7 +838,8 @@ impl<'gc, 'a> Ctx<'gc, 'a> {
                 break;
             };
             let j = list.jumps[pos];
-            if !is_valueless_ctrl(self.chunk.tape[j]) {
+            // A jump already patched past `j` would land one instruction late.
+            if !is_valueless_ctrl(self.chunk.tape[j]) || self.chunk.last_target > j {
                 break;
             }
             // Elision is sound only because nothing else targets the tail
@@ -4582,10 +4583,12 @@ fn compile_repeat(ctx: &mut Ctx, item: Repeat) -> Result<(), CompileError> {
             // constant falls out with no back edge at all.
             let cond_expr = item.cond().ok_or_else(|| ice("repeat without condition"))?;
             let mut desc = compile_expr(ctx, cond_expr, None)?;
-            if matches!(
-                desc.kind,
-                ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(true)
-            ) {
+            if !desc.has_jumps()
+                && matches!(
+                    desc.kind,
+                    ExprKind::Numeral(_) | ExprKind::Str(_) | ExprKind::Bool(true)
+                )
+            {
                 return Ok(());
             }
             ctx.goiffalse(&mut desc)?;
@@ -4607,10 +4610,18 @@ fn compile_repeat(ctx: &mut Ctx, item: Repeat) -> Result<(), CompileError> {
 
 fn compile_if(ctx: &mut Ctx, item: If) -> Result<(), CompileError> {
     let end_label = ctx.new_label();
+    let patches = ctx.chunk.jump_patches.len();
 
     compile_if_chain(ctx, item, end_label)?;
 
-    ctx.set_label(end_label, ctx.next_offset());
+    // An unused label must not count as a jump target: `patch_to_here` keeps
+    // a trailing no-op branch that a target follows.
+    if ctx.chunk.jump_patches[patches..]
+        .iter()
+        .any(|&(_, l)| l == end_label)
+    {
+        ctx.set_label(end_label, ctx.next_offset());
+    }
     Ok(())
 }
 
