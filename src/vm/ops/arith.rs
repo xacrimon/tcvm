@@ -235,7 +235,7 @@ fn table_binop_mm<'gc>(t: Table<'gc>, orig: Op) -> Value<'gc> {
 macro_rules! stage_binop_mm {
     ($pc:ident, $base:ident, $closure:ident, $mm:expr, $a:expr, $b:expr) => {{
         let hdr = unsafe { $base.add($closure.max_stack_size as usize) };
-        if std::hint::likely(unsafe { hdr.add(HDR + 2) }.cast_const() <= thread!().stack_end) {
+        if crate::hint::likely(unsafe { hdr.add(HDR + 2) }.cast_const() <= thread!().stack_end) {
             unsafe {
                 frame::write_hdr(hdr, $mm.to_raw(), handler_bits(ret_store_a), $base, $pc);
                 hdr.add(HDR).write($a);

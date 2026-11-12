@@ -218,7 +218,7 @@ impl<'gc> Value<'gc> {
     /// fast-path check, `get_integer` is the complete one.
     #[inline(always)]
     pub fn get_small(&self) -> Option<i32> {
-        if hint::likely(self.bits >> 32 == SMALL_INT >> 32) {
+        if crate::hint::likely(self.bits >> 32 == SMALL_INT >> 32) {
             Some(self.bits as i32)
         } else {
             None
@@ -313,7 +313,7 @@ impl<'gc> Value<'gc> {
     pub fn write_float(&mut self, f: f64) {
         unsafe {
             core::ptr::write_volatile(self as *mut Self as *mut f64, f);
-            if hint::unlikely(f.to_bits() >= BOX) {
+            if crate::hint::unlikely(f.to_bits() >= BOX) {
                 core::ptr::write_volatile(self as *mut Self as *mut u64, CANONICAL_NAN);
             }
         }

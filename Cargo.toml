@@ -20,8 +20,12 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["lib-all", "jit"]
+default = ["lib-all", "jit", "nightly"]
+# Needs `nightly`.
 jit = []
+# Nightly Rust: tail-call dispatch in the preserve-none ABI, and the JIT. Without it the crate
+# builds on stable.
+nightly = ["hashbrown/nightly"]
 tcvm-dev = []
 lib-all = [
     "lib-coroutine", "lib-debug", "lib-io",

@@ -796,7 +796,7 @@ handler! {
     /// in `R[num_params]`, so mutations to it are visible.
     op fn op_vararg {
         let (dst, count) = insn.ab();
-        if std::hint::unlikely(closure.proto.needs_vararg_table) {
+        if crate::hint::unlikely(closure.proto.needs_vararg_table) {
             tail!(vararg_slow)
         }
         let nv = unsafe { frame::nv(base) };
@@ -804,7 +804,7 @@ handler! {
         let target = unsafe { base.add(dst as usize) };
         if count == 0 {
             let end = unsafe { target.add(wanted) };
-            if std::hint::unlikely(end.cast_const() > thread!().stack_end) {
+            if crate::hint::unlikely(end.cast_const() > thread!().stack_end) {
                 tail!(vararg_grow)
             }
             let ts = thread!();
@@ -898,7 +898,7 @@ handler! {
     /// Lua 5.5 ERRNNIL: raise if `R[a]` is **not** nil.
     op fn op_errnnil {
         let (src, name_key) = insn.ad();
-        if std::hint::unlikely(!reg![src].is_nil()) {
+        if crate::hint::unlikely(!reg![src].is_nil()) {
             raise!(OpError::GlobalRedefined(name_key))
         }
         next!()
