@@ -196,3 +196,112 @@ fn restart_after_a_handler_yields_to_the_host() {
     );
     assert_eq!(raised_in(&mut lua, &src), "handled: t:1: stack overflow");
 }
+
+fn select_count(lua: &mut Lua, n: usize) -> Result<i64, String> {
+    let ex = lua.enter(|ctx| {
+        let select = ctx
+            .globals()
+            .raw_get(Value::string(LuaString::new(ctx, b"select")));
+        let mut args = vec![Value::nil(); n];
+        args[0] = Value::string(LuaString::new(ctx, b"#"));
+        ctx.stash(Executor::start(ctx, select, args.as_slice()))
+    });
+    let r = lua.execute::<i64>(&ex).map_err(|e| match e {
+        RuntimeError::Lua(stashed) => lua.enter(|ctx| {
+            String::from_utf8_lossy(ctx.fetch(&stashed).message(ctx).as_bytes()).into_owned()
+        }),
+        e => panic!("expected a Lua error, got {e:?}"),
+    });
+    // Spent either way, as after any uncaught error.
+    let again = lua.try_enter(|ctx| ctx.fetch(&ex).step(ctx).map(|_| ()));
+    assert!(matches!(again, Err(RuntimeError::BadMode)), "{again:?}");
+    r
+}
+
+// Arguments that would not fit the stack mapping used to panic.
+#[test]
+fn start_with_too_many_arguments() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    assert_eq!(select_count(&mut lua, 60_000), Ok(59_999));
+    assert_eq!(select_count(&mut lua, 70_000), Err("stack overflow".into()));
+}
+
+#[test]
+fn resume_with_too_many_arguments() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load("return coroutine.yield()", Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    let yielded = loop {
+        let r = lua.try_enter(|ctx| -> Result<Option<bool>, RuntimeError> {
+            Ok(match ctx.fetch(&ex).step(ctx)? {
+                StepResult::Pending => None,
+                r => Some(matches!(r, StepResult::Yielded(_))),
+            })
+        });
+        if let Some(y) = r.expect("step") {
+            break y;
+        }
+    };
+    assert!(yielded);
+    let err = lua.enter(|ctx| {
+        match ctx
+            .fetch(&ex)
+            .resume(ctx, vec![Value::nil(); 70_000].as_slice())
+        {
+            Err(RuntimeError::Lua(e)) => {
+                String::from_utf8_lossy(ctx.fetch(&e).message(ctx).as_bytes()).into_owned()
+            }
+            r => panic!("expected a Lua error, got {r:?}"),
+        }
+    });
+    assert_eq!(err, "too many arguments to resume");
+    // The executor is still yielded and takes a resume that fits.
+    lua.resume(&ex, (1i64, 2i64)).expect("resume");
+    let r = lua.try_enter(|ctx| ctx.fetch(&ex).take_result::<(i64, i64)>(ctx));
+    assert_eq!(r.expect("result"), (1, 2));
+}
+
+// A handler yields to the host from the headroom above the normal limit,
+// where its resume still has room.
+#[test]
+fn resume_a_handler_yielded_in_the_headroom() {
+    let mut lua = Lua::new();
+    lua.load_all();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let src = format!(
+                "{RECURSE} error(select(2, xpcall(f, function(m) \
+                 return m .. ' ' .. coroutine.yield() end)), 0)"
+            );
+            let chunk = ctx.load(&src, Some("=t"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    let yielded = loop {
+        let r = lua.try_enter(|ctx| -> Result<Option<bool>, RuntimeError> {
+            Ok(match ctx.fetch(&ex).step(ctx)? {
+                StepResult::Pending => None,
+                r => Some(matches!(r, StepResult::Yielded(_))),
+            })
+        });
+        if let Some(y) = r.expect("step") {
+            break y;
+        }
+    };
+    assert!(yielded);
+    match lua.resume(&ex, (7i64,)) {
+        Err(RuntimeError::Lua(e)) => lua.enter(|ctx| {
+            assert_eq!(
+                ctx.fetch(&e).message(ctx).as_bytes(),
+                b"t:1: stack overflow 7"
+            );
+        }),
+        r => panic!("expected a Lua error, got {r:?}"),
+    }
+}

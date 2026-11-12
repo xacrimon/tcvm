@@ -53,39 +53,39 @@ fn main() {
         return;
     }
 
-    let file_path = args.file.as_os_str().as_encoded_bytes().to_vec();
-    let script_args = args.script_args.clone();
-
-    lua.enter(|ctx| {
+    // `lua.c`'s `createargtable` and `docall`: the script arguments go to the
+    // global `arg` and, as varargs, to the chunk, which runs under `xpcall`
+    // with `msghandler`.
+    // TODO(#228): an `Executor`-level message handler instead of the global.
+    let ex = lua.enter(|ctx| {
+        let chunk = ctx.load_file(&args.file)?;
+        let handler = Function::new_async(ctx.mutation(), msghandler, &[]);
+        let mut call = vec![chunk.into(), Value::function(handler)];
+        call.extend(
+            args.script_args
+                .iter()
+                .map(|s| Value::string(LuaString::new(ctx, s.as_bytes()))),
+        );
         let arg_tbl = Table::new(ctx);
-        let path_str = LuaString::new(ctx, &file_path);
         arg_tbl.raw_set(
             ctx,
             Value::integer(ctx.mutation(), 0),
-            Value::string(path_str),
-        );
-        for (i, s) in script_args.iter().enumerate() {
-            let v = LuaString::new(ctx, s.as_bytes());
-            arg_tbl.raw_set(
+            Value::string(LuaString::new(
                 ctx,
-                Value::integer(ctx.mutation(), (i + 1) as i64),
-                Value::string(v),
-            );
+                args.file.as_os_str().as_encoded_bytes(),
+            )),
+        );
+        for (i, &v) in call[2..].iter().enumerate() {
+            arg_tbl.raw_set(ctx, Value::integer(ctx.mutation(), i as i64 + 1), v);
         }
         let key = LuaString::new(ctx, b"arg");
         ctx.globals()
             .raw_set(ctx, Value::string(key), Value::table(arg_tbl));
-    });
 
-    // `lua.c`'s `docall`: the chunk runs under `xpcall` with `msghandler`.
-    // TODO(#228): an `Executor`-level message handler instead of the global.
-    let ex = lua.enter(|ctx| {
-        let chunk = ctx.load_file(&args.file)?;
         let xpcall = ctx
             .globals()
             .raw_get(Value::string(LuaString::new(ctx, b"xpcall")));
-        let handler = Function::new_async(ctx.mutation(), msghandler, &[]);
-        let executor = Executor::start(ctx, xpcall, (chunk, handler));
+        let executor = Executor::start(ctx, xpcall, call.as_slice());
         Ok::<_, LoadError>(ctx.stash(executor))
     });
     let ex = match ex {

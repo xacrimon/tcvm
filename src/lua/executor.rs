@@ -1,7 +1,7 @@
 use crate::dmm::{Collect, Gc, RefLock};
 use crate::env::error::Exit as ExitKind;
 use crate::env::thread::ThreadStatus;
-use crate::env::{Thread, Value};
+use crate::env::{Error, Thread, Value};
 use crate::lua::RuntimeError;
 use crate::lua::context::Context;
 use crate::lua::convert::{FromMultiValue, IntoMultiValue};
@@ -45,6 +45,9 @@ pub(crate) struct ExecutorInner<'gc> {
     /// resumed when a GC check or an async native interrupted dispatch.
     pub(crate) current: Thread<'gc>,
     pub(crate) mode: ExecutorMode,
+    /// The error `start` raised instead of seeding the call; the first
+    /// `step` returns it.
+    pending: Option<Error<'gc>>,
 }
 
 #[derive(Clone, Copy, Collect)]
@@ -69,29 +72,37 @@ impl<'gc> Executor<'gc> {
     /// chain; a native is entered like any other callee.
     ///
     /// The thread's stack becomes `[f, _, _, _, args...]`: the call's
-    /// frame header is written when dispatch first enters it.
+    /// frame header is written when dispatch first enters it. With arguments
+    /// past the stack limit nothing is seeded: the first `step` raises
+    /// "stack overflow".
     pub fn start<A: IntoMultiValue<'gc>>(
         ctx: Context<'gc>,
         function: impl Into<Value<'gc>>,
         args: A,
     ) -> Self {
         let thread = Thread::new(ctx.mutation());
-        {
-            let mc = ctx.mutation();
-            let mut buf: Vec<Value<'gc>> = Vec::new();
-            args.push_into(mc, &mut buf);
-            let mut ts = thread.borrow_mut(mc);
-            ts.main = true;
+        let mc = ctx.mutation();
+        let mut buf: Vec<Value<'gc>> = Vec::new();
+        args.push_into(mc, &mut buf);
+        let mut ts = thread.borrow_mut(mc);
+        ts.main = true;
+        // Too many may not even fit the stack's mapping.
+        let pending = if ts.resume_args_fit(buf.len()) {
             ts.seed(function.into());
             ts.ensure_stack(ctx.stack_pool());
             ts.set_window(vm::frame::HDR, buf);
-        }
+            None
+        } else {
+            Some(Error::from_str(ctx, "stack overflow"))
+        };
+        drop(ts);
         Executor(Gc::new(
-            ctx.mutation(),
+            mc,
             RefLock::new(ExecutorInner {
                 thread,
                 current: thread,
                 mode: ExecutorMode::Normal,
+                pending,
             }),
         ))
     }
@@ -127,14 +138,21 @@ impl<'gc> Executor<'gc> {
     }
 
     fn step_inner(self, ctx: Context<'gc>) -> Result<StepResult<'gc>, RuntimeError> {
+        let mc = ctx.mutation();
         let (main, current) = {
-            let inner = self.0.borrow();
+            let mut inner = self.0.borrow_mut(mc);
             if inner.mode != ExecutorMode::Normal {
                 return Err(RuntimeError::BadMode);
             }
+            if let Some(err) = inner.pending.take() {
+                return Err(RuntimeError::Lua(crate::lua::Stashable::stash(
+                    err,
+                    mc,
+                    ctx.roots(),
+                )));
+            }
             (inner.thread, inner.current)
         };
-        let mc = ctx.mutation();
         match main.status() {
             ThreadStatus::Result { .. } => {
                 self.0.borrow_mut(mc).mode = ExecutorMode::Result;
@@ -211,7 +229,8 @@ impl<'gc> Executor<'gc> {
 
     /// Re-arm a `Yielded` executor with fresh resume arguments: they replace
     /// the yielded values, and the next `step` delivers them to the yield's
-    /// call site.
+    /// call site. Too many for the stack fail as `coroutine.resume` does,
+    /// leaving the executor yielded.
     pub fn resume<A: IntoMultiValue<'gc>>(
         self,
         ctx: Context<'gc>,
@@ -232,6 +251,14 @@ impl<'gc> Executor<'gc> {
             let yb = ts
                 .yield_bottom
                 .expect("Yielded mode must have a yield bottom");
+            if !ts.resume_args_fit(buf.len()) {
+                let err = Error::from_str(ctx, "too many arguments to resume");
+                return Err(RuntimeError::Lua(crate::lua::Stashable::stash(
+                    err,
+                    mc,
+                    ctx.roots(),
+                )));
+            }
             ts.set_window(yb, buf);
         }
         let mut inner = self.0.borrow_mut(mc);
