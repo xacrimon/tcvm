@@ -3,8 +3,8 @@
 //!
 //! What a generated program prints must depend on nothing but its text, on any correct Lua:
 //!
-//! - It ends. A loop that its text does not bound spends fuel (`tick`), and no function calls
-//!   itself or a later one.
+//! - It ends. A loop that its text does not bound spends fuel (`tick`), and a function calls
+//!   itself or one defined later only with a counter that bounds the depth (`recur`).
 //! - No string grows by more than a bounded amount per operation: an operation that builds a
 //!   string takes at most one operand that may itself have been built (`fresh`), and one that
 //!   multiplies its operand's size (`rep`, `%q`) takes none, so sizes stay linear in the fuel
@@ -304,7 +304,7 @@ impl Gen {
                 "local function f(a, b, c)\n  {}\nend",
                 body.replace('\n', "\n  ")
             )));
-            code.extend(self.driver(&tag, false, wf, &body));
+            code.extend(self.driver(&tag, templates::is_heavy(kind), wf, &body));
             return Unit {
                 tag,
                 kind: kind.into(),
