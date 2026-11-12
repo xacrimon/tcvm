@@ -207,7 +207,9 @@ impl NativeHdr {
     #[inline(always)]
     pub(crate) fn pack(self, nc: &NativeClosure<'_>) -> u64 {
         debug_assert!(self.at < 256 && self.cont < 64 && self.ok < 4);
-        (nc as *const NativeClosure<'_> as usize as u64)
+        // The function's cell, which word 0 holds in every frame.
+        let f = (nc as *const NativeClosure<'_>).wrapping_byte_sub(crate::env::function::FN_NATIVE);
+        (f.addr() as u64)
             | (self.at as u64) << native_word::AT_SHIFT
             | (self.cont as u64) << native_word::CONT_SHIFT
             | (self.ok as u64) << native_word::OK_SHIFT
