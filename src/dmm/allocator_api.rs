@@ -131,6 +131,27 @@ unsafe impl<'gc, A: Allocator> Allocator for MetricsAlloc<'gc, A> {
     }
 }
 
+/// The allocator trait hashbrown's collections take: core's with `nightly`, allocator-api2's
+/// otherwise.
+#[cfg(nightly)]
+pub(crate) use std::alloc::Allocator as HashAllocator;
+
+#[cfg(not(nightly))]
+pub(crate) use allocator_api2::alloc::Allocator as HashAllocator;
+
+#[cfg(not(nightly))]
+unsafe impl<'gc, A: Allocator> allocator_api2::alloc::Allocator for MetricsAlloc<'gc, A> {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        Allocator::allocate(self, layout).map_err(|_| allocator_api2::alloc::AllocError)
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe { Allocator::deallocate(self, ptr, layout) }
+    }
+}
+
 unsafe impl<'gc, A: 'static> Collect<'gc> for MetricsAlloc<'gc, A> {
     const NEEDS_TRACE: bool = false;
 }

@@ -1,7 +1,7 @@
 mod inner {
     use core::hash::{BuildHasher, Hash};
-    use std::alloc::Allocator;
 
+    use crate::dmm::HashAllocator as Allocator;
     use crate::dmm::barrier::IndexWrite;
     use crate::dmm::collect::{Collect, Trace};
 

@@ -12,7 +12,7 @@
 //! [`Local`] handles keep them instead, rooted on the thread until the native
 //! returns.
 
-use std::alloc::{AllocError, Allocator, Layout, StaticAllocator};
+use std::alloc::{AllocError, Allocator, Layout};
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
@@ -272,9 +272,8 @@ impl<'gc> Stack<'gc, '_> {
         let header = ts.spawning.take().expect("Stack::spawn outside an AsyncFn");
         let env = ts.async_env.get_or_insert_with(EnvCell::new).clone();
         let alloc = TaskAlloc(&raw mut ts.task_arena);
-        let fut: Pin<Box<dyn Future<Output = TaskResult>, TaskAlloc>> =
-            Box::into_pin(Box::new_in(f(Cx { env }), alloc)
-                as Box<dyn Future<Output = TaskResult>, TaskAlloc>);
+        let fut =
+            Box::new_in(f(Cx { env }), alloc) as Box<dyn Future<Output = TaskResult>, TaskAlloc>;
         let ts = self.thread_mut();
         ts.tasks.push(Task { fut, header });
         Spawned(())
@@ -307,7 +306,10 @@ impl<'gc> Stack<'gc, '_> {
 /// An async native's future, with where its locals start and the epoch to
 /// restore once it is done.
 pub(crate) struct Task {
-    fut: Pin<Box<dyn Future<Output = TaskResult>, TaskAlloc>>,
+    /// Pinned: never moved out of its box, which `TaskAlloc` frees only by
+    /// dropping it. Not a `Pin<Box<..>>`, which needs the unstable
+    /// `StaticAllocator`.
+    fut: Box<dyn Future<Output = TaskResult>, TaskAlloc>,
     header: TaskHeader,
 }
 
@@ -380,8 +382,7 @@ pub(crate) fn async_cont<'gc>(
     // Through a pointer to the arena, not a borrow of the thread, which the
     // future's `enter`s take whole.
     let task = unsafe { thread.tasks.last_mut().unwrap_unchecked() };
-    let fut: *mut dyn Future<Output = TaskResult> =
-        unsafe { task.fut.as_mut().get_unchecked_mut() };
+    let fut: *mut dyn Future<Output = TaskResult> = &raw mut *task.fut;
     let envp = (&raw mut env).cast::<Env<'static>>();
     // The thread keeps it, so it outlives the poll.
     let cell: *const EnvCell = &**unsafe { thread.async_env.as_ref().unwrap_unchecked() };
@@ -543,10 +544,6 @@ unsafe impl Allocator for TaskAlloc {
         unsafe { (*self.0).free(p, l) }
     }
 }
-
-// Blocks are freed only by `deallocate`: task boxes are never leaked, and the
-// arena's chunks are released only after `tasks` has dropped them all.
-unsafe impl StaticAllocator for TaskAlloc {}
 
 #[cfg(test)]
 mod tests {
