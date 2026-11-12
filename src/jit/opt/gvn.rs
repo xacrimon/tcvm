@@ -59,9 +59,9 @@ impl Versions {
             }
             None => {
                 let mut v = 0;
-                for c in 0..CLASSES {
+                for (c, &any) in self.any.iter().enumerate() {
                     if reads.bits() >> c & 1 != 0 {
-                        v = v.max(self.any[c]);
+                        v = v.max(any);
                     }
                 }
                 [v, 0]
