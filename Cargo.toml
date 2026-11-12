@@ -68,7 +68,6 @@ insta = "1.47.2"
 [build-dependencies]
 cfg_aliases = "0.2.2"
 
-# The suite and its snapshots assume every library.
 [[test]]
 name = "suite"
 path = "tests/suite/main.rs"
