@@ -39,7 +39,7 @@ pub(crate) const THREAD: Gpr = Gpr(25);
 pub(crate) const RT: Gpr = Gpr(23);
 pub(crate) const CLOSURE: Gpr = Gpr(24);
 /// Where a level's record keeps the runtime (its x23), from the record.
-pub(crate) const RT_OF_LEVEL: usize = crate::vm::stack::rec::X + 32;
+pub(crate) const RT_OF_LEVEL: usize = crate::vm::stack::rec::X + 8;
 const PTR_MASK: u64 = (1 << 48) - 1;
 /// The handler slots loaded at every tail-out.
 pub(crate) const INSN: Gpr = Gpr(20);
@@ -253,9 +253,8 @@ pub(crate) unsafe extern "C" fn jit_level() {
         "ldr x10, [x25, #{deep}]",
         "stp x9, x17, [sp, #{prev}]",
         "str x10, [sp, #{deep_saved}]",
-        "str x22, [sp, #{x} + 24]",
-        "stp x23, x24, [sp, #{x} + 32]",
-        "str x25, [sp, #{x} + 48]",
+        "stp x22, x23, [sp, #{x}]",
+        "stp x24, x25, [sp, #{x} + 16]",
         "mov x29, sp",
         "str x29, [x25, #{record}]",
         "sub x9, x29, #{ras}",
@@ -274,8 +273,10 @@ pub(crate) unsafe extern "C" fn jit_level() {
 }
 
 /// The unwind rules of code running with `sp` at a level's record
-/// (`vm::stack::rec`, `{size}` bytes with the registers at `{x}`): the
-/// caller's frame and callee-saved registers are read from it.
+/// (`vm::stack::rec`, `{size}` bytes): the caller's frame is read from it.
+/// The callee-saved registers are left as they are: compiled frames hold
+/// nothing in them, and the Rust caller of the bottom level, which calls
+/// with every register but x29 and x30 clobbered, restores its own.
 macro_rules! level_record_cfi {
     () => {
         concat!(
@@ -283,57 +284,8 @@ macro_rules! level_record_cfi {
             ".cfi_def_cfa sp, {size}\n",
             ".cfi_offset x29, -{size}\n",
             ".cfi_offset x30, -{size} + 8\n",
-            ".cfi_offset x19, -{size} + {x}\n",
-            ".cfi_offset x20, -{size} + {x} + 8\n",
-            ".cfi_offset x21, -{size} + {x} + 16\n",
-            ".cfi_offset x22, -{size} + {x} + 24\n",
-            ".cfi_offset x23, -{size} + {x} + 32\n",
-            ".cfi_offset x24, -{size} + {x} + 40\n",
-            ".cfi_offset x25, -{size} + {x} + 48\n",
-            ".cfi_offset x26, -{size} + {x} + 56\n",
-            ".cfi_offset x27, -{size} + {x} + 64\n",
-            ".cfi_offset x28, -{size} + {x} + 72\n",
         )
     };
-}
-
-/// `jit_level` for the bottom level, from `dispatch_entry`: its record keeps
-/// every callee-saved register of the Rust caller, which `level_return`
-/// gives back.
-#[unsafe(naked)]
-unsafe extern "C" fn jit_level_full() {
-    core::arch::naked_asm!(
-        "sub sp, sp, #{size}",
-        "stp x29, x30, [sp, #0]",
-        "ldr x9, [x25, #{record}]",
-        "ldr x10, [x25, #{deep}]",
-        "stp x9, x17, [sp, #{prev}]",
-        "str x10, [sp, #{deep_saved}]",
-        "stp x19, x20, [sp, #{x}]",
-        "stp x21, x22, [sp, #{x} + 16]",
-        "stp x23, x24, [sp, #{x} + 32]",
-        "stp x25, x26, [sp, #{x} + 48]",
-        "stp x27, x28, [sp, #{x} + 64]",
-        "stp d8, d9, [sp, #{d}]",
-        "stp d10, d11, [sp, #{d} + 16]",
-        "stp d12, d13, [sp, #{d} + 32]",
-        "stp d14, d15, [sp, #{d} + 48]",
-        "mov x29, sp",
-        "str x29, [x25, #{record}]",
-        "sub x9, x29, #{ras}",
-        "str x9, [x25, #{deep}]",
-        "ldr x30, [x23, #{level_ret}]",
-        "br x16",
-        size = const crate::vm::stack::rec::SIZE,
-        prev = const crate::vm::stack::rec::PREV,
-        deep_saved = const crate::vm::stack::rec::DEEP,
-        x = const crate::vm::stack::rec::X,
-        d = const crate::vm::stack::rec::D,
-        record = const crate::jit::layout::RECORD,
-        deep = const crate::jit::layout::NATIVE_DEEP,
-        level_ret = const crate::jit::layout::LEVEL_RET,
-        ras = const RAS_STACK,
-    )
 }
 
 /// Where a handler returns its `Exit` (in x0), which only the bottom level
@@ -341,39 +293,24 @@ unsafe extern "C" fn jit_level_full() {
 /// return 4 bytes in (`level_return_addr`), so an unwinder looking up the
 /// return address less one finds this routine, whose unwind rule reads the
 /// caller's frame from the record: with compiled code's (`unwind::Fde`), a
-/// panic in any level reaches the thread's start. An upper level's record
-/// gives the unwinder stale values for the registers it does not keep,
-/// which only compiled frames, holding nothing in them, see before the
-/// bottom record's.
+/// panic in any level reaches the thread's start.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn level_return() {
     core::arch::naked_asm!(
         level_record_cfi!(),
         "nop",
-        "mov x9, sp",
-        "ldr x25, [x9, #{x} + 48]",
-        "ldr x10, [x9, #{prev}]",
-        "ldr x11, [x9, #{deep_saved}]",
-        "str x10, [x25, #{record}]",
-        "str x11, [x25, #{deep}]",
-        "ldp x19, x20, [x9, #{x}]",
-        "ldp x21, x22, [x9, #{x} + 16]",
-        "ldp x23, x24, [x9, #{x} + 32]",
-        "ldp x25, x26, [x9, #{x} + 48]",
-        "ldp x27, x28, [x9, #{x} + 64]",
-        "ldp d8, d9, [x9, #{d}]",
-        "ldp d10, d11, [x9, #{d} + 16]",
-        "ldp d12, d13, [x9, #{d} + 32]",
-        "ldp d14, d15, [x9, #{d} + 48]",
-        "ldp x29, x30, [x9, #0]",
-        "add sp, x9, #{size}",
+        "ldr x9, [sp, #{x} + 24]",
+        "ldr x10, [sp, #{prev}]",
+        "ldr x11, [sp, #{deep_saved}]",
+        "str x10, [x9, #{record}]",
+        "str x11, [x9, #{deep}]",
+        "ldp x29, x30, [sp], #{size}",
         "ret",
         ".cfi_endproc",
         size = const crate::vm::stack::rec::SIZE,
         prev = const crate::vm::stack::rec::PREV,
         deep_saved = const crate::vm::stack::rec::DEEP,
         x = const crate::vm::stack::rec::X,
-        d = const crate::vm::stack::rec::D,
         record = const crate::jit::layout::RECORD,
         deep = const crate::jit::layout::NATIVE_DEEP,
     )
@@ -450,7 +387,7 @@ pub(crate) unsafe extern "C" fn level_enter() {
         "cbz x20, 1f",
         "str x0, [x21]",
         "1:",
-        "ldr x23, [sp, #{x} + 32]",
+        "ldr x23, [sp, #{x} + 8]",
         "ldr x24, [x22, #-32]",
         "and x24, x24, #{ptr_mask}",
         "ldr x30, [x23, #{level_ret}]",
@@ -499,8 +436,8 @@ pub(crate) extern "rust-preserve-none" fn ret_to_native<'gc>(
         "ldr x11, [x9, #{deep_saved}]",
         "str x10, [x25, #{record}]",
         "str x11, [x25, #{deep}]",
-        "ldp x22, x23, [x9, #{x} + 24]",
-        "ldp x24, x25, [x9, #{x} + 40]",
+        "ldp x22, x23, [x9, #{x}]",
+        "ldp x24, x25, [x9, #{x} + 16]",
         "ldp x29, x30, [x9, #0]",
         "add sp, x9, #{size}",
         "tbnz x30, #0, 2f",
@@ -681,8 +618,8 @@ pub(crate) unsafe extern "rust-preserve-none" fn dispatch_entry<'gc>(
     core::arch::naked_asm!(
         "mov x16, x26",
         "mov x17, #0",
-        "b {jit_level_full}",
-        jit_level_full = sym jit_level_full,
+        "b {jit_level}",
+        jit_level = sym jit_level,
     )
 }
 

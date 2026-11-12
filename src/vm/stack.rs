@@ -188,11 +188,9 @@ pub(crate) struct EntryRecord {
     /// `ThreadState::native_deep` of the level below.
     pub(crate) deep: usize,
     _pad: usize,
-    /// x19 to x28 and d8 to d15 of the Rust code that started the bottom
-    /// level; a level compiled code starts keeps only x22 to x25, x22 its
-    /// `BASE` (`abi::jit_level`).
-    pub(crate) x: [usize; 10],
-    pub(crate) d: [u64; 8],
+    /// x22 to x25 of the code that started the level, x22 its `BASE`
+    /// (`abi::jit_level`).
+    pub(crate) x: [usize; 4],
 }
 
 /// The same on x86-64, where the frame record is what `call` and `push
@@ -218,7 +216,7 @@ impl EntryRecord {
     /// `BASE` of the compiled code that started the level.
     pub(crate) fn base(&self) -> usize {
         cfg_select! {
-            target_arch = "aarch64" => self.x[3],
+            target_arch = "aarch64" => self.x[0],
             _ => self.base,
         }
     }
@@ -233,8 +231,7 @@ pub(crate) mod rec {
     pub(crate) const PREV: usize = offset_of!(EntryRecord, prev);
     pub(crate) const DEEP: usize = offset_of!(EntryRecord, deep);
     pub(crate) const X: usize = offset_of!(EntryRecord, x);
-    pub(crate) const D: usize = offset_of!(EntryRecord, d);
-    const _: () = assert!(SIZE == 192 && PREV == 16 && X == 48 && D == 128);
+    const _: () = assert!(SIZE == 80 && PREV == 16 && X == 48);
 }
 
 #[cfg(all(jit, target_arch = "x86_64"))]
