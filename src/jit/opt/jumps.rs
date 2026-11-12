@@ -84,8 +84,11 @@ fn thread_block(f: &mut Func<'_>, cfg: &CfgInfo, npreds: &mut [u32], b: Block, t
     let mut any = false;
     for &(src, k) in cfg.incoming(b) {
         let k = k as usize;
-        // A call keeps its resume block.
-        if !matches!(f.op(src), Op::Jump | Op::Br) || f.edges(src)[k].target != b {
+        // A call keeps its resume block. A branch this round made a jump has
+        // lost the edges `cfg` names past its first; the next round sees it.
+        if !matches!(f.op(src), Op::Jump | Op::Br)
+            || f.edges(src).get(k).is_none_or(|e| e.target != b)
+        {
             continue;
         }
         let mut args: Vec<Val> = (f.vl(e.args).iter())
@@ -127,4 +130,51 @@ fn thread_block(f: &mut Func<'_>, cfg: &CfgInfo, npreds: &mut [u32], b: Block, t
         f.blocks[b.idx()].dead = true;
     }
     any
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jit::ir::ops::ExitTag;
+    use crate::jit::ir::{List, RegionMeta};
+
+    fn term(f: &mut Func<'_>, b: Block, op: Op, args: &[Val], to: &[Block]) {
+        let i = f.make_inst(op, args, None, ExitTag::Type);
+        f.append(b, i);
+        let calls: Vec<BlockCall> = (to.iter())
+            .map(|&target| BlockCall {
+                target,
+                args: List::default(),
+            })
+            .collect();
+        f.set_edges(i, &calls);
+    }
+
+    /// `x: br c, b0, h` with `b0: jump h` and a jump-only loop header `h`:
+    /// threading `b0` first turns the branch into a jump, which the round's
+    /// edges into `h` still name by its second edge.
+    #[test]
+    fn branch_made_a_jump_earlier_in_the_round() {
+        let mut f = Func::new(RegionMeta {
+            entry_pc: 0,
+            loop_entry: false,
+            params: 0,
+        });
+        let [e, h, x, b0] = [(); 4].map(|_| f.new_block());
+        f.entry = e;
+        let c = f.make_inst(Op::KB1(true), &[], None, ExitTag::Type);
+        f.append(e, c);
+        let c = f.result(c);
+        term(&mut f, e, Op::Jump, &[], &[h]);
+        term(&mut f, h, Op::Jump, &[], &[x]);
+        let k = f.make_inst(Op::KI64(1), &[], None, ExitTag::Type);
+        f.append(x, k);
+        term(&mut f, x, Op::Br, &[c], &[b0, h]);
+        term(&mut f, b0, Op::Jump, &[], &[h]);
+        assert!(thread(&mut f));
+        crate::jit::ir::verify::verify(&f).unwrap();
+        let t = f.terminator(x).unwrap();
+        assert_eq!(f.op(t), Op::Jump);
+        assert_eq!(f.edges(t)[0].target, x);
+    }
 }
