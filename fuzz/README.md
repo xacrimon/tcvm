@@ -29,8 +29,9 @@ tcvm-fuzz run -j 10      # on 10 cores
 tcvm-fuzz run --hours 8  # stop by itself
 ```
 
-A run goes on where the last run into the same output directory stopped, so stopping and
-starting again loses nothing. `--from N` starts at a seed of your choice, `--count N` stops
+A run goes on where the last run into the same output directory stopped. Ctrl-C kills the
+runs in flight at once and drops their seeds (one per job), so stopping and starting again
+loses nothing but those. `--from N` starts at a seed of your choice, `--count N` stops
 after N seeds.
 
 It prints a status line every 30 seconds:
