@@ -271,10 +271,13 @@ macro_rules! min_max {
                 if nargs == 0 {
                     miss!()
                 }
-                let (mut at, first) = num_kind(&reg![a + 4]);
+                // A variable count's arguments may lie past the window `reg!`
+                // checks.
+                let arg = |i: usize| unsafe { *base.add(i) };
+                let (mut at, first) = num_kind(&arg(a as usize + 4));
                 let (mut pick, mut rest) = (a as usize + 4, 0);
                 for i in a as usize + 5..a as usize + 4 + nargs {
-                    let (x, k) = num_kind(&reg![i]);
+                    let (x, k) = num_kind(&arg(i));
                     rest |= k;
                     if let (Some(p), Some(x)) = (at, x)
                         && if $max { p < x } else { x < p }
@@ -286,7 +289,7 @@ macro_rules! min_max {
                 if (first | rest) & !(fb::SMALL | fb::FLOAT) != 0 {
                     miss!()
                 }
-                reg![a] = reg![pick];
+                reg![a] = arg(pick);
                 land1!()
             }
         }
