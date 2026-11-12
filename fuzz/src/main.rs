@@ -303,14 +303,20 @@ fn fuzz(seed: u64, cfg: &Config) -> (generate::Program, Vec<Finding>) {
         hash_seed(seed),
     ];
     for (name, bin) in &cfg.bins {
+        // A hang already confirmed on this binary: the program hangs, so another timeout is
+        // not worth the longer retry.
+        let hung = std::cell::Cell::new(false);
         let go = |m: &oracle::Mode| {
             let env: Vec<(String, String)> = base.iter().chain(&m.env).cloned().collect();
             let r = run(&[bin, "-f", &file], &dir, &env, cfg.timeout * m.slow);
-            // Once more with more time: a loaded machine is no hang.
-            match r.status {
-                Status::Timeout => run(&[bin, "-f", &file], &dir, &env, cfg.timeout * m.slow * 3),
-                _ => r,
+            // Once more with more time: a loaded machine is no hang. Not under GC stress, where
+            // a timeout is no finding either way.
+            if r.status != Status::Timeout || m.name.contains("gc") || hung.get() {
+                return r;
             }
+            let r = run(&[bin, "-f", &file], &dir, &env, cfg.timeout * m.slow * 3);
+            hung.set(r.status == Status::Timeout);
+            r
         };
         let off = go(&oracle::off());
         if !off.ok() || !off.stdout.ends_with("END\n") {
