@@ -10,82 +10,61 @@ use crate::generate::Gen;
 /// The templates of this file.
 pub(super) const STRICT: &[&str] = &["konst", "tailnat", "flow", "arity"];
 
-/// Atoms of a condition: values that fold, and functions as values.
-const CX_K: &[&str] = &[
-    "nil",
-    "true",
-    "false",
-    "0",
-    "1",
-    "-1",
-    "2",
-    "8",
-    "65",
-    "0.0",
-    "-0.0",
-    "0.5",
-    "2.5",
-    "1e300",
-    "2^53",
-    "100.25",
-    "1099511627776",
-    "2147483648",
-    "9223372036854775807",
-    "math.mininteger",
-    "\"\"",
-    "\"x\"",
-    "\"10\"",
-    "\"x\\0y\"",
-    "#\"\"",
-    "#\"a\"",
-    "#\"abc\"",
-    "G1",
-    "G2",
-    "math.max",
-    "type",
-    "rawequal",
+/// Atoms of a condition by class: values that fold, and functions as values.
+const CX_K: &[&[&str]] = &[
+    &["nil", "true", "false"],
+    &[
+        "0",
+        "1",
+        "-1",
+        "2",
+        "8",
+        "65",
+        "1099511627776",
+        "2147483648",
+        "9223372036854775807",
+        "math.mininteger",
+    ],
+    &["0.0", "-0.0", "0.5", "2.5", "1e300", "2^53", "100.25"],
+    &["\"\"", "\"x\"", "\"10\"", "\"x\\0y\""],
+    &["#\"\"", "#\"a\"", "#\"abc\""],
+    &["G1", "G2", "math.max", "type", "rawequal"],
 ];
-/// Numbers that compare without raising.
-const CX_NUM: &[&str] = &[
-    "0",
-    "1",
-    "-1",
-    "2",
-    "7",
-    "8",
-    "65",
-    "0.5",
-    "2.5",
-    "-0.0",
-    "1e300",
-    "2^53",
-    "100.25",
-    "1099511627776",
-    "2147483648",
-    "9223372036854775807",
-    "math.mininteger",
-    "#\"\"",
-    "#\"a\"",
+/// Numbers that compare without raising, by class.
+const CX_NUM: &[&[&str]] = &[
+    &[
+        "0",
+        "1",
+        "-1",
+        "2",
+        "7",
+        "8",
+        "65",
+        "1099511627776",
+        "2147483648",
+        "9223372036854775807",
+        "math.mininteger",
+    ],
+    &["0.5", "2.5", "-0.0", "1e300", "2^53", "100.25"],
+    &["#\"\"", "#\"a\""],
 ];
 
-/// Constants for a native's arguments: none whose text could differ.
-const NAT_K: &[&str] = &[
-    "0",
-    "1",
-    "-1",
-    "2",
-    "3",
-    "7",
-    "-5",
-    "0.5",
-    "2.5",
-    "\"abc\"",
-    "\"10\"",
-    "\"\"",
-    "nil",
-    "true",
-    "2147483648",
-    "math.mininteger",
+/// Constants for a native's arguments by class: none whose text could differ.
+const NAT_K: &[&[&str]] = &[
+    &[
+        "0",
+        "1",
+        "-1",
+        "2",
+        "3",
+        "7",
+        "-5",
+        "2147483648",
+        "math.mininteger",
+    ],
+    &["0.5", "2.5"],
+    &["\"abc\"", "\"10\"", "\"\""],
+    &["nil", "true"],
 ];
 
 /// Natives and the fewest and most arguments a call gives them (one fewer is tried too).
@@ -236,7 +215,7 @@ const ARITY_USES: &[&str] = &[
 
 impl Gen {
     fn cx_const(&mut self) -> &'static str {
-        self.tc(CX_K)
+        self.tclass(CX_K)
     }
 
     fn cx_atom(&mut self) -> String {
@@ -282,11 +261,11 @@ impl Gen {
         }
         let op = self.tc(CMPOPS);
         let l = if self.r.chance(0.5) {
-            self.tc(CX_NUM)
+            self.tclass(CX_NUM)
         } else {
             self.tc(&["a", "b", "c"])
         };
-        let r = self.tc(CX_NUM);
+        let r = self.tclass(CX_NUM);
         format!("({l} {op} {r})")
     }
 
@@ -334,7 +313,7 @@ impl Gen {
         let n = self.r.range((lo - 1).max(0), hi);
         let mut args: Vec<&str> = (0..n)
             .map(|_| {
-                let k = self.tc(NAT_K);
+                let k = self.tclass(NAT_K);
                 self.tc(&["a", "b", "c", "v", "v", "a", "b", k])
             })
             .collect();

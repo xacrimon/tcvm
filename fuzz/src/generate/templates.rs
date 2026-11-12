@@ -23,36 +23,20 @@ const FAMS: &[&str] = &[
 ];
 const NUMF: &[&str] = &["si", "sp", "fl", "fp", "mn", "ib", "bi"];
 
-const KONST: &[&str] = &[
-    "0",
-    "1",
-    "-1",
-    "2",
-    "3",
-    "8",
-    "0.0",
-    "-0.0",
-    "1.0",
-    "0.5",
-    "-2.0",
-    "2147483648",
-    "2147483647",
-    "-2147483648",
-    "1099511627776",
-    "9223372036854775807",
-    "math.mininteger",
-    "2^53",
-    "1e300",
-    "63",
-    "64",
-    "-64",
-    "65",
-    "0x7fffffff",
-    "\"10\"",
-    "\"abc\"",
-    "\"0x10\"",
-    "4.0",
-    "-3",
+/// Constants by class: a template takes a class first, so a rare class is not rare by count.
+const KONST: &[&[&str]] = &[
+    &["0", "1", "-1", "2", "3", "8", "63", "64", "-64", "65", "-3"],
+    &[
+        "2147483648",
+        "2147483647",
+        "-2147483648",
+        "1099511627776",
+        "9223372036854775807",
+        "math.mininteger",
+        "0x7fffffff",
+    ],
+    &["0.0", "-0.0", "1.0", "0.5", "-2.0", "4.0", "2^53", "1e300"],
+    &["\"10\"", "\"abc\"", "\"0x10\""],
 ];
 const INTK: &[&str] = &[
     "0",
@@ -274,8 +258,14 @@ impl Gen {
         self.r.pick(l)
     }
 
+    /// A class, then a member of it.
+    fn tclass(&mut self, classes: &[&[&'static str]]) -> &'static str {
+        let class = *self.r.pick(classes);
+        self.tc(class)
+    }
+
     fn tk(&mut self) -> &'static str {
-        self.tc(KONST)
+        self.tclass(KONST)
     }
 
     fn toperand(&mut self) -> &'static str {
@@ -350,15 +340,15 @@ impl Gen {
 
     fn t_binop(&mut self) -> String {
         let op = self.tc(BINOPS);
-        let f = self.r.f64();
-        if f < 0.4 {
+        let f = self.r.below(4);
+        if f == 0 {
             return format!("return a {op} b");
         }
-        if f < 0.7 {
+        if f == 1 {
             let k = self.tk();
             return format!("return a {op} {k}");
         }
-        if f < 0.85 {
+        if f == 2 {
             let k = self.tk();
             return format!("return {k} {op} a");
         }
@@ -386,14 +376,14 @@ impl Gen {
         let lhs = self.tc(&["a", "a", k1]);
         let k2 = self.tk();
         let rhs = self.tc(&["b", k2, "c"]);
-        let f = self.r.f64();
-        if f < 0.35 {
+        let f = self.r.below(4);
+        if f == 0 {
             return format!("return {lhs} {op} {rhs}");
         }
-        if f < 0.7 {
+        if f == 1 {
             return format!("if {lhs} {op} {rhs} then return 1 else return 2 end");
         }
-        if f < 0.85 {
+        if f == 2 {
             let b = self.tc(&BINOPS[..7]);
             let k = self.tk();
             return format!("local x = a {b} b\nif x {op} {k} then return x end\nreturn not x");
@@ -417,16 +407,16 @@ impl Gen {
             })
             .collect();
         let call = format!("{name}({})", args.join(", "));
-        let f = self.r.f64();
-        if f < 0.4 {
+        let f = self.r.below(6);
+        if f == 0 {
             format!("return {call}")
-        } else if f < 0.55 {
+        } else if f == 1 {
             format!("local x = {call}\nreturn x")
-        } else if f < 0.7 {
+        } else if f == 2 {
             format!("return select('#', {call}), {call}")
-        } else if f < 0.8 {
+        } else if f == 3 {
             format!("return {{{call}}}")
-        } else if f < 0.9 {
+        } else if f == 4 {
             format!("return {call}, 'tail'")
         } else {
             format!("local t = {{{call}, {call}}}\nreturn #t, t[1], t[2]")
@@ -438,30 +428,30 @@ impl Gen {
             "b", "1", "0", "-1", "1.0", "2", "3", "4", "2^53", "'x'", "'y'", "'n'", "1.5", "c",
             "b + 1", "#a",
         ]);
-        let f = self.r.f64();
-        if f < 0.5 {
+        let f = self.r.below(4);
+        if f == 0 {
             return format!("return a[{key}]");
         }
-        if f < 0.7 {
+        if f == 1 {
             let f1 = self.tc(&["x", "y", "z", "n"]);
             let f2 = self.tc(&["x", "y", "z", "n"]);
             return format!("return a.{f1}, a.{f2}");
         }
-        if f < 0.85 {
+        if f == 2 {
             return format!("local v = a[{key}]\nreturn v, type(v), v == nil");
         }
         format!("return rawget(a, {key}), #a")
     }
 
     fn t_tset(&mut self) -> String {
-        let f = self.r.f64();
+        let f = self.r.below(4);
         let key = self.tc(&[
             "b", "1", "0", "-1", "1.0", "4", "'x'", "'q'", "c", "#a + 1", "2.5",
         ]);
-        if f < 0.3 {
+        if f == 0 {
             return format!("local t = {{}}\nt[{key}] = c\nreturn t[{key}], #t, next(t)");
         }
-        if f < 0.55 {
+        if f == 1 {
             let mut fl = ["x", "y", "z", "w"];
             for i in (1..fl.len()).rev() {
                 let j = self.r.below(i + 1);
@@ -479,7 +469,7 @@ impl Gen {
             lines.push(format!("return o.x, o.y, o.z, o.w, (o.x or 0) {op} 1"));
             return lines.join("\n");
         }
-        if f < 0.75 {
+        if f == 2 {
             let fld = self.tc(&["x", "y", "z"]);
             return format!(
                 "local t = {{x = 1, y = 2}}\nt.{fld} = a\nt[{key}] = b\nreturn t.x, t.y, t[{key}]"
@@ -525,16 +515,16 @@ impl Gen {
     }
 
     fn t_while(&mut self) -> String {
-        let f = self.r.f64();
+        let f = self.r.below(3);
         let op = self.tc(&CMPOPS[2..]);
-        if f < 0.35 {
+        if f == 0 {
             let a = self.tc(&["+", "-", "*", ".."]);
             let b = self.tc(&["1", "c", "0.5", "2"]);
             return format!(
                 "local n = 0\nlocal x = a\nwhile x {op} b and n < 20 do\n  x = x {a} {b}\n  n = n + 1\nend\nreturn x, n"
             );
         }
-        if f < 0.65 {
+        if f == 1 {
             let a = self.tc(&["+", "*", "-", "//"]);
             return format!(
                 "local n, x = 0, a\nrepeat\n  n = n + 1\n  x = x {a} c\n  if n > 15 then break end\nuntil x {op} b\nreturn n, x"
@@ -547,20 +537,20 @@ impl Gen {
     }
 
     fn t_gfor(&mut self) -> String {
-        let f = self.r.f64();
-        if f < 0.3 {
+        let f = self.r.below(4);
+        if f == 0 {
             let x = self.tc(&["", "a[k] = nil", "if n > 2 then break end", "b = k"]);
             return format!(
                 "local n, s = 0, {{}}\nfor k, v in pairs(a) do\n  n = n + 1\n  s[#s + 1] = ser(k) .. '=' .. ser(v)\n  {x}\nend\ntable.sort(s)\nreturn n, table.concat(s, ';')"
             );
         }
-        if f < 0.55 {
+        if f == 1 {
             let x = self.tc(&["s + i", "v", "s + v", "i + b"]);
             return format!(
                 "local n, s = 0, 0\nfor i, v in ipairs(a) do\n  n = n + 1\n  s = {x}\n  if n > 30 then break end\nend\nreturn n, s"
             );
         }
-        if f < 0.75 {
+        if f == 2 {
             return "local n, k, v = 0, nil, nil\nrepeat\n  k, v = next(a, k)\n  n = n + 1\nuntil k == nil or n > 20\nreturn n".to_string();
         }
         let s1 = self.tc(&["1", "c", "0.5"]);
@@ -573,18 +563,18 @@ impl Gen {
     fn t_vararg(&mut self) -> String {
         self.helper_stmt("local function va(...) return select('#', ...), ... end");
         self.helper_stmt("local function vb(x, ...) local t = {...} return #t, x, ... end");
-        let f = self.r.f64();
-        if f < 0.25 {
+        let f = self.r.below(5);
+        if f == 0 {
             return "return va(a, b, c)".to_string();
         }
-        if f < 0.45 {
+        if f == 1 {
             let s = self.tc(&["a", "b", "1", "-1", "2", "'#'", "4", "-4"]);
             return format!("return select({s}, a, b, c)");
         }
-        if f < 0.65 {
+        if f == 2 {
             return "return vb(va(a, b))".to_string();
         }
-        if f < 0.8 {
+        if f == 3 {
             let n = self.tc(&[
                 "vb",
                 "va",
@@ -599,8 +589,8 @@ impl Gen {
     }
 
     fn t_closure(&mut self) -> String {
-        let f = self.r.f64();
-        if f < 0.5 {
+        let f = self.r.below(2);
+        if f == 0 {
             let op = self.tc(&["+", "..", "*", "//"]);
             return format!(
                 "local fs = {{}}\nlocal u = a\nfor i = 1, 3 do\n  fs[i] = function() u = u {op} b return u end\nend\nreturn fs[1](), fs[2](), u"
@@ -687,11 +677,11 @@ impl Gen {
     }
 
     fn t_mt(&mut self) -> String {
-        let f = self.r.f64();
-        if f < 0.4 {
+        let f = self.r.below(3);
+        if f == 0 {
             return "return a.x, a[1], a.zz".to_string();
         }
-        if f < 0.7 {
+        if f == 1 {
             let op = self.tc(BINCMP);
             return format!("return a {op} b");
         }
@@ -926,10 +916,10 @@ impl Gen {
         let acc = self.tc(LIMIT_ACCS);
         let test = self.tc(LIMIT_TESTS);
         let step = format!("n = n + 1\n  local x = {e}\n  {acc}\n  if {test} then t = t + 1 end");
-        let form = self.r.f64();
-        let lp = if form < 0.6 {
+        let form = self.r.below(3);
+        let lp = if form == 0 {
             format!("for i = lo, hi, st do\n  {step}\n  if n >= 40 then break end\nend")
-        } else if form < 0.8 {
+        } else if form == 1 {
             format!(
                 "local i = lo\nwhile n < 40 and (st > 0 and i <= hi or st < 0 and i >= hi) do\n  {step}\n  i = i + st\nend"
             )
