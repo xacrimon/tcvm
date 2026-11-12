@@ -245,7 +245,7 @@ pub fn strict_lines(out: &str, strict: &[String], acc: &Accepted) -> String {
     let mut s = String::new();
     for l in out.lines() {
         if unit_of(l).is_some_and(|u| strict.iter().any(|x| x == u)) {
-            s.push_str(&acc.normalize(l));
+            s.push_str(&merge_hist(&acc.normalize(l)));
             s.push('\n');
         }
     }
@@ -267,8 +267,9 @@ pub fn internal_errors(run: &Run) -> Vec<String> {
         .collect()
 }
 
-/// The results of a warm-up line (`U1w H key=count key=count …`); keys hold spaces.
-fn keys(line: &str) -> Option<Vec<&str>> {
+/// The results of a warm-up line (`U1w H key=count key=count …`) with their counts; keys hold
+/// spaces.
+fn entries(line: &str) -> Option<Vec<(&str, &str)>> {
     let rest = line.split_once(" H ")?.1;
     let b = rest.as_bytes();
     let (mut out, mut start, mut i) = (Vec::new(), 0, 0);
@@ -277,7 +278,7 @@ fn keys(line: &str) -> Option<Vec<&str>> {
             let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
             let end = i + 1 + digits;
             if digits > 0 && (end == b.len() || b[end] == b' ') {
-                out.push(&rest[start..i]);
+                out.push((&rest[start..i], &rest[i + 1..end]));
                 start = (end + 1).min(b.len());
                 i = end;
             }
@@ -285,6 +286,25 @@ fn keys(line: &str) -> Option<Vec<&str>> {
         i += 1;
     }
     Some(out)
+}
+
+fn keys(line: &str) -> Option<Vec<&str>> {
+    Some(entries(line)?.into_iter().map(|(k, _)| k).collect())
+}
+
+/// A warm-up line with the counts of keys that normalizing made equal added up, in the order
+/// `hist` sorts them.
+fn merge_hist(line: &str) -> String {
+    let Some(es) = entries(line) else {
+        return line.to_string();
+    };
+    let mut merged: std::collections::BTreeMap<&str, u64> = Default::default();
+    for (k, n) in es {
+        *merged.entry(k).or_default() += n.parse::<u64>().unwrap_or(0);
+    }
+    let head = line.split_once(" H ").map_or(line, |x| x.0);
+    let body: Vec<String> = merged.iter().map(|(k, n)| format!("{k}={n}")).collect();
+    format!("{head} H {}", body.join(" "))
 }
 
 /// A result without its values: `#2,i,f|s` for two results, an integer and a float, and a
@@ -379,6 +399,16 @@ mod tests {
         assert_eq!(
             strict.normalize("E<bad argument #2 to 'string.rep' (number expected, got no value)>"),
             "E<bad argument #2 to 'rep' (number expected, got nil)>"
+        );
+    }
+
+    #[test]
+    fn normalized_warm_up_keys_are_merged() {
+        let acc = Accepted::all_but(&[]);
+        let line = "U1w H E<L3: number (local 'a') has no integer representation>=2 E<L3: number (local 'b') has no integer representation>=3 #1,i1=4";
+        assert_eq!(
+            merge_hist(&acc.normalize(line)),
+            "U1w H #1,i1=4 E<L3: number has no integer representation>=5"
         );
     }
 
