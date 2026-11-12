@@ -188,7 +188,10 @@ for reasons that are no bugs.
   list a new strict template in its `STRICT`, and keep it off floats as text, lengths of
   tables that may have holes, libm and `pairs` order. `templates/stress.rs` holds the ones past
   the sizes the rest reach (`chain`, `recur`, `callslot`, `hoist`); `HEAVY` lists those the
-  driver calls fewer times.
+  driver calls fewer times. `templates/lang.rs` holds the ones over the language's corners
+  by the manual's sections (patterns, formats, `pack`, `utf8`, lexical forms, vararg tables,
+  `_ENV`, `load`, to-be-closed variables, `goto`, `xpcall`, coroutines, inheritance, the table
+  library, numeric edges).
 - `driver.rs`: how a unit's function is called, and with which values. A call goes through
   `call`, which points at `f` or an adapter (`via_tail`, `via_va`, `via_pcall`, `via_co`,
   `via_cs`, `via_dirty`); an adapter must return `f`'s results and raise its errors unchanged.

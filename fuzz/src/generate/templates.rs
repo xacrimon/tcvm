@@ -1,6 +1,7 @@
 //! Hand-written templates: small bodies of `f` that aim at one thing each, ported from the old
 //! Python generator (`tools/fuzz/gen.py`).
 
+mod lang;
 mod stress;
 mod strict;
 
@@ -9,7 +10,7 @@ use crate::ast::{Block, Stmt};
 
 /// Whether a template's units stay within what reference Lua agrees on, so are compared with it.
 pub(super) fn is_strict(kind: &str) -> bool {
-    strict::STRICT.contains(&kind) || stress::STRICT.contains(&kind)
+    strict::STRICT.contains(&kind) || stress::STRICT.contains(&kind) || lang::STRICT.contains(&kind)
 }
 
 /// Whether a template's call is slow, so the driver makes fewer.
@@ -251,6 +252,23 @@ const TEMPLATES: &[(&str, u32)] = &[
     ("recur", 3),
     ("callslot", 3),
     ("hoist", 4),
+    ("pattern", 4),
+    ("strfmt", 3),
+    ("pack", 2),
+    ("utf8", 2),
+    ("lex", 3),
+    ("assign", 2),
+    ("ctor", 3),
+    ("vatab", 3),
+    ("env", 2),
+    ("load", 2),
+    ("tbc", 3),
+    ("goto", 2),
+    ("xpcall", 3),
+    ("coro2", 3),
+    ("oop", 3),
+    ("tablib", 3),
+    ("numedge", 4),
 ];
 
 impl Gen {
@@ -881,6 +899,23 @@ impl Gen {
             "recur" => self.t_recur(),
             "callslot" => self.t_callslot(),
             "hoist" => self.t_hoist(),
+            "pattern" => self.t_pattern(),
+            "strfmt" => self.t_strfmt(),
+            "pack" => self.t_pack(),
+            "utf8" => self.t_utf8(),
+            "lex" => self.t_lex(),
+            "assign" => self.t_assign(),
+            "ctor" => self.t_ctor(),
+            "vatab" => self.t_vatab(),
+            "env" => self.t_env(),
+            "load" => self.t_load(),
+            "tbc" => self.t_tbc(),
+            "goto" => self.t_goto(),
+            "xpcall" => self.t_xpcall(),
+            "coro2" => self.t_coro2(),
+            "oop" => self.t_oop(),
+            "tablib" => self.t_tablib(),
+            "numedge" => self.t_numedge(),
             _ => unreachable!(),
         };
         let mut wf = self.t_warm_fams();
@@ -898,6 +933,13 @@ impl Gen {
                 self.tc(i),
                 self.tc(&["sp", "bi", "ib"]),
                 self.tc(&["sp", "sn", "ot", "si"]),
+            ];
+        }
+        if lang::STRINGY.contains(&kind) {
+            wf = [
+                self.tc(&["st", "st", "ns"]),
+                self.tc(&["si", "sp", "sn"]),
+                self.tc(&["st", "si"]),
             ];
         }
         if kind == "meta2" {
