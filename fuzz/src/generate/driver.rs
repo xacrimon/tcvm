@@ -52,12 +52,14 @@ const ADAPTERS: &[(&str, u32)] = &[
     ("via_pcall", 12),
     ("via_cs", 12),
     ("via_co", 6),
+    ("via_dirty", 10),
 ];
 /// The definitions of the adapters; `call` is the one `run` enters `f` by.
 const ADAPTER_DEFS: &str = "local callee = f
 local function via_tail(a, b, c) return f(a, b, c) end
 local function via_tail2(a, b, c) return via_tail(a, b, c) end
 local function via_va(...) return f(...) end
+local function via_dirty(a, b, c) dirty() return f(a, b, c) end
 local function via_cs(a, b, c) return callee(a, b, c) end
 local function via_pcall(...)
   local r = table.pack(pcall(f, ...))
@@ -148,8 +150,14 @@ impl Gen {
             (300, *self.r.pick(&[300, 600, 1000, 2000]))
         };
         let again = nwarm.min(200);
+        // `f`'s frame then starts on slots that hold values.
+        let dirty = if self.r.chance(0.3) {
+            "dirty()\n      "
+        } else {
+            ""
+        };
         let each = format!(
-            "pos = i\n      local a, b, c = LA[(i - 1) % LA.n + 1], LB[i % LB.n + 1], LC[(i + 1) % LC.n + 1]\n      FUEL = {fuel}\n      local s = sers(call(a, b, c)) .. probes()\n      h[s] = (h[s] or 0) + 1"
+            "pos = i\n      local a, b, c = LA[(i - 1) % LA.n + 1], LB[i % LB.n + 1], LC[(i + 1) % LC.n + 1]\n      FUEL = {fuel}\n      {dirty}local s = sers(call(a, b, c)) .. probes()\n      h[s] = (h[s] or 0) + 1"
         );
         let run = if self.r.chance(0.12) {
             format!(

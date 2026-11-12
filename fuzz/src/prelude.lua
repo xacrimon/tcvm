@@ -135,5 +135,11 @@ local function reset()
   V.sq = { mk("sq0", {}), mk("sq3", { 4, 5, 6 }), mk("sqs", { "p", "q" }), mk("sq1", { 9 }) }
   for k, l in pairs(V) do l.n = (k == "nil1") and 1 or #l end
 end
+-- Leaves values other than nil in the stack slots the next call's frame takes, for code that
+-- reads a slot it never wrote.
+local function dirty()
+  local j1, j2, j3, j4, j5, j6, j7, j8, j9, j10, j11, j12, j13, j14, j15, j16 = 1, 2.5, "s", true, MT, 7, -1, "x", 1, 2.5, "s", true, MT, 7, -1, "x"
+  return j1, j2, j3, j4, j5, j6, j7, j8, j9, j10, j11, j12, j13, j14, j15, j16
+end
 -- Where a driver loop stands, so it resumes after an error instead of restarting.
 local pos = 0
