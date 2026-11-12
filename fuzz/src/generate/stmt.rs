@@ -571,6 +571,136 @@ impl Gen {
         out
     }
 
+    /// A pattern function on a string: what it finds is anything.
+    fn pattern_stmt(&mut self, d: u32) -> Block {
+        let s = self.text(d);
+        let p = str(self.r.pick(&[
+            "%a+",
+            "(%w+)",
+            "%d+",
+            "^%s*(.-)%s*$",
+            "%b()",
+            "%f[%a]%a",
+            "()",
+            "(.)%1",
+            "[^%s]+",
+            ".-",
+            "a*",
+            "(a)(b?)",
+        ]));
+        let v = self.fresh_name("v");
+        let e = match self.r.below(4) {
+            0 => call("string.find", vec![s, p, self.e(Kind::Int, 0)]),
+            1 => call("string.match", vec![s, p]),
+            2 => {
+                let r = match self.r.below(3) {
+                    0 => str(self.r.pick(&["%1", "<%0>", "", "%%"])),
+                    1 => raw("{a = \"A\", b = false}"),
+                    _ => raw("function(m) if #m > 1 then return m:sub(2) end end"),
+                };
+                // At most one replacement per character: the length stays bounded.
+                call("string.gsub", vec![s, p, r, Expr::Int(self.r.range(1, 4))])
+            }
+            _ => {
+                let n = self.fresh_name("n");
+                self.declare(&n, Kind::Int, false);
+                return vec![
+                    local(&n, Expr::Int(0)),
+                    Stmt::Raw(format!(
+                        "for _ in string.gmatch({}, {}) do {n} = {n} + 1 if {n} > 20 then break end end",
+                        crate::ast::expr(&s),
+                        crate::ast::expr(&p)
+                    )),
+                ];
+            }
+        };
+        self.declare(&v, Kind::Any, false);
+        vec![local(&v, e)]
+    }
+
+    /// `xpcall` of a function of the unit or a new one, with a handler.
+    fn xpcall_stmt(&mut self, d: u32) -> Block {
+        let (ok, e) = (self.fresh_name("ok"), self.fresh_name("r"));
+        let h = raw(*self.r.pick(&[
+            "function(e) return type(e) end",
+            "function(e) return e end",
+            "type",
+            "function(e) return select('#', e) end",
+        ]));
+        let f = match self.helper().filter(|_| self.r.chance(0.4)) {
+            Some((f, _)) => name(&f),
+            None => {
+                let outer = self.enter_function();
+                let n = self.r.range(1, 3) as usize;
+                let mut body = self.block(n, d);
+                if self.r.chance(0.6) {
+                    body.push(Stmt::Return(self.args(1, d)));
+                }
+                self.leave_function(outer);
+                Expr::Func(Box::new(Func {
+                    params: vec![],
+                    vararg: None,
+                    body,
+                }))
+            }
+        };
+        let mut args = vec![f, h];
+        let n = self.r.below(3);
+        args.extend(self.args(n, d.min(1)));
+        self.declare(&ok, Kind::Bool, false);
+        self.declare(&e, Kind::Any, false);
+        vec![Stmt::Local(
+            vec![(ok, None), (e, None)],
+            vec![call("xpcall", args)],
+        )]
+    }
+
+    /// A constructor that mixes item kinds and expands a call or `...` at its end or not.
+    fn ctor_stmt(&mut self, d: u32) -> Block {
+        let mut items = Vec::new();
+        for _ in 0..self.r.range(1, 5) {
+            items.push(match self.r.below(5) {
+                0 => crate::ast::Item::Named(self.field(), self.any(d)),
+                1 => crate::ast::Item::Pos(self.call_any(d.min(1))),
+                2 if self.vararg => crate::ast::Item::Pos(Expr::Vararg),
+                _ => crate::ast::Item::Pos(self.any(d)),
+            });
+        }
+        let v = self.fresh_name("v");
+        self.declare(&v, Kind::Any, false);
+        vec![local(&v, Expr::Table(items))]
+    }
+
+    /// `sort`, `concat`, `move` on a sequence the unit built.
+    fn tablib_stmt(&mut self, d: u32) -> Block {
+        let found = self.var(|v| matches!(v.kind, Kind::SeqInt | Kind::SeqStr));
+        let Some((t, k)) = found else {
+            return self.local_stmt(d);
+        };
+        let v = self.fresh_name("v");
+        let (e, vk) = match self.r.below(4) {
+            0 => {
+                let cmp = self.r.pick(&["", ", function(x, y) return x > y end"]);
+                return vec![Stmt::Raw(format!("table.sort({t}{cmp})"))];
+            }
+            1 => (
+                call(
+                    "table.concat",
+                    vec![name(&t), str(self.r.pick(&[",", "", "--"]))],
+                ),
+                Kind::Str,
+            ),
+            // A copy: the sequence keeps no holes.
+            2 => (raw(format!("table.move({t}, 1, #{t}, 1, {{}})")), k),
+            _ => (
+                raw(format!("select('#', table.unpack({t}, 1, #{t}))")),
+                Kind::Int,
+            ),
+        };
+        self.declare(&v, vk, false);
+        vec![local(&v, e)]
+    }
+
     fn pcall_stmt(&mut self, d: u32) -> Block {
         let (ok, e) = (self.fresh_name("ok"), self.fresh_name("r"));
         let h = self.helper();
@@ -755,7 +885,7 @@ impl Gen {
             .map(|&(form, _)| {
                 let ok = match form {
                     "local" | "assign" | "store" | "call" | "probe" | "global" | "multi"
-                    | "junk" => true,
+                    | "junk" | "pattern" | "ctor" | "tablib" => true,
                     "goto" => matches!(self.conts.last(), Some(Some(_))),
                     "break" => self.loops > 0,
                     "coroutine" => nested || self.yields,
@@ -810,6 +940,10 @@ impl Gen {
             }
             "multi" => self.multi_stmt(1),
             "junk" => vec![Stmt::Raw(self.junk())],
+            "pattern" => self.pattern_stmt(2),
+            "xpcall" => self.xpcall_stmt(d1),
+            "ctor" => self.ctor_stmt(2),
+            "tablib" => self.tablib_stmt(2),
             "return" => vec![Stmt::If(
                 vec![(self.cond(2), vec![Stmt::Return(self.args(1, 2))])],
                 None,

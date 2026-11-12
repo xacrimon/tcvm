@@ -162,6 +162,8 @@ The differences `CLAUDE.md` lists as deliberate are avoided by the generator ins
 *strict* unit, the only kind compared with reference Lua, writes no float as text (tcvm
 writes `%.14g`), takes no length of a table with holes, and never yields outside a coroutine.
 A unit's header line says whether it is strict: `do -- U1 free risk=0 roles=[Num, Str, Tab] strict`.
+`free big` marks one of the 5% of free units with 60 to 150 statements, nested deeper, kept to
+the types and given more fuel per call.
 
 ## What the programs reach
 

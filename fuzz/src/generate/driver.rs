@@ -144,7 +144,9 @@ impl Gen {
     ) -> Block {
         let wf = wf.unwrap_or_else(|| self.warm_fams());
         // A call that runs out of fuel costs all of it: the more fuel, the fewer calls.
-        let (fuel, nwarm) = if heavy {
+        let (fuel, nwarm) = if self.big {
+            *self.r.pick(&[(5000, 20), (5000, 60)])
+        } else if heavy {
             *self.r.pick(&[(200, 150), (600, 60), (2000, 20)])
         } else {
             (300, *self.r.pick(&[300, 600, 1000, 2000]))
