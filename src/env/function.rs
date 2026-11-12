@@ -917,3 +917,30 @@ impl<'gc> Function<'gc> {
         Function(g)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Lua;
+
+    /// The closures sit where `FN_LUA` and `FN_NATIVE` say, which off
+    /// `nightly` come from a mirror of the `repr(C, u8)` layout.
+    #[test]
+    fn closure_offsets() {
+        let mut lua = Lua::new();
+        lua.load_all();
+        lua.enter(|ctx| {
+            let f = ctx.load("", None).unwrap();
+            let lf = f.as_lua().unwrap();
+            let c: *const LuaClosure = &*lf;
+            let cell = Gc::as_ptr(f.inner()).addr();
+            assert_eq!(c.addr() - cell, FN_LUA, "FN_LUA");
+
+            let key = Value::string(LuaString::new(ctx, b"print"));
+            let print = ctx.globals().raw_get(key).get_function().unwrap();
+            let nc: *const NativeClosure = print.as_native().unwrap();
+            let cell = Gc::as_ptr(print.inner()).addr();
+            assert_eq!(nc.addr() - cell, FN_NATIVE, "FN_NATIVE");
+        });
+    }
+}
