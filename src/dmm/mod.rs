@@ -24,6 +24,7 @@ mod hashbrown;
 #[doc(hidden)]
 pub use tcvm_derive::__unelide_lifetimes;
 
+pub(crate) use self::allocator_api::HashAllocator;
 pub use self::{
     allocator_api::MetricsAlloc,
     arena::{Arena, Rootable},
