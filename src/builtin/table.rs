@@ -223,13 +223,8 @@ pub(crate) fn lua_insert<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let Some(t) = try_out!(check_tab(
-        ctx,
-        stack.get(0),
-        "insert",
-        1,
-        TAB_R | TAB_W | TAB_L
-    )) else {
+    let t = check_tab(ctx, stack.get(0), "insert", 1, TAB_R | TAB_W | TAB_L);
+    let Some(t) = try_out!(t) else {
         return insert_meta(ctx, &mut stack);
     };
     let e = (t.raw_len() as i64).wrapping_add(1);
@@ -422,13 +417,8 @@ pub(crate) fn lua_remove<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let Some(t) = try_out!(check_tab(
-        ctx,
-        stack.get(0),
-        "remove",
-        1,
-        TAB_R | TAB_W | TAB_L
-    )) else {
+    let t = check_tab(ctx, stack.get(0), "remove", 1, TAB_R | TAB_W | TAB_L);
+    let Some(t) = try_out!(t) else {
         return remove_meta(ctx, &mut stack);
     };
     let size = t.raw_len() as i64;
@@ -496,13 +486,8 @@ fn lua_sort<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let n = match try_out!(check_tab(
-        ctx,
-        stack.get(0),
-        "sort",
-        1,
-        TAB_R | TAB_W | TAB_L
-    )) {
+    let t = check_tab(ctx, stack.get(0), "sort", 1, TAB_R | TAB_W | TAB_L);
+    let n = match try_out!(t) {
         Some(t) => t.raw_len() as i64,
         None => {
             let v = stack.get(0);
@@ -535,10 +520,9 @@ pub(crate) fn sort_len_cont<'gc>(
     mut stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
 ) -> NativeOut {
-    let n = try_out!(
-        util::to_integer(stack.get(2))
-            .ok_or_else(|| Error::from_str(ctx, "object length is not an integer"))
-    );
+    let Some(n) = util::to_integer(stack.get(2)) else {
+        return NativeOut::error(Error::from_str(ctx, "object length is not an integer"));
+    };
     stack.truncate(2);
     sort_start(ctx, stack, n)
 }

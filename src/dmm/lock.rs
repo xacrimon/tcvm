@@ -48,47 +48,47 @@ macro_rules! make_lock_wrapper {
         pub type $gc_locked_type<'gc, T> = Gc<'gc, $locked_type<T>>;
 
         $(
-        impl<T> $locked_type<T> {
-            #[inline]
-            pub fn new(t: T) -> $locked_type<T> {
-                Self { cell: $unlocked_type::new(t) }
+            impl<T> $locked_type<T> {
+                #[inline]
+                pub fn new(t: T) -> $locked_type<T> {
+                    Self { cell: $unlocked_type::new(t) }
+                }
+
+                #[inline]
+                pub fn into_inner(self) -> T {
+                    self.cell.into_inner()
+                }
+
+                $($sized_items)*
             }
 
-            #[inline]
-            pub fn into_inner(self) -> T {
-                self.cell.into_inner()
+            impl<T: ?$Sized> $locked_type<T> {
+                #[inline]
+                pub fn as_ptr(&self) -> *mut T {
+                    self.cell.as_ptr()
+                }
+
+                $($unsized_items)*
+
+                #[doc = concat!("Access the wrapped [`", stringify!($unlocked_type), "`].")]
+                ///
+                /// # Safety
+                /// In order to maintain the invariants of the garbage collector, no new [`Gc`]
+                /// pointers may be adopted by this type as a result of the interior mutability
+                /// afforded by directly accessing the inner [`
+                #[doc = stringify!($unlocked_type)]
+                /// `], unless the write barrier for the containing [`Gc`] pointer is invoked manually
+                /// before collection is triggered.
+                #[inline]
+                pub unsafe fn $unsafe_unlock_method(&self) -> &$unlocked_type<T> {
+                    &self.cell
+                }
+
+                #[inline]
+                pub fn get_mut(&mut self) -> &mut T {
+                    self.cell.get_mut()
+                }
             }
-
-            $($sized_items)*
-        }
-
-        impl<T: ?$Sized> $locked_type<T> {
-            #[inline]
-            pub fn as_ptr(&self) -> *mut T {
-                self.cell.as_ptr()
-            }
-
-            $($unsized_items)*
-
-            #[doc = concat!("Access the wrapped [`", stringify!($unlocked_type), "`].")]
-            ///
-            /// # Safety
-            /// In order to maintain the invariants of the garbage collector, no new [`Gc`]
-            /// pointers may be adopted by this type as a result of the interior mutability
-            /// afforded by directly accessing the inner [`
-            #[doc = stringify!($unlocked_type)]
-            /// `], unless the write barrier for the containing [`Gc`] pointer is invoked manually
-            /// before collection is triggered.
-            #[inline]
-            pub unsafe fn $unsafe_unlock_method(&self) -> &$unlocked_type<T> {
-                &self.cell
-            }
-
-            #[inline]
-            pub fn get_mut(&mut self) -> &mut T {
-                self.cell.get_mut()
-            }
-        }
         )?
 
         impl<T $(: ?$Sized)?> Unlock for $locked_type<T> {
