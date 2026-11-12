@@ -91,10 +91,11 @@ RUSTFLAGS="-C debug-assertions" cargo build --release --workspace \
 tcvm-fuzz run --bin rel=target/release/tcvm-cli --bin dbg=target/dbg/release/tcvm-cli
 ```
 
-Each binary is compared with itself only. A build with debug assertions checks the
-interpreter's and the collector's invariants as it runs, which a release build compiles out;
-it is slower, so a run with both does about half as many seeds. With several binaries the
-configurations in `summary.tsv` carry the binary's name (`dbg:hot`).
+Without `--bin`, a run takes `rel=target/release/tcvm-cli` and, where it is built,
+`dbg=target/dbg/release/tcvm-cli`. Each binary is compared with itself only. A build with debug
+assertions checks the interpreter's and the collector's invariants as it runs, which a release
+build compiles out; it is slower, so a run with both does about half as many seeds. With
+several binaries the configurations in `summary.tsv` carry the binary's name (`dbg:hot`).
 
 ## Looking at a finding
 
@@ -126,6 +127,7 @@ tcvm-fuzz reduce 38 --what ref
 tcvm-fuzz reduce 159 --what diverges --mode hc4,hl20,check
 tcvm-fuzz reduce 67 --what internal --mode hot --grep "used before any definition"
 tcvm-fuzz reduce 1041 --what crash --mode hot
+tcvm-fuzz reduce 2210 --what internal --mode dbg:hot
 tcvm-fuzz reduce 20131 --what crash --mode hc1,hl1,deopt --grep "stack overflow"
 ```
 
