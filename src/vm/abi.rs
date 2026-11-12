@@ -91,30 +91,47 @@ pub(crate) enum Exit {
 }
 
 /// Without `become`, every target returns to the trampoline
-/// (`dispatch::call_handler`) with the next target and its slots; `End` has
-/// none.
+/// (`dispatch::call_handler`) the next one and its `pc`, in registers. A step
+/// without [`Exit::FULL`] keeps the trampoline's other slots (`insn` is the
+/// word before `pc`); a full one leaves them in [`Side`].
 #[cfg(not(nightly))]
 pub(crate) struct Exit {
-    pub(crate) next: Option<Handler>,
-    pub(crate) insn: Slot,
+    /// `handler_bits` of the next target and the flags; 0 is `End`.
+    pub(crate) bits: u64,
     pub(crate) pc: *const Instruction,
-    pub(crate) base: *mut Value<'static>,
+}
+
+/// The slots of a full step, in the runtime (`Runtime::side`).
+#[cfg(not(nightly))]
+#[derive(Clone, Copy)]
+pub(crate) struct Side<'gc> {
+    pub(crate) insn: Slot,
+    pub(crate) base: *mut Value<'gc>,
     pub(crate) closure: Slot,
     #[cfg(target_arch = "aarch64")]
-    pub(crate) thread: *mut ThreadState<'static>,
+    pub(crate) thread: *mut ThreadState<'gc>,
 }
 
 #[cfg(not(nightly))]
-impl Exit {
-    #[allow(non_upper_case_globals)]
-    pub(crate) const End: Exit = Exit {
-        next: None,
+impl Side<'_> {
+    pub(crate) const EMPTY: Self = Side {
         insn: Slot(0),
-        pc: std::ptr::null(),
         base: std::ptr::null_mut(),
         closure: Slot(0),
         #[cfg(target_arch = "aarch64")]
         thread: std::ptr::null_mut(),
+    };
+}
+
+#[cfg(not(nightly))]
+impl Exit {
+    /// The other slots are in [`Side`].
+    pub(crate) const FULL: u64 = 1;
+
+    #[allow(non_upper_case_globals)]
+    pub(crate) const End: Exit = Exit {
+        bits: 0,
+        pc: std::ptr::null(),
     };
 
     /// The step that calls `next` with these slots.
@@ -124,18 +141,30 @@ impl Exit {
         insn: Slot,
         pc: *const Instruction,
         base: *mut Value<'gc>,
-        _rt: Context<'gc>,
+        rt: Context<'gc>,
         closure: Slot,
         #[cfg(target_arch = "aarch64")] thread: *mut ThreadState<'gc>,
     ) -> Exit {
-        Exit {
-            next: Some(next),
+        rt.runtime().side.set(Side {
             insn,
-            pc,
-            base: base.cast(),
+            base,
             closure,
             #[cfg(target_arch = "aarch64")]
-            thread: thread.cast(),
+            thread,
+        });
+        Exit {
+            bits: handler_bits(next) | Self::FULL,
+            pc,
+        }
+    }
+
+    /// The step that calls `next` with the instruction before `pc` and the
+    /// trampoline's other slots.
+    #[inline(always)]
+    pub(crate) fn fast(next: Handler, pc: *const Instruction) -> Exit {
+        Exit {
+            bits: handler_bits(next),
+            pc,
         }
     }
 }
@@ -291,11 +320,12 @@ macro_rules! handler_impl {
                 let mut $pc = __pc;
                 let mut $base = __base;
                 let $rt = __rt;
+                $(#[cfg(not(nightly))] let __thread = $th;)?
                 $(let mut $th = $th;)?
                 $crate::vm::abi::handler_impl!(@bind $kind, __insn, __closure, $insn, $closure, $pc, $nret, $values);
                 $crate::vm::abi::handler_impl!(@thread [$d] [$($th)?], $rt, $thread);
                 $crate::vm::abi::handler_impl!(@slots [$d] $kind, $insn, $closure);
-                $crate::vm::abi::handler_impl!(@body [$d] $kind, $insn, $pc, $base, $rt, $closure, $thread, $nret, $values, [$($th)?]);
+                $crate::vm::abi::handler_impl!(@body [$d] $kind, $insn, $pc, $base, $rt, $closure, $thread, $nret, $values, [$($th __thread)?], __base, __closure);
                 $body
             }
         }
@@ -412,7 +442,8 @@ macro_rules! handler_impl {
 
     // --- body macros --------------------------------------------------------
 
-    (@body [$d:tt] $kind:ident, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident, [$($th:ident)?]) => {
+    (@body [$d:tt] $kind:ident, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident,
+     [$($th:ident $th0:ident)?], $base0:ident, $closure0:ident) => {
         /// Dispatch the instruction at `pc`.
         macro_rules! next {
             () => {{
@@ -421,6 +452,12 @@ macro_rules! handler_impl {
                 let __w: $crate::instruction::Instruction = unsafe { *$pc };
                 $pc = unsafe { $pc.add(1) };
                 let __h = $rt.handler(__w.opcode());
+                // Without `become`: in the frame this target was entered
+                // with, the trampoline keeps its slots.
+                #[cfg(not(nightly))]
+                if $base == $base0 && closure_slot!().raw() == $closure0.raw() $(&& $th == $th0)? {
+                    return $crate::vm::abi::Exit::fast(__h, $pc);
+                }
                 $crate::vm::abi::go!(__h, $crate::vm::abi::Slot::insn(__w), $pc, $base, $rt, closure_slot!() $(, $th)?)
             }};
         }
