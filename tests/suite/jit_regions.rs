@@ -968,6 +968,46 @@ fn arith_kinds() {
     agrees(&src);
 }
 
+/// `math.min`/`math.max` compiled after warm-ups of several kind mixes, then
+/// run on every pair of values: tables with `__lt` are ordered by it (#313),
+/// the other kinds raise or compare as the interpreter does.
+#[test]
+fn min_max_kinds() {
+    let src = r##"
+    local mt = {__lt = function(a, b)
+        local x = type(a) == "table" and a.n or a
+        local y = type(b) == "table" and b.n or b
+        return x < y
+    end}
+    local function o(n) return setmetatable({n = n}, mt) end
+    local vals = {1, -7, 1 << 40, 1.5, 0/0, 2^53, "10", "x", o(2), o(-1), o(1.5), {}, true}
+    local warm = {{1, 2}, {4, 3}, {1, 4}, {7, 8}, {9, 10}, {1, 9}}
+    local function fmt(ok, v)
+        if not ok then return "E:" .. tostring(v) end
+        if type(v) == "table" then return "o:" .. tostring(v.n) end
+        return (math.type(v) or type(v)) .. ":" .. tostring(v)
+    end
+    local out = {}
+    for _, expr in ipairs({"math.min(a, b)", "math.max(a, b)", "math.min(a, 2, b)",
+                           "math.max(b, a, 1.5)"}) do
+        for _, w in ipairs(warm) do
+            local g = load("return function(a, b) return " .. expr .. " end")()
+            local a, b = vals[w[1]], vals[w[2]]
+            for i = 1, 300 do pcall(g, a, b) end
+            for _, x in ipairs(vals) do
+                for _, y in ipairs(vals) do
+                    out[#out + 1] = fmt(pcall(g, x, y))
+                end
+            end
+        end
+    end
+    return table.concat(out, " ")
+"##;
+    let jit = result(src, true);
+    assert!(jit.contains("o:-1"), "no pick by __lt");
+    assert_eq!(jit, result(src, false));
+}
+
 /// Every compare, register and immediate forms, compiled after warm-ups of
 /// several kind mixes, then run on every pair of values: numbers around
 /// 2^53, NaNs and signed zeros, strings with zeros and high bytes, tables

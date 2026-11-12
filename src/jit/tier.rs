@@ -890,7 +890,8 @@ fn record_shape<'gc>(
 
 /// Whether the instruction at `pc` is a call whose arguments a builtin's
 /// `ExitTag::Arg` guard raises on: one that is no number and no string, or
-/// (`cmp`: `min`, `max`, which compare them) strings mixed with numbers.
+/// (`cmp`: `min`, `max`, which compare them, `__lt` ordering any other kind)
+/// strings mixed with numbers.
 fn call_arg_raises<'gc>(
     proto: Gc<'gc, Prototype<'gc>>,
     pc: u32,
@@ -924,7 +925,7 @@ fn call_arg_raises<'gc>(
         } else if v.get_string().is_some() {
             str = true;
         } else {
-            return true;
+            return !cmp;
         }
     }
     cmp && num && str

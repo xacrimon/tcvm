@@ -71,10 +71,6 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
             crate::builtin::string::lua_byte,
             Intrinsic::Builtin(HelperId::StrByte),
         ),
-        #[cfg(feature = "lib-math")]
-        (crate::builtin::math::lua_min, Intrinsic::MinMax(false)),
-        #[cfg(feature = "lib-math")]
-        (crate::builtin::math::lua_max, Intrinsic::MinMax(true)),
     ];
     match nc.function {
         NativeKind::Plain(p) => {
@@ -83,15 +79,25 @@ fn intrinsic_of(f: Function<'_>) -> Option<Intrinsic> {
             }
         }
         NativeKind::Cont(p) => {
-            let cont: &[(ContFn, HelperId)] = &[
-                (base::lua_tostring, HelperId::ToString),
+            let cont: &[(ContFn, Intrinsic)] = &[
+                (base::lua_tostring, Intrinsic::Builtin(HelperId::ToString)),
                 #[cfg(feature = "lib-table")]
-                (crate::builtin::table::lua_insert, HelperId::TInsert),
+                (
+                    crate::builtin::table::lua_insert,
+                    Intrinsic::Builtin(HelperId::TInsert),
+                ),
                 #[cfg(feature = "lib-table")]
-                (crate::builtin::table::lua_remove, HelperId::TRemove),
+                (
+                    crate::builtin::table::lua_remove,
+                    Intrinsic::Builtin(HelperId::TRemove),
+                ),
+                #[cfg(feature = "lib-math")]
+                (crate::builtin::math::lua_min, Intrinsic::MinMax(false)),
+                #[cfg(feature = "lib-math")]
+                (crate::builtin::math::lua_max, Intrinsic::MinMax(true)),
             ];
-            if let Some(&(_, h)) = cont.iter().find(|(f, _)| *f as usize == p as usize) {
-                return Some(Intrinsic::Builtin(h));
+            if let Some(&(_, i)) = cont.iter().find(|(f, _)| *f as usize == p as usize) {
+                return Some(i);
             }
         }
         _ => {}
@@ -470,9 +476,9 @@ fn moved_shape(b: &mut Builder<'_, '_>, args: &[Val]) -> Option<u32> {
 /// `<`. Numbers in the narrowest representation that holds every kind seen
 /// (i32, i64, f64; small integers with floats as floats, picking the original
 /// values; big integers with floats by `NumCmp`), strings by their bytes; a
-/// site that saw both tests which a call has. Guards exit as `ArgCmp`: an
-/// argument that is no number and no string, or strings with numbers,
-/// raise. Only a variable count calls the builtin.
+/// site that saw both tests which a call has. Guards exit as `ArgCmp`. Of
+/// more than one argument, a site that saw any other kind, which `__lt` may
+/// order, calls the builtin, as does a variable count.
 #[allow(clippy::too_many_arguments)]
 fn min_max<'gc>(
     b: &mut Builder<'_, 'gc>,
@@ -496,6 +502,11 @@ fn min_max<'gc>(
             let group = if i == 0 { bits } else { bits >> fb::ARGS_SHIFT };
             s | arg_kinds(b, v, group & fb::KINDS)
         });
+    let (nums, strs) = (all & TypeSet::NUM, all.contains(TypeSet::STR));
+    let others = (bits | bits >> fb::ARGS_SHIFT) & (fb::TAB | fb::OTHER) != 0;
+    if nargs > 1 && (others || (nums.is_empty() && !strs)) {
+        return Emitted::No;
+    }
     pin(b, f, callee);
     if nargs == 1 {
         if c == 2 {
@@ -503,7 +514,6 @@ fn min_max<'gc>(
         }
         return Emitted::Done;
     }
-    let (nums, strs) = (all & TypeSet::NUM, all.contains(TypeSet::STR));
     match (!nums.is_empty(), strs) {
         (true, false) => {
             let r = num_fold(b, max, &args, nums);
@@ -511,7 +521,7 @@ fn min_max<'gc>(
                 b.set(a, r);
             }
         }
-        (false, true) => {
+        (false, _) => {
             let r = str_fold(b, max, &args);
             if c == 2 {
                 b.set(a, r);
@@ -529,8 +539,6 @@ fn min_max<'gc>(
             arm_end(b, join, a, r);
             enter_join(b, join);
         }
-        // Every kind seen raises.
-        (false, false) => b.deopt(ExitTag::ArgCmp),
     }
     Emitted::Done
 }

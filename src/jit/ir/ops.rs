@@ -486,7 +486,8 @@ pub(crate) enum ExitTag {
     /// tell apart at a guard that covers some numbers.
     Arg,
     /// `Arg` for `min`/`max`, which compare their arguments: strings mixed with
-    /// numbers raise too.
+    /// numbers raise too, and any other kind is learned, as `__lt` may order
+    /// it.
     ArgCmp,
     /// A builtin's result was of a kind its inline code does not make, where
     /// the call's feedback never saw one (`floor` without an integer,

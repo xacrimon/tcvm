@@ -18,12 +18,30 @@ pub(crate) fn push_int(out: &mut Vec<u8>, i: i64) {
 /// The VM's "attempt to compare …" runtime-error message for an ordering of two
 /// non-comparable values, in operand order (`a < b`). Used where native code
 /// applies the `<` operator (`math.max`/`min`, `table.sort`'s default order).
-pub(crate) fn compare_error_msg<'gc>(a: Value<'gc>, b: Value<'gc>) -> String {
-    let (ta, tb) = (a.type_name(), b.type_name());
+pub(crate) fn compare_error_msg<'gc>(ctx: Context<'gc>, a: Value<'gc>, b: Value<'gc>) -> String {
+    let (ta, tb) = (object_type_name(ctx, a), object_type_name(ctx, b));
     if ta == tb {
         format!("attempt to compare two {ta} values")
     } else {
         format!("attempt to compare {ta} with {tb}")
+    }
+}
+
+/// `<` on numbers and strings (no string→number coercion); `None` for any
+/// other pair, which `__lt` orders.
+pub(crate) fn prim_lt(x: Value<'_>, y: Value<'_>) -> Option<bool> {
+    if let (Some(x), Some(y)) = (x.get_integer(), y.get_integer()) {
+        Some(x < y)
+    } else if let (Some(x), Some(y)) = (x.get_float(), y.get_float()) {
+        Some(x < y)
+    } else if let (Some(x), Some(y)) = (x.get_integer(), y.get_float()) {
+        Some(crate::vm::num::lt_int_float(x, y))
+    } else if let (Some(x), Some(y)) = (x.get_float(), y.get_integer()) {
+        Some(crate::vm::num::lt_float_int(x, y))
+    } else if let (Some(x), Some(y)) = (x.get_string(), y.get_string()) {
+        Some(x < y)
+    } else {
+        None
     }
 }
 
