@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [".", "derive", "cli"]
+members = [".", "derive", "cli", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"
