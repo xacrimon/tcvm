@@ -13,7 +13,7 @@ pub(super) fn is_strict(kind: &str) -> bool {
 
 const FAMS: &[&str] = &[
     "si", "bi", "fl", "fs", "ns", "st", "ot", "tb", "fn", "nil1", "sp", "sn", "fp", "mn", "ib",
-    "tt", "tm",
+    "tt", "tm", "mx", "ms",
 ];
 const NUMF: &[&str] = &["si", "sp", "fl", "fp", "mn", "ib", "bi"];
 
