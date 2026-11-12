@@ -35,6 +35,20 @@ impl CompileError {
     }
 }
 
+impl CompileError {
+    /// The failure's kind, without its text.
+    pub(crate) fn class(&self) -> &'static str {
+        match self {
+            CompileError::Irreducible => "irreducible",
+            CompileError::TooLarge => "too-large",
+            CompileError::Verify(_) => "verifier",
+            CompileError::Backend(_) => "backend",
+            CompileError::Useless => "useless",
+            CompileError::OutOfCode => "out-of-code",
+        }
+    }
+}
+
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -115,6 +129,8 @@ pub(crate) struct Times {
     stages: [u128; 5],
     /// Each pass's share of `Passes` in nanoseconds, summed over its runs.
     pass: Vec<(&'static str, u128)>,
+    /// The runs of each pass that changed the function (`TCVM_STATS`).
+    changed: Vec<(&'static str, u32)>,
 }
 
 #[cfg(not(feature = "tcvm-dev"))]
@@ -127,6 +143,7 @@ impl Times {
             last: std::time::Instant::now(),
             stages: [0; 5],
             pass: Vec::new(),
+            changed: Vec::new(),
         }
     }
 
@@ -137,11 +154,18 @@ impl Times {
         self.last = now;
     }
 
-    /// Run `f` as the pass `name`, adding its time.
-    fn timed<T>(&mut self, name: &'static str, f: impl FnOnce() -> T) -> T {
+    /// Run `f` as the pass `name`, adding its time; a pass that returns
+    /// `true` changed the function.
+    fn timed<T: 'static>(&mut self, name: &'static str, f: impl FnOnce() -> T) -> T {
         let t = std::time::Instant::now();
         let r = f();
         let ns = t.elapsed().as_nanos();
+        if (&r as &dyn std::any::Any).downcast_ref::<bool>() == Some(&true) {
+            match self.changed.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, x)) => *x += 1,
+                None => self.changed.push((name, 1)),
+            }
+        }
         match self.pass.iter_mut().find(|(n, _)| *n == name) {
             Some((_, x)) => *x += ns,
             None => self.pass.push((name, ns)),
@@ -157,7 +181,7 @@ impl Times {
     }
 
     #[inline(always)]
-    fn timed<T>(&mut self, _: &'static str, f: impl FnOnce() -> T) -> T {
+    fn timed<T: 'static>(&mut self, _: &'static str, f: impl FnOnce() -> T) -> T {
         f()
     }
 }
@@ -615,6 +639,12 @@ pub(crate) fn compile<'gc>(
     }
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Emit);
+    #[cfg(feature = "tcvm-dev")]
+    for &(name, n) in &times.changed {
+        for _ in 0..n {
+            ctx.runtime().stats.event(|| format!("jit pass {name}"));
+        }
+    }
     #[cfg(feature = "tcvm-dev")]
     if config.dev.time {
         let [build, passes, lower, regalloc, emit] = times.stages;

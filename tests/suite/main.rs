@@ -71,6 +71,7 @@ mod return_multires;
 mod send_lua;
 mod shapes;
 mod stack_overflow;
+mod stats;
 mod stmt_temp_reclaim;
 mod string_args;
 mod string_collection;

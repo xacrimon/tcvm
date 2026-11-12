@@ -200,6 +200,8 @@ pub(crate) struct Runtime<'gc> {
     /// Without `become`: the slots of a full step (`Exit::to`).
     #[cfg(not(nightly))]
     pub(crate) side: Cell<crate::vm::abi::Side<'gc>>,
+    #[cfg(feature = "tcvm-dev")]
+    pub(crate) stats: crate::vm::stats::Stats,
 }
 
 // SAFETY: holds no `Gc` pointer that outlives a `Lua::enter`: the fault is
@@ -229,6 +231,8 @@ impl<'gc> Runtime<'gc> {
             panic: Cell::new(None),
             #[cfg(not(nightly))]
             side: Cell::new(crate::vm::abi::Side::EMPTY),
+            #[cfg(feature = "tcvm-dev")]
+            stats: crate::vm::stats::Stats::from_env(),
         }
     }
 }
