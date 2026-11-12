@@ -529,6 +529,14 @@ impl<'gc> ThreadState<'gc> {
         self.top > self.stack_limit + NATIVE_SLACK
     }
 
+    /// Whether `n` values fit where a resume delivers them: where the thread
+    /// yielded, or above the header of the call in slot 0 on a first resume.
+    pub(crate) fn resume_args_fit(&self, n: usize) -> bool {
+        n <= self
+            .stack_limit
+            .saturating_sub(self.yield_bottom.unwrap_or(frame::HDR))
+    }
+
     /// A message handler is running in the headroom above [`STACK_LIMIT`].
     pub(crate) fn in_error_headroom(&self) -> bool {
         self.stack_limit > STACK_LIMIT

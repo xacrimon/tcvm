@@ -98,12 +98,7 @@ fn unresumable_reason<'gc>(
     }
     match co.peer_status() {
         ThreadStatus::Suspended => {
-            let ts = co.borrow();
-            // The args land where `co` yielded, or above the header of the
-            // function in slot 0 on a first resume.
-            let bottom = ts.yield_bottom.unwrap_or(4);
-            (nargs > ts.stack_limit.saturating_sub(bottom))
-                .then_some("too many arguments to resume")
+            (!co.borrow().resume_args_fit(nargs)).then_some("too many arguments to resume")
         }
         ThreadStatus::Result { .. } | ThreadStatus::Stopped => Some("cannot resume dead coroutine"),
         ThreadStatus::Normal => Some("cannot resume non-suspended coroutine"),
