@@ -1,0 +1,15 @@
+name: rust
+description: Install the pinned nightly with the minimal profile and only the listed components
+inputs:
+  components:
+    description: Comma-separated extra components
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+        rustup toolchain install "$channel" --profile minimal ${COMPONENTS:+-c "$COMPONENTS"}

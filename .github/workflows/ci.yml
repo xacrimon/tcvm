@@ -13,14 +13,18 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install
+      - uses: ./.github/actions/rust
+        with:
+          components: rustfmt
       - run: cargo fmt --all --check
 
   clippy:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install
+      - uses: ./.github/actions/rust
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --lib --tests -- -D warnings
@@ -32,11 +36,25 @@ jobs:
             cargo clippy -p tcvm --lib --no-default-features --features "nightly,jit${lib:+,lib-$lib}" -- -D warnings
           done
 
-  test:
-    runs-on: ubuntu-26.04
+  clippy-macos:
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install
+      - uses: ./.github/actions/rust
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-24.04-arm, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --no-fail-fast
       - run: cargo test --lib env::table
@@ -44,7 +62,11 @@ jobs:
           RUSTFLAGS: --cfg tcvm_generic_group
 
   stable:
-    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.100 --profile minimal -c clippy
