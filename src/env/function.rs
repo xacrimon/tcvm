@@ -322,7 +322,7 @@ impl<'gc> LuaClosure<'gc> {
         // SAFETY: a `LuaClosure` only exists as a `FunctionKind::Lua`, allocated
         // with its upvalues after it (`Function::new_lua`).
         unsafe {
-            let fk = (self as *const Self).byte_sub(std::mem::offset_of!(FunctionKind, Lua.0));
+            let fk = (self as *const Self).byte_sub(FN_LUA);
             let p = Gc::<FunctionKind>::trailing_ptr_of(&*fk.cast::<FunctionKind>());
             std::slice::from_raw_parts(p.cast().as_ptr(), self.num_upvalues as usize)
         }
@@ -348,7 +348,7 @@ impl<'gc> NativeClosure<'gc> {
     pub fn upvalues(&self) -> &[Value<'gc>] {
         // SAFETY: as in `LuaClosure::upvalues`.
         unsafe {
-            let fk = (self as *const Self).byte_sub(std::mem::offset_of!(FunctionKind, Native.0));
+            let fk = (self as *const Self).byte_sub(FN_NATIVE);
             let p = Gc::<FunctionKind>::trailing_ptr_of(&*fk.cast::<FunctionKind>());
             std::slice::from_raw_parts(p.cast().as_ptr(), self.num_upvalues as usize)
         }
@@ -675,12 +675,41 @@ pub struct Function<'gc>(Gc<'gc, FunctionKind<'gc>>);
 
 /// Followed in its cell by the closure's upvalues: `UpvalueSlot`s for a Lua
 /// closure, `Value`s for a native.
+///
+/// `repr(C, u8)` without `nightly`, where `offset_of!` cannot name a variant's
+/// field; the JIT, which reads the default layout's niche, needs `nightly`.
+#[cfg_attr(not(nightly), repr(C, u8))]
 pub enum FunctionKind<'gc> {
     /// Inline, not behind another `Gc`: CALL reaches the closure's `code`
     /// with one load fewer.
     Lua(LuaClosure<'gc>),
     Native(NativeClosure<'gc>),
 }
+
+/// The closures' offsets in their `FunctionKind`.
+#[cfg(nightly)]
+pub(crate) const FN_LUA: usize = std::mem::offset_of!(FunctionKind<'static>, Lua.0);
+#[cfg(nightly)]
+pub(crate) const FN_NATIVE: usize = std::mem::offset_of!(FunctionKind<'static>, Native.0);
+
+/// `repr(C, u8)`: the tag, then the variants' fields as a `repr(C)` union
+/// (RFC 2195).
+#[cfg(not(nightly))]
+pub(crate) const FN_LUA: usize = {
+    #[repr(C)]
+    union Payload<'gc> {
+        lua: std::mem::ManuallyDrop<LuaClosure<'gc>>,
+        native: std::mem::ManuallyDrop<NativeClosure<'gc>>,
+    }
+    #[repr(C)]
+    struct Layout<'gc> {
+        tag: u8,
+        payload: Payload<'gc>,
+    }
+    std::mem::offset_of!(Layout<'static>, payload)
+};
+#[cfg(not(nightly))]
+pub(crate) const FN_NATIVE: usize = FN_LUA;
 
 // SAFETY: traces `proto` and the upvalues; a `LuaClosure`'s raw pointers alias
 // data `proto` owns.
