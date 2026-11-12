@@ -6,6 +6,7 @@ members = [".", "derive", "cli"]
 version = "0.1.0"
 authors = ["Joel Wejdenstål <joel.wejdenstal@gmail.com>"]
 edition = "2024"
+rust-version = "1.100"
 license = "Apache-2.0"
 repository = "https://github.com/xacrimon/tcvm"
 
@@ -16,15 +17,14 @@ readme = "README.md"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [features]
 default = ["lib-all", "jit", "nightly"]
-# Needs `nightly`.
+# Needs `nightly`. TODO: what happens now if we enable jit without nightly?
 jit = []
-# Nightly Rust: tail-call dispatch in the preserve-none ABI, and the JIT. Without it the crate
-# builds on stable.
 nightly = ["hashbrown/nightly"]
 tcvm-dev = []
 lib-all = [

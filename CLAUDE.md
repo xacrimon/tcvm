@@ -18,12 +18,15 @@ cargo test --workspace               # tests always have `tcvm-dev`
 INSTA_UPDATE=always cargo test       # accept new snapshots, then check them against `lua`
 cargo clippy --workspace --all-targets --features tcvm/tcvm-dev
 cargo fmt
+cargo +1.100 test --workspace --no-default-features --features tcvm/lib-all   # stable: no `nightly`
 ```
+The default `nightly` feature is the tail-call dispatch in the preserve-none ABI and the JIT; without
+it the crate builds on stable (1.100+) with a trampoline (`vm/abi.rs`, `dispatch::call_handler`).
 The `tcvm-dev` feature holds everything that exists for development only: the IR verifier and
 allocation checker, dumps, timing, the test modes and every `TCVM_*` knob but `TCVM_JIT=off`, plus
 the `Lua` test hooks (`set_jit_inline`, `stop_gc_stress`, `jit_internal_errors`). A plain release
 build has none of it; the tools under `tools/` need the dev build.
-Workspace: `tcvm` (root), `derive/` (`#[derive(Collect)]`), `cli/` (`tcvm-cli`). Toolchain is pinned nightly (`rust-toolchain.toml`), edition 2024; nightly features are listed in `src/lib.rs`.
+Workspace: `tcvm` (root), `derive/` (`#[derive(Collect)]`), `cli/` (`tcvm-cli`). Toolchain is pinned nightly (`rust-toolchain.toml`, the nightly 1.100 branched from), edition 2024; nightly features are listed in `src/lib.rs`.
 
 Tests: `tests/suite/*.rs` (runtime), `test-files/*.lua` (snapshots), `src/compiler/snapshots`, `cli/tests`. Fix a behavior bug together with a regression test. Never reach the tested path through a limitation that planned work removes; force it explicitly (e.g. `Lua::set_jit_inline(false)`).
 

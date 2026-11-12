@@ -12,7 +12,6 @@
         likely_unlikely,
         rust_preserve_none_cc,
         naked_functions_rustic_abi,
-        allocator_api,
         offset_of_enum
     )
 )]
