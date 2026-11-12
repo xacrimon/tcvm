@@ -81,13 +81,13 @@ enum Cmd {
         /// A seed, or a program's file
         program: String,
         /// `ref`: JIT-off differs from reference Lua. `diverges`: MODE differs from JIT-off.
-        /// `internal`: MODE's JIT log has a compiler error
-        #[arg(long, value_parser = ["ref", "diverges", "internal"])]
+        /// `internal`: MODE's JIT log has a compiler error. `crash`: MODE dies of a signal
+        #[arg(long, value_parser = ["ref", "diverges", "internal", "crash"])]
         what: String,
         /// The configuration, as a finding names it (`hot`, `hc4,hl20,check`, …)
         #[arg(long, default_value = "hot")]
         mode: String,
-        /// Text the differing line, or the JIT log's error, must contain
+        /// Text the differing line, the JIT log's error, or a crash's stderr must contain
         #[arg(long)]
         grep: Option<String>,
         #[arg(long, default_value = "lua")]
@@ -390,6 +390,10 @@ fn cmd_reduce(program: &str, what: &str, mode: &str, grep: Option<&str>, lua: &s
                 );
                 oracle::first_diff(&a, &b).is_some_and(|(w, g)| has(&w) || has(&g))
             }
+            "crash" => (0..2).any(|_| {
+                let r = tcvm(&mode);
+                matches!(r.status, Status::Signal(_)) && grep.is_none_or(|g| r.stderr.contains(g))
+            }),
             "diverges" => {
                 // Twice: some findings depend on timing.
                 (0..2).any(|_| {

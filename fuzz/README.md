@@ -124,7 +124,12 @@ ran.
 tcvm-fuzz reduce 38 --what ref
 tcvm-fuzz reduce 159 --what diverges --mode hc4,hl20,check
 tcvm-fuzz reduce 67 --what internal --mode hot --grep "used before any definition"
+tcvm-fuzz reduce 1041 --what crash --mode hot
+tcvm-fuzz reduce 20131 --what crash --mode hc1,hl1,deopt --grep "stack overflow"
 ```
+
+`crash` keeps a candidate while the configuration dies of a signal and JIT-off does not;
+`--grep` then matches the crash's stderr.
 
 This writes `prog/p<seed>.min.lua` in the output directory. It removes whole units, then
 statements, then replaces expressions by their operands, and at last removes lines of the
