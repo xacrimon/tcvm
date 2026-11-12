@@ -29,7 +29,7 @@ jobs:
       - name: clippy without each library
         run: |
           for lib in "" coroutine debug io math os package string table utf8; do
-            cargo clippy -p tcvm --lib --no-default-features --features "jit${lib:+,lib-$lib}" -- -D warnings
+            cargo clippy -p tcvm --lib --no-default-features --features "nightly,jit${lib:+,lib-$lib}" -- -D warnings
           done
 
   test:
@@ -42,3 +42,12 @@ jobs:
       - run: cargo test --lib env::table
         env:
           RUSTFLAGS: --cfg tcvm_generic_group
+
+  stable:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.100 --profile minimal -c clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.100 clippy --workspace --all-targets --no-default-features --features tcvm/lib-all,tcvm/tcvm-dev -- -D warnings
+      - run: cargo +1.100 test --workspace --no-fail-fast --no-default-features --features tcvm/lib-all
