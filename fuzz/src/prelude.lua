@@ -79,10 +79,11 @@ local function reset()
   for _, m in ipairs({ "add", "sub", "mul", "div", "mod", "pow", "unm", "idiv", "band", "bor", "bxor", "shl", "shr", "bnot", "concat" }) do
     MT["__" .. m] = function(x, y) return m .. ":" .. sk(x) .. sk(y) end
   end
-  MT.__eq = function(x, y) return true end
-  MT.__lt = function(x, y) return sk(x) < sk(y) end
-  MT.__le = function(x, y) return sk(x) <= sk(y) end
-  MT.__len = function(x) return 42 end
+  -- Comparisons answer with a bool, so they report their operands: order and int or float.
+  MT.__eq = function(x, y) probe("eq" .. sk(x) .. sk(y)) return rawlen(x) <= rawlen(y) end
+  MT.__lt = function(x, y) probe("lt" .. sk(x) .. sk(y)) return sk(x) < sk(y) end
+  MT.__le = function(x, y) probe("le" .. sk(x) .. sk(y)) return sk(x) <= sk(y) end
+  MT.__len = function(x, y) probe("len" .. sk(x) .. sk(y)) return 42 end
   MTI = { __index = { x = 11, y = "yy", [1] = "one", z = 2.5 } }
   CL = setmetatable({}, { __close = function(o, e) probe(e == nil and "closed" or "closed-err") end })
   NAMES[CL] = "CL"
