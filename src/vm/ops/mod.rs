@@ -335,7 +335,7 @@ macro_rules! count_hot {
                 let c = $rt.hot_counter(w.$byte() as usize % $crate::instruction::HOT_COUNTERS);
                 let n = c.get().wrapping_sub(1);
                 c.set(n);
-                if crate::hint::unlikely(n == 0) {
+                if crate::utils::hint::unlikely(n == 0) {
                     tail!(crate::jit::jit_hot, insn = $crate::vm::abi::Slot::insn(w))
                 }
             }

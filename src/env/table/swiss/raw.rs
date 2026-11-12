@@ -7,7 +7,7 @@ use core::slice;
 use std::alloc::handle_alloc_error;
 
 use super::control::{BitMaskIter, Group, Tag, TagSliceExt};
-use crate::hint::{likely, unlikely};
+use crate::utils::hint::{likely, unlikely};
 
 // `RawTableInner::replace_tag_in_group` stores a group as one `u64` or `u128`.
 const _: () = assert!(

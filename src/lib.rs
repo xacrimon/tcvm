@@ -20,11 +20,11 @@ mod builtin;
 pub(crate) mod compiler;
 pub mod dmm;
 pub mod env;
-mod hint;
 pub(crate) mod instruction;
 pub(crate) mod jit;
 pub mod lua;
 pub(crate) mod parser;
+pub(crate) mod utils;
 pub mod vm;
 
 pub use compiler::format::format_prototype;

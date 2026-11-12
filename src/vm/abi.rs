@@ -514,7 +514,7 @@ macro_rules! handler_impl {
         macro_rules! barrier {
             ($d gc:expr) => {{
                 let __g = $d gc;
-                if $crate::hint::unlikely(!$crate::dmm::Gc::is_gray(__g)) {
+                if $crate::utils::hint::unlikely(!$crate::dmm::Gc::is_gray(__g)) {
                     tail!(
                         $crate::vm::ops::field::barrier_retry,
                         closure = $crate::vm::abi::Slot::from_raw($crate::dmm::Gc::erased_ptr(__g) as u64)
@@ -527,7 +527,7 @@ macro_rules! handler_impl {
         /// it is owed work (`gc_park` dispatches the next instruction).
         macro_rules! gc_check {
             () => {{
-                if $crate::hint::unlikely($rt.gc_due()) {
+                if $crate::utils::hint::unlikely($rt.gc_due()) {
                     tail!($crate::vm::dispatch::gc_park);
                 }
             }};
@@ -663,7 +663,7 @@ macro_rules! handler_impl {
                 let __f: $crate::env::value::Value<'gc> = $d f;
                 let __args: [$crate::env::value::Value<'gc>; _] = [$d ($d arg),*];
                 let __hdr = unsafe { $base.add($closure.max_stack_size as usize) };
-                if $crate::hint::unlikely(unsafe { __hdr.add(4 + __args.len()) }.cast_const() > thread!().stack_end) {
+                if $crate::utils::hint::unlikely(unsafe { __hdr.add(4 + __args.len()) }.cast_const() > thread!().stack_end) {
                     tail!($crate::vm::ops::meta::stage_grow);
                 }
                 unsafe {
