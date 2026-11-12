@@ -181,6 +181,9 @@ for reasons that are no bugs.
 - `expr.rs`, `stmt.rs`: the typed forms of free units. Add a statement form to `FORMS` in
   `mod.rs` and to the `match` in `Gen::stmt`.
 - `templates.rs`: the hand-written shapes that each aim at one thing the JIT speculates on.
+  `templates/strict.rs` holds the ones that are strict (`konst`, `tailnat`, `flow`, `arity`):
+  list a new strict template in its `STRICT`, and keep it off floats as text, lengths of
+  tables that may have holes, libm and `pairs` order.
 - `driver.rs`: how a unit's function is called, and with which values.
 - `src/prelude.lua`: the value pool and the output functions, at the head of every program.
 

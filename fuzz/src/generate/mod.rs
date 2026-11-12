@@ -293,6 +293,8 @@ impl Gen {
                 };
             }
             let (kind, body, wf) = self.template(only);
+            self.strict = templates::is_strict(kind);
+            let wf = wf.map(|w| w.map(|f| self.fam(f)));
             let mut code = std::mem::take(&mut self.pre);
             code.push(Stmt::Raw(format!(
                 "local function f(a, b, c)\n  {}\nend",
@@ -302,7 +304,7 @@ impl Gen {
             return Unit {
                 tag,
                 kind: kind.into(),
-                strict: false,
+                strict: self.strict,
                 code,
             };
         }
