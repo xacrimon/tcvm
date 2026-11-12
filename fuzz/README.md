@@ -185,7 +185,9 @@ for reasons that are no bugs.
   `templates/strict.rs` holds the ones that are strict (`konst`, `tailnat`, `flow`, `arity`):
   list a new strict template in its `STRICT`, and keep it off floats as text, lengths of
   tables that may have holes, libm and `pairs` order.
-- `driver.rs`: how a unit's function is called, and with which values.
+- `driver.rs`: how a unit's function is called, and with which values. A call goes through
+  `call`, which points at `f` or an adapter (`via_tail`, `via_va`, `via_pcall`, `via_co`,
+  `via_cs`); an adapter must return `f`'s results and raise its errors unchanged.
 - `src/prelude.lua`: the value pool and the output functions, at the head of every program.
 
 Programs are a function of their seed, so a change to the generator changes what every seed
