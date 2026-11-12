@@ -42,7 +42,7 @@ const EVENTS: &[&str] = &[
 
 impl Gen {
     /// A strict unit takes no float whose text differs between tcvm and reference Lua.
-    fn fam(&self, f: &'static str) -> &'static str {
+    pub(super) fn fam(&self, f: &'static str) -> &'static str {
         if self.strict && f == "fs" { "fc" } else { f }
     }
 

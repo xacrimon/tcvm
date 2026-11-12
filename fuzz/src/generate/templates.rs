@@ -1,8 +1,15 @@
 //! Hand-written templates: small bodies of `f` that aim at one thing each, ported from the old
 //! Python generator (`tools/fuzz/gen.py`).
 
+mod strict;
+
 use super::Gen;
 use crate::ast::{Block, Stmt};
+
+/// Whether a template's units stay within what reference Lua agrees on, so are compared with it.
+pub(super) fn is_strict(kind: &str) -> bool {
+    strict::STRICT.contains(&kind)
+}
 
 const FAMS: &[&str] = &[
     "si", "bi", "fl", "fs", "ns", "st", "ot", "tb", "fn", "nil1", "sp", "sn", "fp", "mn", "ib",
@@ -246,6 +253,10 @@ const TEMPLATES: &[(&str, u32)] = &[
     ("tarr", 4),
     ("upv", 2),
     ("strmeth", 1),
+    ("konst", 6),
+    ("tailnat", 6),
+    ("flow", 6),
+    ("arity", 4),
 ];
 
 impl Gen {
@@ -862,6 +873,10 @@ impl Gen {
             "tarr" => self.t_tarr(),
             "upv" => self.t_upv(),
             "strmeth" => self.t_strmeth(),
+            "konst" => self.t_konst(),
+            "tailnat" => self.t_tailnat(),
+            "flow" => self.t_flow(),
+            "arity" => self.t_arity(),
             _ => unreachable!(),
         };
         let mut wf = self.t_warm_fams();
