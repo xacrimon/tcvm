@@ -197,6 +197,9 @@ pub(crate) struct Runtime<'gc> {
     pub(crate) host_call: Cell<Option<std::ptr::NonNull<dyn FnMut()>>>,
     /// The panic a `Park::Panic` hands the host.
     pub(crate) panic: Cell<Option<Box<dyn std::any::Any + Send>>>,
+    /// Without `become`: the slots of a full step (`Exit::to`).
+    #[cfg(not(nightly))]
+    pub(crate) side: Cell<crate::vm::abi::Side<'gc>>,
 }
 
 // SAFETY: holds no `Gc` pointer that outlives a `Lua::enter`: the fault is
@@ -224,6 +227,8 @@ impl<'gc> Runtime<'gc> {
             on_thread: Cell::new(false),
             host_call: Cell::new(None),
             panic: Cell::new(None),
+            #[cfg(not(nightly))]
+            side: Cell::new(crate::vm::abi::Side::EMPTY),
         }
     }
 }
@@ -253,29 +258,36 @@ fn call_handler<'gc>(
                 h(insn, pc, base, rt, closure)
             }
         },
-        // The trampoline: each target returns the next.
+        // The trampoline: each target returns the next and its `pc`.
         _ => {
             #[cfg(not(target_arch = "aarch64"))]
             let _ = thread;
-            let mut s = Exit::to(
-                h,
-                insn,
-                pc,
-                base,
-                rt,
-                closure,
-                #[cfg(target_arch = "aarch64")]
-                thread,
-            );
-            while let Some(h) = s.next {
-                s = cfg_select! {
-                    target_arch = "aarch64" => {
-                        h(s.insn, s.pc, s.base.cast(), rt, s.closure, s.thread.cast())
-                    }
-                    _ => h(s.insn, s.pc, s.base.cast(), rt, s.closure),
+            let (mut h, mut insn, mut pc, mut base, mut closure) = (h, insn, pc, base, closure);
+            #[cfg(target_arch = "aarch64")]
+            let mut thread = thread;
+            loop {
+                let e = cfg_select! {
+                    target_arch = "aarch64" => h(insn, pc, base, rt, closure, thread),
+                    _ => h(insn, pc, base, rt, closure),
                 };
+                if e.bits == 0 {
+                    return e;
+                }
+                // SAFETY: a step's `bits` come from `handler_bits`.
+                h = unsafe { crate::vm::abi::handler_from_bits(e.bits) };
+                pc = e.pc;
+                if e.bits & Exit::FULL != 0 {
+                    let s = rt.runtime().side.get();
+                    (insn, base, closure) = (s.insn, s.base, s.closure);
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        thread = s.thread;
+                    }
+                } else {
+                    // SAFETY: a fast step dispatches the instruction before `pc`.
+                    insn = Slot::insn(unsafe { *pc.sub(1) });
+                }
             }
-            s
         }
     }
 }
