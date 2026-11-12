@@ -229,6 +229,17 @@ impl Gen {
                     }
                 }
             }
+            // Two arguments equal but not the same object: compares that answer by bits.
+            if self.r.chance(0.2) {
+                let from = self.r.below(3);
+                let to = (from + 1 + self.r.below(2)) % 3;
+                let k = match (self.strict, self.r.chance(0.5)) {
+                    (_, false) => 0,
+                    (true, true) => 2,
+                    (false, true) => 1,
+                };
+                vs[to] = format!("twin({}, {k})", vs[from]);
+            }
             let [a, b, c] = vs;
             out.push(line(if self.r.chance(0.6) {
                 format!("drive({{n = 1, {a}}}, {{n = 1, {b}}}, {{n = 1, {c}}}, 2, \"{tag}p{j}\")")
