@@ -482,7 +482,8 @@ fn for_seeds<T: Send>(
     });
 }
 
-/// Set by SIGINT and SIGTERM: a run stops taking seeds and writes its summary.
+/// Set by SIGINT and SIGTERM: a run kills the runs in flight, drops their seeds and writes its
+/// summary.
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_stop(_: libc::c_int) {
@@ -562,6 +563,18 @@ fn cmd_run(from: Option<u64>, count: Option<u64>, hours: Option<f64>, keep: usiz
             on_stop as extern "C" fn(libc::c_int) as libc::sighandler_t,
         );
     }
+    // A signal kills the runs in flight: a seed that is half run would hold the stop up for as
+    // long as all its configurations take.
+    std::thread::spawn(|| {
+        while !STOP.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        eprintln!("tcvm-fuzz: stopping, the seeds in flight are dropped");
+        loop {
+            exec::abort();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
     let state = cfg.out.join("state");
     let resume = std::fs::read_to_string(&state)
         .ok()
@@ -609,6 +622,10 @@ fn cmd_run(from: Option<u64>, count: Option<u64>, hours: Option<f64>, keep: usiz
         &stop,
         |seed| fuzz(seed, cfg),
         |seed, (prog, found)| {
+            // Killed runs: what they returned is no finding.
+            if exec::aborted() {
+                return;
+            }
             done += 1;
             top = top.max(seed + 1);
             hit += !found.is_empty() as u64;

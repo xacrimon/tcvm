@@ -3,6 +3,8 @@
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -19,6 +21,25 @@ impl std::fmt::Display for Status {
             Status::Timeout => write!(f, "timeout"),
         }
     }
+}
+
+/// The process groups of the runs in flight, so a stop can kill them.
+static RUNNING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// Set once a stop killed the runs in flight: no run starts after it, and what the killed ones
+/// returned means nothing.
+static ABORTED: AtomicBool = AtomicBool::new(false);
+
+/// Kill every run in flight and start no other.
+pub fn abort() {
+    ABORTED.store(true, Ordering::Relaxed);
+    for &pg in RUNNING.lock().expect("the runs").iter() {
+        // SAFETY: killpg only sends a signal.
+        unsafe { libc::killpg(pg, libc::SIGKILL) };
+    }
+}
+
+pub fn aborted() -> bool {
+    ABORTED.load(Ordering::Relaxed)
 }
 
 pub struct Run {
@@ -56,15 +77,30 @@ pub fn run(argv: &[&str], dir: &Path, env: &[(String, String)], secs: u32) -> Ru
             Ok(())
         });
     }
-    let out = match cmd.output() {
+    let failed = |e: String| Run {
+        status: Status::Exit(-1),
+        stdout: String::new(),
+        stderr: e,
+    };
+    if aborted() {
+        return failed("aborted".into());
+    }
+    let child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => return failed(format!("cannot run {}: {e}", argv[0])),
+    };
+    // The child leads its own process group: its pid is the group's.
+    let pg = child.id() as i32;
+    RUNNING.lock().expect("the runs").push(pg);
+    if aborted() {
+        // SAFETY: killpg only sends a signal.
+        unsafe { libc::killpg(pg, libc::SIGKILL) };
+    }
+    let out = child.wait_with_output();
+    RUNNING.lock().expect("the runs").retain(|&p| p != pg);
+    let out = match out {
         Ok(out) => out,
-        Err(e) => {
-            return Run {
-                status: Status::Exit(-1),
-                stdout: String::new(),
-                stderr: format!("cannot run {}: {e}", argv[0]),
-            };
-        }
+        Err(e) => return failed(format!("cannot run {}: {e}", argv[0])),
     };
     let status = match (out.status.code(), out.status.signal()) {
         (Some(c), _) => Status::Exit(c),
