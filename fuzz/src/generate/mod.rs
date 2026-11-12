@@ -138,6 +138,10 @@ const FORMS: &[(&str, u32)] = &[
     ("goto", 2),
     ("break", 2),
     ("junk", 2),
+    ("pattern", 3),
+    ("xpcall", 2),
+    ("ctor", 2),
+    ("tablib", 2),
 ];
 
 pub struct Gen {
@@ -152,6 +156,8 @@ pub struct Gen {
     loops: u32,
     /// A loop was built: `f` is slow to call.
     heavy: bool,
+    /// A unit many times the usual size: its calls get more fuel.
+    big: bool,
     /// The innermost loop takes `goto` to its end.
     conts: Vec<Option<String>>,
     /// Directly in a coroutine's body: `coroutine.yield` is allowed.
@@ -178,6 +184,7 @@ impl Gen {
             budget: 0,
             loops: 0,
             heavy: false,
+            big: false,
             conts: Vec::new(),
             yields: false,
             vararg: false,
@@ -269,6 +276,7 @@ impl Gen {
         self.names = 0;
         self.loops = 0;
         self.heavy = false;
+        self.big = false;
         self.conts.clear();
         self.yields = false;
         self.vararg = false;
@@ -376,8 +384,24 @@ impl Gen {
         for p in ["a", "b", "c"] {
             self.declare(p, Kind::Arg, true);
         }
-        let stmts = self.r.range(2, 9) as usize;
-        let mut body = self.block_in_scope(stmts, 3);
+        // Now and then a unit many times the usual size, nested deeper.
+        // Kept to the types, so that more of it runs.
+        let big = self.r.chance(0.05);
+        let (stmts, depth) = if big {
+            self.budget = self.r.range(60, 150) as i32;
+            self.heavy = true;
+            self.big = true;
+            self.risk = 0.0;
+            let e = FORMS
+                .iter()
+                .position(|(n, _)| *n == "error")
+                .expect("a form");
+            self.weights[e] = 0;
+            (self.r.range(15, 40) as usize, 4)
+        } else {
+            (self.r.range(2, 9) as usize, 3)
+        };
+        let mut body = self.block_in_scope(stmts, depth);
         body.push(self.final_return());
         self.scopes.pop();
         let mut code = std::mem::take(&mut self.pre);
@@ -392,7 +416,12 @@ impl Gen {
         code.extend(self.driver(&tag, self.heavy, None, ""));
         Unit {
             tag,
-            kind: format!("free risk={} roles={:?}", self.risk, self.roles),
+            kind: format!(
+                "free{} risk={} roles={:?}",
+                if big { " big" } else { "" },
+                self.risk,
+                self.roles
+            ),
             strict: self.strict,
             code,
         }
