@@ -7,12 +7,10 @@
 #![feature(fn_align)]
 #![feature(explicit_tail_calls)]
 #![feature(try_trait_v2)]
-#![feature(macro_metavar_expr)]
 #![feature(likely_unlikely)]
 #![feature(allocator_api)]
 #![feature(rust_preserve_none_cc)]
 #![feature(naked_functions_rustic_abi)]
-#![feature(variant_count)]
 #![feature(offset_of_enum)]
 
 mod builtin;

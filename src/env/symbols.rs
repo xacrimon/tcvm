@@ -12,7 +12,7 @@ use crate::env::string::{Interner, LuaString};
 /// in `crate::env::for_each_metamethod`.
 macro_rules! emit_count {
     ($(($upper:ident, $bit:literal, $bytes:literal, $field:ident);)*) => {
-        pub const METAMETHOD_COUNT: usize = ${count($field)};
+        pub const METAMETHOD_COUNT: usize = [$(stringify!($field)),*].len();
     };
 }
 for_each_metamethod!(emit_count);

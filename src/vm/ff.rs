@@ -27,7 +27,9 @@ fn record(base: *mut Value<'_>, call: Instruction, bits: Bits) {
 /// collector's exit must see the landed call, since it resumes after it).
 /// Nothing before the last `miss!()` may have a visible effect.
 macro_rules! fast_entry {
-    ($(#[$m:meta])* $name:ident => |$call:ident, $a:ident, $nargs:ident, $c:ident, $base:ident, $rt:ident| $body:block) => {
+    // `$d` is a literal `$`: the nested `tail_return!` definition needs one without
+    // `macro_metavar_expr`'s `$$`.
+    (@ ($d:tt) $(#[$m:meta])* $name:ident => |$call:ident, $a:ident, $nargs:ident, $c:ident, $base:ident, $rt:ident| $body:block) => {
         handler! {
             bind(insn, pc, base, rt, closure, thread, nret, values);
             $(#[$m])*
@@ -51,7 +53,7 @@ macro_rules! fast_entry {
                 /// Not through RETURN's handlers: their slow path re-reads the
                 /// instruction at `pc`, which is the TAILCALL.
                 macro_rules! tail_return {
-                    ($$first:expr, $$n:expr) => {{
+                    ($d first:expr, $d n:expr) => {{
                         let ts = thread!();
                         let bi = ts.slot_index(base);
                         debug_assert!(!crate::vm::ops::control::has_tbc_from(ts, bi));
@@ -59,8 +61,8 @@ macro_rules! fast_entry {
                         let r = unsafe { frame::ret(base) };
                         tail!(
                             r,
-                            pc = unsafe { base.add($$first as usize) } as *const Instruction,
-                            insn = Slot::nret($$n)
+                            pc = unsafe { base.add($d first as usize) } as *const Instruction,
+                            insn = Slot::nret($d n)
                         )
                     }};
                 }
@@ -91,6 +93,7 @@ macro_rules! fast_entry {
             }
         }
     };
+    ($($t:tt)*) => { fast_entry!(@ ($) $($t)*); };
 }
 
 /// What a one-argument math entry made of its argument.

@@ -37,7 +37,7 @@ macro_rules! arith_natives {
             }
         )*
 
-        fn arith_natives<'gc>(ctx: Context<'gc>) -> [(LuaString<'gc>, ContFn); ${count($native)}] {
+        fn arith_natives<'gc>(ctx: Context<'gc>) -> [(LuaString<'gc>, ContFn); [$(stringify!($native)),*].len()] {
             [$((ctx.symbols().$mm, $native as ContFn),)*]
         }
     };
