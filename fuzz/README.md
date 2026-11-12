@@ -110,6 +110,7 @@ diff want.txt got.txt
 Output lines start with the unit they belong to (`U1`, `U2`, …):
 
 - `U1w H key=count …`: the warm-up, every distinct result with how many calls gave it.
+- `U1w2 H …`: a second warm-up, on other families (not every unit has one).
 - `U1p3 H …`: two calls with other values.
 - `U1q4 …`: one call.
 - `U1z H …`: the warm-up's values again.

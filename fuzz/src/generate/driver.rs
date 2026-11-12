@@ -7,7 +7,7 @@ use crate::ast::{Block, Stmt};
 
 const FAMS: &[&str] = &[
     "si", "bi", "fl", "fs", "ns", "st", "ot", "tb", "fn", "nil1", "sp", "sn", "fp", "mn", "ib",
-    "tt", "tm",
+    "tt", "tm", "mx", "ms",
 ];
 const NUMF: &[&str] = &["si", "sp", "fl", "fp", "mn", "ib", "bi"];
 /// The pool's families and their sizes, by how often a single call takes a value of each.
@@ -22,6 +22,8 @@ const POOL: &[(&str, i64, u32)] = &[
     ("tb", 7, 1),
     ("fn", 3, 1),
     ("co", 1, 1),
+    ("mx", 8, 1),
+    ("ms", 6, 1),
 ];
 const EVENTS: &[&str] = &[
     "MTI.__index.x = 'changed'",
@@ -60,6 +62,17 @@ impl Gen {
             };
             self.fam(f)
         })
+    }
+
+    /// A family other than `f`'s, often a numeric one for a numeric one: int and float feedback.
+    fn other_fam(&mut self, f: &'static str) -> &'static str {
+        let l = if NUMF.contains(&f) && self.r.chance(0.5) {
+            NUMF
+        } else {
+            FAMS
+        };
+        let g = *self.r.pick(l);
+        self.fam(g)
     }
 
     fn pool_value(&mut self) -> String {
@@ -107,6 +120,20 @@ impl Gen {
             "drive(V.{}, V.{}, V.{}, {nwarm}, \"{tag}w\")",
             wf[0], wf[1], wf[2]
         )));
+        // Another family, long enough for the code to be compiled again on what it saw there.
+        if self.r.chance(0.35) {
+            let mut wf2 = wf;
+            for s in 0..3 {
+                if self.r.chance(0.6) {
+                    wf2[s] = self.other_fam(wf[s]);
+                }
+            }
+            let n2 = (*self.r.pick(&[50, 300])).min(nwarm);
+            out.push(line(format!(
+                "drive(V.{}, V.{}, V.{}, {n2}, \"{tag}w2\")",
+                wf2[0], wf2[1], wf2[2]
+            )));
+        }
         // Between the warm-up and the rest, something the compiled code assumed changes.
         let mut restore = None;
         let x = self.r.f64();
@@ -140,7 +167,15 @@ impl Gen {
             out.push(line(if self.r.chance(0.6) {
                 format!("drive({{n = 1, {a}}}, {{n = 1, {b}}}, {{n = 1, {c}}}, 2, \"{tag}p{j}\")")
             } else {
-                format!("FUEL = {fuel}\nrec(\"{tag}q{j}\", pcall(f, {a}, {b}, {c}))")
+                // Not always three arguments: fewer are nil, more are dropped.
+                let args = match self.r.below(12) {
+                    0 => format!("f, {a}"),
+                    1 => format!("f, {a}, {b}"),
+                    2 => format!("f, {a}, {b}, {c}, {a}"),
+                    3 => "f".to_string(),
+                    _ => format!("f, {a}, {b}, {c}"),
+                };
+                format!("FUEL = {fuel}\nrec(\"{tag}q{j}\", pcall({args}))")
             }));
         }
         out.push(line(format!(
