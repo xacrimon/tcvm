@@ -3,8 +3,8 @@
 //! Every frame, Lua or native, has four words below its base:
 //!
 //! ```text
-//!  base-4  func    closure pointer | nv << 48      native: nc | at << 48 | cont << 56 | ok << 62
-//!  base-3  ret     continuation handler | flags
+//!  base-4  func    function cell | nv << 48      native: function cell | at << 48 | cont << 56 | ok << 62
+//!  base-3  ret     continuation handler (`abi::handler_bits`) | flags
 //!  base-2  caller  the caller's base, null for a thread's bottom frame
 //!  base-1  pc      the caller's resume pc
 //! ```
@@ -33,10 +33,10 @@ pub(crate) const HDR: usize = 4;
 /// Low 48 bits of a header word: a pointer.
 pub(crate) const PTR_MASK: u64 = (1 << 48) - 1;
 
-/// `ret` word flag bits. Handler addresses are 32-byte aligned, so five bits
-/// are free.
+/// `ret` word flag bits, in the five low bits `abi::handler_bits` leaves free.
 pub(crate) mod flag {
-    /// Word 0 is a native closure; word 3 is still the caller's pc.
+    /// Word 0 is a native function and its `NativeHdr`; word 3 is still the
+    /// caller's pc.
     pub(crate) const NATIVE: u64 = 1;
     /// A CLOSURE in this frame captured a local by reference.
     pub(crate) const HAS_OPEN: u64 = 2;
@@ -147,7 +147,7 @@ pub(crate) unsafe fn native_closure<'gc>(base: *mut Value<'gc>) -> &'gc NativeCl
     unsafe { native_closure_of(func_word(base)) }
 }
 
-/// The native closure a native frame's word 0 `func` holds.
+/// The closure of the native function a native frame's word 0 `func` holds.
 #[inline(always)]
 pub(crate) unsafe fn native_closure_of<'gc>(func: u64) -> &'gc NativeClosure<'gc> {
     let f: Gc<'gc, FunctionKind<'gc>> =

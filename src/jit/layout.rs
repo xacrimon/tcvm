@@ -6,6 +6,7 @@ use std::mem::offset_of;
 
 use crate::dmm::Gc;
 use crate::dmm::lock::RefLock;
+use crate::env::function::FN_LUA;
 use crate::env::table::TableState;
 use crate::jit::state::JitRuntime;
 use crate::lua::State;
@@ -107,7 +108,6 @@ pub(crate) const T_HEADER: i32 =
 /// A Lua closure's fields from its function's payload. `FN_IS_VARARG` also
 /// tells a native function, whose variant ends before it, by the niche the
 /// enum's tag takes there (`fn_kind_niche` checks it).
-const FN_LUA: usize = offset_of!(crate::env::function::FunctionKind<'static>, Lua.0);
 pub(crate) const FN_CODE: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, code);
 pub(crate) const FN_NUM_PARAMS: usize =
@@ -117,8 +117,7 @@ pub(crate) const FN_MAX_STACK: usize =
 pub(crate) const FN_IS_VARARG: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, is_vararg);
 /// A native function's closure, from its function's payload.
-pub(crate) const FN_NATIVE: usize =
-    offset_of!(crate::env::function::FunctionKind<'static>, Native.0);
+pub(crate) use crate::env::function::FN_NATIVE;
 /// A function value's top 16 bits.
 pub(crate) const FUNCTION_TAG: u16 = (crate::env::value::FUNCTION_BITS >> 48) as u16;
 /// A Lua closure's prototype pointer (a `Gc`, so the box), and from that

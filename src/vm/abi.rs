@@ -82,9 +82,9 @@ impl Slot {
     }
 }
 
-/// Why the dispatch chain returned to the trampoline: the thread's entry
-/// frame returned, or an error nothing caught ended it. Everything else that
-/// needs the host parks the thread instead (`vm::stack::park`).
+/// Why the dispatch chain returned to `dispatch::call_handler`: the thread's
+/// entry frame returned, or an error nothing caught ended it. Everything else
+/// that needs the host parks the thread instead (`vm::stack::park`).
 #[cfg(nightly)]
 pub(crate) enum Exit {
     End,
@@ -276,28 +276,28 @@ macro_rules! handler_impl {
     (@one $kind:ident [$d:tt] [$insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident]
      [$($th:ident)?] $(#[$m:meta])* $name:ident $body:block) => {
         $crate::vm::abi::handler_abi! {
-        $(#[$m])*
-        #[inline(never)]
-        #[cfg_attr(nightly, rustc_align(32))]
-        #[allow(unused_variables, unused_mut, unused_assignments, unused_macros, unreachable_code, unused_unsafe, clippy::macro_metavars_in_unsafe)]
-        pub(crate) fn $name<'gc>(
-            __insn: $crate::vm::abi::Slot,
-            __pc: *const $crate::instruction::Instruction,
-            __base: *mut $crate::env::value::Value<'gc>,
-            __rt: $crate::lua::Context<'gc>,
-            __closure: $crate::vm::abi::Slot,
-            $($th: *mut $crate::env::thread::ThreadState<'gc>,)?
-        ) -> $crate::vm::abi::Exit {
-            let mut $pc = __pc;
-            let mut $base = __base;
-            let $rt = __rt;
-            $(let mut $th = $th;)?
-            $crate::vm::abi::handler_impl!(@bind $kind, __insn, __closure, $insn, $closure, $pc, $nret, $values);
-            $crate::vm::abi::handler_impl!(@thread [$d] [$($th)?], $rt, $thread);
-            $crate::vm::abi::handler_impl!(@slots [$d] $kind, $insn, $closure);
-            $crate::vm::abi::handler_impl!(@body [$d] $kind, $insn, $pc, $base, $rt, $closure, $thread, $nret, $values, [$($th)?]);
-            $body
-        }
+            $(#[$m])*
+            #[inline(never)]
+            #[cfg_attr(nightly, rustc_align(32))]
+            #[allow(unused_variables, unused_mut, unused_assignments, unused_macros, unreachable_code, unused_unsafe, clippy::macro_metavars_in_unsafe)]
+            pub(crate) fn $name<'gc>(
+                __insn: $crate::vm::abi::Slot,
+                __pc: *const $crate::instruction::Instruction,
+                __base: *mut $crate::env::value::Value<'gc>,
+                __rt: $crate::lua::Context<'gc>,
+                __closure: $crate::vm::abi::Slot,
+                $($th: *mut $crate::env::thread::ThreadState<'gc>,)?
+            ) -> $crate::vm::abi::Exit {
+                let mut $pc = __pc;
+                let mut $base = __base;
+                let $rt = __rt;
+                $(let mut $th = $th;)?
+                $crate::vm::abi::handler_impl!(@bind $kind, __insn, __closure, $insn, $closure, $pc, $nret, $values);
+                $crate::vm::abi::handler_impl!(@thread [$d] [$($th)?], $rt, $thread);
+                $crate::vm::abi::handler_impl!(@slots [$d] $kind, $insn, $closure);
+                $crate::vm::abi::handler_impl!(@body [$d] $kind, $insn, $pc, $base, $rt, $closure, $thread, $nret, $values, [$($th)?]);
+                $body
+            }
         }
     };
 

@@ -68,13 +68,9 @@ fn lua_resume<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let co = try_out!(stack.get(0).get_thread().ok_or_else(|| util::type_error(
-        ctx,
-        "resume",
-        1,
-        "thread",
-        stack.arg(0)
-    )));
+    let Some(co) = stack.get(0).get_thread() else {
+        return NativeOut::error(util::type_error(ctx, "resume", 1, "thread", stack.arg(0)));
+    };
     if let Some(msg) = unresumable_reason(stack.exec(), co, stack.len() - 1) {
         let m = Value::string(LuaString::new(ctx, msg.as_bytes()));
         stack.replace(&[Value::boolean(false), m]);

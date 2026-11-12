@@ -495,8 +495,8 @@ macro_rules! switch_out {
     ($rt:ident, $to:expr) => {{
         let to: *mut ThreadState<'gc> = $to;
         let from = thread_ptr!();
-        // SAFETY: as for `switch_handler`; this frame holds no reference
-        // into either thread past the switch.
+        // SAFETY: `switch_to`'s contract: this frame holds no reference into
+        // either thread past the switch.
         unsafe { crate::vm::stack::switch_to($rt, &raw mut (*from).sw, to, 0) };
         reload_thread!();
         tail!(switch_land)
