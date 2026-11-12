@@ -8,7 +8,7 @@ use crate::env::{
     Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
 };
 use crate::vm::debug::where_prefix;
-use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
+use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont, try_out};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     let fns: &[(&str, NativeFn)] = &[
@@ -160,7 +160,7 @@ fn lua_dofile<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let fname = util::opt_string(ctx, stack.get(0), "dofile", 1)?;
+    let fname = try_out!(util::opt_string(ctx, stack.get(0), "dofile", 1));
     let path = fname.map(|f| f.as_bytes());
     match ctx.load_file_with(path, Value::table(ctx.globals())) {
         Ok(f) => {
@@ -230,7 +230,7 @@ pub(crate) fn ipairs_aux<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let i = util::check_integer(ctx, stack.get(1), "for iterator", 2)?.wrapping_add(1);
+    let i = try_out!(util::check_integer(ctx, stack.get(1), "for iterator", 2)).wrapping_add(1);
     if let Some(t) = stack.get(0).get_table() {
         let v = t.raw_get(Value::integer(ctx.mutation(), i));
         if !v.is_nil() {
@@ -272,15 +272,15 @@ fn lua_load<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
     let chunk = util::to_lstring(ctx, stack.get(0));
-    check_mode(ctx, stack.get(2), "load", 3)?;
+    try_out!(check_mode(ctx, stack.get(2), "load", 3));
     if let Some(s) = chunk {
-        let name = util::opt_string(ctx, stack.get(1), "load", 2)?.unwrap_or(s);
+        let name = try_out!(util::opt_string(ctx, stack.get(1), "load", 2)).unwrap_or(s);
         let env = env_arg(ctx, &stack, 3);
         let loaded = ctx.load_bytes(s.as_bytes(), name, env);
         push_loaded(ctx, &mut stack, loaded);
         return NativeOut::RETURN;
     }
-    let name = util::opt_string(ctx, stack.get(1), "load", 2)?
+    let name = try_out!(util::opt_string(ctx, stack.get(1), "load", 2))
         .unwrap_or_else(|| LuaString::new(ctx, b"=(load)"));
     let Some(reader) = stack.get(0).get_function() else {
         return NativeOut::error(util::type_error(ctx, "load", 1, "function", stack.arg(0)));
@@ -436,7 +436,7 @@ fn lua_pairs<'gc>(
     closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    util::check_any(ctx, &stack, "pairs", 1)?;
+    try_out!(util::check_any(ctx, &stack, "pairs", 1));
     let t = stack.get(0);
     let mm = ctx.mm_of(t, MetamethodBits::PAIRS);
     if mm.is_nil() {
@@ -481,7 +481,7 @@ fn lua_pcall<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    util::check_any(ctx, &stack, "pcall", 1)?;
+    try_out!(util::check_any(ctx, &stack, "pcall", 1));
     stack.open_hidden(0);
     NativeOut::call_then(0, cont::PCALL, Protect::Errors, OnOk::ReturnTrue)
 }
@@ -734,7 +734,7 @@ pub(crate) fn lua_tostring<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    util::check_any(ctx, &stack, "tostring", 1)?;
+    try_out!(util::check_any(ctx, &stack, "tostring", 1));
     let v = stack.get(0);
     let mm = ctx.mm_of(v, MetamethodBits::TOSTRING);
     if mm.is_nil() {
@@ -752,7 +752,7 @@ pub(crate) fn tostring_cont<'gc>(
     mut stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
 ) -> NativeOut {
-    let s = util::tostring_result(ctx, stack.get(0))?;
+    let s = try_out!(util::tostring_result(ctx, stack.get(0)));
     stack.ret1(Value::string(s));
     NativeOut::RETURN
 }

@@ -4,7 +4,7 @@
 
 use crate::env::{Error, Function, LuaString, NativeClosure, Stack, Value};
 use crate::vm::async_native::{AsyncFn, Spawned};
-use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
+use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont, try_out};
 use crate::{Context, Executor, LoadError, Lua, RuntimeError, StashedExecutor, StepResult};
 
 fn start(
@@ -102,7 +102,7 @@ pub(crate) fn add_one<'gc>(
     mut stack: Stack<'gc, '_>,
     status: Result<(), Error<'gc>>,
 ) -> NativeOut {
-    status?;
+    try_out!(status);
     let v = stack.get(0).get_integer().expect("an integer");
     stack.replace(&[Value::integer(ctx.mutation(), v + 1)]);
     NativeOut::RETURN

@@ -332,15 +332,16 @@ impl NativeOut {
     }
 }
 
-impl<'gc> std::ops::FromResidual<Result<std::convert::Infallible, Error<'gc>>> for NativeOut {
-    #[inline(always)]
-    fn from_residual(r: Result<std::convert::Infallible, Error<'gc>>) -> Self {
-        match r {
-            Ok(never) => match never {},
-            Err(e) => NativeOut::error(e),
+/// `?` for a native returning [`NativeOut`]: an `Err` returns as its error.
+macro_rules! try_out {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return $crate::vm::native::NativeOut::error(e),
         }
-    }
+    };
 }
+pub(crate) use try_out;
 
 /// Put `true` before the `nret` values at `values`, which start at or above
 /// `b`, the base of the frame they return from: in the dead slot below them,

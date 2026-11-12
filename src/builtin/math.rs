@@ -14,7 +14,7 @@ use crate::env::{
     Value,
 };
 use crate::vm::abi::Handler;
-use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
+use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont, try_out};
 use crate::vm::{binop_metamethod, ff, native};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -332,7 +332,7 @@ pub(crate) fn lua_max<'gc>(
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    check_any(ctx, &stack, "max", 1)?;
+    try_out!(check_any(ctx, &stack, "max", 1));
     let (best, n) = (stack.get(0), stack.len());
     select_extreme(ctx, stack, false, best, 1, n, false)
 }
@@ -342,7 +342,7 @@ pub(crate) fn lua_min<'gc>(
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    check_any(ctx, &stack, "min", 1)?;
+    try_out!(check_any(ctx, &stack, "min", 1));
     let (best, n) = (stack.get(0), stack.len());
     select_extreme(ctx, stack, true, best, 1, n, false)
 }

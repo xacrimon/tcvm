@@ -6,7 +6,6 @@
 #![cfg_attr(not(feature = "lib-all"), allow(dead_code, unused_imports))]
 #![feature(fn_align)]
 #![feature(explicit_tail_calls)]
-#![feature(try_trait_v2)]
 #![feature(likely_unlikely)]
 #![feature(allocator_api)]
 #![feature(rust_preserve_none_cc)]

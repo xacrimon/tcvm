@@ -5,7 +5,7 @@ use crate::env::thread::ThreadStatus;
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Thread, Value,
 };
-use crate::vm::native::{Execution, NativeOut, OnOk, cont};
+use crate::vm::native::{Execution, NativeOut, OnOk, cont, try_out};
 use crate::vm::{close, coro};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
@@ -68,10 +68,13 @@ fn lua_resume<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let co = stack
-        .get(0)
-        .get_thread()
-        .ok_or_else(|| util::type_error(ctx, "resume", 1, "thread", stack.arg(0)))?;
+    let co = try_out!(stack.get(0).get_thread().ok_or_else(|| util::type_error(
+        ctx,
+        "resume",
+        1,
+        "thread",
+        stack.arg(0)
+    )));
     if let Some(msg) = unresumable_reason(stack.exec(), co, stack.len() - 1) {
         let m = Value::string(LuaString::new(ctx, msg.as_bytes()));
         stack.replace(&[Value::boolean(false), m]);
@@ -221,7 +224,7 @@ fn lua_close<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let co = opt_co(ctx, &stack, "close")?;
+    let co = try_out!(opt_co(ctx, &stack, "close"));
     // Pointer-eq against current first to avoid re-borrowing the running
     // thread's RefLock (mut-borrowed by the interpreter).
     if co.ptr_eq(stack.exec().current_thread()) {
