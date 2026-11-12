@@ -19,7 +19,7 @@ use crate::env::string::MAX_LEN;
 use crate::env::{
     Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
 };
-use crate::vm::native::{NativeOut, OnOk, Protect, cont};
+use crate::vm::native::{NativeOut, OnOk, Protect, cont, try_out};
 use crate::vm::{IndexChain, walk_index_chain};
 
 mod meta;
@@ -248,9 +248,13 @@ fn lua_format<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
     let fmt_val = stack.get(0);
-    let fmt_str = fmt_val
-        .get_string()
-        .ok_or_else(|| util::type_error(ctx, "format", 1, "string", stack.arg(0)))?;
+    let fmt_str = try_out!(fmt_val.get_string().ok_or_else(|| util::type_error(
+        ctx,
+        "format",
+        1,
+        "string",
+        stack.arg(0)
+    )));
     let fmt = fmt_str.as_bytes();
 
     // The context's scratch buffer; a pending conversion keeps it for its future, where a
@@ -265,7 +269,7 @@ fn lua_format<'gc>(
         Ok(None) => {
             let s = LuaString::checked(ctx, &f.out);
             ctx.put_buf(f.out);
-            stack.ret1(Value::string(s?));
+            stack.ret1(Value::string(try_out!(s)));
             return NativeOut::RETURN;
         }
         Err(e) => {
@@ -762,8 +766,8 @@ fn lua_gsub<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let s = util::check_string(ctx, stack.get(0), "gsub", 1)?;
-    let p = util::check_string(ctx, stack.get(1), "gsub", 2)?;
+    let s = try_out!(util::check_string(ctx, stack.get(0), "gsub", 1));
+    let p = try_out!(util::check_string(ctx, stack.get(1), "gsub", 2));
     let repl = stack.get(2);
     let n_arg = stack.get(3);
     // Default cap is `len+1`: at most one match per position plus the empty
@@ -771,13 +775,18 @@ fn lua_gsub<'gc>(
     let max_n = if n_arg.is_nil() {
         s.len() as i64 + 1
     } else {
-        util::check_integer(ctx, n_arg, "gsub", 4)?
+        try_out!(util::check_integer(ctx, n_arg, "gsub", 4))
     };
 
     // Fast path: string/number replacement template, fully synchronous.
     if let Some(template) = util::to_lstring(ctx, repl) {
-        let (result, count) =
-            gsub_string(ctx, s.as_bytes(), p.as_bytes(), template.as_bytes(), max_n)?;
+        let (result, count) = try_out!(gsub_string(
+            ctx,
+            s.as_bytes(),
+            p.as_bytes(),
+            template.as_bytes(),
+            max_n
+        ));
         stack.replace(&[result, Value::integer(ctx.mutation(), count)]);
         return NativeOut::RETURN;
     }
@@ -847,7 +856,7 @@ fn gsub_drive<'gc>(
     let mut done = false;
     if let Some(v) = resumed {
         let e = int(&stack, G_E) as usize;
-        match repl_bytes(ctx, v)? {
+        match try_out!(repl_bytes(ctx, v)) {
             Some(r) => out.extend_from_slice(r.as_bytes()),
             None => out.extend_from_slice(&src[pos..e]),
         }
@@ -857,7 +866,7 @@ fn gsub_drive<'gc>(
     }
     let mut ms = MatchState::new(src, body);
     while !done && count < max_n {
-        match ms.match_at(pos).map_err(|e| pat_err(ctx, e))? {
+        match try_out!(ms.match_at(pos).map_err(|e| pat_err(ctx, e))) {
             Some(e) if Some(e) != last => {
                 count += 1;
                 let call = if let Some(f) = repl.get_function() {
@@ -865,14 +874,15 @@ fn gsub_drive<'gc>(
                     let n = ms.num_captures(true);
                     let mut args = Vec::with_capacity(n);
                     for i in 0..n {
-                        let cv = ms.get_onecapture(i, pos, e).map_err(|e| pat_err(ctx, e))?;
+                        let cv =
+                            try_out!(ms.get_onecapture(i, pos, e).map_err(|e| pat_err(ctx, e)));
                         args.push(cap_to_value(ctx, src, cv));
                     }
                     Some((Value::function(f), args))
                 } else {
                     // A table is indexed by the first capture, through
                     // `__index`.
-                    let cv = ms.get_onecapture(0, pos, e).map_err(|e| pat_err(ctx, e))?;
+                    let cv = try_out!(ms.get_onecapture(0, pos, e).map_err(|e| pat_err(ctx, e)));
                     let key = cap_to_value(ctx, src, cv);
                     let raw = repl.get_table().map_or(Value::nil(), |t| t.raw_get(key));
                     let chain = if raw.is_nil() {
@@ -882,7 +892,7 @@ fn gsub_drive<'gc>(
                     };
                     match chain {
                         IndexChain::Resolved(v) => {
-                            match repl_bytes(ctx, v)? {
+                            match try_out!(repl_bytes(ctx, v)) {
                                 Some(r) => out.extend_from_slice(r.as_bytes()),
                                 None => out.extend_from_slice(&src[pos..e]),
                             }
@@ -928,7 +938,7 @@ fn gsub_drive<'gc>(
         }
     }
     out.extend_from_slice(&src[pos..]);
-    let result = Value::string(LuaString::checked(ctx, &out)?);
+    let result = Value::string(try_out!(LuaString::checked(ctx, &out)));
     stack.replace(&[result, Value::integer(mc, count)]);
     NativeOut::RETURN
 }

@@ -4,7 +4,7 @@ use crate::env::{
     Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Table, Value,
 };
 use crate::vm::async_native::{AsyncError, Cx};
-use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
+use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont, try_out};
 use crate::vm::{
     IndexChain, NewIndexChain, binop_metamethod, walk_index_chain, walk_newindex_chain,
 };
@@ -89,11 +89,11 @@ fn lua_concat<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let Some(t) = check_tab(ctx, stack.get(0), "concat", 1, TAB_R | TAB_L)? else {
+    let Some(t) = try_out!(check_tab(ctx, stack.get(0), "concat", 1, TAB_R | TAB_L)) else {
         return concat_meta(ctx, &mut stack);
     };
-    let (sep, mut i, last) = concat_args(ctx, &stack, t.raw_len() as i64)?;
-    let s = ctx.with_buf(|out| {
+    let (sep, mut i, last) = try_out!(concat_args(ctx, &stack, t.raw_len() as i64));
+    let s = try_out!(ctx.with_buf(|out| {
         // `i < last` rather than `i <= last`, so `i` never steps past `last`.
         while i < last {
             add_field(ctx, out, t.raw_get(Value::integer(ctx.mutation(), i)), i)?;
@@ -104,7 +104,7 @@ fn lua_concat<'gc>(
             add_field(ctx, out, t.raw_get(Value::integer(ctx.mutation(), i)), i)?;
         }
         LuaString::checked(ctx, out)
-    })?;
+    }));
     stack.ret1(Value::string(s));
     NativeOut::RETURN
 }
@@ -223,11 +223,17 @@ pub(crate) fn lua_insert<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let Some(t) = check_tab(ctx, stack.get(0), "insert", 1, TAB_R | TAB_W | TAB_L)? else {
+    let Some(t) = try_out!(check_tab(
+        ctx,
+        stack.get(0),
+        "insert",
+        1,
+        TAB_R | TAB_W | TAB_L
+    )) else {
         return insert_meta(ctx, &mut stack);
     };
     let e = (t.raw_len() as i64).wrapping_add(1);
-    let pos = insert_pos(ctx, &stack, e)?;
+    let pos = try_out!(insert_pos(ctx, &stack, e));
     let mut i = e;
     while i > pos {
         let v = t.raw_get(Value::integer(ctx.mutation(), i - 1));
@@ -287,12 +293,12 @@ fn lua_move<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let f = util::check_integer(ctx, stack.get(1), "move", 2)?;
-    let e = util::check_integer(ctx, stack.get(2), "move", 3)?;
-    let t = util::check_integer(ctx, stack.get(3), "move", 4)?;
+    let f = try_out!(util::check_integer(ctx, stack.get(1), "move", 2));
+    let e = try_out!(util::check_integer(ctx, stack.get(2), "move", 3));
+    let t = try_out!(util::check_integer(ctx, stack.get(3), "move", 4));
     let tt = if stack.get(4).is_nil() { 0 } else { 4 };
-    let src = check_tab(ctx, stack.get(0), "move", 1, TAB_R)?;
-    let dst = check_tab(ctx, stack.get(tt), "move", tt + 1, TAB_W)?;
+    let src = try_out!(check_tab(ctx, stack.get(0), "move", 1, TAB_R));
+    let dst = try_out!(check_tab(ctx, stack.get(tt), "move", tt + 1, TAB_W));
     let (a1, a2) = (stack.get(0), stack.get(tt));
     if e < f {
         stack.ret1(a2);
@@ -416,11 +422,17 @@ pub(crate) fn lua_remove<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let Some(t) = check_tab(ctx, stack.get(0), "remove", 1, TAB_R | TAB_W | TAB_L)? else {
+    let Some(t) = try_out!(check_tab(
+        ctx,
+        stack.get(0),
+        "remove",
+        1,
+        TAB_R | TAB_W | TAB_L
+    )) else {
         return remove_meta(ctx, &mut stack);
     };
     let size = t.raw_len() as i64;
-    let mut pos = remove_pos(ctx, &stack, size)?;
+    let mut pos = try_out!(remove_pos(ctx, &stack, size));
     let result = t.raw_get(Value::integer(ctx.mutation(), pos));
     while pos < size {
         let v = t.raw_get(Value::integer(ctx.mutation(), pos + 1));
@@ -484,7 +496,13 @@ fn lua_sort<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let n = match check_tab(ctx, stack.get(0), "sort", 1, TAB_R | TAB_W | TAB_L)? {
+    let n = match try_out!(check_tab(
+        ctx,
+        stack.get(0),
+        "sort",
+        1,
+        TAB_R | TAB_W | TAB_L
+    )) {
         Some(t) => t.raw_len() as i64,
         None => {
             let v = stack.get(0);
@@ -517,15 +535,17 @@ pub(crate) fn sort_len_cont<'gc>(
     mut stack: Stack<'gc, '_>,
     _status: Result<(), Error<'gc>>,
 ) -> NativeOut {
-    let n = util::to_integer(stack.get(2))
-        .ok_or_else(|| Error::from_str(ctx, "object length is not an integer"))?;
+    let n = try_out!(
+        util::to_integer(stack.get(2))
+            .ok_or_else(|| Error::from_str(ctx, "object length is not an integer"))
+    );
     stack.truncate(2);
     sort_start(ctx, stack, n)
 }
 
 /// Sort `t[1..n]`, `n` being `#t`.
 fn sort_start<'gc>(ctx: Context<'gc>, mut stack: Stack<'gc, '_>, n: i64) -> NativeOut {
-    if !sort_args(ctx, &mut stack, n)? {
+    if !try_out!(sort_args(ctx, &mut stack, n)) {
         stack.clear();
         return NativeOut::RETURN;
     }
@@ -1067,10 +1087,10 @@ fn lua_unpack<'gc>(
     _closure: &NativeClosure<'gc>,
     mut stack: Stack<'gc, '_>,
 ) -> NativeOut {
-    let Some(t) = check_tab(ctx, stack.get(0), "unpack", 1, TAB_R | TAB_L)? else {
+    let Some(t) = try_out!(check_tab(ctx, stack.get(0), "unpack", 1, TAB_R | TAB_L)) else {
         return unpack_meta(ctx, &mut stack);
     };
-    let Some((i, n)) = unpack_range(ctx, &stack, t.raw_len() as i64)? else {
+    let Some((i, n)) = try_out!(unpack_range(ctx, &stack, t.raw_len() as i64)) else {
         stack.clear();
         return NativeOut::RETURN;
     };
