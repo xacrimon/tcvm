@@ -5,7 +5,7 @@
 use crate::env::LuaString;
 use crate::env::feedback::FeedbackVector;
 use crate::env::value::Value;
-use crate::instruction::{Instruction, Op, Reg};
+use crate::instruction::{Instruction, Op};
 use crate::jit::feedback::{self as fb, Bits};
 use crate::vm::abi::{Slot, handler};
 use crate::vm::frame::{self, HDR, copy_values, fill_nil};
@@ -47,6 +47,23 @@ macro_rules! fast_entry {
                         tail!(native_call)
                     };
                 }
+                /// Return `R[first] ..` (`n` values) from this frame, for a TAILCALL.
+                /// Not through RETURN's handlers: their slow path re-reads the
+                /// instruction at `pc`, which is the TAILCALL.
+                macro_rules! tail_return {
+                    ($$first:expr, $$n:expr) => {{
+                        let ts = thread!();
+                        let bi = ts.slot_index(base);
+                        debug_assert!(!crate::vm::ops::control::has_tbc_from(ts, bi));
+                        crate::vm::ops::control::close_upvalues(rt.mutation(), ts, bi);
+                        let r = unsafe { frame::ret(base) };
+                        tail!(
+                            r,
+                            pc = unsafe { base.add($$first as usize) } as *const Instruction,
+                            insn = Slot::nret($$n)
+                        )
+                    }};
+                }
                 macro_rules! land1 {
                     (gc) => {{
                         land1!(@land);
@@ -58,14 +75,10 @@ macro_rules! fast_entry {
                         next!()
                     }};
                     (@land) => {{
-                        set_closure!(unsafe { frame::closure(base) });
                         if $call.op() == Op::TAILCALL {
-                            // Not RETURN1's handler: the frame may have something to close.
-                            tail!(
-                                crate::vm::ops::call::op_return,
-                                insn = Slot::insn(Instruction::ret(Reg($a), 2))
-                            )
+                            tail_return!($a, 1)
                         }
+                        set_closure!(unsafe { frame::closure(base) });
                         if $c == 0 {
                             let ts = thread!();
                             ts.top = ts.slot_index(base) + $a as usize + 1;
@@ -305,14 +318,10 @@ fast_entry! {
         if nargs < 1 || reg![a + 4].is_falsy() {
             miss!()
         }
-        set_closure!(unsafe { frame::closure(base) });
         if call.op() == Op::TAILCALL {
-            // `b` is the argument count as RETURN wants it (0: up to `top`).
-            tail!(
-                crate::vm::ops::call::op_return,
-                insn = Slot::insn(Instruction::ret(Reg(a + HDR as u8), call.b()))
-            )
+            tail_return!(a as usize + HDR, nargs)
         }
+        set_closure!(unsafe { frame::closure(base) });
         let n = if c == 0 { nargs } else { (c as usize - 1).min(nargs) };
         unsafe { copy_values(base.add(a as usize), base.add(a as usize + HDR), n) };
         if c == 0 {
