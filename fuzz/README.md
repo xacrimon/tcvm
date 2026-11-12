@@ -69,8 +69,9 @@ To start over, delete the output directory. Do that after fixing bugs too: the c
 | `interp` | The JIT-off run itself failed: a panic, a crash, a timeout. |
 | `reference` | Reference Lua failed on the program. This is a bug in the generator, not in tcvm. |
 
-A timeout is retried once with three times the limit before it counts. Timeouts under
-`TCVM_GC_STRESS` are not findings.
+A timeout is retried once with three times the limit before it counts, but not under
+`TCVM_GC_STRESS`, where timeouts are no findings, and not once the program has hung on that
+binary: a hanging program costs one limit per configuration.
 
 ### Configurations
 
