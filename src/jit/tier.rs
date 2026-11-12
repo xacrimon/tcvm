@@ -395,6 +395,14 @@ fn log(ctx: Context<'_>, msg: impl FnOnce() -> String) {
     let _ = (ctx, msg);
 }
 
+/// Count a `TCVM_STATS` event.
+fn stat(ctx: Context<'_>, key: impl FnOnce() -> String) {
+    #[cfg(feature = "tcvm-dev")]
+    ctx.runtime().stats.event(key);
+    #[cfg(not(feature = "tcvm-dev"))]
+    let _ = (ctx, key);
+}
+
 /// Compile the entry at `at` and install it; its entry address.
 fn try_compile<'gc>(
     ctx: Context<'gc>,
@@ -420,6 +428,7 @@ fn try_compile<'gc>(
     match compile_caught(ctx, closure, at, frame, &[]) {
         Ok(region) => {
             let entry = install(ctx, closure, state, at, word, region)?;
+            stat(ctx, || format!("jit compiled {}", word.op().name()));
             log(ctx, || {
                 format!(
                     "compiled {} pc{at} ({}), {} bytes, {} exits",
@@ -438,6 +447,7 @@ fn try_compile<'gc>(
                     crate::jit::compile::chunk_name(closure)
                 )
             });
+            stat(ctx, || format!("jit failed {}", e.class()));
             #[cfg(feature = "tcvm-dev")]
             if e.internal() {
                 let n = &ctx.jit().internal_errors;
@@ -648,6 +658,7 @@ fn retire_invalidated<'gc>(ctx: Context<'gc>, closure: LuaFn<'gc>, region: &Regi
     if region.retired.replace(true) {
         return;
     }
+    stat(ctx, || "jit invalidated".into());
     log(ctx, || {
         format!(
             "invalidated {} pc{}",
@@ -742,6 +753,7 @@ fn on_exit<'gc>(
     }
     let n = e.count.get() + 1;
     e.count.set(n);
+    stat(ctx, || format!("jit exit {:?}", e.tag));
     if n == 1 {
         log(ctx, || {
             format!(
@@ -1081,6 +1093,7 @@ fn on_entry_fail<'gc>(
     }
     let n = region.entry_fails.get() + 1;
     region.entry_fails.set(n);
+    stat(ctx, || "jit entry-fail".into());
     let name = || crate::jit::compile::chunk_name(closure);
     if n == 1 {
         log(ctx, || {
@@ -1192,6 +1205,7 @@ fn recompile<'gc>(
     let jit = ctx.jit();
     let result = if budget_left && state.borrow().compiles < MAX_COMPILES && !jit.exhausted.get() {
         compile_caught(ctx, closure, at, frame, &seen).map_err(|e| {
+            stat(ctx, || format!("jit failed {}", e.class()));
             log(ctx, || {
                 format!(
                     "recompile of {} pc{at} failed: {e}",
@@ -1231,6 +1245,7 @@ fn recompile<'gc>(
             if !region.fast_entry.is_null() {
                 set_fast(ctx, &closure.proto, &mut st, region.fast_entry as usize);
             }
+            stat(ctx, || "jit recompiled".into());
             log(ctx, || {
                 format!(
                     "recompiled {} pc{at}",
@@ -1243,6 +1258,7 @@ fn recompile<'gc>(
             let e = st.entries.remove(ei);
             retire_entry(ctx, closure, &mut st, &e);
             st.refused.push(at);
+            stat(ctx, || "jit blacklisted".into());
             log(ctx, || {
                 format!(
                     "blacklisted {} pc{at}",

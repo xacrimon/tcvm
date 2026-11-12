@@ -10,6 +10,8 @@ pub mod native;
 pub(crate) mod num;
 pub(crate) mod ops;
 pub(crate) mod stack;
+#[cfg(feature = "tcvm-dev")]
+pub(crate) mod stats;
 pub(crate) mod unwind;
 
 pub(crate) use ops::meta::{

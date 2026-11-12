@@ -153,10 +153,14 @@ impl Lua {
             let empty_dict_sentinel = Shape::dict_sentinel(mc, None, false);
             let interner = Interner::new(mc);
             let symbols = Symbols::intern_all(mc, &interner);
+            let rt = Runtime::new(mc.metrics());
             State {
+                #[cfg(feature = "tcvm-dev")]
+                dispatch: crate::vm::stats::table(rt.stats.on()),
+                #[cfg(not(feature = "tcvm-dev"))]
                 dispatch: crate::vm::dispatch::TABLE,
                 rets: crate::vm::dispatch::RETS,
-                rt: Runtime::new(mc.metrics()),
+                rt,
                 #[cfg(jit)]
                 jit: crate::jit::state::JitRuntime::new(),
                 root_shapes,
@@ -270,6 +274,22 @@ impl Lua {
             jit => self.arena.mutate(|_, root| root.jit.internal_errors.get()),
             _ => 0,
         }
+    }
+
+    /// Count what runs from now on, or stop (`vm::stats`; `TCVM_STATS` counts
+    /// from the start).
+    #[cfg(feature = "tcvm-dev")]
+    pub fn set_stats(&mut self, on: bool) {
+        self.arena.mutate_root(|_, root| {
+            root.rt.stats.set_on(on);
+            root.dispatch = crate::vm::stats::table(on);
+        });
+    }
+
+    /// The counts so far, in `TCVM_STATS`'s format.
+    #[cfg(feature = "tcvm-dev")]
+    pub fn stats(&mut self) -> String {
+        self.arena.mutate(|_, root| root.rt.stats.report())
     }
 
     /// Turn inlining on or off for regions compiled from now on: tests of the
