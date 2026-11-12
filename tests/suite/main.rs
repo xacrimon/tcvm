@@ -45,6 +45,7 @@ mod loop_close;
 mod main_yielded;
 mod math_fast_entries;
 mod math_frexp_ldexp;
+mod math_min_max;
 mod metamethod_dispatch;
 mod metamethod_many_results;
 mod metatable_classes;

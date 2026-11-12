@@ -5,7 +5,6 @@ use crate::env::{
 };
 use crate::vm::async_native::{AsyncError, Cx};
 use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
-use crate::vm::num;
 use crate::vm::{
     IndexChain, NewIndexChain, binop_metamethod, walk_index_chain, walk_newindex_chain,
 };
@@ -587,9 +586,9 @@ fn sort_primitive<'gc>(ctx: Context<'gc>, t: Table<'gc>, n: usize) -> bool {
         vals = is.into_iter().map(|i| Value::integer(mc, i)).collect();
     } else if vals.iter().all(number) {
         vals.sort_unstable_by(|x, y| {
-            if prim_lt(*x, *y) == Some(true) {
+            if util::prim_lt(*x, *y) == Some(true) {
                 std::cmp::Ordering::Less
-            } else if prim_lt(*y, *x) == Some(true) {
+            } else if util::prim_lt(*y, *x) == Some(true) {
                 std::cmp::Ordering::Greater
             } else {
                 std::cmp::Ordering::Equal
@@ -884,12 +883,12 @@ fn sort_drive<'gc>(
                     if !comp.is_nil() {
                         return sort_call(&mut stack, st, comp, &[x, y]);
                     }
-                    match prim_lt(x, y) {
+                    match util::prim_lt(x, y) {
                         Some(b) => b,
                         None => {
                             let m = binop_metamethod(ctx, x, y, MetamethodBits::LT);
                             if m.is_nil() {
-                                let msg = util::compare_error_msg(x, y);
+                                let msg = util::compare_error_msg(ctx, x, y);
                                 return NativeOut::error(util::runtime_error(ctx, &msg));
                             }
                             return sort_call(&mut stack, st, m, &[x, y]);
@@ -1059,23 +1058,6 @@ pub(crate) fn sort_cont<'gc>(
         _ => SortResume::Set,
     };
     sort_drive(ctx, stack, resume)
-}
-
-/// The default order's `<` on primitives (no string→number coercion).
-fn prim_lt(x: Value<'_>, y: Value<'_>) -> Option<bool> {
-    if let (Some(x), Some(y)) = (x.get_integer(), y.get_integer()) {
-        Some(x < y)
-    } else if let (Some(x), Some(y)) = (x.get_float(), y.get_float()) {
-        Some(x < y)
-    } else if let (Some(x), Some(y)) = (x.get_integer(), y.get_float()) {
-        Some(num::lt_int_float(x, y))
-    } else if let (Some(x), Some(y)) = (x.get_float(), y.get_integer()) {
-        Some(num::lt_float_int(x, y))
-    } else if let (Some(x), Some(y)) = (x.get_string(), y.get_string()) {
-        Some(x < y)
-    } else {
-        None
-    }
 }
 
 /// `unpack(t [, i [, j]])` — return `t[i]..t[j]` (`i` defaults to 1, `j` to

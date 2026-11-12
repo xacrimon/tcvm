@@ -6,15 +6,16 @@ use rand_pcg::Pcg64;
 use crate::Context;
 use crate::builtin::util::{
     arg_error, check_any, check_integer, check_number, compare_error_msg, float_to_integer,
-    num_to_value,
+    num_to_value, prim_lt, runtime_error,
 };
 use crate::env::function::NativeKind;
 use crate::env::{
-    Error, Function, LuaString, NativeClosure, NativeFn, Stack, Table, Userdata, Value,
+    Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Table, Userdata,
+    Value,
 };
 use crate::vm::abi::Handler;
-use crate::vm::num;
-use crate::vm::{ff, native};
+use crate::vm::native::{ContFn, NativeOut, OnOk, Protect, cont};
+use crate::vm::{binop_metamethod, ff, native};
 
 pub fn load<'gc>(ctx: Context<'gc>) {
     // Third column: the CALL entry, `call` unless the builtin has a fast path.
@@ -33,8 +34,6 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         ("frexp", lua_frexp, call),
         ("ldexp", lua_ldexp, call),
         ("log", lua_log, ff::ff_log),
-        ("max", lua_max, ff::ff_max),
-        ("min", lua_min, ff::ff_min),
         ("modf", lua_modf, call),
         ("rad", lua_rad, call),
         ("random", lua_random, call),
@@ -67,6 +66,15 @@ pub fn load<'gc>(ctx: Context<'gc>) {
         );
         let key = Value::string(LuaString::new(ctx, name.as_bytes()));
         lib.raw_set(ctx, key, Value::function(handler));
+    }
+
+    // `max` and `min` continue after `__lt`.
+    let conts: [(&str, ContFn, Handler); 2] =
+        [("max", lua_max, ff::ff_max), ("min", lua_min, ff::ff_min)];
+    for (name, f, entry) in conts {
+        let f = Function::new_native_with_entry(ctx.mutation(), NativeKind::Cont(f), &[], entry);
+        let key = Value::string(LuaString::new(ctx, name.as_bytes()));
+        lib.raw_set(ctx, key, Value::function(f));
     }
 
     let set = |name: &str, v: Value<'gc>| {
@@ -323,55 +331,91 @@ pub(crate) fn lua_max<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<(), Error<'gc>> {
-    select_extreme(ctx, stack, "max", false)
+) -> NativeOut {
+    check_any(ctx, &stack, "max", 1)?;
+    let (best, n) = (stack.get(0), stack.len());
+    select_extreme(ctx, stack, false, best, 1, n, false)
 }
 
 pub(crate) fn lua_min<'gc>(
     ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
     stack: Stack<'gc, '_>,
-) -> Result<(), Error<'gc>> {
-    select_extreme(ctx, stack, "min", true)
+) -> NativeOut {
+    check_any(ctx, &stack, "min", 1)?;
+    let (best, n) = (stack.get(0), stack.len());
+    select_extreme(ctx, stack, true, best, 1, n, false)
 }
 
-/// Shared `max`/`min` body: returns the argument that is largest (or smallest),
-/// preserving its original subtype. Per the manual the result is selected "with
-/// the `<` operator", so comparisons use Lua ordering semantics (no string→
-/// number coercion); a non-orderable pair raises the VM's "attempt to compare"
-/// error rather than a bad-argument error. Requires at least one argument.
+// The window while `__lt` runs: the pick, the compared argument's index,
+// the call's slot, then the arguments left, the compared one first.
+const BEST: usize = 0;
+const CUR: usize = 1;
+const END: usize = 2;
+const ARGS: usize = 3;
+
+/// `max`/`min` of `best` and `stack[i..end]` by the `<` operator, the pick
+/// changing when the next argument is above it (`min`: below), so the first
+/// of equals stays. `slow`: the window is in the layout above.
 fn select_extreme<'gc>(
     ctx: Context<'gc>,
     mut stack: Stack<'gc, '_>,
-    fname: &str,
     want_min: bool,
-) -> Result<(), Error<'gc>> {
-    check_any(ctx, &stack, fname, 1)?;
-    let n = stack.len();
-    let mut best = stack.get(0);
-    for i in 1..n {
+    mut best: Value<'gc>,
+    mut i: usize,
+    mut end: usize,
+    slow: bool,
+) -> NativeOut {
+    while i < end {
         let v = stack.get(i);
-        // max keeps `v` when best < v; min keeps `v` when v < best.
         let (lhs, rhs) = if want_min { (v, best) } else { (best, v) };
-        let lt = if let (Some(x), Some(y)) = (lhs.get_integer(), rhs.get_integer()) {
-            x < y
-        } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_float()) {
-            x < y
-        } else if let (Some(x), Some(y)) = (lhs.get_integer(), rhs.get_float()) {
-            num::lt_int_float(x, y)
-        } else if let (Some(x), Some(y)) = (lhs.get_float(), rhs.get_integer()) {
-            num::lt_float_int(x, y)
-        } else if let (Some(x), Some(y)) = (lhs.get_string(), rhs.get_string()) {
-            x < y
-        } else {
-            return Err(Error::from_str(ctx, &compare_error_msg(lhs, rhs)));
+        let lt = match prim_lt(lhs, rhs) {
+            Some(lt) => lt,
+            None => {
+                let mm = binop_metamethod(ctx, lhs, rhs, MetamethodBits::LT);
+                if mm.is_nil() {
+                    let msg = compare_error_msg(ctx, lhs, rhs);
+                    return NativeOut::error(runtime_error(ctx, &msg));
+                }
+                if !slow {
+                    let k = end - i;
+                    if i < ARGS {
+                        stack.extend(std::iter::repeat_n(Value::nil(), ARGS - i));
+                    }
+                    stack.as_mut_slice().copy_within(i..end, ARGS);
+                    (i, end) = (ARGS, ARGS + k);
+                    stack.truncate(end);
+                }
+                let s = stack.as_mut_slice();
+                s[BEST] = best;
+                s[CUR] = Value::small(i as i32);
+                s[END] = Value::small(end as i32);
+                stack.stage(end, mm, &[lhs, rhs]);
+                let cont = if want_min { cont::MIN } else { cont::MAX };
+                return NativeOut::call_then(end, cont, Protect::No, OnOk::Cont);
+            }
         };
         if lt {
             best = v;
         }
+        i += 1;
     }
     stack.ret1(best);
-    Ok(())
+    NativeOut::RETURN
+}
+
+/// `__lt` answered for [`select_extreme`]; its first result decides.
+pub(crate) fn extreme_cont<'gc, const MIN: bool>(
+    ctx: Context<'gc>,
+    _closure: &NativeClosure<'gc>,
+    mut stack: Stack<'gc, '_>,
+    _status: Result<(), Error<'gc>>,
+) -> NativeOut {
+    let small = |v: Value<'gc>| v.get_small().unwrap_or(0) as usize;
+    let (i, end) = (small(stack.get(CUR)), small(stack.get(END)));
+    let best = stack.get(if stack.get(end).is_falsy() { BEST } else { i });
+    stack.truncate(end);
+    select_extreme(ctx, stack, MIN, best, i + 1, end, true)
 }
 
 /// `tointeger(x)` — the integer value of `x` if it has one, else `nil`. No

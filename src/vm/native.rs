@@ -104,6 +104,10 @@ cont_table! {
     GSUB => crate::builtin::gsub_cont,
     #[cfg(feature = "lib-string")]
     ONE_RESULT => crate::builtin::one_result,
+    #[cfg(feature = "lib-math")]
+    MIN => crate::builtin::math::extreme_cont::<true>,
+    #[cfg(feature = "lib-math")]
+    MAX => crate::builtin::math::extreme_cont::<false>,
     HANDLER => crate::vm::unwind::handler_cont,
     CLOSE => crate::vm::unwind::close_cont,
     CLOSE_ENTRY => crate::vm::close::close_entry_cont,
