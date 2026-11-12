@@ -1,6 +1,7 @@
 //! Hand-written templates: small bodies of `f` that aim at one thing each, ported from the old
 //! Python generator (`tools/fuzz/gen.py`).
 
+mod stress;
 mod strict;
 
 use super::Gen;
@@ -8,7 +9,12 @@ use crate::ast::{Block, Stmt};
 
 /// Whether a template's units stay within what reference Lua agrees on, so are compared with it.
 pub(super) fn is_strict(kind: &str) -> bool {
-    strict::STRICT.contains(&kind)
+    strict::STRICT.contains(&kind) || stress::STRICT.contains(&kind)
+}
+
+/// Whether a template's call is slow, so the driver makes fewer.
+pub(super) fn is_heavy(kind: &str) -> bool {
+    stress::HEAVY.contains(&kind)
 }
 
 const FAMS: &[&str] = &[
@@ -257,6 +263,10 @@ const TEMPLATES: &[(&str, u32)] = &[
     ("tailnat", 6),
     ("flow", 6),
     ("arity", 4),
+    ("chain", 3),
+    ("recur", 3),
+    ("callslot", 3),
+    ("hoist", 4),
 ];
 
 impl Gen {
@@ -877,12 +887,28 @@ impl Gen {
             "tailnat" => self.t_tailnat(),
             "flow" => self.t_flow(),
             "arity" => self.t_arity(),
+            "chain" => self.t_chain(),
+            "recur" => self.t_recur(),
+            "callslot" => self.t_callslot(),
+            "hoist" => self.t_hoist(),
             _ => unreachable!(),
         };
         let mut wf = self.t_warm_fams();
         if kind == "for" && self.r.f64() < 0.8 {
             let p = &["si", "sp", "sn", "ib", "bi"];
             wf = [self.tc(p), self.tc(p), self.tc(p)];
+        }
+        // The calls that exit come after the warm-up: `b` a number until then.
+        if kind == "callslot" {
+            wf[1] = self.tc(&["si", "sp", "fl", "mn"]);
+        }
+        if kind == "hoist" && self.r.f64() < 0.7 {
+            let i = &["si", "sp", "ib", "bi", "sn"];
+            wf = [
+                self.tc(i),
+                self.tc(&["sp", "bi", "ib"]),
+                self.tc(&["sp", "sn", "ot", "si"]),
+            ];
         }
         if kind == "meta2" {
             let mut m = NUMF.to_vec();

@@ -186,7 +186,9 @@ for reasons that are no bugs.
 - `templates.rs`: the hand-written shapes that each aim at one thing the JIT speculates on.
   `templates/strict.rs` holds the ones that are strict (`konst`, `tailnat`, `flow`, `arity`):
   list a new strict template in its `STRICT`, and keep it off floats as text, lengths of
-  tables that may have holes, libm and `pairs` order.
+  tables that may have holes, libm and `pairs` order. `templates/stress.rs` holds the ones past
+  the sizes the rest reach (`chain`, `recur`, `callslot`, `hoist`); `HEAVY` lists those the
+  driver calls fewer times.
 - `driver.rs`: how a unit's function is called, and with which values. A call goes through
   `call`, which points at `f` or an adapter (`via_tail`, `via_va`, `via_pcall`, `via_co`,
   `via_cs`, `via_dirty`); an adapter must return `f`'s results and raise its errors unchanged.
