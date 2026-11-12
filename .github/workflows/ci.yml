@@ -46,7 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test:
+  test-matrix:
     strategy:
       fail-fast: false
       matrix:
@@ -61,11 +61,18 @@ jobs:
         env:
           RUSTFLAGS: --cfg tcvm_generic_group
 
+  test:
+    needs: test-matrix
+    if: always()
+    runs-on: ubuntu-26.04
+    steps:
+      - run: test '${{ needs.test-matrix.result }}' = success
+
   stable:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-26.04, ubuntu-24.04-arm]
+        os: [ubuntu-26.04, ubuntu-24.04-arm, macos-26]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
