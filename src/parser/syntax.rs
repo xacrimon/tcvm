@@ -1,5 +1,3 @@
-use std::mem;
-
 use cstree::{
     RawSyntaxKind, Syntax, interning::TokenInterner, syntax::SyntaxText, util::NodeOrToken,
 };
@@ -11,7 +9,8 @@ use super::{
 
 impl Syntax for SyntaxKind {
     fn from_raw(raw: RawSyntaxKind) -> Self {
-        debug_assert!(raw.0 < mem::variant_count::<SyntaxKind>() as u32);
+        // `Semicolon` is the last variant.
+        debug_assert!(raw.0 <= SyntaxKind::Semicolon as u32);
         unsafe { std::mem::transmute(raw.0) }
     }
 

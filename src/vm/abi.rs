@@ -164,28 +164,28 @@ pub(crate) enum Jump<'gc> {
 #[cfg(target_arch = "aarch64")]
 macro_rules! handler {
     (bind($insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident); $($items:tt)*) => {
-        $crate::vm::abi::handler_impl!(@items [$insn, $pc, $base, $rt, $closure, $thread, $nret, $values] [$thread] $($items)*);
+        $crate::vm::abi::handler_impl!(@items [$] [$insn, $pc, $base, $rt, $closure, $thread, $nret, $values] [$thread] $($items)*);
     };
 }
 
 #[cfg(not(target_arch = "aarch64"))]
 macro_rules! handler {
     (bind($insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident); $($items:tt)*) => {
-        $crate::vm::abi::handler_impl!(@items [$insn, $pc, $base, $rt, $closure, $thread, $nret, $values] [] $($items)*);
+        $crate::vm::abi::handler_impl!(@items [$] [$insn, $pc, $base, $rt, $closure, $thread, $nret, $values] [] $($items)*);
     };
 }
 
 /// The architecture-independent part of [`handler!`]: `[$($th)?]` is the
 /// thread parameter on aarch64 and empty on x86-64.
 macro_rules! handler_impl {
-    (@items [$($names:ident),*] [$($th:ident)?]) => {};
-    (@items [$($names:ident),*] [$($th:ident)?]
+    (@items [$d:tt] [$($names:ident),*] [$($th:ident)?]) => {};
+    (@items [$d:tt] [$($names:ident),*] [$($th:ident)?]
      $(#[$m:meta])* $kind:ident fn $name:ident $body:block $($rest:tt)*) => {
-        $crate::vm::abi::handler_impl!(@one $kind [$($names),*] [$($th)?] $(#[$m])* $name $body);
-        $crate::vm::abi::handler_impl!(@items [$($names),*] [$($th)?] $($rest)*);
+        $crate::vm::abi::handler_impl!(@one $kind [$d] [$($names),*] [$($th)?] $(#[$m])* $name $body);
+        $crate::vm::abi::handler_impl!(@items [$d] [$($names),*] [$($th)?] $($rest)*);
     };
 
-    (@one $kind:ident [$insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident]
+    (@one $kind:ident [$d:tt] [$insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident]
      [$($th:ident)?] $(#[$m:meta])* $name:ident $body:block) => {
         $(#[$m])*
         #[inline(never)]
@@ -204,9 +204,9 @@ macro_rules! handler_impl {
             let $rt = __rt;
             $(let mut $th = $th;)?
             $crate::vm::abi::handler_impl!(@bind $kind, __insn, __closure, $insn, $closure, $pc, $nret, $values);
-            $crate::vm::abi::handler_impl!(@thread [$($th)?], $rt, $thread);
-            $crate::vm::abi::handler_impl!(@slots $kind, $insn, $closure);
-            $crate::vm::abi::handler_impl!(@body $kind, $insn, $pc, $base, $rt, $closure, $thread, $nret, $values, [$($th)?]);
+            $crate::vm::abi::handler_impl!(@thread [$d] [$($th)?], $rt, $thread);
+            $crate::vm::abi::handler_impl!(@slots [$d] $kind, $insn, $closure);
+            $crate::vm::abi::handler_impl!(@body [$d] $kind, $insn, $pc, $base, $rt, $closure, $thread, $nret, $values, [$($th)?]);
             $body
         }
     };
@@ -235,7 +235,7 @@ macro_rules! handler_impl {
     };
 
     // The thread: the slot on aarch64, a load from the runtime on x86-64.
-    (@thread [$th:ident], $rt:ident, $thread:ident) => {
+    (@thread [$d:tt] [$th:ident], $rt:ident, $thread:ident) => {
         macro_rules! thread {
             () => {
                 (unsafe { &mut *$th })
@@ -247,10 +247,10 @@ macro_rules! handler_impl {
                 $th
             };
         }
-        /// Make `$$ts` the running thread, in the slot and the runtime.
+        /// Make `$ts` the running thread, in the slot and the runtime.
         macro_rules! switch {
-            ($$ts:expr) => {{
-                let __ts: *mut $crate::env::thread::ThreadState<'gc> = $$ts;
+            ($d ts:expr) => {{
+                let __ts: *mut $crate::env::thread::ThreadState<'gc> = $d ts;
                 $th = __ts;
                 $rt.set_thread(__ts);
             }};
@@ -262,7 +262,7 @@ macro_rules! handler_impl {
             }};
         }
     };
-    (@thread [], $rt:ident, $thread:ident) => {
+    (@thread [$d:tt] [], $rt:ident, $thread:ident) => {
         macro_rules! thread {
             () => {
                 (unsafe { &mut *$rt.thread_ptr() })
@@ -274,8 +274,8 @@ macro_rules! handler_impl {
             };
         }
         macro_rules! switch {
-            ($$ts:expr) => {{
-                let __ts: *mut $crate::env::thread::ThreadState<'gc> = $$ts;
+            ($d ts:expr) => {{
+                let __ts: *mut $crate::env::thread::ThreadState<'gc> = $d ts;
                 $rt.set_thread(__ts);
             }};
         }
@@ -285,15 +285,15 @@ macro_rules! handler_impl {
     };
 
     // How the running closure travels on to the next target.
-    (@slots op, $insn:ident, $closure:ident) => {
+    (@slots [$d:tt] op, $insn:ident, $closure:ident) => {
         macro_rules! closure_slot {
             () => {
                 $crate::vm::abi::Slot::closure($closure)
             };
         }
         macro_rules! set_closure {
-            ($$f:expr) => {
-                $closure = $$f
+            ($d f:expr) => {
+                $closure = $d f
             };
         }
         macro_rules! insn_slot {
@@ -302,15 +302,15 @@ macro_rules! handler_impl {
             };
         }
     };
-    (@slots $kind:ident, $insn:ident, $closure:ident) => {
+    (@slots [$d:tt] $kind:ident, $insn:ident, $closure:ident) => {
         macro_rules! closure_slot {
             () => {
                 $closure
             };
         }
         macro_rules! set_closure {
-            ($$f:expr) => {
-                $closure = $crate::vm::abi::Slot::closure($$f)
+            ($d f:expr) => {
+                $closure = $crate::vm::abi::Slot::closure($d f)
             };
         }
         macro_rules! insn_slot {
@@ -322,7 +322,7 @@ macro_rules! handler_impl {
 
     // --- body macros --------------------------------------------------------
 
-    (@body $kind:ident, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident, [$($th:ident)?]) => {
+    (@body [$d:tt] $kind:ident, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident, $nret:ident, $values:ident, [$($th:ident)?]) => {
         /// Dispatch the instruction at `pc`.
         macro_rules! next {
             () => {{
@@ -337,36 +337,36 @@ macro_rules! handler_impl {
 
         /// Tail-call another target with these slots, some replaced.
         macro_rules! tail {
-            ($$f:expr) => {
-                become $$f(insn_slot!(), $pc, $base, $rt, closure_slot!() $(, $th)?)
+            ($d f:expr) => {
+                become $d f(insn_slot!(), $pc, $base, $rt, closure_slot!() $(, $th)?)
             };
-            ($$f:expr, insn = $$i:expr) => {
-                become $$f($$i, $pc, $base, $rt, closure_slot!() $(, $th)?)
+            ($d f:expr, insn = $d i:expr) => {
+                become $d f($d i, $pc, $base, $rt, closure_slot!() $(, $th)?)
             };
-            ($$f:expr, closure = $$c:expr) => {
-                become $$f(insn_slot!(), $pc, $base, $rt, $$c $(, $th)?)
+            ($d f:expr, closure = $d c:expr) => {
+                become $d f(insn_slot!(), $pc, $base, $rt, $d c $(, $th)?)
             };
-            ($$f:expr, insn = $$i:expr, closure = $$c:expr) => {
-                become $$f($$i, $pc, $base, $rt, $$c $(, $th)?)
+            ($d f:expr, insn = $d i:expr, closure = $d c:expr) => {
+                become $d f($d i, $pc, $base, $rt, $d c $(, $th)?)
             };
-            ($$f:expr, pc = $$p:expr, insn = $$i:expr) => {
-                become $$f($$i, $$p, $base, $rt, closure_slot!() $(, $th)?)
+            ($d f:expr, pc = $d p:expr, insn = $d i:expr) => {
+                become $d f($d i, $d p, $base, $rt, closure_slot!() $(, $th)?)
             };
-            ($$f:expr, pc = $$p:expr, insn = $$i:expr, closure = $$c:expr) => {
-                become $$f($$i, $$p, $base, $rt, $$c $(, $th)?)
+            ($d f:expr, pc = $d p:expr, insn = $d i:expr, closure = $d c:expr) => {
+                become $d f($d i, $d p, $base, $rt, $d c $(, $th)?)
             };
-            ($$f:expr, pc = $$p:expr, insn = $$i:expr, base = $$b:expr) => {
-                become $$f($$i, $$p, $$b, $rt, closure_slot!() $(, $th)?)
+            ($d f:expr, pc = $d p:expr, insn = $d i:expr, base = $d b:expr) => {
+                become $d f($d i, $d p, $d b, $rt, closure_slot!() $(, $th)?)
             };
         }
 
-        /// Register `$$i` of the running frame, as a place.
+        /// Register `$i` of the running frame, as a place.
         macro_rules! reg {
-            ($$i:expr) => {
+            ($d i:expr) => {
                 (*unsafe {
                     #[cfg(debug_assertions)]
-                    $crate::vm::abi::check_reg($base, ($$i) as usize);
-                    &mut *$base.add(($$i) as usize)
+                    $crate::vm::abi::check_reg($base, ($d i) as usize);
+                    &mut *$base.add(($d i) as usize)
                 })
             };
         }
@@ -381,17 +381,17 @@ macro_rules! handler_impl {
         /// Raise an `OpError` from this frame: the fault goes to the runtime,
         /// `impl_error` renders and unwinds it.
         macro_rules! raise {
-            ($$kind:expr) => {{
+            ($d kind:expr) => {{
                 ::std::hint::cold_path();
-                $rt.set_fault($$kind);
+                $rt.set_fault($d kind);
                 tail!($crate::vm::unwind::impl_error)
             }};
         }
 
         /// Raise an `Error` from this frame.
         macro_rules! throw {
-            ($$err:expr) => {
-                raise!($crate::vm::unwind::OpError::Thrown($$err))
+            ($d err:expr) => {
+                raise!($crate::vm::unwind::OpError::Thrown($d err))
             };
         }
 
@@ -410,20 +410,20 @@ macro_rules! handler_impl {
             }};
         }
 
-        /// Leave dispatch with `$$e`, the frame published.
+        /// Leave dispatch with `$e`, the frame published.
         macro_rules! exit {
-            ($$e:expr) => {{
+            ($d e:expr) => {{
                 sync!();
-                return $$e;
+                return $d e;
             }};
         }
 
-        /// Before a store into `$$gc`: a gray object needs no
+        /// Before a store into `$gc`: a gray object needs no
         /// barrier; any other goes to `barrier_retry`, which runs the barrier
         /// out of line and re-dispatches this instruction.
         macro_rules! barrier {
-            ($$gc:expr) => {{
-                let __g = $$gc;
+            ($d gc:expr) => {{
+                let __g = $d gc;
                 if ::std::hint::unlikely(!$crate::dmm::Gc::is_gray(__g)) {
                     tail!(
                         $crate::vm::ops::field::barrier_retry,
@@ -443,14 +443,14 @@ macro_rules! handler_impl {
             }};
         }
 
-        /// A conditional branch's exit: jump `$$off` past the next
-        /// instruction if `$$cond`. The opaque asm in both arms keeps LLVM
+        /// A conditional branch's exit: jump `$off` past the next
+        /// instruction if `$cond`. The opaque asm in both arms keeps LLVM
         /// from if-converting the `pc` update into a select and from merging
         /// the two dispatch tails.
         macro_rules! branch {
-            ($$cond:expr, $$off:expr) => {{
-                if $$cond {
-                    $pc = unsafe { $pc.offset(($$off) as isize) };
+            ($d cond:expr, $d off:expr) => {{
+                if $d cond {
+                    $pc = unsafe { $pc.offset(($d off) as isize) };
                     #[allow(clippy::pointers_in_nomem_asm_block)]
                     unsafe {
                         ::core::arch::asm!("/* {0} */", inout(reg) $pc, options(nomem, nostack, preserves_flags));
@@ -466,10 +466,10 @@ macro_rules! handler_impl {
             }};
         }
 
-        /// Unconditional jump by `$$off` instructions.
+        /// Unconditional jump by `$off` instructions.
         macro_rules! jump_by {
-            ($$off:expr) => {
-                $pc = unsafe { $pc.offset(($$off) as isize) }
+            ($d off:expr) => {
+                $pc = unsafe { $pc.offset(($d off) as isize) }
             };
         }
 
@@ -481,12 +481,12 @@ macro_rules! handler_impl {
             };
         }
 
-        /// Continue in the Lua frame at `$$b` at `$$p` (a continuation
+        /// Continue in the Lua frame at `$b` at `$p` (a continuation
         /// resuming its caller).
         macro_rules! resume {
-            ($$b:expr, $$p:expr) => {{
-                $base = $$b;
-                $pc = $$p;
+            ($d b:expr, $d p:expr) => {{
+                $base = $d b;
+                $pc = $d p;
                 set_closure!(unsafe { $crate::vm::frame::closure($base) });
                 next!()
             }};
@@ -495,8 +495,8 @@ macro_rules! handler_impl {
         /// Go where a cold routine says, at the start of the thread's
         /// current level: the unwinder may have dropped levels above it.
         macro_rules! jump {
-            ($$j:expr) => {{
-                let __j: $crate::vm::abi::Jump<'gc> = $$j;
+            ($d j:expr) => {{
+                let __j: $crate::vm::abi::Jump<'gc> = $d j;
                 reload_thread!();
                 let (__h, __i, __p, __b): ($crate::vm::abi::Handler, $crate::vm::abi::Slot, *const $crate::instruction::Instruction, *mut $crate::env::value::Value<'gc>) = match __j {
                     $crate::vm::abi::Jump::Ret { ret: __r, nret: __n, values: __v, base: __b } => {
@@ -513,7 +513,7 @@ macro_rules! handler_impl {
             }};
         }
 
-        $crate::vm::abi::handler_impl!(@kind_body $kind, $insn, $pc, $base, $rt, $closure, $thread);
+        $crate::vm::abi::handler_impl!(@kind_body [$d] $kind, $insn, $pc, $base, $rt, $closure, $thread);
     };
 
     (@jump $h:ident, $i:ident, $p:ident, $b:ident, $rt:ident, [$th:ident], $c:expr) => {{
@@ -539,39 +539,39 @@ macro_rules! handler_impl {
         }
     }};
 
-    (@kind_body op, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident) => {
-        /// Constant `$$i` of the running prototype.
+    (@kind_body [$d:tt] op, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident) => {
+        /// Constant `$i` of the running prototype.
         macro_rules! k {
-            ($$i:expr) => {{
-                debug_assert!((($$i) as usize) < $closure.proto.constants.len());
-                unsafe { *$closure.constants.add(($$i) as usize) }
+            ($d i:expr) => {{
+                debug_assert!((($d i) as usize) < $closure.proto.constants.len());
+                unsafe { *$closure.constants.add(($d i) as usize) }
             }};
         }
 
-        /// Upvalue slot `$$i`, or the field its descriptor says it holds.
+        /// Upvalue slot `$i`, or the field its descriptor says it holds.
         macro_rules! upval {
-            ($$i:expr) => {{
-                debug_assert!((($$i) as usize) < $closure.upvalues().len());
-                unsafe { *$closure.upvalue_ptr().add(($$i) as usize) }
+            ($d i:expr) => {{
+                debug_assert!((($d i) as usize) < $closure.upvalues().len());
+                unsafe { *$closure.upvalue_ptr().add(($d i) as usize) }
             }};
-            (value $$i:expr) => {{
-                let __s = upval!($$i);
-                debug_assert!($closure.proto.upvalue_desc[($$i) as usize].by_value);
+            (value $d i:expr) => {{
+                let __s = upval!($d i);
+                debug_assert!($closure.proto.upvalue_desc[($d i) as usize].by_value);
                 unsafe { __s.value }
             }};
-            (cell $$i:expr) => {{
-                let __s = upval!($$i);
-                debug_assert!(!$closure.proto.upvalue_desc[($$i) as usize].by_value);
+            (cell $d i:expr) => {{
+                let __s = upval!($d i);
+                debug_assert!(!$closure.proto.upvalue_desc[($d i) as usize].by_value);
                 unsafe { __s.cell }
             }};
         }
 
-        /// Stage the metamethod call `$$f($$args..)` above the window and
-        /// enter it, `$$ret` taking its results.
+        /// Stage the metamethod call `$f($args..)` above the window and
+        /// enter it, `$ret` taking its results.
         macro_rules! call_mm {
-            ($$ret:expr, $$f:expr, [$$($$arg:expr),* $$(,)?]) => {{
-                let __f: $crate::env::value::Value<'gc> = $$f;
-                let __args: [$crate::env::value::Value<'gc>; _] = [$$($$arg),*];
+            ($d ret:expr, $d f:expr, [$d ($d arg:expr),* $d (,)?]) => {{
+                let __f: $crate::env::value::Value<'gc> = $d f;
+                let __args: [$crate::env::value::Value<'gc>; _] = [$d ($d arg),*];
                 let __hdr = unsafe { $base.add($closure.max_stack_size as usize) };
                 if ::std::hint::unlikely(unsafe { __hdr.add(4 + __args.len()) }.cast_const() > thread!().stack_end) {
                     tail!($crate::vm::ops::meta::stage_grow);
@@ -580,7 +580,7 @@ macro_rules! handler_impl {
                     $crate::vm::frame::write_hdr(
                         __hdr,
                         __f.to_raw(),
-                        $crate::vm::abi::handler_bits($$ret),
+                        $crate::vm::abi::handler_bits($d ret),
                         $base,
                         $pc,
                     );
@@ -598,7 +598,7 @@ macro_rules! handler_impl {
             }};
         }
     };
-    (@kind_body $kind:ident, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident) => {};
+    (@kind_body [$d:tt] $kind:ident, $insn:ident, $pc:ident, $base:ident, $rt:ident, $closure:ident, $thread:ident) => {};
 }
 
 pub(crate) use {handler, handler_impl};
