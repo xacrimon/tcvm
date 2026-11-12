@@ -29,7 +29,7 @@ handler! {
     /// is past its budget: the function runs interpreted, which takes no native
     /// stack.
     op fn op_jit_entry {
-        if std::hint::unlikely(below_budget(thread!())) {
+        if crate::hint::unlikely(below_budget(thread!())) {
             next!()
         }
         let code = rt.jit_entry(insn.d());
@@ -39,7 +39,7 @@ handler! {
     /// A compiled loop entry, or the instruction it replaced past the
     /// budget.
     op fn op_jit_loop {
-        if std::hint::unlikely(below_budget(thread!())) {
+        if crate::hint::unlikely(below_budget(thread!())) {
             let word = original_of(closure.proto, insn);
             let h = rt.handler(word.opcode());
             tail!(h, insn = Slot::insn(word))

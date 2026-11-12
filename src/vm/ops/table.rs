@@ -14,10 +14,10 @@ use crate::vm::unwind::OpError;
 macro_rules! check_index_key {
     ($k:expr) => {{
         let k: Value<'gc> = $k;
-        if std::hint::unlikely(k.is_nil()) {
+        if crate::hint::unlikely(k.is_nil()) {
             raise!(OpError::NilIndex)
         }
-        if std::hint::unlikely(k.get_float().is_some_and(f64::is_nan)) {
+        if crate::hint::unlikely(k.get_float().is_some_and(f64::is_nan)) {
             raise!(OpError::NanIndex)
         }
     }};

@@ -145,7 +145,7 @@ fn ic_get<'gc>(
     state: &TableState<'gc>,
 ) -> Option<Value<'gc>> {
     let live = state.shape();
-    let v = if std::hint::likely(matches!(cache, InlineCache::Own { .. }))
+    let v = if crate::hint::likely(matches!(cache, InlineCache::Own { .. }))
         && let InlineCache::Own { shape, loc, .. } = cache
         && Shape::ptr_eq(live, shape)
     {
@@ -190,7 +190,7 @@ fn ic_get<'gc>(
 fn ic_set<'gc>(ctx: Context<'gc>, cache: InlineCache<'gc>, t: Table<'gc>, v: Value<'gc>) -> bool {
     let state = t.inner().borrow();
     let live = state.shape();
-    if std::hint::likely(matches!(cache, InlineCache::Own { .. }))
+    if crate::hint::likely(matches!(cache, InlineCache::Own { .. }))
         && let InlineCache::Own {
             shape,
             loc,

@@ -1,5 +1,4 @@
 use core::alloc::{Allocator, Layout};
-use core::hint::{likely, unlikely};
 use core::iter::FusedIterator;
 use core::marker::PhantomData;
 use core::mem;
@@ -8,6 +7,7 @@ use core::slice;
 use std::alloc::handle_alloc_error;
 
 use super::control::{BitMaskIter, Group, Tag, TagSliceExt};
+use crate::hint::{likely, unlikely};
 
 // `RawTableInner::replace_tag_in_group` stores a group as one `u64` or `u128`.
 const _: () = assert!(

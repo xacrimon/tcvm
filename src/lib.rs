@@ -4,18 +4,24 @@
 #![cfg_attr(not(any(debug_assertions, test)), allow(clippy::drop_non_drop))]
 // Without a library, the VM's and other libraries' code for it is left unused.
 #![cfg_attr(not(feature = "lib-all"), allow(dead_code, unused_imports))]
-#![feature(fn_align)]
-#![feature(explicit_tail_calls)]
-#![feature(likely_unlikely)]
-#![feature(allocator_api)]
-#![feature(rust_preserve_none_cc)]
-#![feature(naked_functions_rustic_abi)]
-#![feature(offset_of_enum)]
+#![cfg_attr(
+    nightly,
+    feature(
+        fn_align,
+        explicit_tail_calls,
+        likely_unlikely,
+        rust_preserve_none_cc,
+        naked_functions_rustic_abi,
+        allocator_api,
+        offset_of_enum
+    )
+)]
 
 mod builtin;
 pub(crate) mod compiler;
 pub mod dmm;
 pub mod env;
+mod hint;
 pub(crate) mod instruction;
 pub(crate) mod jit;
 pub mod lua;

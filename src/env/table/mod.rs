@@ -410,7 +410,7 @@ impl<'gc> Table<'gc> {
     #[inline]
     pub fn meta(self, ctx: Context<'gc>) -> Option<shape::MtCache<'gc>> {
         let c = self.shape().mt_cache()?;
-        if std::hint::likely(!c.is_stale()) {
+        if crate::hint::likely(!c.is_stale()) {
             return Some(c);
         }
         self.refresh_meta(ctx)
