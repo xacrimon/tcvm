@@ -1099,6 +1099,41 @@ fn cmp_kinds() {
     agrees(src);
 }
 
+/// `==` compiled at a site that saw only tables compares the big integers
+/// that arrive later by value, with each other and with floats.
+#[test]
+fn eq_of_big_integers_the_site_never_saw() {
+    let src = r##"
+    local function eq(a, b) return a == b end
+    local x = 1 << 40
+    local t = {}
+    for i = 1, 3000 do eq(t, t) end
+    local out = {eq(x, x + 0), eq(x, 2.0^40), eq(2.0^40, x),
+                 eq(x, x + 1), eq(x, 2.0^41), eq(2.0^41, x), eq(x, t), eq(1.5, t), eq("a", x)}
+    local n = 0
+    for i = 1, 3000 do
+        if eq(x, x + 0) then n = n + 1 end
+        if eq(2.0^40, x) then n = n + 1 end
+    end
+    for i = 1, #out do out[i] = tostring(out[i]) end
+    return table.concat(out, " ") .. " " .. n
+"##;
+    let want = "true true true false false false false false false 6000";
+    assert_eq!(result(src, true), want);
+    let mut lua = Lua::new();
+    lua.set_jit_inline(false);
+    lua.load_all();
+    let ex = start_on(&mut lua, src);
+    lua.finish(&ex).unwrap();
+    lua.enter(|ctx| {
+        let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        assert_eq!(
+            v.get_string().expect("a string").as_bytes(),
+            want.as_bytes()
+        );
+    });
+}
+
 /// Array reads and writes compiled without misses, then given misses:
 /// holes, keys outside the array part (0, negative, huge, floats), and
 /// classes with `__index` or `__newindex` arriving after the compile.

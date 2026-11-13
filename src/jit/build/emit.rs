@@ -1890,20 +1890,27 @@ fn generic_eq(b: &mut Builder<'_, '_>, x: Val, y: Val, sense: bool, succs: &[Blo
         b.deopt(ExitTag::Mm);
     }
     enter_join(b, not_udata);
+    if !big {
+        // Two big integers the site never saw: equal by value, not by bits.
+        let other = all_in(b, TypeSet::BIGINT, &[x, y]);
+        b.deopt(ExitTag::Type);
+        enter_join(b, other);
+    }
     b.jump(no);
 }
 
 /// `f == v` for a float `f` and a value `v` known not to be a small integer
-/// or a float: equal only as a big integer of the same value.
+/// or a float: equal only as a big integer of the same value, which exits
+/// where the site never saw one.
 fn big_float_eq(b: &mut Builder<'_, '_>, big: bool, v: Val, f: Val, yes: Block, no: Block) {
-    if !big {
-        b.jump(no);
-        return;
-    }
     let not_big = all_in(b, TypeSet::BIGINT, &[v]);
-    let i = b.ins(Op::Unbox(Rep::I64), &[v]);
-    let c = b.ins(Op::IFCmp(Cc::Eq), &[i, f]);
-    b.br(c, yes, no);
+    if big {
+        let i = b.ins(Op::Unbox(Rep::I64), &[v]);
+        let c = b.ins(Op::IFCmp(Cc::Eq), &[i, f]);
+        b.br(c, yes, no);
+    } else {
+        b.deopt(ExitTag::Type);
+    }
     enter_join(b, not_big);
     b.jump(no);
 }
