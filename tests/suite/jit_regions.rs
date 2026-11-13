@@ -2278,6 +2278,77 @@ fn tail_misses_keep_their_arguments() {
     );
 }
 
+/// A vararg function's compiled tail call to a function that never compiles
+/// (an irreducible loop) keeps the frame's vararg count through the miss:
+/// the callee's own tail call finds the frame's function slot by it, and
+/// the stack stays where it was.
+#[test]
+fn tail_misses_keep_the_vararg_count() {
+    agrees_calling(
+        "local F
+        local function g(k)
+          local i = 0
+          if k < 0 then goto b end
+          ::a:: i = i + 1
+          ::b:: i = i + 2
+          if i < 5 then goto a end
+          if k == 0 then return 'done' end
+          return F(k - 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+        end
+        F = function(k, ...) local a, b, c return g(k) end
+        local function run(k) local r = F(k) return r end
+        return run(100000)",
+    );
+}
+
+/// The same miss with no room for the callee's window raises the overflow
+/// from the callee's frame, at its first line: the tail caller's is gone.
+#[test]
+fn tail_miss_overflow_is_raised_in_the_callee() {
+    let mut lua = Lua::new();
+    lua.set_jit_inline(false);
+    lua.load_all();
+    let src = "local function g(m)
+          local LOCALS
+          local i = 0
+          if m < 0 then goto b end
+          ::a:: i = i + 1
+          ::b:: i = i + 2
+          if i < 5 then goto a end
+          return m + i
+        end
+        local function F(m, ...) return g(m) end
+        local function rec(n)
+          local i = 0
+          if n < 0 then goto b end
+          ::a:: i = i + 1
+          ::b:: i = i + 2
+          if i < 5 then goto a end
+          return F(n, 1, 2, 3) + rec(n + 1)
+        end
+        local ok, e = pcall(rec, 1)
+        return tostring(ok) .. ' ' .. e .. ' ' .. F(1, 2, 3)"
+        .replace(
+            "LOCALS",
+            &(0..150)
+                .map(|k| format!("l{k}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    let ex = start_on(&mut lua, &src);
+    lua.finish(&ex)
+        .unwrap_or_else(|e| panic!("{src:?} failed: {e:?}"));
+    let got = lua.enter(|ctx| {
+        let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        String::from_utf8_lossy(v.get_string().expect("a string result").as_bytes()).into_owned()
+    });
+    // Line 10 where the tail call ran interpreted (no JIT, or it is off).
+    assert!(
+        got == "false c:1: stack overflow 7" || got == "false c:10: stack overflow 7",
+        "{got}"
+    );
+}
+
 /// A region a dependency invalidated, called next through its register
 /// entry by a compiled caller (`h` changes the method `g` folded): its dead
 /// entry stores the parameters before the interpreter runs the function

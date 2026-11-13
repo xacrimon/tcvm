@@ -169,11 +169,12 @@ handler! {
                 .get_function()
                 .and_then(|f| f.as_lua())
                 .expect("an inlined Lua closure");
-            // A tail callee in the region frame's place: its header, as the
-            // interpreter's `TAILCALL` leaves it.
+            // A tail callee in the region frame's place: its header, the
+            // frame's vararg count kept as a compiled tail call keeps it.
             if fr.delta == 0 {
                 unsafe {
-                    frame::set_func_word(fbase, frame::lua_func_word(callee, 0));
+                    let nv = frame::nv(fbase);
+                    frame::set_func_word(fbase, frame::lua_func_word(callee, nv));
                     if fr.open {
                         frame::set_flags(fbase, frame::flag::HAS_OPEN);
                     }

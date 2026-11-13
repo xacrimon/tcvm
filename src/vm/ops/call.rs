@@ -388,6 +388,31 @@ handler! {
         tail!(enter, pc = ts.slot_ptr(hdr) as *const Instruction, insn = insn)
     }
 
+    /// A compiled tail call's callee in the frame it reuses (`direct_miss`):
+    /// `pc` is the header, complete, whose word 0 keeps the frame's vararg
+    /// count. The callee is a Lua function that is not vararg, its
+    /// parameters filled in.
+    #[cfg(jit)]
+    slow fn enter_tail {
+        let nb = unsafe { (pc as *mut Value<'gc>).add(HDR) };
+        let callee = unsafe { frame::closure(nb) };
+        base = nb;
+        pc = callee.code;
+        if crate::utils::hint::unlikely(
+            unsafe { nb.add(callee.max_stack_size as usize) }.cast_const() > thread!().stack_end,
+        ) {
+            let ts = thread!();
+            let end = ts.slot_index(nb) + callee.max_stack_size as usize;
+            if !ts.ensure_frame_slots(end) {
+                // The caller's frame is gone: raised at the callee's start.
+                pc = unsafe { pc.add(1) };
+                raise!(OpError::StackOverflow)
+            }
+        }
+        set_closure!(callee);
+        start!(pc, rt, callee)
+    }
+
     /// `enter` of a Lua callee with missing parameters or varargs.
     slow fn enter_fixup {
         let nargs = insn.as_nret();

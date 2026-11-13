@@ -319,8 +319,8 @@ pub(crate) unsafe extern "C" fn level_return() {
 /// Where a fast entry's failed checks go, and a direct tail call while its
 /// callee's prototype has no fast entry (`jit::tail_miss`). A tail call
 /// from a frame dispatch entered has its landing for a return address:
-/// `enter` runs the call from the header the tail call wrote, in the level.
-/// Otherwise on to the caller's slow path.
+/// `enter_tail` runs the callee in the frame the tail call left, in the
+/// level. Otherwise on to the caller's slow path.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn direct_miss() {
     core::arch::naked_asm!(
@@ -331,11 +331,7 @@ pub(crate) unsafe extern "C" fn direct_miss() {
         "b.eq 1f",
         "b {call_miss}",
         "1:",
-        "movz x16, #{tag}, lsl #48",
-        "orr x16, x16, x24",
-        "str x16, [x22, #-32]",
         "sub x21, x22, #32",
-        "mov x22, xzr",
         "ldr x23, [x25, #{record}]",
         "ldr x23, [x23, #{rt_of_level}]",
         "ldr x30, [x23, #{level_ret}]",
@@ -344,9 +340,8 @@ pub(crate) unsafe extern "C" fn direct_miss() {
         rt_of_level = const RT_OF_LEVEL,
         level_land = const crate::jit::layout::LEVEL_LAND,
         level_ret = const crate::jit::layout::LEVEL_RET,
-        tag = const crate::jit::layout::FUNCTION_TAG,
         call_miss = sym call_miss,
-        enter = sym crate::vm::ops::call::enter,
+        enter = sym crate::vm::ops::call::enter_tail,
     )
 }
 
