@@ -273,11 +273,11 @@ fn varying_closure<'gc>(b: &Builder<'_, 'gc>, v: Val) -> Option<LuaFn<'gc>> {
 pub(super) enum Emitted {
     /// Nothing: the CALL is a call.
     No,
-    /// Its results.
-    Done,
+    /// Its results, this many in `R[A..]`.
+    Done(u8),
     /// Its results, and a block for the call itself, where the inline code
     /// found the builtin must run, with the builtin as a constant.
-    Fallback(Block, Val),
+    Fallback(Block, Val, u8),
 }
 
 /// Whether the callee the CALL at `pc` is known to call has an intrinsic
@@ -289,19 +289,19 @@ pub(super) fn has_intrinsic(b: &Builder<'_, '_>, pc: u32, callee: Val) -> bool {
 /// Compile the CALL at `pc` as its callee's intrinsic, if it has one that
 /// covers the call's shape.
 pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: Val) -> Emitted {
-    // A tail call returns the one result: not for a builtin that may
-    // return more.
     let tail = insn.op() == crate::instruction::Op::TAILCALL;
-    let (a, nb, c) = if tail {
-        (insn.a(), insn.b(), 2)
-    } else {
-        (insn.a(), insn.b(), insn.c())
-    };
     let Some(f) = known_callee(b, pc, callee) else {
         return Emitted::No;
     };
     let Some(intr) = intrinsic_of(f) else {
         return Emitted::No;
+    };
+    // A tail call returns what the builtin does: `table.insert` nothing, the
+    // others one result (not for a builtin that may return more).
+    let (a, nb, c) = match intr {
+        Intrinsic::Builtin(HelperId::TInsert) if tail => (insn.a(), insn.b(), 1),
+        _ if tail => (insn.a(), insn.b(), 2),
+        _ => (insn.a(), insn.b(), insn.c()),
     };
     match intr {
         Intrinsic::Select => return select(b, pc, a, nb, c, f, callee, tail),
@@ -314,7 +314,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
             // The interpreter's builtin raises; nothing follows.
             pin(b, f, callee);
             b.deopt(ExitTag::Slow);
-            return Emitted::Done;
+            return Emitted::Done(0);
         }
         Intrinsic::MinMax(max) if nb != 0 => return min_max(b, pc, max, a, nb - 1, c, f, callee),
         Intrinsic::StrLen | Intrinsic::Builtin(HelperId::StrSub | HelperId::StrByte) if nb != 0 => {
@@ -358,7 +358,7 @@ fn assert<'gc>(
         };
         b.set(a + k, v);
     }
-    Emitted::Done
+    Emitted::Done(c - 1)
 }
 
 /// A builtin by its helper; `type` of a known kind is a constant.
@@ -404,7 +404,7 @@ fn builtin<'gc>(
             let n = b.ins(Op::StrLenOf, &[p]);
             b.set(a, n);
         }
-        return Emitted::Done;
+        return Emitted::Done(c - 1);
     }
     if h == HelperId::Type
         && let Some(name) = type_name(b.ty(args[0]).set)
@@ -413,7 +413,7 @@ fn builtin<'gc>(
             let s = b.konst(Value::string(LuaString::new(b.ctx, name.as_bytes())));
             b.set(a, s);
         }
-        return Emitted::Done;
+        return Emitted::Done(c - 1);
     }
     // A tail call's after-snapshot would resume at the `RETURN` after it.
     let class = (h == HelperId::SetMetatable
@@ -422,7 +422,7 @@ fn builtin<'gc>(
         .then(|| moved_shape(b, &args))
         .flatten();
     let r = b.ins(Op::Helper(h), &args);
-    let mut out = Emitted::Done;
+    let mut out = Emitted::Done(c - 1);
     if !matches!(
         h,
         HelperId::Type | HelperId::GetMetatable | HelperId::RawEqual | HelperId::ToNumber
@@ -432,7 +432,7 @@ fn builtin<'gc>(
         let (slow, ok) = (b.new_sealed_succ(), b.new_sealed_succ());
         b.br(failed, slow, ok);
         b.switch_to(ok);
-        out = Emitted::Fallback(slow, k);
+        out = Emitted::Fallback(slow, k, c - 1);
     }
     if c == 2 {
         let r = if h == HelperId::RawEqual {
@@ -513,7 +513,7 @@ fn min_max<'gc>(
         if c == 2 {
             b.set(a, args[0]);
         }
-        return Emitted::Done;
+        return Emitted::Done(c - 1);
     }
     match (!nums.is_empty(), strs) {
         (true, false) => {
@@ -541,7 +541,7 @@ fn min_max<'gc>(
             enter_join(b, join);
         }
     }
-    Emitted::Done
+    Emitted::Done(c - 1)
 }
 
 /// [`min_max`]'s fold of numbers of kinds `nums`, each argument guarded to
@@ -665,6 +665,14 @@ fn string<'gc>(
     if !(min..=max).contains(&nargs) || c == 0 || c > 2 {
         return Emitted::No;
     }
+    // `byte` out of range returns nothing, which its helper makes a nil: not
+    // a tail call's result.
+    if intr == Intrinsic::Builtin(HelperId::StrByte)
+        && b.feedback(pc) & fb::OTHER_RESULT != 0
+        && b.code(pc).op() == crate::instruction::Op::TAILCALL
+    {
+        return Emitted::No;
+    }
     let k = pin(b, f, callee);
     let s = b.reg(a + 4);
     let t = b.ty(s);
@@ -720,8 +728,8 @@ fn string<'gc>(
         b.set(a, r);
     }
     match slow {
-        Some(slow) => Emitted::Fallback(slow, k),
-        None => Emitted::Done,
+        Some(slow) => Emitted::Fallback(slow, k, c - 1),
+        None => Emitted::Done(c - 1),
     }
 }
 
@@ -850,7 +858,7 @@ fn select<'gc>(
         }
     };
     b.set(a, r);
-    Emitted::Done
+    Emitted::Done(c - 1)
 }
 
 /// The value of a constant.
@@ -918,7 +926,7 @@ fn emit_math<'gc>(
         for (k, &r) in results.iter().take(c as usize - 1).enumerate() {
             b.set(a + k as u8, r);
         }
-        return done(slow, k);
+        return done(slow, k, c);
     }
     let r = match intr {
         Intrinsic::Sqrt => {
@@ -957,7 +965,7 @@ fn emit_math<'gc>(
                     }
                     None => {
                         log_arms(b, a, x, base);
-                        return Emitted::Done;
+                        return Emitted::Done(c - 1);
                     }
                 }
             }
@@ -966,16 +974,16 @@ fn emit_math<'gc>(
             let y = b.reg(a + 5);
             match fmod(b, a, x, y, bits) {
                 Some(r) => r,
-                None => return Emitted::Done,
+                None => return Emitted::Done(c - 1),
             }
         }
         Intrinsic::Floor | Intrinsic::Ceil => match round(b, a, x, bits, intr == Intrinsic::Ceil) {
             Some(r) => r,
-            None => return Emitted::Done,
+            None => return Emitted::Done(c - 1),
         },
         Intrinsic::Abs => match abs(b, a, x, bits) {
             Some(r) => r,
-            None => return Emitted::Done,
+            None => return Emitted::Done(c - 1),
         },
         Intrinsic::Pairs | Intrinsic::Ipairs => unreachable!("returned above"),
         Intrinsic::Select
@@ -990,7 +998,7 @@ fn emit_math<'gc>(
     if c == 2 {
         b.set(a, r);
     }
-    done(slow, k)
+    done(slow, k, c)
 }
 
 /// `R[a] = log(x, base)` of a base that varies, compared as the builtin
@@ -1061,10 +1069,10 @@ fn fallback(b: &mut Builder<'_, '_>, cond: Val, holds: bool) -> Block {
     slow
 }
 
-fn done(slow: Option<Block>, k: Val) -> Emitted {
+fn done(slow: Option<Block>, k: Val, c: u8) -> Emitted {
     match slow {
-        Some(s) => Emitted::Fallback(s, k),
-        None => Emitted::Done,
+        Some(s) => Emitted::Fallback(s, k, c - 1),
+        None => Emitted::Done(c - 1),
     }
 }
 

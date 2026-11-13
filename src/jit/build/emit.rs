@@ -474,16 +474,17 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
             if intrinsic {
                 return_guard(b, before);
             }
-            let (slow, none) = match intrinsics::emit(b, pc, insn, callee) {
-                Emitted::No => (Some(b.cur), true),
-                Emitted::Done => (None, false),
-                Emitted::Fallback(slow, _) => (Some(slow), false),
+            let (slow, n) = match intrinsics::emit(b, pc, insn, callee) {
+                Emitted::No => (Some(b.cur), None),
+                Emitted::Done(n) => (None, Some(n)),
+                Emitted::Fallback(slow, _, n) => (Some(slow), Some(n)),
             };
+            let none = n.is_none();
             // `return error(...)` left already.
             if slow != Some(b.cur) && !b.terminated() {
                 b.flush();
                 debug_assert!(intrinsic);
-                return_tested(b, a, 1);
+                return_tested(b, a, n.unwrap());
             }
             if let Some(slow) = slow {
                 b.switch_to(slow);
@@ -651,17 +652,17 @@ fn body_tailcall(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
         }
     };
     match intrinsics::emit(b, pc, insn, callee) {
-        Emitted::Done => {
+        Emitted::Done(n) => {
             if !b.terminated() {
                 b.flush();
-                super::inline::inline_return(b, a, 1);
+                super::inline::inline_return(b, a, n);
             }
         }
         // The builtin runs only where the inline code gave up: cold.
-        Emitted::Fallback(slow, f) => {
+        Emitted::Fallback(slow, f, n) => {
             if !b.terminated() {
                 b.flush();
-                super::inline::inline_return(b, a, 1);
+                super::inline::inline_return(b, a, n);
             }
             b.switch_to(slow);
             cold(b, |b| real(b, f));
@@ -2135,8 +2136,8 @@ fn emit_call(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
                 call(b, pc, insn, callee)
             }
         }
-        Emitted::Done => {}
-        Emitted::Fallback(slow, f) => {
+        Emitted::Done(_) => {}
+        Emitted::Fallback(slow, f, _) => {
             // The builtin's results join the inline code's.
             let moved = b.moved_shape.take();
             let join = b.new_block();

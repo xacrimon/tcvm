@@ -575,6 +575,75 @@ fn tail_calls_and_multret() {
     );
 }
 
+/// A tail-called builtin that returns nothing returns nothing from compiled
+/// code: `table.insert` as its intrinsic, from a function region, from a body
+/// inlined in a loop and from one inlined in a region frame's place;
+/// `string.byte` out of range by the call.
+#[test]
+fn tail_called_builtins_without_results() {
+    let mixed = r##"
+    local t, u = {}, {}
+    local function f(a, b) return a:byte(b) end
+    local function g(a) return table.insert(t, a) end
+    local function k(a) return g(a) end
+    local function h(a, b) return (a:byte(b)) end
+    local function w(a) local x = table.insert(u, a); return x end
+    local n0, n1, m, mixed = 0, 0, 0, 0
+    for i = 1, 3000 do
+        if select("#", f("", -1)) == 0 then n0 = n0 + 1 else n1 = n1 + 1 end
+        m = m + select("#", g(i)) + select("#", k(i)) + select("#", w(i)) + select("#", (g(i)))
+        mixed = mixed + select("#", f("ab", i % 3)) + (f("ab", 1) or 0) + select("#", h("", 1))
+    end
+    return table.concat({n0, n1, m, #t, #u, mixed}, " ")
+"##;
+    let inserts = r##"
+    local t = {}
+    local function g(a) return table.insert(t, a) end
+    local function k(a) return g(a) end
+    local m = 0
+    for i = 1, 3000 do
+        m = m + select("#", g(i)) + select("#", k(i)) + select("#", (g(i)))
+    end
+    return m .. " " .. #t
+"##;
+    for inline in [true, false] {
+        for (src, want) in [
+            (mixed, "3000 0 6000 9000 3000 296000"),
+            (inserts, "3000 9000"),
+        ] {
+            let mut lua = Lua::new();
+            lua.set_jit_inline(inline);
+            lua.set_stats(true);
+            lua.load_all();
+            let ex = start_on(&mut lua, src);
+            lua.finish(&ex).unwrap();
+            lua.enter(|ctx| {
+                let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+                assert_eq!(
+                    String::from_utf8_lossy(v.get_string().expect("a string").as_bytes()),
+                    want,
+                    "inline {inline}"
+                );
+            });
+            // The intrinsic, not the interpreter's TAILCALL of the builtin
+            // (the lib's `jit` cfg: no JIT on stable or on other targets).
+            if src == inserts
+                && cfg!(all(
+                    feature = "jit",
+                    feature = "nightly",
+                    any(target_arch = "aarch64", target_arch = "x86_64")
+                ))
+            {
+                let stats = lua.stats();
+                let tailcalls: u64 = (stats.lines())
+                    .find_map(|l| l.strip_prefix("op TAILCALL ")?.parse().ok())
+                    .unwrap_or(0);
+                assert!(tailcalls < 1000, "inline {inline}: {tailcalls}");
+            }
+        }
+    }
+}
+
 /// TAILCALL's fast arm (a Lua callee without varargs, from a frame with
 /// nothing to close) and the callees and frames that take the interpreter's.
 #[test]
