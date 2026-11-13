@@ -4817,3 +4817,23 @@ fn inference_follows_a_long_rotation() {
     );
     assert_eq!(result(&src, true), "450.0 1.5 float");
 }
+
+/// A join of a register guarded on each path, where the guarded value is an
+/// unboxed integer: the refinement that replaces the parameter is defined
+/// before the conversion that boxes it for the loop.
+#[test]
+fn joined_refinements_convert_after_their_definition() {
+    compiles_cleanly(
+        "local function f(b, n, lim)
+            while n <= lim do
+                n = n + 1
+                tostring(n)
+                if n == b then G = n end
+            end
+        end
+        f(0, 2147483646, 2147483649)
+        for i = 1, 300 do G = nil f(i % 5, 0, 3) end
+        return tostring(G)",
+        true,
+    );
+}

@@ -2459,6 +2459,7 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
     let mut refined: Vec<(Block, Val, Val, TypeSet)> = Vec::new();
     // Parameters replaced by a constant (op, one argument for its type).
     let mut konsts: Vec<(Block, Val, Op, Val)> = Vec::new();
+    let mut heads: Vec<usize> = Vec::new();
     loop {
         map.clear();
         map.extend((0..f.vals.len() as u32).map(Val));
@@ -2565,10 +2566,15 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
         if !changed {
             break;
         }
+        // What this round put where each block starts: a conversion of one
+        // of them goes after it.
+        heads.clear();
+        heads.resize(f.blocks.len(), 0);
         for (b, p, x, set) in refined.drain(..) {
             let x = resolve(&map, x);
             let i = f.make_inst(Op::Refine(set), &[x], None, ExitTag::Type);
-            f.insert(b, 0, i);
+            f.insert(b, heads[b.idx()], i);
+            heads[b.idx()] += 1;
             let r = f.result(i);
             while map.len() < f.vals.len() {
                 map.push(Val(map.len() as u32));
@@ -2577,7 +2583,8 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
         }
         for (b, p, op, a) in konsts.drain(..) {
             let i = f.make_inst(op, &[], None, ExitTag::Type);
-            f.insert(b, 0, i);
+            f.insert(b, heads[b.idx()], i);
+            heads[b.idx()] += 1;
             let r = f.result(i);
             f.vals[r.idx()].ty = f.vals[a.idx()].ty;
             while map.len() < f.vals.len() {
@@ -2588,7 +2595,7 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
         // A replacement of another representation enters through a
         // conversion at the parameter's block.
         for &b in &cfg.rpo {
-            let mut at = 0;
+            let mut at = heads[b.idx()];
             for k in 0..f.blocks[b.idx()].params.len() {
                 let p = f.params(b)[k];
                 let s = resolve(&map, p);
