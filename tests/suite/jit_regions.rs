@@ -4837,3 +4837,18 @@ fn joined_refinements_convert_after_their_definition() {
         true,
     );
 }
+
+/// An arithmetic site that saw no number tests its operands, and its cold
+/// arm takes the checkpoint the numeric arm made behind its own tests: the
+/// checkpoint names the registers as the instruction found them, not the
+/// numeric arm's refinements of them.
+#[test]
+fn cold_arms_take_checkpoints_made_in_numeric_arms() {
+    compiles_cleanly(
+        "local function f(a, b) return a - b end
+        local n = 0
+        for i = 1, 600 do if not pcall(f, 1 << 62, nil) then n = n + 1 end end
+        return table.concat({n, f(7, 2), f(2.5, 1), f(1 << 62, 1), tostring((pcall(f, {}, 1)))}, ' ')",
+        true,
+    );
+}

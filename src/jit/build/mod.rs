@@ -259,8 +259,9 @@ pub(crate) struct Builder<'a, 'gc> {
     /// Writes of the instruction being emitted, applied at its end so its
     /// exits see the frame before it.
     pending: Vec<(u8, Val)>,
-    /// The `Before` snapshot of the instruction being emitted.
-    cur_snap: Option<Snap>,
+    /// The `Before` snapshot of the instruction being emitted and the block
+    /// it read the registers at: an arm's own is not a sibling arm's.
+    cur_snap: Option<(Snap, Block)>,
     pub(crate) pc: u32,
     pub(crate) deopt_all: bool,
     pub(crate) known: Known<'gc>,
@@ -287,6 +288,9 @@ pub(crate) struct Builder<'a, 'gc> {
     /// The refinements the instruction being emitted made, in order: its
     /// `Before` snapshot, shared by all its arms, names what they refined.
     pc_refines: Vec<(Val, Val)>,
+    /// The block the instruction being emitted started in: it dominates
+    /// every arm of the instruction and what follows it.
+    pc_block: Block,
     /// The `Before` snapshot exits take until a side effect (Maglev's
     /// checkpointed frame): every instruction from its pc on can run again.
     ckpt: Option<Snap>,
@@ -454,6 +458,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             pc_written: RegSet::EMPTY,
             #[cfg(feature = "tcvm-dev")]
             pc_start: (Block(0), None),
+            pc_block: Block(0),
         }
     }
 
@@ -507,6 +512,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             pc_written: RegSet::EMPTY,
             #[cfg(feature = "tcvm-dev")]
             pc_start: (Block(0), None),
+            pc_block: Block(0),
         }
     }
 
@@ -1369,7 +1375,10 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         s
     }
 
-    fn snapshot(&mut self, pc: u32, kind: ExitKind, live: RegSet) -> Snap {
+    /// `at`: the block whose register values the snapshot names: the current
+    /// one, or for a checkpoint, which other arms and later instructions
+    /// take too, the one its instruction started in.
+    fn snapshot(&mut self, pc: u32, kind: ExitKind, live: RegSet, at: Block) -> Snap {
         let regs = self.exit_regs(live);
         // Reading a register creates no snapshot, so the entries are the
         // pool's tail.
@@ -1383,7 +1392,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             if r >= self.nregs || self.untouched(r) {
                 continue;
             }
-            let mut v = self.reg(r as u8);
+            let mut v = self.read_var_at(r as u8, at);
             if kind == ExitKind::Before {
                 for &(from, to) in self.pc_refines.iter().rev() {
                     if v == to {
@@ -1425,12 +1434,19 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         {
             return s;
         }
-        if let Some(s) = self.cur_snap {
+        if let Some((s, at)) = self.cur_snap
+            && (at == self.pc_block || at == self.cur)
+        {
             return s;
         }
         let live = self.cfg.live_in[self.pc as usize];
-        let s = self.snapshot(self.pc, ExitKind::Before, live);
-        self.cur_snap = Some(s);
+        let at = if self.pc_effect {
+            self.cur
+        } else {
+            self.pc_block
+        };
+        let s = self.snapshot(self.pc, ExitKind::Before, live, at);
+        self.cur_snap = Some((s, at));
         if !self.pc_effect {
             self.ckpt = Some(s);
             #[cfg(feature = "tcvm-dev")]
@@ -1533,7 +1549,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
             Some(&l) => l,
             None => RegSet::EMPTY,
         };
-        self.snapshot(pc, ExitKind::After, live)
+        self.snapshot(pc, ExitKind::After, live, self.cur)
     }
 
     /// Whether `r`'s home slot still holds what it held at the root: the
@@ -1580,7 +1596,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// state: a successor of the one being emitted.
     pub(crate) fn snap_at(&mut self, pc: u32) -> Snap {
         let live = self.cfg.live_in[pc as usize];
-        self.snapshot(pc, ExitKind::Before, live)
+        self.snapshot(pc, ExitKind::Before, live, self.cur)
     }
 
     /// Assume `class` keeps `bits` as they are now.
@@ -2159,6 +2175,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         // The collector's chance at each entry; `prune_gc_checks` keeps it
         // when code outside loops allocates.
         self.pc = entry_pc;
+        self.pc_block = prologue;
         let s = self.snap_before();
         self.ins_snap(Op::GcCheck, &[], s, ExitTag::Gc);
         self.jump(first);
@@ -2324,6 +2341,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
     /// What the builder keeps of one instruction starts over at `pc`.
     fn start_pc(&mut self, pc: u32) {
         self.pc = pc;
+        self.pc_block = self.cur;
         self.cur_snap = None;
         self.pc_refines.clear();
         self.pc_site = None;
