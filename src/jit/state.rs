@@ -199,8 +199,11 @@ struct EntryTable {
 
 impl JitRuntime {
     pub(crate) fn new() -> Self {
-        let config = JitConfig::from_env();
-        let start = config.hot_call().min(config.hot_loop());
+        Self::with_config(JitConfig::from_env())
+    }
+
+    fn with_config(config: JitConfig) -> Self {
+        let start = config.hot_loop();
         let exit_regs_buf: Box<[Cell<u64>; EXIT_REGS]> =
             Box::new(std::array::from_fn(|_| Cell::new(0)));
         let exit_regs = exit_regs_buf.as_ptr() as *mut u64;
@@ -400,4 +403,19 @@ pub(crate) fn jit_state<'gc>(
     // SAFETY: the barrier above covers the adopted pointer.
     unsafe { proto.jit.as_cell() }.set(Some(s));
     s
+}
+
+#[cfg(all(test, feature = "tcvm-dev"))]
+mod tests {
+    use super::*;
+
+    /// Loop counters start at `hot_loop`, whatever `hot_call` is.
+    #[test]
+    fn loop_counters_start_at_hot_loop() {
+        let mut config = JitConfig::from_env();
+        config.dev.hot_call = 1;
+        config.dev.hot_loop = 200;
+        let rt = JitRuntime::with_config(config);
+        assert!(rt.hot.iter().all(|c| c.get() == 200));
+    }
 }
