@@ -250,9 +250,15 @@ impl Lua {
     /// stay. A no-op in a build without the JIT.
     pub fn set_jit(&mut self, on: bool) {
         cfg_select! {
-            jit => self
-                .arena
-                .mutate_root(|_, root| root.jit.config.enabled = on),
+            jit => self.arena.mutate_root(|_, root| {
+                root.jit.config.enabled = on;
+                // `jit_hot` parks the mask while the JIT is off.
+                if on {
+                    root.jit
+                        .call_mask
+                        .set(root.jit.config.hot_call() as u64 - 1);
+                }
+            }),
             _ => {
                 let _ = on;
             }

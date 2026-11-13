@@ -66,3 +66,33 @@ fn nothing_is_counted_until_asked() {
     assert!(stats.contains("op FORLOOP_I 0\n"), "{stats}");
     assert!(stats.lines().all(|l| l.ends_with(" 0")), "{stats}");
 }
+
+#[test]
+fn functions_compile_after_the_jit_is_turned_back_on() {
+    let mut lua = Lua::new();
+    lua.set_jit_inline(false);
+    lua.set_stats(true);
+    lua.load_all();
+    let run = |lua: &mut Lua, src: &str| {
+        let ex = start_on(lua, src);
+        lua.finish(&ex)
+            .unwrap_or_else(|e| panic!("{src:?} failed: {e:?}"));
+    };
+    run(&mut lua, "function f(x) return x * 2 + 1 end");
+    // Enough calls with the JIT off for `f`'s count to trip.
+    lua.set_jit(false);
+    run(&mut lua, "for i = 1, 1000 do f(i) end");
+    lua.set_jit(true);
+    run(
+        &mut lua,
+        "local s = 0 for i = 1, 100000 do s = s + f(i) end",
+    );
+    let stats = lua.stats();
+    if cfg!(all(
+        feature = "jit",
+        feature = "nightly",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )) {
+        assert_eq!(count(&stats, "jit compiled FUNC"), 1, "{stats}");
+    }
+}
