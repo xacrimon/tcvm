@@ -4,6 +4,9 @@
 //! checked by the vendored checker and for operands sharing a register
 //! within an instruction, which that checker does not see.
 
+use rand::{RngExt, SeedableRng};
+use rand_pcg::Pcg64;
+
 use super::{Ctx, Env, Output};
 use crate::jit::backend::reg::{
     Block as RBlock, Inst, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
@@ -31,25 +34,6 @@ impl TargetInst for T {
 
     fn is_remat(&self) -> bool {
         false
-    }
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-
-    fn chance(&mut self, percent: u64) -> bool {
-        self.below(100) < percent
     }
 }
 
@@ -100,7 +84,7 @@ struct B {
 }
 
 struct Gen {
-    rng: Rng,
+    rng: Pcg64,
     v: VCode<T>,
     blocks: Vec<B>,
     /// Blocks made inside a cold arm, which the order puts last.
@@ -116,7 +100,7 @@ impl Gen {
     }
 
     fn class(&mut self) -> RegClass {
-        if self.rng.chance(30) {
+        if self.rng.random_ratio(30, 100) {
             RegClass::Float
         } else {
             RegClass::Int
@@ -124,7 +108,7 @@ impl Gen {
     }
 
     fn pick(&mut self, avail: &[VReg]) -> Option<VReg> {
-        (!avail.is_empty()).then(|| avail[self.rng.below(avail.len() as u64) as usize])
+        (!avail.is_empty()).then(|| avail[self.rng.random_range(0..avail.len())])
     }
 
     /// A value of class `c`, made in `b` when none is available.
@@ -161,7 +145,7 @@ impl Gen {
     }
 
     fn snapshot(&mut self, ops: &mut Vec<Operand>, avail: &[VReg]) {
-        for _ in 0..self.rng.below(6) {
+        for _ in 0..self.rng.random_range(0..6) {
             if let Some(v) = self.pick(avail) {
                 ops.push(Operand::new(
                     v,
@@ -175,15 +159,15 @@ impl Gen {
 
     fn op(&mut self, b: u32, avail: &mut Vec<VReg>) {
         // A constant, which the allocator may compute again.
-        if self.rng.chance(15) {
+        if self.rng.random_ratio(15, 100) {
             let c = self.class();
             let d = self.v.new_vreg(c);
             self.v.remat[d.vreg()] = if c != RegClass::Int {
-                Remat::Float(self.rng.next())
-            } else if self.rng.chance(25) {
-                Remat::Slot(self.rng.below(16) as u8)
+                Remat::Float(self.rng.random())
+            } else if self.rng.random_ratio(25, 100) {
+                Remat::Slot(self.rng.random_range(0..16))
             } else {
-                Remat::Int(self.rng.next())
+                Remat::Int(self.rng.random())
             };
             self.blocks[b as usize].insts.push((
                 T::Op,
@@ -195,7 +179,7 @@ impl Gen {
         }
         // A value computed from another, which the allocator may compute
         // again from it.
-        if self.rng.chance(10) {
+        if self.rng.random_ratio(10, 100) {
             let ints: Vec<VReg> = avail
                 .iter()
                 .copied()
@@ -205,7 +189,7 @@ impl Gen {
                 let d = self.v.new_vreg(RegClass::Int);
                 self.v.remat[d.vreg()] = Remat::AndImm {
                     src: src.vreg() as u32,
-                    imm: self.rng.next(),
+                    imm: self.rng.random(),
                 };
                 self.blocks[b as usize].insts.push((
                     T::Op,
@@ -219,7 +203,7 @@ impl Gen {
         let mut ops = Vec::new();
         let mut clob = PRegSet::empty();
         let mut defs = Vec::new();
-        match self.rng.below(10) {
+        match self.rng.random_range(0..10) {
             0..=5 => {
                 // Registers the instruction needs at its early and late
                 // points, per class, kept within what the classes have.
@@ -233,27 +217,29 @@ impl Gen {
                     n[1] += late as u32;
                     true
                 };
-                for _ in 0..self.rng.below(4) {
+                for _ in 0..self.rng.random_range(0..4) {
                     let Some(v) = self.pick(avail) else { break };
-                    let pos = if self.rng.chance(70) {
+                    let pos = if self.rng.random_ratio(70, 100) {
                         OperandPos::Early
                     } else {
                         OperandPos::Late
                     };
                     let late = pos == OperandPos::Late;
-                    let c = if self.rng.chance(75) && fits(&mut need, v.class(), true, late) {
+                    let c = if self.rng.random_ratio(75, 100)
+                        && fits(&mut need, v.class(), true, late)
+                    {
                         OperandConstraint::Reg
                     } else {
                         OperandConstraint::Any
                     };
                     ops.push(Operand::new(v, c, OperandKind::Use, pos));
                 }
-                if self.rng.chance(30) {
+                if self.rng.random_ratio(30, 100) {
                     self.snapshot(&mut ops, avail);
                 }
-                for _ in 0..self.rng.below(3) {
+                for _ in 0..self.rng.random_range(0..3) {
                     let c = self.class();
-                    let pos = if self.rng.chance(80) {
+                    let pos = if self.rng.random_ratio(80, 100) {
                         OperandPos::Late
                     } else {
                         OperandPos::Early
@@ -270,7 +256,7 @@ impl Gen {
                     ));
                     defs.push(d);
                 }
-                if self.rng.chance(15) {
+                if self.rng.random_ratio(15, 100) {
                     let c = self.class();
                     if fits(&mut need, c, true, true) {
                         ops.push(Operand::reg_temp(self.v.new_vreg(c)));
@@ -289,7 +275,7 @@ impl Gen {
                 });
                 if let (Some(d), Some(t)) = (tied, input)
                     && need.iter().all(|n| n[0] + n[1] <= 4)
-                    && self.rng.chance(40)
+                    && self.rng.random_ratio(40, 100)
                 {
                     ops[d] = Operand::reg_reuse_def(ops[d].vreg(), t);
                 }
@@ -297,7 +283,7 @@ impl Gen {
             6..=7 => {
                 // A helper: arguments in x0.. and d0.., the result in x0 or d0.
                 let (mut xn, mut dn) = (0, 0);
-                for _ in 0..self.rng.below(4) {
+                for _ in 0..self.rng.random_range(0..4) {
                     let Some(v) = self.pick(avail) else { break };
                     let r = if v.class() == RegClass::Int {
                         xn += 1;
@@ -309,7 +295,7 @@ impl Gen {
                     ops.push(Operand::reg_fixed_use(v, r));
                 }
                 clob = caller_saved();
-                if self.rng.chance(60) {
+                if self.rng.random_ratio(60, 100) {
                     let c = self.class();
                     let d = self.v.new_vreg(c);
                     let r = if c == RegClass::Int { int(0) } else { float(0) };
@@ -317,14 +303,14 @@ impl Gen {
                     clob.remove(r);
                     defs.push(d);
                 }
-                if self.rng.chance(30) {
+                if self.rng.random_ratio(30, 100) {
                     self.snapshot(&mut ops, avail);
                 }
             }
             _ => {
                 // An exit's snapshot.
                 if let Some(v) = self.pick(avail)
-                    && self.rng.chance(50)
+                    && self.rng.random_ratio(50, 100)
                 {
                     ops.push(Operand::reg_use(v));
                 }
@@ -337,13 +323,13 @@ impl Gen {
 
     fn region(&mut self, cur: u32, depth: u32, avail: &mut Vec<VReg>) -> u32 {
         let mut cur = cur;
-        for _ in 0..1 + self.rng.below(4) {
-            match self.rng.below(10) {
+        for _ in 0..self.rng.random_range(1..=4) {
+            match self.rng.random_range(0..10) {
                 4..=5 if depth < 3 => cur = self.diamond(cur, depth, avail),
                 6..=7 if depth < 3 => cur = self.looop(cur, depth, avail),
                 8 => cur = self.call(cur, avail),
                 _ => {
-                    for _ in 0..1 + self.rng.below(4) {
+                    for _ in 0..self.rng.random_range(1..=4) {
                         self.op(cur, avail);
                     }
                 }
@@ -353,7 +339,7 @@ impl Gen {
     }
 
     fn params(&mut self, b: u32) {
-        for _ in 0..self.rng.below(4) {
+        for _ in 0..self.rng.random_range(0..4) {
             let c = self.class();
             let p = self.v.new_vreg(c);
             self.blocks[b as usize].params.push(p);
@@ -389,7 +375,7 @@ impl Gen {
         direct: bool,
         avail: &mut Vec<VReg>,
     ) -> Option<Vec<VReg>> {
-        if direct && self.rng.chance(30) {
+        if direct && self.rng.random_ratio(30, 100) {
             return Some(self.args_for(cur, j, avail));
         }
         let a = self.block();
@@ -408,7 +394,7 @@ impl Gen {
         let mut ae = avail.clone();
         let direct_t = self.arm(cur, j, depth, true, &mut at).map(|a| (0, a));
         let was = self.in_cold;
-        self.in_cold |= self.rng.chance(25);
+        self.in_cold |= self.rng.random_ratio(25, 100);
         // Both edges to the join would be no branch.
         let direct_e = (self.arm(cur, j, depth, direct_t.is_none(), &mut ae)).map(|a| (1, a));
         self.in_cold = was;
@@ -430,7 +416,10 @@ impl Gen {
         avail.extend(self.blocks[h as usize].params.clone());
         let latch = self.region(h, depth + 1, avail);
         // The back edge straight from the branch (critical) or via a block.
-        let direct = self.rng.chance(30).then(|| self.args_for(latch, h, avail));
+        let direct = self
+            .rng
+            .random_ratio(30, 100)
+            .then(|| self.args_for(latch, h, avail));
         self.br(latch, avail);
         match direct {
             Some(args) => self.edge(latch, h, args),
@@ -452,12 +441,12 @@ impl Gen {
             .copied()
             .filter(|v| v.class() == RegClass::Int)
             .collect();
-        for &r in &INTS[..self.rng.below(3) as usize] {
+        for &r in &INTS[..self.rng.random_range(0..3)] {
             if let Some(v) = self.pick(&ints) {
                 ops.push(Operand::reg_fixed_use(v, int(r)));
             }
         }
-        for _ in 0..self.rng.below(5) {
+        for _ in 0..self.rng.random_range(0..5) {
             if let Some(v) = self.pick(avail) {
                 ops.push(Operand::new(
                     v,
@@ -475,7 +464,7 @@ impl Gen {
         self.edge(cur, r, Vec::new());
         let mut clob = all_regs();
         let mut ops = Vec::new();
-        for &r in &INTS[..self.rng.below(3) as usize] {
+        for &r in &INTS[..self.rng.random_range(0..3)] {
             let d = self.v.new_vreg(RegClass::Int);
             ops.push(Operand::reg_fixed_def(d, int(r)));
             clob.remove(int(r));
@@ -515,7 +504,7 @@ impl Gen {
 /// A function, and its blocks in allocation order with how many are hot.
 fn generate(seed: u64) -> (VCode<T>, Vec<u32>, usize) {
     let mut g = Gen {
-        rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+        rng: Pcg64::seed_from_u64(seed),
         v: VCode::new(),
         blocks: Vec::new(),
         cold: Vec::new(),
@@ -525,7 +514,7 @@ fn generate(seed: u64) -> (VCode<T>, Vec<u32>, usize) {
     let mut avail = Vec::new();
     // The entry's parameters, fixed in x0.. as `MInst::Params`.
     let mut ops = Vec::new();
-    for &r in &INTS[..1 + g.rng.below(3) as usize] {
+    for &r in &INTS[..g.rng.random_range(1..=3)] {
         let p = g.v.new_vreg(RegClass::Int);
         ops.push(Operand::reg_fixed_def(p, int(r)));
         avail.push(p);
@@ -533,7 +522,7 @@ fn generate(seed: u64) -> (VCode<T>, Vec<u32>, usize) {
     g.blocks[0].insts.push((T::Op, ops, PRegSet::empty()));
     let end = g.region(entry, 0, &mut avail);
     let mut ops = Vec::new();
-    for _ in 0..g.rng.below(3) {
+    for _ in 0..g.rng.random_range(0..3) {
         if let Some(v) = g.pick(&avail) {
             ops.push(Operand::reg_use(v));
         }
@@ -544,7 +533,7 @@ fn generate(seed: u64) -> (VCode<T>, Vec<u32>, usize) {
     // Odd blocks cold too: loop headers and blocks dominating hot ones
     // laid out after them.
     for b in 1..g.blocks.len() {
-        if g.rng.chance(10) {
+        if g.rng.random_ratio(10, 100) {
             g.cold[b] = true;
         }
     }
@@ -809,7 +798,7 @@ type Insts = Vec<(Vec<Operand>, PRegSet)>;
 /// One block of `insts` and a return of `ret`, allocated and checked.
 fn straight(v: VCode<T>, insts: Insts, ret: &[VReg]) -> (VCode<T>, Output) {
     let mut g = Gen {
-        rng: Rng(1),
+        rng: Pcg64::seed_from_u64(1),
         v,
         blocks: Vec::new(),
         cold: Vec::new(),
