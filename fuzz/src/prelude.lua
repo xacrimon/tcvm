@@ -104,36 +104,7 @@ local function reset()
   MTI = { __index = { x = 11, y = "yy", [1] = "one", z = 2.5 } }
   CL = setmetatable({}, { __close = function(o, e) probe(e == nil and "closed" or "closed-err") end })
   NAMES[CL] = "CL"
-  V = {}
-  V.si = { 0, 1, -1, 2, 3, 7, -7, 100, 5, 16 }
-  V.bi = { 2147483647, 2147483648, -2147483648, -2147483649, 1 << 40, math.maxinteger, math.mininteger, 4294967296, -(1 << 53), 1 << 62 }
-  V.fl = { 0.5, -2.5, 3.75, 1.0, -1.0, 2.0, 100.25, 1e15, 0.1, 7.0 }
-  V.fs = { 0.0, -0.0, 2.0 ^ 53, 2.0 ^ 63, -(2.0 ^ 63), 1 / 0, -1 / 0, 0 / 0, 1e308, 2.0 ^ 31 }
-  -- `fs` without the floats that `tostring` writes with more than 14 digits.
-  V.fc = { 0.0, -0.0, 1 / 0, -1 / 0, 0 / 0, 1e308, 2.0 ^ 31, 4294967296.0 }
-  V.ns = { "10", "0x10", " 3 ", "1e2", "-7", "2.5", "9223372036854775808", "0x7fffffffffffffff" }
-  V.st = { "", "a", "abc", "hello world", "x\0y", "10a", "B" }
-  V.ot = { true, false }
-  V.tb = {
-    mk("plain", {}), mk("arr", { 10, 20, 30, n = 3 }), mk("rec", { x = 1, y = "two", z = 3.5 }),
-    mk("mt", { 1, 2, x = 5 }, MT), mk("mti", {}, MTI), mk("hole", { 1, nil, 3 }), mk("mix", { 5, 6, x = 7, [2.5] = "f", [-1] = "neg" }),
-  }
-  V.fn = { mk("f1", function(...) return select("#", ...) end), mk("f2", function(a) return a end), math.abs }
-  NAMES[math.abs] = "abs"
-  V.co = { coroutine.create(function() end) }
-  V.nil1 = { nil }
-  V.sp = { 1, 2, 3, 5, 7 }
-  V.sn = { -1, -2, -3 }
-  V.mx = { 1, 2.5, "10", true, 3, "abc", 7.0, false }
-  V.ms = { 1, "2", 3, "4.5", 5, "0x10" }
-  V.fp = { 0.5, 1.5, 2.25, 3.0 }
-  V.mn = { 1, 2.5, -3, 4.0, 7, -0.5 }
-  V.ib = { 1, 2147483647, -2147483648, 3, 1 << 40 }
-  V.tt = { V.tb[2], V.tb[3], V.tb[7] }
-  V.tm = { V.tb[4], V.tb[5] }
-  -- Tables without holes, for code that takes lengths.
-  V.sq = { mk("sq0", {}), mk("sq3", { 4, 5, 6 }), mk("sqs", { "p", "q" }), mk("sq1", { 9 }) }
-  for k, l in pairs(V) do l.n = (k == "nil1") and 1 or #l end
+  --@POOL
 end
 -- Leaves values other than nil in the stack slots the next call's frame takes, for code that
 -- reads a slot it never wrote.

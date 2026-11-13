@@ -25,24 +25,15 @@ impl std::fmt::Display for Status {
     }
 }
 
-/// The process groups of the runs in flight, so a stop can kill them.
-static RUNNING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-/// Set once a stop killed the runs in flight: no run starts after it, and what the killed ones
-/// returned means nothing.
-static ABORTED: AtomicBool = AtomicBool::new(false);
+/// Every run: cancelled when the fuzzer is stopped, and what the killed runs returned then means
+/// nothing.
+pub static ALL: Cancel = Cancel {
+    stopped: AtomicBool::new(false),
+    groups: Mutex::new(Vec::new()),
+};
 
-/// Kill every run in flight and start no other.
-pub fn abort() {
-    ABORTED.store(true, Ordering::Relaxed);
-    for &pg in RUNNING.lock().expect("the runs").iter() {
-        // SAFETY: killpg only sends a signal.
-        unsafe { libc::killpg(pg, libc::SIGKILL) };
-    }
-}
-
-pub fn aborted() -> bool {
-    ABORTED.load(Ordering::Relaxed)
-}
+/// Variables added to a run's environment.
+pub type Env = [(&'static str, String)];
 
 pub struct Run {
     pub status: Status,
@@ -58,7 +49,7 @@ impl Run {
 
 /// Run `argv` in `dir` with `env` added and every inherited `TCVM_*` removed; its process group
 /// is killed past `secs`.
-pub fn run(argv: &[&str], dir: &Path, env: &[(String, String)], secs: u32) -> Run {
+pub fn run(argv: &[&str], dir: &Path, env: &Env, secs: u32) -> Run {
     run_for(argv, dir, env, Duration::from_secs(secs as u64), None)
 }
 
@@ -66,6 +57,7 @@ pub fn run(argv: &[&str], dir: &Path, env: &[(String, String)], secs: u32) -> Ru
 #[derive(Default)]
 pub struct Cancel {
     stopped: AtomicBool,
+    /// The process groups of the runs in flight.
     groups: Mutex<Vec<i32>>,
 }
 
@@ -87,10 +79,12 @@ impl Cancel {
 pub fn run_for(
     argv: &[&str],
     dir: &Path,
-    env: &[(String, String)],
+    env: &Env,
     limit: Duration,
     cancel: Option<&Cancel>,
 ) -> Run {
+    let cancels = [Some(&ALL), cancel];
+    let cancelled = || cancels.iter().flatten().any(|c| c.cancelled());
     let mut cmd = Command::new(argv[0]);
     // Own process group: a terminal Ctrl-C reaches only the fuzzer, so the runs in flight
     // finish instead of being recorded as SIGINT crashes.
@@ -109,7 +103,7 @@ pub fn run_for(
         stdout: String::new(),
         stderr: e,
     };
-    if aborted() || cancel.is_some_and(Cancel::cancelled) {
+    if cancelled() {
         return failed("aborted".into());
     }
     let child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
@@ -118,11 +112,11 @@ pub fn run_for(
     };
     // The child leads its own process group: its pid is the group's.
     let pg = child.id() as i32;
-    RUNNING.lock().expect("the runs").push(pg);
-    if let Some(c) = cancel {
+    for c in cancels.iter().flatten() {
         c.groups.lock().expect("the runs").push(pg);
     }
-    if aborted() || cancel.is_some_and(Cancel::cancelled) {
+    // Cancelled between the check and the registration: no `cancel` saw the group.
+    if cancelled() {
         // SAFETY: killpg only sends a signal.
         unsafe { libc::killpg(pg, libc::SIGKILL) };
     }
@@ -150,8 +144,7 @@ pub fn run_for(
     *watch.0.lock().expect("the watchdog") = true;
     watch.1.notify_one();
     dog.join().expect("the watchdog");
-    RUNNING.lock().expect("the runs").retain(|&p| p != pg);
-    if let Some(c) = cancel {
+    for c in cancels.iter().flatten() {
         c.groups.lock().expect("the runs").retain(|&p| p != pg);
     }
     let out = match out {

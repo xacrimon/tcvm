@@ -4,13 +4,6 @@
 
 use crate::generate::Gen;
 
-/// The templates of this file that are strict: no float or table reaches a string, no length of
-/// a table with holes, no `pairs` order.
-pub(super) const STRICT: &[&str] = &["chain", "recur", "hoist"];
-
-/// The templates whose call is slow: the driver calls them fewer times.
-pub(super) const HEAVY: &[&str] = &["chain", "recur"];
-
 /// What the end of a chain computes from the value that left its front.
 const INJECT: &[&str] = &[
     "X + 0.5", "X * 2", "X // 1", "-X", "X + b", "X / 2", "X - 1", "X % 7",

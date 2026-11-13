@@ -21,14 +21,19 @@
 
 mod driver;
 mod expr;
+mod pool;
 mod scenario;
 mod stmt;
 mod templates;
 
-use crate::ast::{Block, Expr, Printer, Stmt};
+use std::sync::LazyLock;
+
+use crate::ast::{self, Block, Expr, Func, Item, Printer, Stmt};
 use crate::rng::Rng;
 
-pub const PRELUDE: &str = include_str!("../prelude.lua");
+/// The head of every program: the output functions, and `reset` with the pool.
+static PRELUDE: LazyLock<String> =
+    LazyLock::new(|| include_str!("../prelude.lua").replace("--@POOL\n", &pool::lua()));
 
 /// What the generator knows of an expression's value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,8 +90,11 @@ struct Var {
 
 pub struct Unit {
     pub tag: String,
+    /// What the unit is, for its header line: a template's name, or a description.
     pub kind: String,
     pub strict: bool,
+    /// Many times the usual size.
+    pub big: bool,
     pub code: Block,
 }
 
@@ -96,7 +104,7 @@ pub struct Program {
 
 impl Program {
     pub fn text(&self) -> String {
-        let mut out = String::from(PRELUDE);
+        let mut out = PRELUDE.clone();
         for u in &self.units {
             let strict = if u.strict { " strict" } else { "" };
             out.push_str(&format!("do -- {} {}{strict}\n  reset()\n", u.tag, u.kind));
@@ -110,40 +118,83 @@ impl Program {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    Local,
+    Assign,
+    Store,
+    Call,
+    Probe,
+    If,
+    For,
+    ForDyn,
+    While,
+    Repeat,
+    Ipairs,
+    Pairs,
+    Iter,
+    Closure,
+    Method,
+    Pcall,
+    Error,
+    Close,
+    Coroutine,
+    Global,
+    Multi,
+    Return,
+    Vararg,
+    Goto,
+    Break,
+    Junk,
+    Pattern,
+    Xpcall,
+    Ctor,
+    Tablib,
+}
+
 /// The statement forms and how often a unit takes each; a unit drops some of them altogether
 /// (swarm testing: a form that is always there hides what its absence would show).
-const FORMS: &[(&str, u32)] = &[
-    ("local", 10),
-    ("assign", 10),
-    ("store", 6),
-    ("call", 4),
-    ("probe", 4),
-    ("if", 7),
-    ("for", 6),
-    ("fordyn", 3),
-    ("while", 3),
-    ("repeat", 2),
-    ("ipairs", 3),
-    ("pairs", 2),
-    ("iter", 1),
-    ("closure", 4),
-    ("method", 2),
-    ("pcall", 3),
-    ("error", 2),
-    ("close", 1),
-    ("coroutine", 2),
-    ("global", 3),
-    ("multi", 2),
-    ("return", 2),
-    ("vararg", 2),
-    ("goto", 2),
-    ("break", 2),
-    ("junk", 2),
-    ("pattern", 3),
-    ("xpcall", 2),
-    ("ctor", 2),
-    ("tablib", 2),
+const FORMS: &[(Form, u32)] = &[
+    (Form::Local, 10),
+    (Form::Assign, 10),
+    (Form::Store, 6),
+    (Form::Call, 4),
+    (Form::Probe, 4),
+    (Form::If, 7),
+    (Form::For, 6),
+    (Form::ForDyn, 3),
+    (Form::While, 3),
+    (Form::Repeat, 2),
+    (Form::Ipairs, 3),
+    (Form::Pairs, 2),
+    (Form::Iter, 1),
+    (Form::Closure, 4),
+    (Form::Method, 2),
+    (Form::Pcall, 3),
+    (Form::Error, 2),
+    (Form::Close, 1),
+    (Form::Coroutine, 2),
+    (Form::Global, 3),
+    (Form::Multi, 2),
+    (Form::Return, 2),
+    (Form::Vararg, 2),
+    (Form::Goto, 2),
+    (Form::Break, 2),
+    (Form::Junk, 2),
+    (Form::Pattern, 3),
+    (Form::Xpcall, 2),
+    (Form::Ctor, 2),
+    (Form::Tablib, 2),
 ];
+
+/// Builds Lua text: a template's body of `f`, a scenario's part.
+type Build = fn(&mut Gen) -> String;
+
+/// Whether `gen`'s KIND names a kind of unit.
+pub fn is_kind(name: &str) -> bool {
+    matches!(name, "free" | "limits" | "scenario")
+        || templates::TEMPLATES.iter().any(|t| t.name == name)
+}
 
 pub struct Gen {
     pub r: Rng,
@@ -176,10 +227,15 @@ pub struct Gen {
 
 impl Gen {
     pub fn new(seed: u64) -> Gen {
+        Gen::with(Rng::new(seed))
+    }
+
+    /// At the start of a unit.
+    fn with(r: Rng) -> Gen {
         Gen {
-            r: Rng::new(seed),
+            r,
             strict: false,
-            scopes: Vec::new(),
+            scopes: vec![Vec::new()],
             pre: Vec::new(),
             names: 0,
             budget: 0,
@@ -207,15 +263,16 @@ impl Gen {
         format!("{prefix}{}", self.names)
     }
 
-    fn declare(&mut self, name: &str, kind: Kind, fixed: bool) {
-        let v = Var {
+    fn declare(&mut self, name: &str, kind: Kind, fixed: bool) -> &mut Var {
+        let scope = self.scopes.last_mut().expect("a scope");
+        scope.push(Var {
             name: name.to_string(),
             kind,
             fixed,
             helper: None,
             outlives: false,
-        };
-        self.scopes.last_mut().expect("a scope").push(v);
+        });
+        scope.last_mut().expect("the variable")
     }
 
     /// A visible variable `ok` accepts: (name, kind).
@@ -253,34 +310,21 @@ impl Gen {
         self.scopes.iter().flatten().any(|v| v.name == name)
     }
 
-    fn weight(&self, form: &str) -> u32 {
-        let i = FORMS.iter().position(|(n, _)| *n == form).expect("a form");
-        self.weights[i]
-    }
-
     fn unit(&mut self, idx: usize, only: Option<&str>) -> Unit {
         let tag = format!("U{idx}");
+        *self = Gen::with(self.r.clone());
         self.risk = *self.r.pick(&[0.0, 0.0, 0.0, 0.02, 0.02, 0.08, 0.25]);
         self.strict = self.r.chance(0.6);
         self.weights = (FORMS.iter())
-            .map(|&(name, w)| {
-                let core = matches!(name, "local" | "assign" | "if");
-                if !core && self.r.chance(0.25) || name == "error" && self.risk == 0.0 {
+            .map(|&(form, w)| {
+                let core = matches!(form, Form::Local | Form::Assign | Form::If);
+                if !core && self.r.chance(0.25) || form == Form::Error && self.risk == 0.0 {
                     0
                 } else {
                     w * self.r.range(1, 3) as u32
                 }
             })
             .collect();
-        self.scopes = vec![Vec::new()];
-        self.pre.clear();
-        self.names = 0;
-        self.loops = 0;
-        self.heavy = false;
-        self.big = false;
-        self.conts.clear();
-        self.yields = false;
-        self.vararg = false;
         self.budget = self.r.range(4, 28) as i32;
         // A few hundred lines of parts that are programs of their own, wired together.
         if only == Some("scenario") || only.is_none() && self.r.chance(0.08) {
@@ -289,6 +333,7 @@ impl Gen {
                 tag,
                 kind,
                 strict: self.strict,
+                big: false,
                 code,
             };
         }
@@ -309,25 +354,27 @@ impl Gen {
                     tag,
                     kind: "limits".into(),
                     strict: false,
+                    big: false,
                     code,
                 };
             }
-            let (kind, mut body, wf) = self.template(only);
+            let (t, mut body, wf) = self.template(only);
             if self.r.chance(0.25) {
                 body = format!("{}\n{body}", self.junk());
             }
-            self.strict = templates::is_strict(kind);
-            let wf = wf.map(|w| w.map(|f| self.fam(f)));
+            self.strict = t.strict;
+            let wf = wf.map(|f| self.fam(f));
             let mut code = std::mem::take(&mut self.pre);
             code.push(Stmt::Raw(format!(
                 "local function f(a, b, c)\n  {}\nend",
                 body.replace('\n', "\n  ")
             )));
-            code.extend(self.driver(&tag, templates::is_heavy(kind), wf, &body));
+            code.extend(self.driver(&tag, t.heavy, Some(wf), &body));
             return Unit {
                 tag,
-                kind: kind.into(),
+                kind: t.name.into(),
                 strict: self.strict,
+                big: false,
                 code,
             };
         }
@@ -354,24 +401,20 @@ impl Gen {
                     Kind::Float,
                     Expr::Float(*self.r.pick(&[0.0, 0.5, 1.0, 2.5, -1.5])),
                 ),
-                2 => (
-                    Kind::Str,
-                    crate::ast::str(self.r.pick(&["", "a", "up", "10"])),
-                ),
+                2 => (Kind::Str, ast::str(self.r.pick(&["", "a", "up", "10"]))),
                 3 => (Kind::Rec, Expr::Table(vec![])),
                 _ => (
                     Kind::SeqInt,
                     Expr::Table(
                         (0..self.r.range(0, 3))
-                            .map(|i| crate::ast::Item::Pos(Expr::Int(i)))
+                            .map(|i| Item::Pos(Expr::Int(i)))
                             .collect(),
                     ),
                 ),
             };
             let n = self.fresh_name("u");
-            self.declare(&n, k, false);
-            self.scopes[0].last_mut().expect("the variable").outlives = true;
-            self.pre.push(crate::ast::local(&n, e));
+            self.declare(&n, k, false).outlives = true;
+            self.pre.push(ast::local(&n, e));
         }
         // Lua 5.5 global declarations: a declared global with its definition check, and under
         // `global *` every other name as before.
@@ -387,8 +430,7 @@ impl Gen {
                 self.pre.push(Stmt::Raw(format!(
                     "global function {h}(x)\n  return x, {g}\nend"
                 )));
-                self.declare(&h, Kind::Func, true);
-                self.scopes[0].last_mut().expect("the function").helper = Some(1);
+                self.declare(&h, Kind::Func, true).helper = Some(1);
             }
         }
         self.scopes.push(Vec::new());
@@ -403,11 +445,8 @@ impl Gen {
             self.heavy = true;
             self.big = true;
             self.risk = 0.0;
-            let e = FORMS
-                .iter()
-                .position(|(n, _)| *n == "error")
-                .expect("a form");
-            self.weights[e] = 0;
+            let e = FORMS.iter().position(|f| f.0 == Form::Error);
+            self.weights[e.expect("a form")] = 0;
             (self.r.range(15, 40) as usize, 4)
         } else {
             (self.r.range(2, 9) as usize, 3)
@@ -418,7 +457,7 @@ impl Gen {
         let mut code = std::mem::take(&mut self.pre);
         code.push(Stmt::LocalFunc(
             "f".into(),
-            crate::ast::Func {
+            Func {
                 params: vec!["a".into(), "b".into(), "c".into()],
                 vararg: None,
                 body,
@@ -434,6 +473,7 @@ impl Gen {
                 self.roles
             ),
             strict: self.strict,
+            big,
             code,
         }
     }

@@ -1,6 +1,6 @@
 //! Expressions by the kind of value they produce.
 
-use super::{Gen, Kind, Role};
+use super::{Gen, Kind, Role, pool};
 use crate::ast::{Expr, Item, bin, call, name, raw, str, un};
 
 const INTS: &[i64] = &[
@@ -150,9 +150,9 @@ impl Gen {
             Role::Str => self.var_of(Kind::Str).unwrap_or_else(|| self.str_lit()),
             Role::Tab => match self.var(|v| matches!(v.kind, Kind::Rec)) {
                 Some((n, _)) => name(&n),
-                None => raw(format!("V.tb[{}]", self.r.range(1, 7))),
+                None => raw(format!("V.tb[{}]", self.r.range(1, pool::size("tb")))),
             },
-            Role::Func | Role::Mixed => raw(format!("V.fn[{}]", self.r.range(1, 3))),
+            Role::Func | Role::Mixed => raw(format!("V.fn[{}]", self.r.range(1, pool::size("fn")))),
         }
     }
 
@@ -448,7 +448,7 @@ impl Gen {
                 Some(v) if self.r.chance(0.5) => v,
                 _ => match self.helper() {
                     Some((h, _)) => name(&h),
-                    None => raw(format!("V.fn[{}]", self.r.range(1, 3))),
+                    None => raw(format!("V.fn[{}]", self.r.range(1, pool::size("fn")))),
                 },
             },
         }
@@ -566,7 +566,7 @@ impl Gen {
                 call(&f, self.args(n, d))
             }
             3 => {
-                let f = format!("V.fn[{}]", self.r.range(1, 3));
+                let f = format!("V.fn[{}]", self.r.range(1, pool::size("fn")));
                 let n = self.r.below(3);
                 call(&f, self.args(n, d))
             }
@@ -599,55 +599,53 @@ impl Gen {
     }
 
     fn call_any_builtin(&mut self, d: u32) -> Expr {
-        {
-            // N a number, S a string, T a table, A anything.
-            let (f, sig) = *self.r.pick(&[
-                ("math.max", "NNn"),
-                ("math.min", "NNn"),
-                ("math.abs", "N"),
-                ("math.floor", "N"),
-                ("math.ceil", "N"),
-                ("math.fmod", "NN"),
-                ("math.tointeger", "A"),
-                ("math.ult", "NN"),
-                ("math.type", "A"),
-                ("math.sqrt", "N"),
-                ("tonumber", "A"),
-                ("tonumber", "SB"),
-                ("rawget", "TA"),
-                ("rawequal", "AA"),
-                ("type", "A"),
-                ("string.byte", "Snn"),
-                ("string.sub", "SNn"),
-                ("string.len", "S"),
-                ("getmetatable", "A"),
-                ("select", "IAaa"),
-                ("ipairs", "T"),
-                ("assert", "Aaa"),
-            ]);
-            let mut args = Vec::new();
-            for c in sig.chars() {
-                // A lowercase parameter is optional.
-                if c.is_ascii_lowercase() && self.r.chance(0.5) {
-                    break;
-                }
-                // Now and then a value of no particular type in its place.
-                let c = if !matches!(c, 'I' | 'B') && self.risky() {
-                    'A'
-                } else {
-                    c.to_ascii_uppercase()
-                };
-                args.push(match c {
-                    'N' => self.num(d),
-                    'S' => self.text(d),
-                    'T' => self.container(d).0,
-                    'I' => Expr::Int(*self.r.pick(&[1, 2, -1, 3, -2])),
-                    'B' => Expr::Int(*self.r.pick(&[2, 10, 16, 36])),
-                    _ => self.any(d),
-                });
+        // N a number, S a string, T a table, A anything.
+        let (f, sig) = *self.r.pick(&[
+            ("math.max", "NNn"),
+            ("math.min", "NNn"),
+            ("math.abs", "N"),
+            ("math.floor", "N"),
+            ("math.ceil", "N"),
+            ("math.fmod", "NN"),
+            ("math.tointeger", "A"),
+            ("math.ult", "NN"),
+            ("math.type", "A"),
+            ("math.sqrt", "N"),
+            ("tonumber", "A"),
+            ("tonumber", "SB"),
+            ("rawget", "TA"),
+            ("rawequal", "AA"),
+            ("type", "A"),
+            ("string.byte", "Snn"),
+            ("string.sub", "SNn"),
+            ("string.len", "S"),
+            ("getmetatable", "A"),
+            ("select", "IAaa"),
+            ("ipairs", "T"),
+            ("assert", "Aaa"),
+        ]);
+        let mut args = Vec::new();
+        for c in sig.chars() {
+            // A lowercase parameter is optional.
+            if c.is_ascii_lowercase() && self.r.chance(0.5) {
+                break;
             }
-            call(f, args)
+            // Now and then a value of no particular type in its place.
+            let c = if !matches!(c, 'I' | 'B') && self.risky() {
+                'A'
+            } else {
+                c.to_ascii_uppercase()
+            };
+            args.push(match c {
+                'N' => self.num(d),
+                'S' => self.text(d),
+                'T' => self.container(d).0,
+                'I' => Expr::Int(*self.r.pick(&[1, 2, -1, 3, -2])),
+                'B' => Expr::Int(*self.r.pick(&[2, 10, 16, 36])),
+                _ => self.any(d),
+            });
         }
+        call(f, args)
     }
 
     /// An expression of any kind, as a value: an operand goes through `num` or `text`.

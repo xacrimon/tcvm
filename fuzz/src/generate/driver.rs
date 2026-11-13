@@ -2,28 +2,28 @@
 //! speculating on them), then with values of other families, then with the first again. A
 //! warm-up's results are counted per distinct result, the calls after it are written out.
 
-use super::{Gen, Role};
+use super::{Gen, Role, pool};
 use crate::ast::{Block, Stmt};
 
-const FAMS: &[&str] = &[
+pub(super) const FAMS: &[&str] = &[
     "si", "bi", "fl", "fs", "ns", "st", "ot", "tb", "fn", "nil1", "sp", "sn", "fp", "mn", "ib",
     "tt", "tm", "mx", "ms",
 ];
-const NUMF: &[&str] = &["si", "sp", "fl", "fp", "mn", "ib", "bi"];
-/// The pool's families and their sizes, by how often a single call takes a value of each.
-const POOL: &[(&str, i64, u32)] = &[
-    ("si", 10, 3),
-    ("bi", 10, 2),
-    ("fl", 10, 2),
-    ("fs", 10, 2),
-    ("ns", 8, 1),
-    ("st", 7, 1),
-    ("ot", 2, 1),
-    ("tb", 7, 1),
-    ("fn", 3, 1),
-    ("co", 1, 1),
-    ("mx", 8, 1),
-    ("ms", 6, 1),
+pub(super) const NUMF: &[&str] = &["si", "sp", "fl", "fp", "mn", "ib", "bi"];
+/// The families a single call takes a value of, by how often.
+const POOL: &[(&str, u32)] = &[
+    ("si", 3),
+    ("bi", 2),
+    ("fl", 2),
+    ("fs", 2),
+    ("ns", 1),
+    ("st", 1),
+    ("ot", 1),
+    ("tb", 1),
+    ("fn", 1),
+    ("co", 1),
+    ("mx", 1),
+    ("ms", 1),
 ];
 const EVENTS: &[&str] = &[
     "MTI.__index.x = 'changed'",
@@ -108,8 +108,7 @@ impl Gen {
     }
 
     fn adapter(&mut self) -> &'static str {
-        let w: Vec<u32> = ADAPTERS.iter().map(|a| a.1).collect();
-        ADAPTERS[self.r.weighted(&w)].0
+        self.r.pick_by(ADAPTERS, |a| a.1).0
     }
 
     /// A family other than `f`'s, often a numeric one for a numeric one: int and float feedback.
@@ -127,10 +126,9 @@ impl Gen {
         if self.r.chance(0.05) {
             return "nil".into();
         }
-        let w: Vec<u32> = POOL.iter().map(|p| p.2).collect();
-        let (fam, n, _) = POOL[self.r.weighted(&w)];
-        let n = if self.strict && fam == "fs" { 8 } else { n };
-        format!("V.{}[{}]", self.fam(fam), self.r.range(1, n))
+        let fam = self.r.pick_by(POOL, |p| p.1).0;
+        let fam = self.fam(fam);
+        format!("V.{fam}[{}]", self.r.range(1, pool::size(fam)))
     }
 
     /// `wf` overrides the families the roles call for; `body` is `f`'s text where it is a

@@ -5,13 +5,6 @@
 
 use crate::generate::Gen;
 
-/// The templates of this file that are strict. Not `assign` and `ctor`: the manual leaves the
-/// order of assignment undefined. Not `coro2`: tcvm yields across natives on purpose.
-pub(super) const STRICT: &[&str] = &[
-    "pattern", "strfmt", "pack", "utf8", "lex", "vatab", "env", "load", "tbc", "goto", "xpcall",
-    "oop", "tablib", "numedge",
-];
-
 /// Templates whose `a` is a string, `b` a small integer.
 pub(super) const STRINGY: &[&str] = &["pattern", "strfmt", "pack", "utf8", "lex"];
 

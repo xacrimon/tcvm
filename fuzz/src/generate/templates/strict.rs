@@ -7,9 +7,6 @@
 use super::{CMPOPS, INTK};
 use crate::generate::Gen;
 
-/// The templates of this file.
-pub(super) const STRICT: &[&str] = &["konst", "tailnat", "flow", "arity"];
-
 /// Atoms of a condition by class: values that fold, and functions as values.
 const CX_K: &[&[&str]] = &[
     &["nil", "true", "false"],
@@ -272,37 +269,38 @@ impl Gen {
     pub(super) fn t_konst(&mut self) -> String {
         let c = self.t_cx(3);
         let c2 = self.t_cx(2);
-        let tail = self.tc(&[
+        const TAILS: &[&str] = &[
             "return 1",
             "return a",
             "return b, c",
             "return math.type(a)",
             "return select('#', a, b, c)",
             "return math.max(a, b)",
-        ]);
-        let opts = [
-            format!("if {c} then end\n{tail}"),
-            format!("if {c} then elseif {c2} then end\n{tail}"),
-            format!(
+        ];
+        match self.r.below(14) {
+            0 => format!("if {c} then end\n{}", self.tc(TAILS)),
+            1 => format!("if {c} then elseif {c2} then end\n{}", self.tc(TAILS)),
+            2 => format!(
                 "local x = 0\nif {c} then x = 1 elseif {c2} then x = 2 else x = 3 end\nreturn x"
             ),
-            format!(
+            3 => format!(
                 "local n = 0\nwhile {c} do\n  n = n + 1\n  if n > 5 then break end\nend\nreturn n"
             ),
-            format!(
+            4 => format!(
                 "local n = 0\nrepeat\n  n = n + 1\n  if n > 5 then break end\nuntil {c}\nreturn n"
             ),
-            format!("local n = 0\nrepeat n = n + 1 until {c} or n > 3\nreturn n"),
-            format!("return {c}"),
-            format!("local x = {c}\nreturn x, type(x)"),
-            format!("return {c}, {c2}"),
-            format!("local t = {{{c}, {c2}}}\nreturn t[1], t[2]"),
-            format!("local n = 0\nfor i = 1, 4 do\n  if {c} then n = n + i end\nend\nreturn n"),
-            format!("return select('#', {c}), not {c2}"),
-            format!("local x = {c}\nlocal y = {c2}\nreturn x == y, x and 1, y or 2"),
-            format!("if {c} then return 'A' end\nif {c2} then return 'B' end\nreturn 'C'"),
-        ];
-        self.r.pick(&opts).clone()
+            5 => format!("local n = 0\nrepeat n = n + 1 until {c} or n > 3\nreturn n"),
+            6 => format!("return {c}"),
+            7 => format!("local x = {c}\nreturn x, type(x)"),
+            8 => format!("return {c}, {c2}"),
+            9 => format!("local t = {{{c}, {c2}}}\nreturn t[1], t[2]"),
+            10 => {
+                format!("local n = 0\nfor i = 1, 4 do\n  if {c} then n = n + i end\nend\nreturn n")
+            }
+            11 => format!("return select('#', {c}), not {c2}"),
+            12 => format!("local x = {c}\nlocal y = {c2}\nreturn x == y, x and 1, y or 2"),
+            _ => format!("if {c} then return 'A' end\nif {c2} then return 'B' end\nreturn 'C'"),
+        }
     }
 
     fn nat_call(&mut self) -> String {
