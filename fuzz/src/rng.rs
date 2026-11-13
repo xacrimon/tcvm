@@ -1,66 +1,57 @@
-//! xoshiro256**, seeded through splitmix64: a program is a function of its seed alone.
+//! The random source of everything that must repeat: a program is a function of its seed alone,
+//! and so is a reduction. `rand` over PCG-64 (`rand_pcg`, which tcvm's `math.random` uses too): a
+//! named algorithm seeded from the seed, not the thread's generator, which no seed brings back.
+//! `Cargo.lock` pins `rand`, whose sampling may change between versions: an update changes the
+//! program of every seed.
+
+use rand::distr::weighted::WeightedIndex;
+use rand::seq::{IndexedRandom, SliceRandom};
+use rand::{RngExt as _, SeedableRng};
+use rand_pcg::Pcg64;
 
 #[derive(Clone)]
-pub struct Rng([u64; 4]);
+pub struct Rng(Pcg64);
 
 impl Rng {
     pub fn new(seed: u64) -> Rng {
-        let mut x = seed;
-        let mut next = || {
-            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = x;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        };
-        Rng([next(), next(), next(), next()])
-    }
-
-    pub fn u64(&mut self) -> u64 {
-        let s = &mut self.0;
-        let r = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
-        let t = s[1] << 17;
-        s[2] ^= s[0];
-        s[3] ^= s[1];
-        s[1] ^= s[2];
-        s[0] ^= s[3];
-        s[2] ^= t;
-        s[3] = s[3].rotate_left(45);
-        r
+        Rng(Pcg64::seed_from_u64(seed))
     }
 
     /// Uniform in `0..n`; `n` > 0.
     pub fn below(&mut self, n: usize) -> usize {
-        (self.u64() % n as u64) as usize
+        self.0.random_range(0..n)
     }
 
     /// Uniform in `lo..=hi`.
     pub fn range(&mut self, lo: i64, hi: i64) -> i64 {
-        lo + (self.u64() % (hi - lo + 1) as u64) as i64
+        self.0.random_range(lo..=hi)
     }
 
+    /// Uniform in `0.0..1.0`.
     pub fn f64(&mut self) -> f64 {
-        (self.u64() >> 11) as f64 / (1u64 << 53) as f64
+        self.0.random()
     }
 
     pub fn chance(&mut self, p: f64) -> bool {
-        self.f64() < p
+        self.0.random_bool(p)
     }
 
     pub fn pick<'a, T>(&mut self, l: &'a [T]) -> &'a T {
-        &l[self.below(l.len())]
+        l.choose(&mut self.0).expect("something to pick")
+    }
+
+    pub fn shuffle<T>(&mut self, l: &mut [T]) {
+        l.shuffle(&mut self.0);
+    }
+
+    /// An element drawn by `weight`; the weights are not all zero.
+    pub fn pick_by<'a, T>(&mut self, l: &'a [T], weight: impl Fn(&T) -> u32) -> &'a T {
+        (l.choose_weighted(&mut self.0, weight)).expect("a weight above zero")
     }
 
     /// An index drawn by weight; the weights are not all zero.
     pub fn weighted(&mut self, weights: &[u32]) -> usize {
-        let total: u64 = weights.iter().map(|&w| w as u64).sum();
-        let mut x = self.u64() % total;
-        for (i, &w) in weights.iter().enumerate() {
-            if x < w as u64 {
-                return i;
-            }
-            x -= w as u64;
-        }
-        unreachable!()
+        let index = WeightedIndex::new(weights).expect("a weight above zero");
+        self.0.sample(index)
     }
 }

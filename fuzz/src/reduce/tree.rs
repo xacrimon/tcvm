@@ -11,13 +11,10 @@ use cstree::util::NodeOrToken;
 use tcvm::parser::kind::SyntaxKind;
 use tcvm::parser::syntax::SyntaxNode;
 
-use super::patch::{Kind, Patch, apply_patches, cut};
+use super::passes::word_runs;
+use super::patch::{Kind, Patch, SOFT, apply_patches, cut};
 use super::problem::Problem;
 use crate::rng::Rng;
-
-const SOFT: Kind = Kind::Cuts {
-    keep_newlines: true,
-};
 
 pub struct Node {
     kind: SyntaxKind,
@@ -195,10 +192,6 @@ fn minimal_substitutions(root: &Node, source: &str) -> Vec<Patch> {
         .collect()
 }
 
-fn word(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
-}
-
 /// The names a node mentions: identifier tokens, and the last path segment of string literals.
 fn names_mentioned(node: &Node, source: &str) -> HashSet<String> {
     let mut names = HashSet::new();
@@ -209,13 +202,8 @@ fn names_mentioned(node: &Node, source: &str) -> HashSet<String> {
                 let text = source[n.start..n.end].trim_matches(['"', '\'']);
                 if let Some(base) = text.rsplit('/').next().filter(|b| !b.is_empty()) {
                     names.insert(base.to_string());
-                    let w: String = base
-                        .bytes()
-                        .take_while(|&c| word(c))
-                        .map(char::from)
-                        .collect();
-                    if !w.is_empty() {
-                        names.insert(w);
+                    if let Some(&(0, e)) = word_runs(base.as_bytes()).first() {
+                        names.insert(base[..e].to_string());
                     }
                 }
             }
@@ -312,17 +300,9 @@ fn orphaned_declaration_cuts(root: &Node, source: &str) -> Vec<Patch> {
             _ => None,
         })
         .collect();
-    let b = source.as_bytes();
     let mut occurrences: HashMap<&str, Vec<usize>> = HashMap::new();
-    let mut i = 0;
-    while i < b.len() {
-        if word(b[i]) {
-            let j = (i..b.len()).find(|&j| !word(b[j])).unwrap_or(b.len());
-            occurrences.entry(&source[i..j]).or_default().push(i);
-            i = j;
-        } else {
-            i += 1;
-        }
+    for (s, e) in word_runs(source.as_bytes()) {
+        occurrences.entry(&source[s..e]).or_default().push(s);
     }
     let spans: Vec<(usize, usize)> = gc.iter().map(|(n, _)| (n.start, n.end)).collect();
     // Each candidate's occurrences outside itself.

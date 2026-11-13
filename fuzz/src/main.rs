@@ -1,23 +1,24 @@
 //! tcvm-fuzz: generated Lua programs, run under tcvm with the JIT off and in several JIT
-//! configurations and under reference Lua, and compared (`oracle`). `tcvm-fuzz run 0 1000`
-//! fuzzes the seeds 0..1000; needs `tcvm-dev` builds of tcvm-cli.
+//! configurations and under reference Lua, and compared (`oracle`). `tcvm-fuzz run` fuzzes seed
+//! after seed; needs `tcvm-dev` builds of tcvm-cli.
 
 mod ast;
 mod exec;
 mod generate;
 mod oracle;
+mod par;
 mod reduce;
 mod rng;
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use exec::{Run, Status, run};
-use oracle::Accepted;
+use oracle::{Accepted, Mode};
 
 const REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
@@ -43,6 +44,12 @@ struct Common {
     /// Seconds a run may take
     #[arg(long, default_value_t = 10)]
     timeout: u32,
+    /// Reference Lua 5.5
+    #[arg(long, default_value = "lua")]
+    lua: String,
+    /// Accepted differences from reference Lua to report after all
+    #[arg(long, value_delimiter = ',', value_parser = clap::builder::PossibleValuesParser::new(oracle::RULES))]
+    enforce: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -67,32 +74,24 @@ enum Cmd {
         keep: usize,
         #[command(flatten)]
         common: Common,
-        /// Reference Lua 5.5
-        #[arg(long, default_value = "lua")]
-        lua: String,
         /// Skip the comparison with reference Lua
         #[arg(long)]
         no_ref: bool,
-        /// Accepted differences from reference Lua to report after all
-        #[arg(long, value_delimiter = ',', value_parser = clap::builder::PossibleValuesParser::new(oracle::RULES))]
-        enforce: Vec<String>,
     },
     /// Shrink a program that shows a finding, to FILE.min.lua or p<SEED>.min.lua
     Reduce {
         /// A seed, or a program's file
         program: String,
-        /// `ref`: JIT-off differs from reference Lua. `diverges`: MODE differs from JIT-off.
-        /// `internal`: MODE's JIT log has a compiler error. `crash`: MODE dies of a signal
-        #[arg(long, value_parser = ["ref", "diverges", "internal", "crash"])]
-        what: String,
+        /// The finding a candidate must show
+        #[arg(long)]
+        what: What,
         /// The configuration, as a finding names it (`hot`, `hc4,hl20,check`, `dbg:hot`, …)
         #[arg(long, default_value = "hot")]
         mode: String,
-        /// Text the differing line, the JIT log's error, or a crash's stderr must contain
+        /// Text the differing line, the JIT log's error, or a crash's stderr must contain,
+        /// as it is or with its numbers as `N` (a signature of `triage`)
         #[arg(long)]
         grep: Option<String>,
-        #[arg(long, default_value = "lua")]
-        lua: String,
         /// Stop after this many seconds with the smallest program so far (the output file
         /// always holds it)
         #[arg(long, value_name = "SECS")]
@@ -113,6 +112,18 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum What {
+    /// JIT-off differs from reference Lua
+    Ref,
+    /// MODE differs from JIT-off
+    Diverges,
+    /// MODE's JIT log has a compiler error
+    Internal,
+    /// MODE dies of a signal and JIT-off does not
+    Crash,
 }
 
 struct Config {
@@ -164,10 +175,11 @@ impl Config {
             std::fs::write(&probe, "local s = 0 for i = 1, 100 do s = s + i end\n")
                 .expect("a probe");
             let hot = [
-                ("TCVM_JIT_HOT_LOOP".to_string(), "1".to_string()),
-                ("TCVM_JIT_LOG".to_string(), "1".to_string()),
+                ("TCVM_JIT_HOT_LOOP", "1".to_string()),
+                ("TCVM_JIT_LOG", "1".to_string()),
             ];
             let r = run(&[path, "-f", "probe.lua"], &out.join("prog"), &hot, 10);
+            let _ = std::fs::remove_file(&probe);
             if !r.ok() || !r.stderr.contains("jit:") {
                 die(&format!(
                     "{path}: does not run, or is not a tcvm-dev build (no TCVM_JIT_LOG output)"
@@ -181,8 +193,8 @@ impl Config {
                 std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1).max(1))
             }),
             timeout: c.timeout,
-            lua: None,
-            accepted: Accepted::all_but(&[]),
+            lua: Some(c.lua.clone()),
+            accepted: Accepted::all_but(&c.enforce),
         }
     }
 }
@@ -194,8 +206,9 @@ fn die(msg: &str) -> ! {
 
 struct Finding {
     /// `reference` (reference Lua failed: a generator bug), `interp` (the JIT-off run failed),
-    /// `ref` (JIT-off differs from reference Lua), `diverges`, `crash`, `hang` (a JIT
-    /// configuration against JIT-off), `internal` (a compile failed on a compiler error).
+    /// `ref` (JIT-off differs from reference Lua), `diverges`, `crash`, `hang`, `slow` (a
+    /// configuration against JIT-off; `slow` is a timeout under GC stress), `internal` (a
+    /// compile failed on a compiler error).
     what: &'static str,
     bin: String,
     mode: String,
@@ -224,23 +237,31 @@ fn diff_detail(want: &str, got: &str, r: &Run) -> (String, String, String) {
     let mut d = format!("want {} | got {}", clip(&w), clip(&g));
     let mut sig = oracle::signature(&w, &g);
     if !r.ok() {
-        d.push_str(&format!(" | {} | {}", r.status, tail(&r.stderr, 300)));
-        sig = format!(
-            "{} | {}",
-            r.status,
-            squash(
-                tail(&r.stderr, 300)
-                    .lines()
-                    .find(|l| l.contains("panicked") || l.contains("error"))
-                    .unwrap_or("")
-            )
-        );
+        let (s, e) = failure(r);
+        d.push_str(&format!(" | {e}"));
+        sig = s;
     }
     (unit, sig, d)
 }
 
+/// Of a failed run: (the signature, the status with the end of its stderr).
+fn failure(r: &Run) -> (String, String) {
+    let err = tail(&r.stderr, 300);
+    let line = (err.lines())
+        .find(|l| l.contains("panicked") || l.contains("error"))
+        .unwrap_or("");
+    (
+        format!("{} | {}", r.status, squash(line)),
+        format!("{} | {err}", r.status),
+    )
+}
+
 /// `s` with every number as `N`, cut short.
 fn squash(s: &str) -> String {
+    numberless(s).chars().take(100).collect()
+}
+
+fn numberless(s: &str) -> String {
     let mut out = String::new();
     let mut digits = false;
     for c in s.chars() {
@@ -251,7 +272,7 @@ fn squash(s: &str) -> String {
         }
         digits = c.is_ascii_digit();
     }
-    out.chars().take(100).collect()
+    out
 }
 
 fn fuzz(seed: u64, cfg: &Config) -> (generate::Program, Vec<Finding>) {
@@ -276,66 +297,47 @@ fn fuzz(seed: u64, cfg: &Config) -> (generate::Program, Vec<Finding>) {
             detail,
         })
     };
-    let failed = |r: &Run| {
-        (
-            format!(
-                "{} | {}",
-                r.status,
-                squash(
-                    tail(&r.stderr, 300)
-                        .lines()
-                        .find(|l| l.contains("panicked") || l.contains("error"))
-                        .unwrap_or("")
-                )
-            ),
-            format!("{} | {}", r.status, tail(&r.stderr, 300)),
-        )
-    };
     let reference = cfg.lua.as_ref().and_then(|lua| {
         let r = run(&[lua, &file], &dir, &[], cfg.timeout);
         if r.ok() && r.stdout.ends_with("END\n") {
             return Some(oracle::strict_lines(&r.stdout, &strict, &cfg.accepted));
         }
-        let (sig, d) = failed(&r);
+        let (sig, d) = failure(&r);
         add("reference", "lua", "", String::new(), sig, d);
         None
     });
     let mut r = rng::Rng::new(seed ^ 0x6d6f_6465);
-    let big = prog.units.iter().any(|u| u.kind.starts_with("free big"));
-    let modes = oracle::modes(&mut r, big);
+    let modes = oracle::modes(&mut r, prog.units.iter().any(|u| u.big));
     // The debug-assertions build is there for its assertions: JIT-off, everything compiled
     // at once and one drawn configuration under the verifier reach them at a third of the cost.
-    let light: Vec<oracle::Mode> = {
-        let mut drawn = oracle::mode_named(&modes[2].name).expect("a drawn mode");
-        if !drawn.name.contains("check") {
-            drawn.name.push_str(",check");
-            drawn.env.push(("TCVM_JIT_CHECK".into(), "1".into()));
-        }
-        vec![oracle::mode_named("hot").expect("hot"), drawn]
+    let light = {
+        let (hot, drawn) = (&modes[1], &modes[2]);
+        let checked = match drawn.name.contains("check") {
+            true => drawn.clone(),
+            false => Mode::named(&format!("{},check", drawn.name)).expect("a mode"),
+        };
+        vec![hot.clone(), checked]
     };
-    let base = [
-        ("TCVM_JIT_LOG".to_string(), "1".to_string()),
-        hash_seed(seed),
-    ];
+    let base = [("TCVM_JIT_LOG", "1".to_string()), hash_seed(seed)];
     for (name, bin) in &cfg.bins {
         // A hang already confirmed on this binary: the program hangs, so another timeout is
         // not worth the longer retry.
         let hung = std::cell::Cell::new(false);
-        let go = |m: &oracle::Mode| {
-            let env: Vec<(String, String)> = base.iter().chain(&m.env).cloned().collect();
-            let r = run(&[bin, "-f", &file], &dir, &env, cfg.timeout * m.slow);
+        let go = |m: &Mode| {
+            let env = [&base[..], &m.env].concat();
+            let r = run(&[bin, "-f", &file], &dir, &env, cfg.timeout * m.slow());
             // Once more with more time: a loaded machine is no hang. Not under GC stress, where
-            // a timeout is no finding either way.
-            if r.status != Status::Timeout || m.name.contains("gc") || hung.get() {
+            // a timeout is no hang either way.
+            if r.status != Status::Timeout || m.gc || hung.get() {
                 return r;
             }
-            let r = run(&[bin, "-f", &file], &dir, &env, cfg.timeout * m.slow * 3);
+            let r = run(&[bin, "-f", &file], &dir, &env, cfg.timeout * m.slow() * 3);
             hung.set(r.status == Status::Timeout);
             r
         };
-        let off = go(&oracle::off());
+        let off = go(&Mode::off());
         if !off.ok() || !off.stdout.ends_with("END\n") {
-            let (sig, d) = failed(&off);
+            let (sig, d) = failure(&off);
             add("interp", name, "off", String::new(), sig, d);
             continue;
         }
@@ -365,7 +367,7 @@ fn fuzz(seed: u64, cfg: &Config) -> (generate::Program, Vec<Finding>) {
             let what = match r.status {
                 Status::Signal(_) => "crash",
                 // Collecting at every step is slow, not stuck.
-                Status::Timeout if m.name.contains("gc") => "slow",
+                Status::Timeout if m.gc => "slow",
                 Status::Timeout => "hang",
                 Status::Exit(_) => "diverges",
             };
@@ -376,20 +378,19 @@ fn fuzz(seed: u64, cfg: &Config) -> (generate::Program, Vec<Finding>) {
     (prog, found)
 }
 
-fn hash_seed(seed: u64) -> (String, String) {
-    ("TCVM_HASH_SEED".to_string(), (seed % 1000 + 1).to_string())
+fn hash_seed(seed: u64) -> (&'static str, String) {
+    ("TCVM_HASH_SEED", (seed % 1000 + 1).to_string())
 }
 
 fn cmd_reduce(
     program: &str,
-    what: &str,
+    what: What,
     mode: &str,
     grep: Option<&str>,
-    lua: &str,
     max_time: Option<u64>,
     cfg: &Config,
 ) {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     // `dbg:hot`: the configuration of one binary, as a finding names it.
     let (bin, mode) = match mode.split_once(':') {
         Some((n, m)) => match cfg.bins.iter().find(|(b, _)| b == n) {
@@ -398,7 +399,7 @@ fn cmd_reduce(
         },
         None => (&cfg.bins[0].1, mode),
     };
-    let mode = oracle::mode_named(mode).unwrap_or_else(|| die(&format!("no mode {mode}")));
+    let mode = Mode::named(mode).unwrap_or_else(|| die(&format!("no mode {mode}")));
     let seed: Option<u64> = program.parse().ok();
     // A seed's program file, `p<SEED>.lua` or a reduction of it, keeps the seed's hash seed.
     let file_seed = (Path::new(program).file_stem()).and_then(|s| {
@@ -410,7 +411,7 @@ fn cmd_reduce(
             .ok()
     });
     let base = [
-        ("TCVM_JIT_LOG".to_string(), "1".to_string()),
+        ("TCVM_JIT_LOG", "1".to_string()),
         hash_seed(seed.or(file_seed).unwrap_or(0)),
     ];
     let dirs: Vec<PathBuf> = (0..cfg.jobs)
@@ -420,22 +421,30 @@ fn cmd_reduce(
             d
         })
         .collect();
-    let has = |line: &str| grep.is_none_or(|g| line.contains(g));
-    let test = |text: &str, w: usize, limit: std::time::Duration, cancel: &exec::Cancel| {
+    let lua = cfg.lua.as_deref().expect("a reference");
+    // The numbers of a message change as the program shrinks: the signature does not.
+    let has = |text: &str| grep.is_none_or(|g| text.contains(g) || numberless(text).contains(g));
+    let test = |text: &str, w: usize, limit: Duration, cancel: &exec::Cancel| {
         let (dir, file) = (&dirs[w], "reduce.lua");
         std::fs::write(dir.join(file), text).expect("the candidate's file");
         let timed_out = std::cell::Cell::new(false);
-        let tcvm = |m: &oracle::Mode| {
-            let env: Vec<(String, String)> = base.iter().chain(&m.env).cloned().collect();
-            let r = exec::run_for(&[bin, "-f", file], dir, &env, limit * m.slow, Some(cancel));
+        let tcvm = |m: &Mode| {
+            let env = [&base[..], &m.env].concat();
+            let r = exec::run_for(
+                &[bin, "-f", file],
+                dir,
+                &env,
+                limit * m.slow(),
+                Some(cancel),
+            );
             timed_out.set(timed_out.get() || r.status == Status::Timeout);
             r
         };
-        let off = tcvm(&oracle::off());
+        let off = tcvm(&Mode::off());
         let interesting = off.ok()
             && off.stdout.ends_with("END\n")
             && match what {
-                "ref" => {
+                What::Ref => {
                     let r = exec::run_for(&[lua, file], dir, &[], limit, Some(cancel));
                     timed_out.set(timed_out.get() || r.status == Status::Timeout);
                     let strict: Vec<String> = (text.lines())
@@ -450,19 +459,18 @@ fn cmd_reduce(
                         oracle::first_diff(&a, &b).is_some_and(|(w, g)| has(&w) || has(&g))
                     }
                 }
-                "crash" => {
+                What::Crash => {
                     let r = tcvm(&mode);
-                    matches!(r.status, Status::Signal(_))
-                        && grep.is_none_or(|g| r.stderr.contains(g))
+                    matches!(r.status, Status::Signal(_)) && has(&r.stderr)
                 }
-                "diverges" => {
+                What::Diverges => {
                     let r = tcvm(&mode);
                     match oracle::first_diff(&off.stdout, &r.stdout) {
                         Some((w, g)) => has(&w) || has(&g),
                         None => !r.ok() && grep.is_none(),
                     }
                 }
-                _ => oracle::internal_errors(&tcvm(&mode)).iter().any(|l| has(l)),
+                What::Internal => oracle::internal_errors(&tcvm(&mode)).iter().any(|l| has(l)),
             };
         reduce::Outcome {
             interesting,
@@ -484,7 +492,7 @@ fn cmd_reduce(
     let options = reduce::Options {
         workers: cfg.jobs,
         timeout_cap: cfg.timeout as f64,
-        deadline: max_time.map(|s| start + std::time::Duration::from_secs(s)),
+        deadline: max_time.map(|s| start + Duration::from_secs(s)),
         log: &log,
         save: &save,
     };
@@ -499,43 +507,34 @@ fn cmd_reduce(
     println!("{}", out.display());
 }
 
-/// Run `job` on every seed of `lo..hi` until `stop`, on `jobs` threads; `each` gets the
-/// results as they come.
-fn for_seeds<T: Send>(
-    lo: u64,
-    hi: u64,
-    jobs: usize,
-    stop: &(dyn Fn() -> bool + Sync),
-    job: impl Fn(u64) -> T + Sync,
-    mut each: impl FnMut(u64, T),
-) {
-    let next = AtomicU64::new(lo);
-    let (tx, rx) = mpsc::channel();
-    std::thread::scope(|s| {
-        for _ in 0..jobs {
-            let (tx, next, job) = (tx.clone(), &next, &job);
-            s.spawn(move || {
-                while !stop() {
-                    let seed = next.fetch_add(1, Ordering::Relaxed);
-                    if seed >= hi || tx.send((seed, job(seed))).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(tx);
-        for (seed, t) in rx {
-            each(seed, t);
-        }
-    });
-}
-
 /// Set by SIGINT and SIGTERM: a run kills the runs in flight, drops their seeds and writes its
 /// summary.
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+}
+
+/// From now on a SIGINT or SIGTERM sets `STOP` and kills the runs in flight: a seed that is half
+/// run would hold the stop up for as long as all its configurations take.
+fn stop_on_signals() {
+    let handler = on_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+    std::thread::spawn(|| {
+        while !STOP.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("tcvm-fuzz: stopping, the seeds in flight are dropped");
+        // Again and again: a run may have started since.
+        loop {
+            exec::ALL.cancel();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
 }
 
 /// The findings of one cause, over a whole run.
@@ -547,19 +546,33 @@ struct Group {
     modes: Vec<String>,
 }
 
+impl Group {
+    fn kept(&self) -> String {
+        let kept: Vec<String> = self.kept.iter().map(|s| s.to_string()).collect();
+        kept.join(" ")
+    }
+}
+
+/// By (kind, signature).
 type Groups = BTreeMap<(String, String), Group>;
 
-/// `summary.tsv`: a line per cause, the most seen first within each kind.
+/// The causes with their kind and signature, the most seen first within each kind.
+fn by_count(groups: &Groups) -> Vec<(&str, &str, &Group)> {
+    let mut rows: Vec<_> = (groups.iter())
+        .map(|((what, sig), g)| (what.as_str(), sig.as_str(), g))
+        .collect();
+    rows.sort_by_key(|&(what, _, g)| (what, std::cmp::Reverse(g.seeds)));
+    rows
+}
+
+/// `summary.tsv`: a line per cause.
 fn write_summary(dir: &Path, groups: &Groups) {
-    let mut rows: Vec<_> = groups.iter().collect();
-    rows.sort_by_key(|(k, g)| (k.0.clone(), std::cmp::Reverse(g.seeds)));
     let mut text = String::from("what\tseeds\tkept\tmodes\tsignature\n");
-    for ((what, sig), g) in rows {
-        let kept: Vec<String> = g.kept.iter().map(|s| s.to_string()).collect();
+    for (what, sig, g) in by_count(groups) {
         text.push_str(&format!(
             "{what}\t{}\t{}\t{}\t{sig}\n",
             g.seeds,
-            kept.join(" "),
+            g.kept(),
             g.modes.join(" ")
         ));
     }
@@ -590,195 +603,195 @@ fn read_summary(dir: &Path) -> Groups {
     groups
 }
 
-/// Fuzz seeds from `from` on, until `count` are done, `hours` have passed or a signal stops
-/// it. The output directory holds the run's state, so the next run goes on where this one
-/// stopped:
+/// A run's records in its output directory, which the next run into it goes on from:
 ///
 /// - `summary.tsv`: every cause seen (`signature`), how many seeds showed it and under which
 ///   configurations, and the seeds whose programs are kept.
 /// - `findings.tsv`: the findings of the kept programs, one per line.
 /// - `prog/p<seed>.lua`: the kept programs, up to `keep` per cause.
 /// - `state`: the next seed. `log.txt`: a line per session and per status report.
-fn cmd_run(from: Option<u64>, count: Option<u64>, hours: Option<f64>, keep: usize, cfg: &Config) {
-    // SAFETY: the handler only stores to an atomic.
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            on_stop as extern "C" fn(libc::c_int) as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            on_stop as extern "C" fn(libc::c_int) as libc::sighandler_t,
-        );
+struct Session<'a> {
+    cfg: &'a Config,
+    keep: usize,
+    groups: Groups,
+    findings: std::fs::File,
+    log: std::fs::File,
+    started: Instant,
+    /// The first seed of this session, and the one after the highest done.
+    lo: u64,
+    top: u64,
+    done: u64,
+    /// Seeds with findings.
+    hit: u64,
+}
+
+impl<'a> Session<'a> {
+    fn open(cfg: &'a Config, keep: usize, from: Option<u64>) -> Session<'a> {
+        let append = |name: &str| {
+            let mut file = std::fs::OpenOptions::new();
+            let file = file.create(true).append(true).open(cfg.out.join(name));
+            file.expect("a file of the run")
+        };
+        let state = std::fs::read_to_string(cfg.out.join("state")).ok();
+        let lo = from
+            .or(state.and_then(|s| s.trim().parse().ok()))
+            .unwrap_or(0);
+        Session {
+            cfg,
+            keep,
+            groups: read_summary(&cfg.out),
+            findings: append("findings.tsv"),
+            log: append("log.txt"),
+            started: Instant::now(),
+            lo,
+            top: lo,
+            done: 0,
+            hit: 0,
+        }
     }
-    // A signal kills the runs in flight: a seed that is half run would hold the stop up for as
-    // long as all its configurations take.
-    std::thread::spawn(|| {
-        while !STOP.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+
+    fn say(&mut self, line: String) {
+        eprintln!("{line}");
+        let _ = writeln!(self.log, "{line}");
+    }
+
+    fn program(&self, seed: u64) -> PathBuf {
+        self.cfg.out.join(format!("prog/p{seed}.lua"))
+    }
+
+    /// Count a seed's findings by cause; its program stays if it is one of the first of a cause.
+    fn record(&mut self, seed: u64, prog: &generate::Program, found: &[Finding]) {
+        self.done += 1;
+        self.top = self.top.max(seed + 1);
+        self.hit += !found.is_empty() as u64;
+        let mut kept = false;
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for f in found {
+            let key = (f.what.to_string(), f.sig.clone());
+            let g = self.groups.entry(key.clone()).or_default();
+            if !seen.contains(&key) {
+                seen.push(key);
+                g.seeds += 1;
+                if g.kept.len() < self.keep {
+                    g.kept.push(seed);
+                }
+            }
+            // With several binaries, which one showed it.
+            let mode = match self.cfg.bins.len() {
+                1 => f.mode.clone(),
+                _ => format!("{}:{}", f.bin, f.mode),
+            };
+            if !g.modes.contains(&mode) && g.modes.len() < MAX_MODES {
+                g.modes.push(mode);
+            }
+            if g.kept.contains(&seed) {
+                kept = true;
+                let unit = prog.units.iter().find(|u| u.tag == f.unit);
+                let kind = unit.map_or("", |u| u.kind.as_str());
+                let detail = f.detail.replace(['\t', '\n'], " ");
+                writeln!(
+                    self.findings,
+                    "{seed}\t{}\t{}\t{}\t{}\t{kind}\t{detail}",
+                    f.what, f.bin, f.mode, f.unit
+                )
+                .expect("a finding");
+            }
         }
-        eprintln!("tcvm-fuzz: stopping, the seeds in flight are dropped");
-        loop {
-            exec::abort();
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        if !kept {
+            let _ = std::fs::remove_file(self.program(seed));
         }
-    });
-    let state = cfg.out.join("state");
-    let resume = std::fs::read_to_string(&state)
-        .ok()
-        .and_then(|s| s.trim().parse().ok());
-    let lo: u64 = from.or(resume).unwrap_or(0);
-    let hi = count.map_or(u64::MAX, |n| lo.saturating_add(n));
-    let mut groups = read_summary(&cfg.out);
-    let mut findings = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(cfg.out.join("findings.tsv"))
-        .expect("findings.tsv");
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(cfg.out.join("log.txt"))
-        .expect("log.txt");
+    }
+
+    /// Write the summary and `next` as the seed the next run starts at.
+    fn save(&self, next: u64) {
+        write_summary(&self.cfg.out, &self.groups);
+        std::fs::write(self.cfg.out.join("state"), next.to_string()).expect("the state");
+    }
+
+    fn rate(&self) -> f64 {
+        self.done as f64 / self.started.elapsed().as_secs_f64().max(0.001)
+    }
+}
+
+/// The configurations a cause lists at most.
+const MAX_MODES: usize = 12;
+/// Seconds between status lines.
+const STATUS_SECS: u64 = 30;
+
+/// Fuzz seeds from `from` on (or where the last run into the output directory stopped), until
+/// `count` are done, `hours` have passed or a signal stops it.
+fn cmd_run(from: Option<u64>, count: Option<u64>, hours: Option<f64>, keep: usize, cfg: &Config) {
+    stop_on_signals();
+    let mut s = Session::open(cfg, keep, from);
     let rev = std::process::Command::new("git")
         .args(["-C", REPO, "rev-parse", "--short", "HEAD"])
         .output();
-    let rev = rev
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let rev = rev.map_or(String::new(), |o| {
+        String::from_utf8_lossy(&o.stdout).trim().into()
+    });
     let bins: Vec<String> = cfg.bins.iter().map(|(n, p)| format!("{n}={p}")).collect();
-    let mut say = |line: String| {
-        eprintln!("{line}");
-        let _ = writeln!(log, "{line}");
-    };
-    say(format!(
-        "run from seed {lo}, {} jobs, tcvm at {rev}, {}, reference {}",
+    s.say(format!(
+        "run from seed {}, {} jobs, tcvm at {rev}, {}, reference {}",
+        s.lo,
         cfg.jobs,
         bins.join(" "),
         cfg.lua.as_deref().unwrap_or("none")
     ));
-    let started = std::time::Instant::now();
-    let mut last = started;
-    let (mut done, mut hit, mut top) = (0u64, 0u64, lo);
-    let deadline = hours.map(|h| started + std::time::Duration::from_secs_f64(h * 3600.0));
-    let stop =
-        || STOP.load(Ordering::Relaxed) || deadline.is_some_and(|d| std::time::Instant::now() >= d);
-    for_seeds(
-        lo,
-        hi,
-        cfg.jobs,
-        &stop,
-        |seed| fuzz(seed, cfg),
-        |seed, (prog, found)| {
-            // Killed runs: what they returned is no finding.
-            if exec::aborted() {
-                return;
-            }
-            done += 1;
-            top = top.max(seed + 1);
-            hit += !found.is_empty() as u64;
-            let mut keep_program = false;
-            let mut seen: Vec<(String, String)> = Vec::new();
-            for f in &found {
-                let key = (f.what.to_string(), f.sig.clone());
-                let g = groups.entry(key.clone()).or_default();
-                if !seen.contains(&key) {
-                    seen.push(key);
-                    g.seeds += 1;
-                    if g.kept.len() < keep {
-                        g.kept.push(seed);
-                    }
-                }
-                // With several binaries, which one showed it.
-                let mode = match cfg.bins.len() {
-                    1 => f.mode.clone(),
-                    _ => format!("{}:{}", f.bin, f.mode),
-                };
-                if !g.modes.contains(&mode) && g.modes.len() < 12 {
-                    g.modes.push(mode);
-                }
-                if g.kept.contains(&seed) {
-                    keep_program = true;
-                    let unit = prog.units.iter().find(|u| u.tag == f.unit);
-                    let kind = unit.map_or("", |u| u.kind.as_str());
-                    let detail = f.detail.replace(['\t', '\n'], " ");
-                    writeln!(
-                        findings,
-                        "{seed}\t{}\t{}\t{}\t{}\t{kind}\t{detail}",
-                        f.what, f.bin, f.mode, f.unit
-                    )
-                    .expect("a finding");
-                }
-            }
-            if !keep_program {
-                let _ = std::fs::remove_file(cfg.out.join(format!("prog/p{seed}.lua")));
-            }
-            if last.elapsed().as_secs() >= 30 {
-                last = std::time::Instant::now();
-                write_summary(&cfg.out, &groups);
-                // Seeds below this are done or lost with the workers: a few run twice after a kill.
-                let _ = std::fs::write(
-                    &state,
-                    top.saturating_sub(4 * cfg.jobs as u64).max(lo).to_string(),
-                );
-                let secs = started.elapsed().as_secs_f64();
-                say(format!(
-                    "{:.1}h: {done} seeds ({:.1}/s), {hit} with findings, {} causes, at seed {top}",
-                    secs / 3600.0,
-                    done as f64 / secs,
-                    groups.len()
-                ));
-            }
-        },
-    );
-    write_summary(&cfg.out, &groups);
-    std::fs::write(&state, top.to_string()).expect("the state");
-    let secs = started.elapsed().as_secs_f64();
-    say(format!(
-        "stopped at seed {top}: {done} seeds in {secs:.0}s ({:.1}/s), {hit} with findings, {} causes; {}",
-        done as f64 / secs.max(0.001),
-        groups.len(),
+    let deadline = hours.map(|h| s.started + Duration::from_secs_f64(h * 3600.0));
+    let stop = || STOP.load(Ordering::Relaxed) || deadline.is_some_and(|d| Instant::now() >= d);
+    let seeds = s.lo..count.map_or(u64::MAX, |n| s.lo.saturating_add(n));
+    let mut last = Instant::now();
+    let job = |seed| fuzz(seed, cfg);
+    par::stream(seeds, cfg.jobs, &stop, job, |seed, (prog, found)| {
+        // A killed seed: what its runs returned is no finding, and its program is not kept.
+        if exec::ALL.cancelled() {
+            let _ = std::fs::remove_file(s.program(seed));
+            return;
+        }
+        s.record(seed, &prog, &found);
+        if last.elapsed().as_secs() >= STATUS_SECS {
+            last = Instant::now();
+            // Seeds below this are done or lost with the workers: a few run twice after a kill.
+            s.save(s.top.saturating_sub(4 * cfg.jobs as u64).max(s.lo));
+            s.say(format!(
+                "{:.1}h: {} seeds ({:.1}/s), {} with findings, {} causes, at seed {}",
+                s.started.elapsed().as_secs_f64() / 3600.0,
+                s.done,
+                s.rate(),
+                s.hit,
+                s.groups.len(),
+                s.top
+            ));
+        }
+    });
+    s.save(s.top);
+    s.say(format!(
+        "stopped at seed {}: {} seeds in {:.0}s ({:.1}/s), {} with findings, {} causes; {}",
+        s.top,
+        s.done,
+        s.started.elapsed().as_secs_f64(),
+        s.rate(),
+        s.hit,
+        s.groups.len(),
         cfg.out.join("summary.tsv").display()
     ));
 }
 
 fn cmd_triage(dir: Option<&Path>) {
     let dir = dir.map_or_else(|| Path::new(REPO).join("target/fuzz"), Path::to_path_buf);
-    let groups = read_summary(&dir);
-    let mut rows: Vec<_> = groups.iter().collect();
-    rows.sort_by_key(|(k, g)| (k.0.clone(), std::cmp::Reverse(g.seeds)));
-    for ((what, sig), g) in rows {
-        let kept: Vec<String> = g.kept.iter().map(|s| s.to_string()).collect();
+    for (what, sig, g) in by_count(&read_summary(&dir)) {
         println!(
             "== {what}: {} seeds (kept {}) in {}",
             g.seeds,
-            kept.join(" "),
+            g.kept(),
             g.modes.join(" ")
         );
         println!("   {sig}");
     }
 }
 
-/// tcvm's opcodes, from the table in its source.
-fn opcodes() -> Vec<&'static str> {
-    (include_str!("../../src/instruction.rs").lines())
-        .filter_map(|l| {
-            let mut w = l.split_whitespace();
-            let (code, name) = (w.next()?, w.next()?);
-            let hex = code.strip_prefix("0x")?;
-            (hex.len() == 2
-                && u8::from_str_radix(hex, 16).is_ok()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
-            .then_some(name)
-        })
-        .collect()
-}
-
 fn cmd_cover(lo: u64, hi: u64, cfg: &Config) {
-    let (name, bin) = &cfg.bins[0];
-    let _ = name;
+    let bin = &cfg.bins[0].1;
     let dir = cfg.out.join("prog");
     let job = |seed: u64| {
         let file = format!("c{seed}.lua");
@@ -788,16 +801,10 @@ fn cmd_cover(lo: u64, hi: u64, cfg: &Config) {
         )
         .expect("the program's file");
         let mut stats = Vec::new();
-        for (tag, mode) in [
-            ("off", oracle::off()),
-            (
-                "hot",
-                oracle::modes(&mut rng::Rng::new(0), false).swap_remove(1),
-            ),
-        ] {
+        for tag in ["off", "hot"] {
             let st = format!("c{seed}.{tag}.stats");
-            let mut env = mode.env.clone();
-            env.push(("TCVM_STATS".into(), st.clone()));
+            let mut env = Mode::named(tag).expect("a mode").env;
+            env.push(("TCVM_STATS", st.clone()));
             let r = run(&[bin, "-f", &file], &dir, &env, cfg.timeout);
             stats.push((
                 r.ok(),
@@ -808,10 +815,11 @@ fn cmd_cover(lo: u64, hi: u64, cfg: &Config) {
         let _ = std::fs::remove_file(dir.join(&file));
         stats
     };
+    // Every opcode of the binary: its stats list the ones it never dispatched too.
     let mut ops: BTreeMap<String, u64> = BTreeMap::new();
     let mut events: BTreeMap<String, u64> = BTreeMap::new();
     let mut failed = 0;
-    for_seeds(lo, hi, cfg.jobs, &|| false, job, |_, stats| {
+    par::stream(lo..hi, cfg.jobs, &|| false, job, |_, stats| {
         for (i, (ok, text)) in stats.iter().enumerate() {
             failed += !ok as u32;
             for l in text.lines() {
@@ -828,16 +836,14 @@ fn cmd_cover(lo: u64, hi: u64, cfg: &Config) {
             }
         }
     });
-    let all = opcodes();
-    let missing: Vec<&str> = all
-        .iter()
-        .copied()
-        .filter(|o| !ops.contains_key(*o))
+    let missing: Vec<&str> = (ops.iter())
+        .filter(|&(_, &n)| n == 0)
+        .map(|(op, _)| op.as_str())
         .collect();
     println!(
         "{} of {} opcodes dispatched with the JIT off; never: {}",
-        all.len() - missing.len(),
-        all.len(),
+        ops.len() - missing.len(),
+        ops.len(),
         missing.join(" ")
     );
     println!("with everything compiled at its first count:");
@@ -851,23 +857,25 @@ fn cmd_cover(lo: u64, hi: u64, cfg: &Config) {
 
 fn main() {
     match Args::parse().cmd {
-        Cmd::Gen { seed, kind } => print!(
-            "{}",
-            generate::Gen::new(seed).program(kind.as_deref()).text()
-        ),
+        Cmd::Gen { seed, kind } => {
+            if let Some(k) = kind.as_deref().filter(|k| !generate::is_kind(k)) {
+                die(&format!("no unit kind {k}"));
+            }
+            let prog = generate::Gen::new(seed).program(kind.as_deref());
+            print!("{}", prog.text())
+        }
         Cmd::Run {
             from,
             count,
             hours,
             keep,
             common,
-            lua,
             no_ref,
-            enforce,
         } => {
             let mut cfg = Config::new(&common);
-            cfg.lua = (!no_ref).then_some(lua);
-            cfg.accepted = Accepted::all_but(&enforce);
+            if no_ref {
+                cfg.lua = None;
+            }
             cmd_run(from, count, hours, keep, &cfg);
         }
         Cmd::Reduce {
@@ -875,15 +883,13 @@ fn main() {
             what,
             mode,
             grep,
-            lua,
             max_time,
             common,
         } => cmd_reduce(
             &program,
-            &what,
+            what,
             &mode,
             grep.as_deref(),
-            &lua,
             max_time,
             &Config::new(&common),
         ),

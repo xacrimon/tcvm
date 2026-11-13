@@ -9,7 +9,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -19,6 +18,7 @@ use super::nondet::{
 };
 use super::timeout::Timeout;
 pub use crate::exec::Cancel;
+use crate::par;
 
 /// One run of the test.
 #[derive(Clone, Copy, Debug)]
@@ -81,6 +81,8 @@ pub struct Oracle<'a> {
     /// The reduction's current test case and every one it adopted, oldest first.
     pub incumbent: String,
     history: Vec<String>,
+    /// Counts the changes of `incumbent`.
+    version: u64,
     pub calls: u64,
     calls_at_last_verify: u64,
     /// Evidence about the final result, for the report.
@@ -89,36 +91,6 @@ pub struct Oracle<'a> {
     /// Called with each new incumbent.
     save: &'a dyn Fn(&str),
     deadline: Option<Instant>,
-}
-
-/// Below this many items, `parallel` runs them on the calling thread: spawning costs more.
-const INLINE: usize = 64;
-
-/// Run `f(i, worker)` for `i` in `0..n` on `workers` threads; results in order of `i`.
-pub fn parallel<T: Send>(workers: usize, n: usize, f: impl Fn(usize, usize) -> T + Sync) -> Vec<T> {
-    if n <= INLINE {
-        return (0..n).map(|i| f(i, 0)).collect();
-    }
-    let next = AtomicUsize::new(0);
-    let out: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    std::thread::scope(|s| {
-        for w in 0..workers.min(n) {
-            let (next, out, f) = (&next, &out, &f);
-            s.spawn(move || {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    let r = f(i, w);
-                    *out[i].lock().expect("a result") = Some(r);
-                }
-            });
-        }
-    });
-    (out.into_iter())
-        .map(|m| m.into_inner().expect("a result").expect("every job ran"))
-        .collect()
 }
 
 /// One run with its wall time.
@@ -248,18 +220,38 @@ impl Pool {
     }
 }
 
+/// How a candidate of a batch gets its answer.
+enum Answer {
+    /// Known to the submitter without a run; never adopted.
+    Given(bool),
+    /// The latched verdict of an earlier run.
+    Cached(bool),
+    /// The verdict of the batch's job of this index.
+    Job(usize),
+}
+
+struct Candidate {
+    text: String,
+    key: (usize, u64),
+    answer: Answer,
+}
+
 /// A submitted batch.
 pub struct Ticket {
-    texts: Vec<String>,
-    answered: Vec<bool>,
-    out: Vec<Option<bool>>,
-    keys: Vec<(usize, u64)>,
-    jobs: Vec<usize>,
-    job_of: Vec<usize>,
+    candidates: Vec<Candidate>,
+    /// The cache key of each job's candidate.
+    jobs: Vec<(usize, u64)>,
     rx: mpsc::Receiver<Done>,
     cancel: Arc<Cancel>,
     used: f64,
     epoch: u64,
+}
+
+impl Ticket {
+    /// Kill the batch's runs; workers skip its queued jobs when they come to them.
+    fn cancel(self) {
+        self.cancel.cancel();
+    }
 }
 
 impl<'a> Oracle<'a> {
@@ -274,6 +266,7 @@ impl<'a> Oracle<'a> {
             timeout: Timeout::new(o.timeout_cap),
             history: vec![initial.clone()],
             incumbent: initial,
+            version: 0,
             calls: 0,
             calls_at_last_verify: 0,
             final_evidence: Evidence::default(),
@@ -511,6 +504,7 @@ impl<'a> Oracle<'a> {
         self.timeout.note_reduction();
         self.history.push(text.clone());
         self.incumbent = text;
+        self.version += 1;
         (self.save)(&self.incumbent);
     }
 
@@ -623,68 +617,54 @@ impl<'a> Oracle<'a> {
         answers: Vec<Option<bool>>,
         speculative: bool,
     ) -> Ticket {
-        let answered: Vec<bool> = answers.iter().map(Option::is_some).collect();
-        let mut out = answers;
-        let keys: Vec<(usize, u64)> = parallel(self.workers, texts.len(), |i, _| match out[i] {
+        let keys = par::map(self.workers, texts.len(), |i| match answers[i] {
             Some(_) => (0, 0),
             None => cache_key(&texts[i]),
         });
-        for i in 0..texts.len() {
-            if out[i].is_none()
-                && let Some(l) = self.ledgers.get(&keys[i])
-            {
-                out[i] = self.latched(l);
-            }
-        }
-        // Duplicates in one batch run once.
-        let mut jobs: Vec<usize> = Vec::new();
-        let mut seen = HashMap::new();
-        let mut job_of = vec![usize::MAX; texts.len()];
-        for i in 0..texts.len() {
-            if out[i].is_none() {
-                job_of[i] = *seen.entry(keys[i]).or_insert_with(|| {
-                    jobs.push(i);
-                    jobs.len() - 1
-                });
-            }
-        }
         let (limit, used) = self.secs();
         let policy = self.policy.active.then(|| Arc::new(self.policy.clone()));
         let (reply, rx) = mpsc::channel();
         let cancel = Arc::new(Cancel::default());
-        let queued = (jobs.iter().enumerate())
-            .map(|(j, &i)| Job {
-                text: Arc::new(texts[i].clone()),
-                work: Work::Eval {
-                    ledger: self.ledgers.get(&keys[i]).cloned().unwrap_or_default(),
-                    policy: policy.clone(),
-                },
-                limit,
-                used,
-                cancel: cancel.clone(),
-                index: j,
-                reply: reply.clone(),
+        let mut queued: Vec<Job> = Vec::new();
+        let mut jobs = Vec::new();
+        // Duplicates in one batch run once.
+        let mut seen = HashMap::new();
+        let candidates = (texts.into_iter().zip(answers).zip(keys))
+            .map(|((text, given), key)| {
+                let ledger = self.ledgers.get(&key).filter(|_| given.is_none());
+                let answer = match (given, ledger.and_then(|l| self.latched(l))) {
+                    (Some(r), _) => Answer::Given(r),
+                    (None, Some(r)) => Answer::Cached(r),
+                    (None, None) => Answer::Job(*seen.entry(key).or_insert_with(|| {
+                        jobs.push(key);
+                        queued.push(Job {
+                            text: Arc::new(text.clone()),
+                            work: Work::Eval {
+                                ledger: ledger.cloned().unwrap_or_default(),
+                                policy: policy.clone(),
+                            },
+                            limit,
+                            used,
+                            cancel: cancel.clone(),
+                            index: queued.len(),
+                            reply: reply.clone(),
+                        });
+                        queued.len() - 1
+                    })),
+                };
+                Candidate { text, key, answer }
             })
             .collect();
         self.seq += 1;
         self.pool.push(speculative, self.seq, queued);
         Ticket {
-            texts,
-            answered,
-            out,
-            keys,
+            candidates,
             jobs,
-            job_of,
             rx,
             cancel,
             used,
             epoch: self.epoch,
         }
-    }
-
-    /// Workers skip a cancelled batch's queued jobs when they come to them.
-    pub fn cancel(&mut self, t: Ticket) {
-        t.cancel.cancel();
     }
 
     /// Wait for a batch and take its results in order, calling `adopt` for each interesting one;
@@ -696,7 +676,7 @@ impl<'a> Oracle<'a> {
     ) -> Option<(Vec<bool>, usize)> {
         self.maybe_verify();
         if t.epoch != self.epoch {
-            self.cancel(t);
+            t.cancel();
             return None;
         }
         let mut done: Vec<Option<Done>> = (0..t.jobs.len()).map(|_| None).collect();
@@ -707,22 +687,26 @@ impl<'a> Oracle<'a> {
         }
         let tested = t.jobs.len();
         let mut verdicts = Vec::with_capacity(tested);
-        for (j, d) in done.into_iter().enumerate() {
+        for (key, d) in t.jobs.iter().zip(done) {
             let d = d.expect("every job ran");
             self.record(&d.runs, t.used);
             self.policy.replay_calls += d.runs.len().saturating_sub(1) as u64;
-            self.ledgers.insert(t.keys[t.jobs[j]], d.ledger);
+            self.ledgers.insert(*key, d.ledger);
             verdicts.push(d.verdict);
         }
-        let mut result = Vec::with_capacity(t.texts.len());
-        for i in 0..t.texts.len() {
-            let r = t.out[i].unwrap_or_else(|| verdicts[t.job_of[i]]);
-            if r && !t.answered[i] {
+        let mut result = Vec::with_capacity(t.candidates.len());
+        for c in &t.candidates {
+            let (r, tested) = match c.answer {
+                Answer::Given(r) => (r, false),
+                Answer::Cached(r) => (r, true),
+                Answer::Job(j) => (verdicts[j], true),
+            };
+            if r && tested {
                 let unselected = (self.policy.active)
-                    .then(|| self.ledgers.get(&t.keys[i]))
+                    .then(|| self.ledgers.get(&c.key))
                     .flatten()
                     .and_then(|l| l.accepted_at.map(|_| l.unselected()));
-                adopt(self, &t.texts[i], unselected);
+                adopt(self, &c.text, unselected);
             }
             result.push(r);
         }
@@ -736,6 +720,7 @@ impl<'a> Oracle<'a> {
         }
         self.timeout.note_reduction();
         self.incumbent = text.to_string();
+        self.version += 1;
         self.history.push(self.incumbent.clone());
         (self.save)(&self.incumbent);
         if self.policy.active {
@@ -818,24 +803,27 @@ pub struct Watch {
     initial_size: usize,
     iters: u64,
     best: f64,
-    at_tick: String,
+    /// The test case's version at the last tick.
+    at_tick: u64,
 }
 
 impl Watch {
-    pub fn new(tick: u64, current: &str) -> Watch {
+    pub fn new(tick: u64, p: &Problem) -> Watch {
         Watch {
             tick,
             since: 0,
-            initial_size: current.len(),
+            initial_size: p.current().len(),
             iters: 0,
             best: 0.0,
-            at_tick: current.to_string(),
+            at_tick: p.version(),
         }
     }
 }
 
 impl Control {
-    fn observe(&mut self, tested: usize, changed: bool, current: &str) {
+    /// `tested` more tests ran, which `changed` the test case or not; it is now of `size`
+    /// bytes, at `version`.
+    fn observe(&mut self, tested: usize, changed: bool, size: usize, version: u64) {
         if changed {
             self.consecutive = 0;
             self.made_progress = true;
@@ -851,12 +839,12 @@ impl Control {
             while w.since >= w.tick {
                 w.since -= w.tick;
                 w.iters += 1;
-                let rate = w.initial_size.saturating_sub(current.len()) as f64 / w.iters as f64;
+                let rate = w.initial_size.saturating_sub(size) as f64 / w.iters as f64;
                 w.best = w.best.max(rate);
-                if rate < 0.5 * w.best || current == w.at_tick {
+                if rate < 0.5 * w.best || version == w.at_tick {
                     self.cancelled = true;
                 }
-                w.at_tick = current.to_string();
+                w.at_tick = version;
             }
         }
     }
@@ -864,34 +852,36 @@ impl Control {
 
 struct Restart {
     current: String,
+    /// Counts the changes of `current`.
+    version: u64,
     original: String,
     fixpoint: String,
+    /// The fixpoint's `sort_key`.
+    key: (usize, usize),
 }
 
-/// A batch a view submitted, with the current test case it was built against.
+/// A batch a view submitted, with the version of the test case it was built against.
 pub struct Pending {
     ticket: Ticket,
-    current: String,
+    version: u64,
     rejected: usize,
 }
 
 /// The candidates a view answers without a run: the current test case, and in a restart the
 /// original (interesting) and anything not below the fixpoint (not).
-pub struct Filter {
-    current: String,
-    restart: Option<(String, (usize, usize), String)>,
+pub struct Filter<'p> {
+    current: &'p str,
+    restart: Option<&'p Restart>,
 }
 
-impl Filter {
+impl Filter<'_> {
     pub fn check(&self, t: &str) -> Option<bool> {
         if t == self.current {
             return Some(true);
         }
-        match &self.restart {
-            Some((original, ..)) if t == original => Some(true),
-            Some((_, key, fixpoint)) if (sort_key(t), t) >= (*key, fixpoint.as_str()) => {
-                Some(false)
-            }
+        match self.restart {
+            Some(r) if t == r.original => Some(true),
+            Some(r) if (sort_key(t), t) >= (r.key, r.fixpoint.as_str()) => Some(false),
             _ => None,
         }
     }
@@ -912,7 +902,9 @@ impl<'o, 'a> Problem<'o, 'a> {
             oracle,
             restart: Some(Restart {
                 current: original.clone(),
+                version: 0,
                 original,
+                key: sort_key(&fixpoint),
                 fixpoint,
             }),
             control: Control::default(),
@@ -926,6 +918,14 @@ impl<'o, 'a> Problem<'o, 'a> {
         }
     }
 
+    /// Changes whenever `current` does.
+    pub fn version(&self) -> u64 {
+        match &self.restart {
+            Some(r) => r.version,
+            None => self.oracle.version,
+        }
+    }
+
     pub fn nondeterministic(&self) -> bool {
         self.oracle.policy.active
     }
@@ -935,65 +935,62 @@ impl<'o, 'a> Problem<'o, 'a> {
     }
 
     /// What answers a candidate without a run.
-    pub fn filter(&self) -> Filter {
+    pub fn filter(&self) -> Filter<'_> {
         Filter {
-            current: self.current().to_string(),
-            restart: (self.restart.as_ref()).map(|r| {
-                (
-                    r.original.clone(),
-                    sort_key(&r.fixpoint),
-                    r.fixpoint.clone(),
-                )
-            }),
+            current: self.current(),
+            restart: self.restart.as_ref(),
         }
+    }
+
+    fn observe(&mut self, tested: usize, changed: bool) {
+        let (size, version) = (self.current().len(), self.version());
+        self.control.observe(tested, changed, size, version);
     }
 
     /// Candidates the filter rejected before they were tested count against a pass's budget.
     pub fn note_rejected(&mut self, n: usize) {
         if n > 0 {
-            let now = self.current().to_string();
-            self.control.observe(n, false, &now);
+            self.observe(n, false);
         }
     }
 
     /// Submit `texts` for testing; `speculative` ones queue behind the others.
     pub fn submit(&mut self, texts: Vec<String>, speculative: bool) -> Pending {
         let filter = self.filter();
-        let answers = parallel(self.oracle.workers, texts.len(), |i, _| {
+        let answers = par::map(self.oracle.workers, texts.len(), |i| {
             filter.check(&texts[i])
         });
         let rejected = answers.iter().filter(|a| **a == Some(false)).count();
         Pending {
+            version: self.version(),
             ticket: self.oracle.submit(texts, answers, speculative),
-            current: self.current().to_string(),
             rejected,
         }
     }
 
     pub fn cancel(&mut self, p: Pending) {
-        self.oracle.cancel(p.ticket);
+        p.ticket.cancel();
     }
 
     /// Whether each submitted text is interesting, adopting in order each one smaller than the
     /// current test case; with the number of tests run. `None` when the current test case or
     /// the policy changed since the batch was submitted.
     pub fn finish(&mut self, p: Pending) -> Option<(Vec<bool>, usize)> {
-        if p.current != self.current() {
+        if p.version != self.version() {
             self.cancel(p);
             return None;
         }
-        let mut view = self.restart.as_mut().map(|r| &mut r.current);
+        let mut view = self.restart.as_mut();
         let (r, tested) = self.oracle.finish(p.ticket, |o, t, unselected| {
             o.improve(t, unselected);
-            if let Some(c) = view.as_deref_mut()
-                && less(t, c)
+            if let Some(view) = view.as_deref_mut()
+                && less(t, &view.current)
             {
-                *c = t.to_string();
+                view.current = t.to_string();
+                view.version += 1;
             }
         })?;
-        let now = self.current().to_string();
-        self.control
-            .observe(tested + p.rejected, now != p.current, &now);
+        self.observe(tested + p.rejected, self.version() != p.version);
         Some((r, tested))
     }
 

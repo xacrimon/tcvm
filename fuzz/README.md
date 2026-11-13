@@ -64,14 +64,15 @@ To start over, delete the output directory. Do that after fixing bugs too: the c
 | `diverges` | A JIT configuration printed something else than JIT-off, or exited differently. |
 | `crash` | A JIT configuration died of a signal. |
 | `hang` | A JIT configuration ran out of time where JIT-off did not. |
+| `slow` | A configuration under `TCVM_GC_STRESS` ran out of time: slow, not known to be stuck. |
 | `internal` | A compile failed on a verifier, checker or backend error, or a panic. The region falls back to the interpreter, so the output is right. |
 | `ref` | JIT-off printed something else than reference Lua. |
 | `interp` | The JIT-off run itself failed: a panic, a crash, a timeout. |
 | `reference` | Reference Lua failed on the program. This is a bug in the generator, not in tcvm. |
 
 A timeout is retried once with three times the limit before it counts, but not under
-`TCVM_GC_STRESS`, where timeouts are no findings, and not once the program has hung on that
-binary: a hanging program costs one limit per configuration.
+`TCVM_GC_STRESS`, where a timeout is `slow` either way, and not once the program has hung on
+that binary: a hanging program costs one limit per configuration.
 
 ### Configurations
 
@@ -141,7 +142,10 @@ tcvm-fuzz reduce 20131 --what crash --mode hc1,hl1,deopt --grep "stack overflow"
 
 This writes `prog/p<seed>.min.lua` in the output directory (`FILE.min.lua` for a file), and
 rewrites it on every improvement. `--grep TEXT` keeps it on one finding where a program shows
-several: the differing line, the JIT log's error, or the crash's stderr must contain the text.
+several: the differing line, the JIT log's error, or the crash's stderr must contain the text,
+as it is or with every number as `N`. A signature of `triage` is of that form, and still matches
+when the value numbers in a message change as the program shrinks. `--enforce` and `--lua` are
+`run`'s: give `reduce` the ones the finding was found with.
 `--max-time SECS` stops it with the smallest program so far.
 
 The reducer is shrinkray's (`src/reduce/`): grammar passes on tcvm's own parser (delete runs of
@@ -183,7 +187,8 @@ under GC stress (`gc4096` and up): at short ones it runs 10 to 50 times slower (
 tcvm-fuzz cover 0 600
 ```
 
-Runs the seeds with `TCVM_STATS` and prints the opcodes the interpreter never dispatched and
+Runs the seeds with `TCVM_STATS` and prints the opcodes the interpreter never dispatched (the
+binary's own list: its stats name every opcode) and
 the JIT's events (regions compiled by entry kind, failed compiles by class, exits by tag,
 passes that changed something). Use it after changing the generator, to see that a new form
 reaches what it was written for.
@@ -195,14 +200,15 @@ bounded, and what it prints depends on nothing but its text. A new statement or 
 form has to keep all of that, or runs start timing out and reference Lua starts disagreeing
 for reasons that are no bugs.
 
-- `expr.rs`, `stmt.rs`: the typed forms of free units. Add a statement form to `FORMS` in
-  `mod.rs` and to the `match` in `Gen::stmt`.
+- `expr.rs`, `stmt.rs`: the typed forms of free units. Add a statement form to `Form` and
+  `FORMS` in `mod.rs` and to the `match` in `Gen::stmt`.
 - `templates.rs`: the hand-written shapes that each aim at one thing the JIT speculates on.
-  `templates/strict.rs` holds the ones that are strict (`konst`, `tailnat`, `flow`, `arity`):
-  list a new strict template in its `STRICT`, and keep it off floats as text, lengths of
-  tables that may have holes, libm and `pairs` order. `templates/stress.rs` holds the ones past
-  the sizes the rest reach (`chain`, `recur`, `callslot`, `hoist`); `HEAVY` lists those the
-  driver calls fewer times. `templates/lang.rs` holds the ones over the language's corners
+  Its `TEMPLATES` lists every template with its weight, whether it is strict (`s(…)`) and
+  whether the driver calls it fewer times (`heavy(…)`); a new template is a row there.
+  `templates/strict.rs` holds strict ones (`konst`, `tailnat`, `flow`, `arity`): keep a strict
+  template off floats as text, lengths of tables that may have holes, libm and `pairs` order.
+  `templates/stress.rs` holds the ones past the sizes the rest reach (`chain`, `recur`,
+  `callslot`, `hoist`). `templates/lang.rs` holds the ones over the language's corners
   by the manual's sections (patterns, formats, `pack`, `utf8`, lexical forms, vararg tables,
   `_ENV`, `load`, to-be-closed variables, `goto`, `xpcall`, coroutines, inheritance, the table
   library, numeric edges).
@@ -216,7 +222,8 @@ for reasons that are no bugs.
   `via_cs`, `via_dirty`); an adapter must return `f`'s results and raise its errors unchanged.
   After the warm-up some calls pass `twin(v, k)`: a value equal to another argument but not the
   same object.
-- `src/prelude.lua`: the value pool and the output functions, at the head of every program.
+- `src/prelude.lua`: the output functions, at the head of every program, with the value pool
+  of `generate/pool.rs` in its `reset`. A family's values and its size are that table's alone.
 
 Programs are a function of their seed, so a change to the generator changes what every seed
 produces: kept programs stay valid as files, but `gen` and `reduce` on an old seed give the

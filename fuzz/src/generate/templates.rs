@@ -1,28 +1,48 @@
-//! Hand-written templates: small bodies of `f` that aim at one thing each, ported from the old
-//! Python generator (`tools/fuzz/gen.py`).
+//! Hand-written templates: small bodies of `f` that aim at one thing each.
 
 mod lang;
 mod stress;
 mod strict;
 
-use super::Gen;
+use super::driver::{FAMS, NUMF};
+use super::{Build, Gen};
 use crate::ast::{Block, Stmt};
 
-/// Whether a template's units stay within what reference Lua agrees on, so are compared with it.
-pub(super) fn is_strict(kind: &str) -> bool {
-    strict::STRICT.contains(&kind) || stress::STRICT.contains(&kind) || lang::STRICT.contains(&kind)
+pub(super) struct Template {
+    pub name: &'static str,
+    /// How often a unit takes it.
+    weight: u32,
+    /// The body of `f`.
+    body: Build,
+    /// Its units stay within what reference Lua agrees on, so are compared with it: no float or
+    /// table reaches a string, no length of a table that may have holes, no libm function whose
+    /// last bit may differ, no `pairs` order.
+    pub strict: bool,
+    /// Its call is slow, so the driver makes fewer.
+    pub heavy: bool,
 }
 
-/// Whether a template's call is slow, so the driver makes fewer.
-pub(super) fn is_heavy(kind: &str) -> bool {
-    stress::HEAVY.contains(&kind)
+const fn t(name: &'static str, weight: u32, body: Build) -> Template {
+    Template {
+        name,
+        weight,
+        body,
+        strict: false,
+        heavy: false,
+    }
 }
 
-const FAMS: &[&str] = &[
-    "si", "bi", "fl", "fs", "ns", "st", "ot", "tb", "fn", "nil1", "sp", "sn", "fp", "mn", "ib",
-    "tt", "tm", "mx", "ms",
-];
-const NUMF: &[&str] = &["si", "sp", "fl", "fp", "mn", "ib", "bi"];
+/// A strict template.
+const fn s(name: &'static str, weight: u32, body: Build) -> Template {
+    Template {
+        strict: true,
+        ..t(name, weight, body)
+    }
+}
+
+const fn heavy(t: Template) -> Template {
+    Template { heavy: true, ..t }
+}
 
 /// Constants by class: a template takes a class first, so a rare class is not rare by count.
 const KONST: &[&[&str]] = &[
@@ -217,58 +237,60 @@ const LIMIT_WARM: &[&str] = &[
     "0, 30, 3, 7",
 ];
 
-/// The templates (all but `limits`) and how often a unit takes each.
-const TEMPLATES: &[(&str, u32)] = &[
-    ("binop", 6),
-    ("unop", 2),
-    ("cmp", 5),
-    ("logic", 1),
-    ("builtin", 6),
-    ("tget", 3),
-    ("tset", 3),
-    ("for", 5),
-    ("while", 2),
-    ("gfor", 2),
-    ("vararg", 2),
-    ("closure", 1),
-    ("rec", 1),
-    ("tail", 2),
-    ("str", 2),
-    ("expr", 4),
-    ("coerce", 3),
-    ("mt", 1),
-    ("call", 3),
-    ("coro", 2),
-    ("meta2", 3),
-    ("close", 1),
-    ("tarr", 4),
-    ("upv", 2),
-    ("strmeth", 1),
-    ("konst", 6),
-    ("tailnat", 6),
-    ("flow", 6),
-    ("arity", 4),
-    ("chain", 3),
-    ("recur", 3),
-    ("callslot", 3),
-    ("hoist", 4),
-    ("pattern", 4),
-    ("strfmt", 3),
-    ("pack", 2),
-    ("utf8", 2),
-    ("lex", 3),
-    ("assign", 2),
-    ("ctor", 3),
-    ("vatab", 3),
-    ("env", 2),
-    ("load", 2),
-    ("tbc", 3),
-    ("goto", 2),
-    ("xpcall", 3),
-    ("coro2", 3),
-    ("oop", 3),
-    ("tablib", 3),
-    ("numedge", 4),
+/// The templates (all but `limits`).
+pub(super) const TEMPLATES: &[Template] = &[
+    t("binop", 6, Gen::t_binop),
+    t("unop", 2, Gen::t_unop),
+    t("cmp", 5, Gen::t_cmp),
+    t("logic", 1, Gen::t_logic),
+    t("builtin", 6, Gen::t_builtin),
+    t("tget", 3, Gen::t_tget),
+    t("tset", 3, Gen::t_tset),
+    t("for", 5, Gen::t_for),
+    t("while", 2, Gen::t_while),
+    t("gfor", 2, Gen::t_gfor),
+    t("vararg", 2, Gen::t_vararg),
+    t("closure", 1, Gen::t_closure),
+    t("rec", 1, Gen::t_rec),
+    t("tail", 2, Gen::t_tail),
+    t("str", 2, Gen::t_str),
+    t("expr", 4, Gen::t_expr_tpl),
+    t("coerce", 3, Gen::t_coerce),
+    t("mt", 1, Gen::t_mt),
+    t("call", 3, Gen::t_call),
+    t("coro", 2, Gen::t_coro),
+    t("meta2", 3, Gen::t_meta2),
+    t("close", 1, Gen::t_close),
+    t("tarr", 4, Gen::t_tarr),
+    t("upv", 2, Gen::t_upv),
+    t("strmeth", 1, Gen::t_strmeth),
+    s("konst", 6, Gen::t_konst),
+    s("tailnat", 6, Gen::t_tailnat),
+    s("flow", 6, Gen::t_flow),
+    s("arity", 4, Gen::t_arity),
+    heavy(s("chain", 3, Gen::t_chain)),
+    heavy(s("recur", 3, Gen::t_recur)),
+    t("callslot", 3, Gen::t_callslot),
+    s("hoist", 4, Gen::t_hoist),
+    s("pattern", 4, Gen::t_pattern),
+    s("strfmt", 3, Gen::t_strfmt),
+    s("pack", 2, Gen::t_pack),
+    s("utf8", 2, Gen::t_utf8),
+    s("lex", 3, Gen::t_lex),
+    // Not strict: the manual leaves the order of assignment undefined.
+    t("assign", 2, Gen::t_assign),
+    t("ctor", 3, Gen::t_ctor),
+    s("vatab", 3, Gen::t_vatab),
+    s("env", 2, Gen::t_env),
+    s("load", 2, Gen::t_load),
+    s("tbc", 3, Gen::t_tbc),
+    s("goto", 2, Gen::t_goto),
+    s("xpcall", 3, Gen::t_xpcall),
+    // Not strict: tcvm yields across natives on purpose.
+    t("coro2", 3, Gen::t_coro2),
+    s("oop", 3, Gen::t_oop),
+    s("tablib", 3, Gen::t_tablib),
+    s("numedge", 4, Gen::t_numedge),
 ];
 
 impl Gen {
@@ -358,21 +380,16 @@ impl Gen {
 
     fn t_binop(&mut self) -> String {
         let op = self.tc(BINOPS);
-        let f = self.r.below(4);
-        if f == 0 {
-            return format!("return a {op} b");
+        match self.r.below(4) {
+            0 => format!("return a {op} b"),
+            1 => format!("return a {op} {}", self.tk()),
+            2 => format!("return {} {op} a", self.tk()),
+            _ => {
+                let op2 = self.tc(BINOPS);
+                let o = self.toperand();
+                format!("local x = a {op} b\nreturn x {op2} {o}, math.type(x)")
+            }
         }
-        if f == 1 {
-            let k = self.tk();
-            return format!("return a {op} {k}");
-        }
-        if f == 2 {
-            let k = self.tk();
-            return format!("return {k} {op} a");
-        }
-        let op2 = self.tc(BINOPS);
-        let o = self.toperand();
-        format!("local x = a {op} b\nreturn x {op2} {o}, math.type(x)")
     }
 
     fn t_unop(&mut self) -> String {
@@ -394,19 +411,16 @@ impl Gen {
         let lhs = self.tc(&["a", "a", k1]);
         let k2 = self.tk();
         let rhs = self.tc(&["b", k2, "c"]);
-        let f = self.r.below(4);
-        if f == 0 {
-            return format!("return {lhs} {op} {rhs}");
+        match self.r.below(4) {
+            0 => format!("return {lhs} {op} {rhs}"),
+            1 => format!("if {lhs} {op} {rhs} then return 1 else return 2 end"),
+            2 => {
+                let b = self.tc(&BINOPS[..7]);
+                let k = self.tk();
+                format!("local x = a {b} b\nif x {op} {k} then return x end\nreturn not x")
+            }
+            _ => format!("if not ({lhs} {op} {rhs}) then return 'n' end return 'y'"),
         }
-        if f == 1 {
-            return format!("if {lhs} {op} {rhs} then return 1 else return 2 end");
-        }
-        if f == 2 {
-            let b = self.tc(&BINOPS[..7]);
-            let k = self.tk();
-            return format!("local x = a {b} b\nif x {op} {k} then return x end\nreturn not x");
-        }
-        format!("if not ({lhs} {op} {rhs}) then return 'n' end return 'y'")
     }
 
     fn t_logic(&mut self) -> String {
@@ -425,19 +439,13 @@ impl Gen {
             })
             .collect();
         let call = format!("{name}({})", args.join(", "));
-        let f = self.r.below(6);
-        if f == 0 {
-            format!("return {call}")
-        } else if f == 1 {
-            format!("local x = {call}\nreturn x")
-        } else if f == 2 {
-            format!("return select('#', {call}), {call}")
-        } else if f == 3 {
-            format!("return {{{call}}}")
-        } else if f == 4 {
-            format!("return {call}, 'tail'")
-        } else {
-            format!("local t = {{{call}, {call}}}\nreturn #t, t[1], t[2]")
+        match self.r.below(6) {
+            0 => format!("return {call}"),
+            1 => format!("local x = {call}\nreturn x"),
+            2 => format!("return select('#', {call}), {call}"),
+            3 => format!("return {{{call}}}"),
+            4 => format!("return {call}, 'tail'"),
+            _ => format!("local t = {{{call}, {call}}}\nreturn #t, t[1], t[2]"),
         }
     }
 
@@ -446,55 +454,50 @@ impl Gen {
             "b", "1", "0", "-1", "1.0", "2", "3", "4", "2^53", "'x'", "'y'", "'n'", "1.5", "c",
             "b + 1", "#a",
         ]);
-        let f = self.r.below(4);
-        if f == 0 {
-            return format!("return a[{key}]");
+        match self.r.below(4) {
+            0 => format!("return a[{key}]"),
+            1 => {
+                let f1 = self.tc(&["x", "y", "z", "n"]);
+                let f2 = self.tc(&["x", "y", "z", "n"]);
+                format!("return a.{f1}, a.{f2}")
+            }
+            2 => format!("local v = a[{key}]\nreturn v, type(v), v == nil"),
+            _ => format!("return rawget(a, {key}), #a"),
         }
-        if f == 1 {
-            let f1 = self.tc(&["x", "y", "z", "n"]);
-            let f2 = self.tc(&["x", "y", "z", "n"]);
-            return format!("return a.{f1}, a.{f2}");
-        }
-        if f == 2 {
-            return format!("local v = a[{key}]\nreturn v, type(v), v == nil");
-        }
-        format!("return rawget(a, {key}), #a")
     }
 
     fn t_tset(&mut self) -> String {
-        let f = self.r.below(4);
         let key = self.tc(&[
             "b", "1", "0", "-1", "1.0", "4", "'x'", "'q'", "c", "#a + 1", "2.5",
         ]);
-        if f == 0 {
-            return format!("local t = {{}}\nt[{key}] = c\nreturn t[{key}], #t, next(t)");
-        }
-        if f == 1 {
-            let mut fl = ["x", "y", "z", "w"];
-            for i in (1..fl.len()).rev() {
-                let j = self.r.below(i + 1);
-                fl.swap(i, j);
+        match self.r.below(4) {
+            0 => format!("local t = {{}}\nt[{key}] = c\nreturn t[{key}], #t, next(t)"),
+            1 => {
+                let mut fl = ["x", "y", "z", "w"];
+                self.r.shuffle(&mut fl);
+                let src = self.tc(&["a", "b", "c", "a.x", "b[1]", "c.y", "a[b]"]);
+                let mut lines = vec!["local o = {}".to_string()];
+                let n = self.r.range(1, 4) as usize;
+                for nm in &fl[..n] {
+                    let k = self.tk();
+                    let v = self.tc(&[src, "a", "b", "c", k]);
+                    lines.push(format!("o.{nm} = {v}"));
+                }
+                let op = self.tc(&["+", "..", "<", "=="]);
+                lines.push(format!("return o.x, o.y, o.z, o.w, (o.x or 0) {op} 1"));
+                lines.join("\n")
             }
-            let src = self.tc(&["a", "b", "c", "a.x", "b[1]", "c.y", "a[b]"]);
-            let mut lines = vec!["local o = {}".to_string()];
-            let n = self.r.range(1, 4) as usize;
-            for nm in &fl[..n] {
-                let k = self.tk();
-                let v = self.tc(&[src, "a", "b", "c", k]);
-                lines.push(format!("o.{nm} = {v}"));
+            2 => {
+                let fld = self.tc(&["x", "y", "z"]);
+                format!(
+                    "local t = {{x = 1, y = 2}}\nt.{fld} = a\nt[{key}] = b\nreturn t.x, t.y, t[{key}]"
+                )
             }
-            let op = self.tc(&["+", "..", "<", "=="]);
-            lines.push(format!("return o.x, o.y, o.z, o.w, (o.x or 0) {op} 1"));
-            return lines.join("\n");
+            _ => {
+                let k = self.tc(&["1", "2", "3", "b", "4"]);
+                format!("local t = {{a, b, c}}\nt[{k}] = nil\nreturn #t, t[1], t[2], t[3]")
+            }
         }
-        if f == 2 {
-            let fld = self.tc(&["x", "y", "z"]);
-            return format!(
-                "local t = {{x = 1, y = 2}}\nt.{fld} = a\nt[{key}] = b\nreturn t.x, t.y, t[{key}]"
-            );
-        }
-        let k = self.tc(&["1", "2", "3", "b", "4"]);
-        format!("local t = {{a, b, c}}\nt[{k}] = nil\nreturn #t, t[1], t[2], t[3]")
     }
 
     fn t_for(&mut self) -> String {
@@ -533,82 +536,82 @@ impl Gen {
     }
 
     fn t_while(&mut self) -> String {
-        let f = self.r.below(3);
         let op = self.tc(&CMPOPS[2..]);
-        if f == 0 {
-            let a = self.tc(&["+", "-", "*", ".."]);
-            let b = self.tc(&["1", "c", "0.5", "2"]);
-            return format!(
-                "local n = 0\nlocal x = a\nwhile x {op} b and n < 20 do\n  x = x {a} {b}\n  n = n + 1\nend\nreturn x, n"
-            );
+        match self.r.below(3) {
+            0 => {
+                let a = self.tc(&["+", "-", "*", ".."]);
+                let b = self.tc(&["1", "c", "0.5", "2"]);
+                format!(
+                    "local n = 0\nlocal x = a\nwhile x {op} b and n < 20 do\n  x = x {a} {b}\n  n = n + 1\nend\nreturn x, n"
+                )
+            }
+            1 => {
+                let a = self.tc(&["+", "*", "-", "//"]);
+                format!(
+                    "local n, x = 0, a\nrepeat\n  n = n + 1\n  x = x {a} c\n  if n > 15 then break end\nuntil x {op} b\nreturn n, x"
+                )
+            }
+            _ => {
+                let a = self.tc(&["1", "c", "0.25"]);
+                format!(
+                    "local n, x = 0, a\n::top::\nn = n + 1\nif n < 10 and x {op} b then\n  x = x + {a}\n  goto top\nend\nreturn n, x"
+                )
+            }
         }
-        if f == 1 {
-            let a = self.tc(&["+", "*", "-", "//"]);
-            return format!(
-                "local n, x = 0, a\nrepeat\n  n = n + 1\n  x = x {a} c\n  if n > 15 then break end\nuntil x {op} b\nreturn n, x"
-            );
-        }
-        let a = self.tc(&["1", "c", "0.25"]);
-        format!(
-            "local n, x = 0, a\n::top::\nn = n + 1\nif n < 10 and x {op} b then\n  x = x + {a}\n  goto top\nend\nreturn n, x"
-        )
     }
 
     fn t_gfor(&mut self) -> String {
-        let f = self.r.below(4);
-        if f == 0 {
-            let x = self.tc(&["", "a[k] = nil", "if n > 2 then break end", "b = k"]);
-            return format!(
-                "local n, s = 0, {{}}\nfor k, v in pairs(a) do\n  n = n + 1\n  s[#s + 1] = ser(k) .. '=' .. ser(v)\n  {x}\nend\ntable.sort(s)\nreturn n, table.concat(s, ';')"
-            );
+        match self.r.below(4) {
+            0 => {
+                let x = self.tc(&["", "a[k] = nil", "if n > 2 then break end", "b = k"]);
+                format!(
+                    "local n, s = 0, {{}}\nfor k, v in pairs(a) do\n  n = n + 1\n  s[#s + 1] = ser(k) .. '=' .. ser(v)\n  {x}\nend\ntable.sort(s)\nreturn n, table.concat(s, ';')"
+                )
+            }
+            1 => {
+                let x = self.tc(&["s + i", "v", "s + v", "i + b"]);
+                format!(
+                    "local n, s = 0, 0\nfor i, v in ipairs(a) do\n  n = n + 1\n  s = {x}\n  if n > 30 then break end\nend\nreturn n, s"
+                )
+            }
+            2 => "local n, k, v = 0, nil, nil\nrepeat\n  k, v = next(a, k)\n  n = n + 1\nuntil k == nil or n > 20\nreturn n".to_string(),
+            _ => {
+                let s1 = self.tc(&["1", "c", "0.5"]);
+                let s2 = self.tc(&["0", "a", "0.0"]);
+                format!(
+                    "local function it(s, i)\n  i = i + {s1}\n  if i <= s then return i, i * 2 end\nend\nlocal n, last = 0, nil\nfor i, j in it, b, {s2} do n = n + 1; last = j; if n > 20 then break end end\nreturn n, last"
+                )
+            }
         }
-        if f == 1 {
-            let x = self.tc(&["s + i", "v", "s + v", "i + b"]);
-            return format!(
-                "local n, s = 0, 0\nfor i, v in ipairs(a) do\n  n = n + 1\n  s = {x}\n  if n > 30 then break end\nend\nreturn n, s"
-            );
-        }
-        if f == 2 {
-            return "local n, k, v = 0, nil, nil\nrepeat\n  k, v = next(a, k)\n  n = n + 1\nuntil k == nil or n > 20\nreturn n".to_string();
-        }
-        let s1 = self.tc(&["1", "c", "0.5"]);
-        let s2 = self.tc(&["0", "a", "0.0"]);
-        format!(
-            "local function it(s, i)\n  i = i + {s1}\n  if i <= s then return i, i * 2 end\nend\nlocal n, last = 0, nil\nfor i, j in it, b, {s2} do n = n + 1; last = j; if n > 20 then break end end\nreturn n, last"
-        )
     }
 
     fn t_vararg(&mut self) -> String {
         self.helper_stmt("local function va(...) return select('#', ...), ... end");
         self.helper_stmt("local function vb(x, ...) local t = {...} return #t, x, ... end");
-        let f = self.r.below(5);
-        if f == 0 {
-            return "return va(a, b, c)".to_string();
+        match self.r.below(5) {
+            0 => "return va(a, b, c)".to_string(),
+            1 => {
+                let s = self.tc(&["a", "b", "1", "-1", "2", "'#'", "4", "-4"]);
+                format!("return select({s}, a, b, c)")
+            }
+            2 => "return vb(va(a, b))".to_string(),
+            3 => {
+                let n = self.tc(&[
+                    "vb",
+                    "va",
+                    "math.max",
+                    "select",
+                    "string.byte",
+                    "table.unpack",
+                ]);
+                format!("return {n}(a, b, c)")
+            }
+            _ => "local x, y, z, w = va(a)\nreturn x, y, z, w".to_string(),
         }
-        if f == 1 {
-            let s = self.tc(&["a", "b", "1", "-1", "2", "'#'", "4", "-4"]);
-            return format!("return select({s}, a, b, c)");
-        }
-        if f == 2 {
-            return "return vb(va(a, b))".to_string();
-        }
-        if f == 3 {
-            let n = self.tc(&[
-                "vb",
-                "va",
-                "math.max",
-                "select",
-                "string.byte",
-                "table.unpack",
-            ]);
-            return format!("return {n}(a, b, c)");
-        }
-        "local x, y, z, w = va(a)\nreturn x, y, z, w".to_string()
     }
 
     fn t_closure(&mut self) -> String {
-        let f = self.r.below(2);
-        if f == 0 {
+        if self.r.chance(0.5) {
             let op = self.tc(&["+", "..", "*", "//"]);
             return format!(
                 "local fs = {{}}\nlocal u = a\nfor i = 1, 3 do\n  fs[i] = function() u = u {op} b return u end\nend\nreturn fs[1](), fs[2](), u"
@@ -645,26 +648,28 @@ impl Gen {
     }
 
     fn t_str(&mut self) -> String {
-        let k1 = self.tk();
-        let k2 = self.tk();
-        let i1 = self.tc(INTK);
-        let i2 = self.tc(INTK);
-        let opts = [
-            "return a .. b".to_string(),
-            "return #a".to_string(),
-            "return string.sub(a, b, c)".to_string(),
-            "return a:sub(b)".to_string(),
-            "return string.byte(a, b, c)".to_string(),
-            format!("return a .. {k1}"),
-            format!("return {k2} .. a .. b"),
-            "return string.len(a), #a".to_string(),
-            "local s = a .. ''\nreturn s, #s".to_string(),
-            "return (a .. b) == 'ab'".to_string(),
-            "return string.byte(a, -1)".to_string(),
-            "return a:byte(1, -1)".to_string(),
-            format!("return string.sub(a, {i1}, {i2})"),
+        const FIXED: &[&str] = &[
+            "return a .. b",
+            "return #a",
+            "return string.sub(a, b, c)",
+            "return a:sub(b)",
+            "return string.byte(a, b, c)",
+            "return string.len(a), #a",
+            "local s = a .. ''\nreturn s, #s",
+            "return (a .. b) == 'ab'",
+            "return string.byte(a, -1)",
+            "return a:byte(1, -1)",
         ];
-        self.r.pick(&opts).clone()
+        match self.r.below(FIXED.len() + 3) {
+            0 => format!("return a .. {}", self.tk()),
+            1 => format!("return {} .. a .. b", self.tk()),
+            2 => {
+                let i = self.tc(INTK);
+                let j = self.tc(INTK);
+                format!("return string.sub(a, {i}, {j})")
+            }
+            n => FIXED[n - 3].to_string(),
+        }
     }
 
     fn t_expr_tpl(&mut self) -> String {
@@ -673,37 +678,38 @@ impl Gen {
     }
 
     fn t_coerce(&mut self) -> String {
-        let b = self.tc(&["10", "16", "2", "36", "b"]);
-        let k1 = self.tk();
-        let k2 = self.tk();
-        let k3 = self.tk();
-        let opts = [
-            "return a + 0, a * 1, a - 0".to_string(),
-            "return a // 1, a % 1".to_string(),
-            "return math.tointeger(a)".to_string(),
-            "return a | 0".to_string(),
-            "return tonumber(a)".to_string(),
-            format!("return tonumber(a, {b})"),
-            "return a == a + 0".to_string(),
-            "return a + 0.0".to_string(),
-            format!("return a // {k1}, a % {k2}"),
-            "return math.floor(a), math.ceil(a)".to_string(),
-            "local x = a\nif math.type(x) == 'integer' then return x + 1 end\nreturn x".to_string(),
-            format!("return math.fmod(a, b), math.fmod(a, {k3})"),
+        const FIXED: &[&str] = &[
+            "return a + 0, a * 1, a - 0",
+            "return a // 1, a % 1",
+            "return math.tointeger(a)",
+            "return a | 0",
+            "return tonumber(a)",
+            "return a == a + 0",
+            "return a + 0.0",
+            "return math.floor(a), math.ceil(a)",
+            "local x = a\nif math.type(x) == 'integer' then return x + 1 end\nreturn x",
         ];
-        self.r.pick(&opts).clone()
+        match self.r.below(FIXED.len() + 3) {
+            0 => {
+                let b = self.tc(&["10", "16", "2", "36", "b"]);
+                format!("return tonumber(a, {b})")
+            }
+            1 => {
+                let k1 = self.tk();
+                let k2 = self.tk();
+                format!("return a // {k1}, a % {k2}")
+            }
+            2 => format!("return math.fmod(a, b), math.fmod(a, {})", self.tk()),
+            n => FIXED[n - 3].to_string(),
+        }
     }
 
     fn t_mt(&mut self) -> String {
-        let f = self.r.below(3);
-        if f == 0 {
-            return "return a.x, a[1], a.zz".to_string();
+        match self.r.below(3) {
+            0 => "return a.x, a[1], a.zz".to_string(),
+            1 => format!("return a {} b", self.tc(BINCMP)),
+            _ => "return #a, -a, a(b)".to_string(),
         }
-        if f == 1 {
-            let op = self.tc(BINCMP);
-            return format!("return a {op} b");
-        }
-        "return #a, -a, a(b)".to_string()
     }
 
     fn t_call(&mut self) -> String {
@@ -711,57 +717,62 @@ impl Gen {
         self.helper_stmt("local function g2(x, y) return y, x end");
         self.helper_stmt("local function gv(...) return ... end");
         self.helper_stmt("local obj = { m = function(self, x) return self, x end }");
-        let op = self.tc(BINCMP);
-        let opts = [
-            "return g2(a)".to_string(),
-            "return g2(a, b, c, a)".to_string(),
-            "return g0(a, b)".to_string(),
-            "return gv(a, b, c)".to_string(),
-            "return (gv(a, b, c))".to_string(),
-            "return {gv(a, b)}, #{gv(a, b, c)}".to_string(),
-            "return b(a)".to_string(),
-            "return a(b, c)".to_string(),
-            "return obj:m(a)".to_string(),
-            "return obj.m(a, b)".to_string(),
-            "return g2(gv(a, b, c))".to_string(),
-            format!("local x, y = g2(a, b)\nreturn y {op} x"),
-            "return select(-1, gv(a, b, c))".to_string(),
-            "return select(2, gv(a, b, c)), select('#', gv())".to_string(),
-            "return pcall(g2, a, b)".to_string(),
-            "return pcall(a, b)".to_string(),
-            "return string.format('%s', a)".to_string(),
+        const FIXED: &[&str] = &[
+            "return g2(a)",
+            "return g2(a, b, c, a)",
+            "return g0(a, b)",
+            "return gv(a, b, c)",
+            "return (gv(a, b, c))",
+            "return {gv(a, b)}, #{gv(a, b, c)}",
+            "return b(a)",
+            "return a(b, c)",
+            "return obj:m(a)",
+            "return obj.m(a, b)",
+            "return g2(gv(a, b, c))",
+            "return select(-1, gv(a, b, c))",
+            "return select(2, gv(a, b, c)), select('#', gv())",
+            "return pcall(g2, a, b)",
+            "return pcall(a, b)",
+            "return string.format('%s', a)",
         ];
-        self.r.pick(&opts).clone()
+        match self.r.below(FIXED.len() + 1) {
+            0 => format!("local x, y = g2(a, b)\nreturn y {} x", self.tc(BINCMP)),
+            n => FIXED[n - 1].to_string(),
+        }
     }
 
     fn t_coro(&mut self) -> String {
-        let o1 = self.tc(&["+", "..", "*", "-"]);
-        let o2 = self.tc(BINOPS);
-        let opts = [
-            format!("local co = coroutine.wrap(function(x)\n  for i = 1, 3 do x = x {o1} coroutine.yield(x) end\n  return x\nend)\nco(a); co(b); co(c)\nreturn co(b)"),
-            format!("local co = coroutine.create(function(x, y)\n  local ok, v = pcall(function() return coroutine.yield(x {o2} y) end)\n  return ok, v\nend)\nlocal r1 = {{ coroutine.resume(co, a, b) }}\nlocal r2 = {{ coroutine.resume(co, c) }}\nreturn #r1, r1[2], #r2, r2[2], r2[3]"),
-            "local n = 0\nlocal co = coroutine.wrap(function()\n  for i = a, b do n = n + 1; coroutine.yield(i) if n > 10 then break end end\n  return \"end\"\nend)\nlocal last\nfor j = 1, 12 do last = co() if last == \"end\" then break end end\nreturn n, last".to_string(),
-        ];
-        self.r.pick(&opts).clone()
+        match self.r.below(3) {
+            0 => {
+                let o1 = self.tc(&["+", "..", "*", "-"]);
+                format!("local co = coroutine.wrap(function(x)\n  for i = 1, 3 do x = x {o1} coroutine.yield(x) end\n  return x\nend)\nco(a); co(b); co(c)\nreturn co(b)")
+            }
+            1 => {
+                let o2 = self.tc(BINOPS);
+                format!("local co = coroutine.create(function(x, y)\n  local ok, v = pcall(function() return coroutine.yield(x {o2} y) end)\n  return ok, v\nend)\nlocal r1 = {{ coroutine.resume(co, a, b) }}\nlocal r2 = {{ coroutine.resume(co, c) }}\nreturn #r1, r1[2], #r2, r2[2], r2[3]")
+            }
+            _ => "local n = 0\nlocal co = coroutine.wrap(function()\n  for i = a, b do n = n + 1; coroutine.yield(i) if n > 10 then break end end\n  return \"end\"\nend)\nlocal last\nfor j = 1, 12 do last = co() if last == \"end\" then break end end\nreturn n, last".to_string(),
+        }
     }
 
     fn t_meta2(&mut self) -> String {
-        let op = self.tc(BINOPS);
-        let opts = [
-            "return a.x, a.y, a[1]".to_string(),
-            "a.q = b\nreturn rawget(a, 'q'), a.q".to_string(),
-            "return a == b, a ~= b, rawequal(a, b)".to_string(),
-            "return a < b, a <= b".to_string(),
-            "return #a, rawlen(a)".to_string(),
-            "return a .. b".to_string(),
-            "return -a".to_string(),
-            "return a(b, c)".to_string(),
-            "return a + b, b + a".to_string(),
-            "return a[b], a[c]".to_string(),
-            "return getmetatable(a)".to_string(),
-            format!("local x = a.x\nreturn x {op} 1"),
+        const FIXED: &[&str] = &[
+            "return a.x, a.y, a[1]",
+            "a.q = b\nreturn rawget(a, 'q'), a.q",
+            "return a == b, a ~= b, rawequal(a, b)",
+            "return a < b, a <= b",
+            "return #a, rawlen(a)",
+            "return a .. b",
+            "return -a",
+            "return a(b, c)",
+            "return a + b, b + a",
+            "return a[b], a[c]",
+            "return getmetatable(a)",
         ];
-        self.r.pick(&opts).clone()
+        match self.r.below(FIXED.len() + 1) {
+            0 => format!("local x = a.x\nreturn x {} 1", self.tc(BINOPS)),
+            n => FIXED[n - 1].to_string(),
+        }
     }
 
     fn t_close(&mut self) -> String {
@@ -853,71 +864,17 @@ impl Gen {
         }
     }
 
-    /// A template: (its kind, the body of `f`, the families `f` is warmed up with).
+    /// A template, `only` if it names one: (it, the body of `f`, the families `f` is warmed up
+    /// with).
     pub(super) fn template(
         &mut self,
         only: Option<&str>,
-    ) -> (&'static str, String, Option<[&'static str; 3]>) {
-        let kind = match only.and_then(|k| TEMPLATES.iter().find(|(n, _)| *n == k)) {
-            Some(&(n, _)) => n,
-            None => {
-                let w: Vec<u32> = TEMPLATES.iter().map(|&(_, w)| w).collect();
-                TEMPLATES[self.r.weighted(&w)].0
-            }
+    ) -> (&'static Template, String, [&'static str; 3]) {
+        let t = match only.and_then(|k| TEMPLATES.iter().find(|t| t.name == k)) {
+            Some(t) => t,
+            None => self.r.pick_by(TEMPLATES, |t| t.weight),
         };
-        let body = match kind {
-            "binop" => self.t_binop(),
-            "unop" => self.t_unop(),
-            "cmp" => self.t_cmp(),
-            "logic" => self.t_logic(),
-            "builtin" => self.t_builtin(),
-            "tget" => self.t_tget(),
-            "tset" => self.t_tset(),
-            "for" => self.t_for(),
-            "while" => self.t_while(),
-            "gfor" => self.t_gfor(),
-            "vararg" => self.t_vararg(),
-            "closure" => self.t_closure(),
-            "rec" => self.t_rec(),
-            "tail" => self.t_tail(),
-            "str" => self.t_str(),
-            "expr" => self.t_expr_tpl(),
-            "coerce" => self.t_coerce(),
-            "mt" => self.t_mt(),
-            "call" => self.t_call(),
-            "coro" => self.t_coro(),
-            "meta2" => self.t_meta2(),
-            "close" => self.t_close(),
-            "tarr" => self.t_tarr(),
-            "upv" => self.t_upv(),
-            "strmeth" => self.t_strmeth(),
-            "konst" => self.t_konst(),
-            "tailnat" => self.t_tailnat(),
-            "flow" => self.t_flow(),
-            "arity" => self.t_arity(),
-            "chain" => self.t_chain(),
-            "recur" => self.t_recur(),
-            "callslot" => self.t_callslot(),
-            "hoist" => self.t_hoist(),
-            "pattern" => self.t_pattern(),
-            "strfmt" => self.t_strfmt(),
-            "pack" => self.t_pack(),
-            "utf8" => self.t_utf8(),
-            "lex" => self.t_lex(),
-            "assign" => self.t_assign(),
-            "ctor" => self.t_ctor(),
-            "vatab" => self.t_vatab(),
-            "env" => self.t_env(),
-            "load" => self.t_load(),
-            "tbc" => self.t_tbc(),
-            "goto" => self.t_goto(),
-            "xpcall" => self.t_xpcall(),
-            "coro2" => self.t_coro2(),
-            "oop" => self.t_oop(),
-            "tablib" => self.t_tablib(),
-            "numedge" => self.t_numedge(),
-            _ => unreachable!(),
-        };
+        let (kind, body) = (t.name, (t.body)(self));
         let mut wf = self.t_warm_fams();
         if kind == "for" && self.r.f64() < 0.8 {
             let p = &["si", "sp", "sn", "ib", "bi"];
@@ -949,7 +906,7 @@ impl Gen {
             n.push("tm");
             wf = [self.tc(&["tm", "tb", "tt"]), self.tc(&m), self.tc(&n)];
         }
-        (kind, body, Some(wf))
+        (t, body, wf)
     }
 
     /// The whole code of a `limits` unit: integer loops with bounds and steps near the limits.
@@ -958,17 +915,14 @@ impl Gen {
         let acc = self.tc(LIMIT_ACCS);
         let test = self.tc(LIMIT_TESTS);
         let step = format!("n = n + 1\n  local x = {e}\n  {acc}\n  if {test} then t = t + 1 end");
-        let form = self.r.below(3);
-        let lp = if form == 0 {
-            format!("for i = lo, hi, st do\n  {step}\n  if n >= 40 then break end\nend")
-        } else if form == 1 {
-            format!(
+        let lp = match self.r.below(3) {
+            0 => format!("for i = lo, hi, st do\n  {step}\n  if n >= 40 then break end\nend"),
+            1 => format!(
                 "local i = lo\nwhile n < 40 and (st > 0 and i <= hi or st < 0 and i >= hi) do\n  {step}\n  i = i + st\nend"
-            )
-        } else {
-            format!(
+            ),
+            _ => format!(
                 "for j = 1, 12 do\n  local i = lo + (j - 1) * st\n  {step}\n  if i == hi then break end\nend"
-            )
+            ),
         };
         let body = format!("local s, t, n = 0, 0, 0\n{lp}\nreturn s, t, n, math.type(s)");
         let warm = self.tc(LIMIT_WARM);

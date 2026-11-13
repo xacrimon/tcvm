@@ -7,11 +7,20 @@
 //! bytes, and it returns a number and a string. Parts keep to what reference Lua agrees on: no
 //! float reaches a string, sorts order totally, `pairs` only feeds sorted keys.
 
-use super::Gen;
+use super::{Build, Gen, Role};
 use crate::ast::{Block, Stmt};
 
-const PARTS: &[&str] = &[
-    "cls", "lex", "sched", "vm", "ser", "vec", "memo", "lru", "events",
+/// The parts by the prefix of their names, and what builds each.
+const PARTS: &[(&str, Build)] = &[
+    ("cls", Gen::sc_cls),
+    ("lex", Gen::sc_lex),
+    ("sched", Gen::sc_sched),
+    ("vm", Gen::sc_vm),
+    ("ser", Gen::sc_ser),
+    ("vec", Gen::sc_vec),
+    ("memo", Gen::sc_memo),
+    ("lru", Gen::sc_lru),
+    ("events", Gen::sc_events),
 ];
 
 /// What every part reads its inputs through.
@@ -34,41 +43,22 @@ impl Gen {
     /// A scenario unit's code: its parts, `f` wiring them, and the driver.
     pub(super) fn scenario_unit(&mut self, tag: &str) -> (String, Block) {
         let k = self.r.range(3, 5) as usize;
-        let mut parts: Vec<&str> = PARTS.to_vec();
-        for i in (1..parts.len()).rev() {
-            let j = self.r.below(i + 1);
-            parts.swap(i, j);
-        }
+        let mut parts = PARTS.to_vec();
+        self.r.shuffle(&mut parts);
         parts.truncate(k);
         let mut code: Block = vec![Stmt::Raw(WIRING.to_string())];
-        for p in &parts {
-            let text = match *p {
-                "cls" => self.sc_cls(),
-                "lex" => self.sc_lex(),
-                "sched" => self.sc_sched(),
-                "vm" => self.sc_vm(),
-                "ser" => self.sc_ser(),
-                "vec" => self.sc_vec(),
-                "memo" => self.sc_memo(),
-                "lru" => self.sc_lru(),
-                _ => self.sc_events(),
-            };
-            code.push(Stmt::Raw(text));
+        for (_, build) in &parts {
+            code.push(Stmt::Raw(build(self)));
         }
+        let parts: Vec<&str> = parts.iter().map(|p| p.0).collect();
         let body = self.sc_wire(&parts);
         code.push(Stmt::Raw(format!(
             "local function f(a, b, c)\n  {}\nend",
             body.replace('\n', "\n  ")
         )));
         self.strict = true;
-        self.roles = std::array::from_fn(|_| {
-            *self.r.pick(&[
-                super::Role::Num,
-                super::Role::Int,
-                super::Role::Str,
-                super::Role::Mixed,
-            ])
-        });
+        self.roles =
+            std::array::from_fn(|_| *self.r.pick(&[Role::Num, Role::Int, Role::Str, Role::Mixed]));
         code.extend(self.driver(tag, true, None, &body));
         (format!("scenario parts={parts:?}"), code)
     }

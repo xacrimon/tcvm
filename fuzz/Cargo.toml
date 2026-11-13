@@ -13,3 +13,5 @@ clap = { version = "4.6.1", features = ["derive"] }
 libc = "0.2.186"
 cstree = "0.14.0"
 tcvm = { path = "..", default-features = false, features = ["parser-api"] }
+rand = { version = "0.10", default-features = false, features = ["alloc"] }
+rand_pcg = "0.10"

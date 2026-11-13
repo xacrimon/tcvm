@@ -105,25 +105,59 @@ impl Accepted {
     }
 }
 
+/// A configuration a program runs under, named by what it sets: `off`, `default`, `hot`, or
+/// knobs joined by commas (`hc4,hl20,noinline,deopt,check,far,gc64`).
+#[derive(Clone)]
 pub struct Mode {
     pub name: String,
-    pub env: Vec<(String, String)>,
+    pub env: Vec<(&'static str, String)>,
+    /// Under `TCVM_GC_STRESS`: slow, so it gets more time and its timeouts are no hangs.
+    pub gc: bool,
+}
+
+impl Mode {
+    /// The mode `name` names: how a finding's configuration is run again.
+    pub fn named(name: &str) -> Option<Mode> {
+        let mut env = Vec::new();
+        for part in name.split(',') {
+            let (k, v) = match part {
+                "default" => continue,
+                "hot" => {
+                    env.push(("TCVM_JIT_HOT_CALL", "1".to_string()));
+                    ("TCVM_JIT_HOT_LOOP", "1")
+                }
+                "off" => ("TCVM_JIT", "off"),
+                "noinline" => ("TCVM_JIT_INLINE", "0"),
+                "deopt" => ("TCVM_JIT_DEOPT_ALL", "1"),
+                "check" => ("TCVM_JIT_CHECK", "1"),
+                "far" => ("TCVM_JIT_FAR", "1"),
+                _ => [
+                    ("hc", "TCVM_JIT_HOT_CALL"),
+                    ("hl", "TCVM_JIT_HOT_LOOP"),
+                    ("gc", "TCVM_GC_STRESS"),
+                ]
+                .into_iter()
+                .find_map(|(prefix, k)| {
+                    let n = part.strip_prefix(prefix)?;
+                    n.parse::<u32>().is_ok().then_some((k, n))
+                })?,
+            };
+            env.push((k, v.to_string()));
+        }
+        Some(Mode {
+            name: name.into(),
+            gc: env.iter().any(|e| e.0 == "TCVM_GC_STRESS"),
+            env,
+        })
+    }
+
+    pub fn off() -> Mode {
+        Mode::named("off").expect("a mode")
+    }
+
     /// How many times the time limit it gets.
-    pub slow: u32,
-}
-
-fn env(pairs: &[(&str, String)]) -> Vec<(String, String)> {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.clone()))
-        .collect()
-}
-
-pub fn off() -> Mode {
-    Mode {
-        name: "off".into(),
-        env: env(&[("TCVM_JIT", "off".into())]),
-        slow: 1,
+    pub fn slow(&self) -> u32 {
+        if self.gc { 3 } else { 1 }
     }
 }
 
@@ -131,101 +165,40 @@ pub fn off() -> Mode {
 /// compiled at its first count, and a few drawn from the knobs. `big`: the program has a unit
 /// many times the usual size, which collections at short intervals make 10 to 50 times slower.
 pub fn modes(r: &mut Rng, big: bool) -> Vec<Mode> {
-    let one = "1".to_string();
-    let mut out = vec![
-        Mode {
-            name: "default".into(),
-            env: vec![],
-            slow: 1,
-        },
-        Mode {
-            name: "hot".into(),
-            env: env(&[
-                ("TCVM_JIT_HOT_CALL", one.clone()),
-                ("TCVM_JIT_HOT_LOOP", one.clone()),
-            ]),
-            slow: 1,
-        },
-    ];
+    let mut names = vec!["default".to_string(), "hot".to_string()];
     for _ in 0..3 {
         let hc = *r.pick(&[1, 1, 2, 4, 16, 64]);
         let hl = *r.pick(&[1, 1, 2, 3, 5, 20, 57]);
         let mut name = format!("hc{hc},hl{hl}");
-        let mut e = env(&[
-            ("TCVM_JIT_HOT_CALL", hc.to_string()),
-            ("TCVM_JIT_HOT_LOOP", hl.to_string()),
-        ]);
-        let mut slow = 1;
-        let mut knob = |p: f64, tag: &str, k: &str, v: String, r: &mut Rng| {
+        for (p, knob) in [
+            (0.3, "noinline"),
+            (0.3, "deopt"),
+            (0.4, "check"),
+            (0.1, "far"),
+        ] {
             if r.chance(p) {
-                name.push_str(&format!(",{tag}"));
-                e.push((k.to_string(), v));
-                true
-            } else {
-                false
+                name.push_str(&format!(",{knob}"));
             }
-        };
-        knob(0.3, "noinline", "TCVM_JIT_INLINE", "0".into(), r);
-        knob(0.3, "deopt", "TCVM_JIT_DEOPT_ALL", one.clone(), r);
-        knob(0.4, "check", "TCVM_JIT_CHECK", one.clone(), r);
-        knob(0.1, "far", "TCVM_JIT_FAR", one.clone(), r);
+        }
         let n = match big {
             true => *r.pick(&[4096, 16384, 65536]),
             false => *r.pick(&[1, 7, 64, 64, 1000, 1000]),
         };
-        if knob(0.2, &format!("gc{n}"), "TCVM_GC_STRESS", n.to_string(), r) {
-            slow = 3;
+        if r.chance(0.2) {
+            name.push_str(&format!(",gc{n}"));
         }
-        out.push(Mode { name, env: e, slow });
+        names.push(name);
     }
     if r.chance(0.3) {
         let n = match big {
             true => *r.pick(&[4096, 16384]),
             false => *r.pick(&[1, 16, 16, 256, 256]),
         };
-        out.push(Mode {
-            name: format!("off,gc{n}"),
-            env: env(&[
-                ("TCVM_JIT", "off".into()),
-                ("TCVM_GC_STRESS", n.to_string()),
-            ]),
-            slow: 3,
-        });
+        names.push(format!("off,gc{n}"));
     }
-    out
-}
-
-/// The mode `name` names (`Mode::name`): how a finding's configuration is run again.
-pub fn mode_named(name: &str) -> Option<Mode> {
-    let mut e = Vec::new();
-    let mut slow = 1;
-    for part in name.split(',') {
-        let (k, v): (&str, String) = match part {
-            "default" => continue,
-            "hot" => {
-                e.push(("TCVM_JIT_HOT_CALL".to_string(), "1".to_string()));
-                ("TCVM_JIT_HOT_LOOP", "1".into())
-            }
-            "off" => ("TCVM_JIT", "off".into()),
-            "noinline" => ("TCVM_JIT_INLINE", "0".into()),
-            "deopt" => ("TCVM_JIT_DEOPT_ALL", "1".into()),
-            "check" => ("TCVM_JIT_CHECK", "1".into()),
-            "far" => ("TCVM_JIT_FAR", "1".into()),
-            p if p.starts_with("hc") => ("TCVM_JIT_HOT_CALL", p[2..].into()),
-            p if p.starts_with("hl") => ("TCVM_JIT_HOT_LOOP", p[2..].into()),
-            p if p.starts_with("gc") => {
-                slow = 3;
-                ("TCVM_GC_STRESS", p[2..].into())
-            }
-            _ => return None,
-        };
-        e.push((k.to_string(), v));
-    }
-    Some(Mode {
-        name: name.into(),
-        env: e,
-        slow,
-    })
+    (names.iter())
+        .map(|n| Mode::named(n).expect("a mode"))
+        .collect()
 }
 
 /// The unit an output line belongs to: lines start with `U<n>`.
@@ -259,16 +232,14 @@ pub fn strict_lines(out: &str, strict: &[String], acc: &Accepted) -> String {
     s
 }
 
-/// Lines of a JIT log that report a failed compile the compiler is to blame for.
+/// Lines of a JIT log that report a compile the compiler itself failed on (`jit: compile of f
+/// pc3 failed: verifier: …`, or `backend: …`, which a panic and the allocation checker report as
+/// too); a refusal (`too large`, `irreducible control flow`) is none.
 pub fn internal_errors(run: &Run) -> Vec<String> {
     (run.stderr.lines())
         .filter(|l| {
-            let l = l.to_ascii_lowercase();
-            l.contains("failed: verifier")
-                || l.contains("failed: backend")
-                || l.contains("panicked")
-                || l.contains("allocation check")
-                || l.contains("checker")
+            l.starts_with("jit: ")
+                && (l.contains(" failed: verifier: ") || l.contains(" failed: backend: "))
         })
         .map(|l| l.chars().take(300).collect())
         .collect()
@@ -438,16 +409,20 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_is_found_again_by_its_name() {
-        let mut r = Rng::new(7);
-        for m in modes(&mut r, false) {
-            let again = mode_named(&m.name).expect("a mode");
-            let sorted = |e: &[(String, String)]| {
-                let mut e = e.to_vec();
-                e.sort();
-                e
-            };
-            assert_eq!(sorted(&again.env), sorted(&m.env), "{}", m.name);
-        }
+    fn a_mode_sets_what_its_name_lists() {
+        let m = Mode::named("hc4,hl20,noinline,gc64").expect("a mode");
+        let env: Vec<(&str, &str)> = m.env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            env,
+            [
+                ("TCVM_JIT_HOT_CALL", "4"),
+                ("TCVM_JIT_HOT_LOOP", "20"),
+                ("TCVM_JIT_INLINE", "0"),
+                ("TCVM_GC_STRESS", "64"),
+            ]
+        );
+        assert!(m.gc && !Mode::off().gc);
+        assert!(Mode::named("hot,bogus").is_none() && Mode::named("hcx").is_none());
+        assert!(modes(&mut Rng::new(7), false).len() >= 5);
     }
 }

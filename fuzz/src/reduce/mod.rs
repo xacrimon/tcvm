@@ -143,8 +143,9 @@ struct Reducer {
     unlocked_ok: bool,
     probation: HashMap<&'static str, bool>,
     incomplete: BTreeMap<&'static str, Pass>,
-    /// For a pass that ran to completion without progress, the test case it ran on.
-    fingerprints: HashMap<&'static str, String>,
+    /// For a pass that ran to completion without progress, the version of the test case it ran
+    /// on.
+    fingerprints: HashMap<&'static str, u64>,
 }
 
 impl Reducer {
@@ -171,24 +172,19 @@ impl Reducer {
         // A deterministic pass that made no progress on this test case makes none again. Under a
         // nondeterministic test a rejected candidate may pass on a retry.
         let deterministic = !p.nondeterministic();
-        if deterministic
-            && self
-                .fingerprints
-                .get(pass.name)
-                .is_some_and(|f| f == p.current())
-        {
+        let started = p.version();
+        if deterministic && self.fingerprints.get(pass.name) == Some(&started) {
             return;
         }
         let use_budget = budgeted && self.probation.get(pass.name).copied().unwrap_or(false);
-        let started = p.current().to_string();
         p.control = Control {
             budget: use_budget.then_some(PROBATION_BUDGET),
-            watch: watch.then(|| Watch::new(WATCH_TESTS, &started)),
+            watch: watch.then(|| Watch::new(WATCH_TESTS, p)),
             ..Control::default()
         };
         (pass.run)(p, &mut self.rng);
         let control = std::mem::take(&mut p.control);
-        let progress = control.made_progress || p.current() != started;
+        let progress = control.made_progress || p.version() != started;
         if progress {
             self.log(p, pass.name);
         }
@@ -207,7 +203,7 @@ impl Reducer {
             if progress || !deterministic {
                 self.fingerprints.remove(pass.name);
             } else {
-                self.fingerprints.insert(pass.name, p.current().to_string());
+                self.fingerprints.insert(pass.name, p.version());
             }
         }
     }
@@ -216,7 +212,7 @@ impl Reducer {
         let all = great_passes();
         let mut current = all.clone();
         while !p.cancelled() {
-            let prev = p.current().to_string();
+            let prev = p.version();
             let mut successful = Vec::new();
             for pass in &current {
                 let size = p.current().len();
@@ -225,7 +221,7 @@ impl Reducer {
                     successful.push(*pass);
                 }
             }
-            if p.current() == prev {
+            if p.version() == prev {
                 if current.len() == all.len() {
                     break;
                 }
@@ -239,16 +235,16 @@ impl Reducer {
     }
 
     fn run_some_passes(&mut self, p: &mut Problem) {
-        let prev = p.current().to_string();
+        let prev = p.version();
         self.run_great_passes(p);
-        if prev != p.current() && !self.unlocked_ok {
+        if prev != p.version() && !self.unlocked_ok {
             return;
         }
         self.unlocked_ok = true;
         for pass in ok_passes() {
             self.run_pass(p, pass, true, false);
         }
-        if prev != p.current() {
+        if prev != p.version() {
             return;
         }
         for pass in last_ditch_passes() {
@@ -275,15 +271,15 @@ impl Reducer {
         }
         self.initial_cut(p);
         while !p.oracle.expired() {
-            let prev = p.current().to_string();
+            let prev = p.version();
             self.run_some_passes(p);
-            if p.current() != prev {
+            if p.version() != prev {
                 continue;
             }
             for pass in polish_passes() {
                 self.run_pass(p, pass, true, false);
             }
-            if p.current() != prev {
+            if p.version() != prev {
                 continue;
             }
             if !self.incomplete.is_empty() {
@@ -291,7 +287,7 @@ impl Reducer {
                 for pass in incomplete {
                     self.run_pass(p, pass, false, false);
                 }
-                if p.current() != prev {
+                if p.version() != prev {
                     continue;
                 }
             }

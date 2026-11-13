@@ -4,7 +4,10 @@
 //! ones of a window are merged in candidate order: the largest prefix that still combines into a
 //! reduction is kept, the first one after it dropped, and the rest merged again.
 
-use super::problem::{Pending, Problem, less, parallel};
+use std::collections::VecDeque;
+
+use super::problem::{Pending, Problem, less};
+use crate::par;
 use crate::rng::Rng;
 
 /// How a pass's patches are applied. Every patch of a pass is of the same kind.
@@ -20,6 +23,11 @@ pub enum Kind<'s> {
     /// Delete ranges of the elements `sep` splits the text into, separators with them.
     Split(&'s str),
 }
+
+/// Cuts that keep line breaks.
+pub const SOFT: Kind = Kind::Cuts {
+    keep_newlines: true,
+};
 
 /// Sorted `(start, end, replacement)`; for cuts the replacement is empty.
 pub type Patch = Vec<(usize, usize, String)>;
@@ -51,6 +59,7 @@ impl Kind<'_> {
                 }
                 Some(out)
             }
+            // `Regions` returned above.
             Kind::Replace | Kind::Regions => {
                 all.dedup();
                 for w in all.windows(2) {
@@ -135,7 +144,7 @@ impl<'s> Applier<'s> {
     /// What `patch` on top of what was accepted comes to, for each of `patches`, in parallel.
     fn candidates(&self, p: &Problem, patches: &[Patch]) -> Vec<Candidate> {
         let filter = p.filter();
-        parallel(p.workers(), patches.len(), |i, _| {
+        par::map(p.workers(), patches.len(), |i| {
             let Some(combined) = self.kind.combine(&[&self.current, &patches[i]]) else {
                 return Candidate::Conflict;
             };
@@ -149,13 +158,6 @@ impl<'s> Applier<'s> {
                 None => Candidate::Text(text),
             }
         })
-    }
-
-    /// Test `patches`, whose candidates are `texts`, and merge the interesting ones; which of
-    /// them were merged.
-    fn try_texts(&mut self, p: &mut Problem, patches: &[Patch], texts: Vec<String>) -> Vec<bool> {
-        let (ok, _) = p.test(&texts);
-        self.merge(p, patches, &ok)
     }
 
     /// Merge the patches whose candidates were interesting (`ok`); which of them were merged.
@@ -174,13 +176,13 @@ impl<'s> Applier<'s> {
                     prefixes.push((k + 1, c));
                 }
             }
-            let texts: Vec<String> = parallel(p.workers(), prefixes.len(), |j, _| {
+            let texts: Vec<String> = par::map(p.workers(), prefixes.len(), |j| {
                 self.kind.apply(&prefixes[j].1, &self.initial)
             });
-            let current = p.current().to_string();
+            let current = p.current();
             // Only texts no larger than the current test case can be reductions.
             let candidates: Vec<String> = (texts.iter())
-                .filter(|t| **t == current || !less(&current, t))
+                .filter(|t| *t == current || !less(current, t))
                 .cloned()
                 .collect();
             p.test(&candidates);
@@ -252,7 +254,8 @@ impl<'s> Applier<'s> {
             }
         }
         p.note_rejected(rejected);
-        let tested = self.try_texts(p, &window, texts);
+        let (ok, _) = p.test(&texts);
+        let tested = self.merge(p, &window, &ok);
         let mut out = vec![false; patches.len()];
         for (j, &i) in of.iter().enumerate() {
             out[i] = tested[j];
@@ -322,16 +325,14 @@ pub fn apply_patches(p: &mut Problem, rng: &mut Rng, kind: Kind, patches: Vec<Pa
             return;
         }
     }
-    for i in (1..patches.len()).rev() {
-        patches.swap(i, rng.below(i + 1));
-    }
+    rng.shuffle(&mut patches);
     patches.sort_by_key(|q| std::cmp::Reverse(kind.size(q)));
     let mut applier = Applier::new(kind, p);
     let size = WINDOW;
     let mut ahead = size;
-    let mut windows: std::collections::VecDeque<Window> = std::collections::VecDeque::new();
+    let mut windows: VecDeque<Window> = std::collections::VecDeque::new();
     let mut next = 0;
-    let cancel_all = |p: &mut Problem, windows: &mut std::collections::VecDeque<Window>| {
+    let cancel_all = |p: &mut Problem, windows: &mut VecDeque<Window>| {
         for w in windows.drain(..) {
             p.cancel(w.pending);
         }
@@ -370,14 +371,14 @@ pub fn apply_patches(p: &mut Problem, rng: &mut Rng, kind: Kind, patches: Vec<Pa
             continue;
         }
         p.note_rejected(w.rejected);
-        let before = (p.current().to_string(), applier.current.clone());
+        let before = (p.version(), applier.current.clone());
         let Some((ok, _)) = p.finish(w.pending) else {
             cancel_all(p, &mut windows);
             continue;
         };
         next = w.end;
         applier.merge(p, &w.patches, &ok);
-        if (p.current(), &applier.current) != (before.0.as_str(), &before.1) {
+        if (p.version(), &applier.current) != (before.0, &before.1) {
             cancel_all(p, &mut windows);
             ahead = size;
         } else {

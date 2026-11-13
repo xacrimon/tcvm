@@ -1,8 +1,10 @@
 //! Statements. Each form returns the statements it adds to the block being built and
 //! declares what they bring into scope.
 
-use super::{FORMS, Gen, Kind};
-use crate::ast::{Block, Expr, Func, Stmt, assign, bin, call, local, name, raw, str, un};
+use super::{FORMS, Form, Gen, Kind};
+use crate::ast::{
+    self, Block, Expr, Func, Item, Stmt, assign, bin, call, local, name, raw, str, un,
+};
 
 /// What a function body must not inherit from the code around it.
 struct Outer {
@@ -30,6 +32,55 @@ impl Gen {
         self.yields = o.yields;
         self.vararg = o.vararg;
         self.va = o.va;
+    }
+
+    /// A function's body in a scope of its own: what `setup` declares and starts it with, `count`
+    /// (a range) statements at most, and a return.
+    fn func_body(
+        &mut self,
+        count: (i64, i64),
+        d: u32,
+        setup: impl FnOnce(&mut Gen) -> Block,
+    ) -> Block {
+        let outer = self.enter_function();
+        self.scopes.push(Vec::new());
+        let mut body = setup(self);
+        let n = self.r.range(count.0, count.1) as usize;
+        body.extend(self.block_in_scope(n, d));
+        body.push(self.final_return());
+        self.scopes.pop();
+        self.leave_function(outer);
+        body
+    }
+
+    /// A method's function: `self` a record, and the parameter `p`.
+    fn method_func(&mut self, p: String, d: u32) -> Func {
+        let body = self.func_body((0, 2), d, |g| {
+            g.declare("self", Kind::Rec, true);
+            g.declare(&p, Kind::Any, false);
+            Vec::new()
+        });
+        Func {
+            params: vec![p],
+            vararg: None,
+            body,
+        }
+    }
+
+    /// `function() … end` of a few statements, most often with a return.
+    fn thunk(&mut self, d: u32) -> Expr {
+        let outer = self.enter_function();
+        let n = self.r.range(1, 3) as usize;
+        let mut body = self.block(n, d);
+        if self.r.chance(0.6) {
+            body.push(Stmt::Return(self.args(1, d)));
+        }
+        self.leave_function(outer);
+        Expr::Func(Box::new(Func {
+            params: vec![],
+            vararg: None,
+            body,
+        }))
     }
 
     /// Up to `n` statements in a scope of their own.
@@ -96,8 +147,7 @@ impl Gen {
             (Kind::SeqAny, 2),
             (Kind::Rec, 4),
         ];
-        let w: Vec<u32> = KINDS.iter().map(|k| k.1).collect();
-        KINDS[self.r.weighted(&w)].0
+        self.r.pick_by(KINDS, |k| k.1).0
     }
 
     pub(super) fn local_stmt(&mut self, d: u32) -> Block {
@@ -247,6 +297,17 @@ impl Gen {
         b
     }
 
+    /// `loop_body` in a scope of its own that holds the loop's variables.
+    fn loop_scope(&mut self, vars: &[(&str, Kind)], head: Block, n: usize, d: u32) -> Block {
+        self.scopes.push(Vec::new());
+        for &(v, kind) in vars {
+            self.declare(v, kind, true);
+        }
+        let body = self.loop_body(true, head, n, d);
+        self.scopes.pop();
+        body
+    }
+
     fn for_stmt(&mut self, d: u32) -> Block {
         let v = self.fresh_name("i");
         let (a, b, step, kind) = if self.r.chance(0.15) {
@@ -271,12 +332,9 @@ impl Gen {
                 Kind::Int,
             )
         };
-        self.scopes.push(Vec::new());
-        self.declare(&v, kind, true);
         let n = self.r.range(1, 4) as usize;
         let head = self.nested_tick();
-        let body = self.loop_body(true, head, n, d);
-        self.scopes.pop();
+        let body = self.loop_scope(&[(&v, kind)], head, n, d);
         vec![Stmt::NumFor(v, a, b, step, body)]
     }
 
@@ -311,12 +369,9 @@ impl Gen {
             let (a, b) = (bound(self), bound(self));
             (a, b, self.r.chance(0.6).then(|| bound(self)))
         };
-        self.scopes.push(Vec::new());
-        self.declare(&v, Kind::Num, true);
         let head = vec![self.tick()];
         let n = self.r.range(1, 4) as usize;
-        let body = self.loop_body(true, head, n, d);
-        self.scopes.pop();
+        let body = self.loop_scope(&[(&v, Kind::Num)], head, n, d);
         vec![Stmt::NumFor(v, a, b, step, body)]
     }
 
@@ -326,12 +381,9 @@ impl Gen {
             // Bounded by its counter, which nothing else assigns.
             let c = self.fresh_name("n");
             let lim = Expr::Int(self.r.range(0, 15));
-            self.scopes.push(Vec::new());
-            self.declare(&c, Kind::Int, true);
             let mut head = vec![assign(name(&c), bin("+", name(&c), Expr::Int(1)))];
             head.extend(self.nested_tick());
-            let body = self.loop_body(true, head, n, d);
-            self.scopes.pop();
+            let body = self.loop_scope(&[(&c, Kind::Int)], head, n, d);
             let op = *self.r.pick(&["<", "<=", "~="]);
             return vec![
                 local(&c, Expr::Int(0)),
@@ -342,13 +394,11 @@ impl Gen {
         let c = self.cond(d);
         let trips = self.fresh_name("n");
         let bounded = self.r.chance(0.9);
-        self.scopes.push(Vec::new());
         let mut head = vec![self.tick()];
         if bounded {
             head.push(assign(name(&trips), bin("+", name(&trips), Expr::Int(1))));
         }
-        let body = self.loop_body(true, head, n, d);
-        self.scopes.pop();
+        let body = self.loop_scope(&[], head, n, d);
         if !bounded {
             return vec![Stmt::While(c, body)];
         }
@@ -374,18 +424,14 @@ impl Gen {
     fn ipairs_stmt(&mut self, d: u32) -> Block {
         let (t, k) = self.container(d);
         let (i, v) = (self.fresh_name("i"), self.fresh_name("e"));
-        self.scopes.push(Vec::new());
-        self.declare(&i, Kind::Int, true);
         let vk = match k {
             Kind::SeqInt => Kind::Int,
             Kind::SeqStr => Kind::Str,
             _ => Kind::Any,
         };
-        self.declare(&v, vk, true);
         let head = vec![self.tick()];
         let n = self.r.range(1, 3) as usize;
-        let body = self.loop_body(true, head, n, d);
-        self.scopes.pop();
+        let body = self.loop_scope(&[(&i, Kind::Int), (&v, vk)], head, n, d);
         vec![Stmt::GenFor(
             vec![i, v],
             vec![call("ipairs", vec![t])],
@@ -431,13 +477,9 @@ impl Gen {
             self.r.range(1, 3)
         );
         let (i, j) = (self.fresh_name("i"), self.fresh_name("j"));
-        self.scopes.push(Vec::new());
-        self.declare(&i, Kind::Int, true);
-        self.declare(&j, Kind::Int, true);
         let n = self.r.range(1, 3) as usize;
         let head = self.nested_tick();
-        let body = self.loop_body(true, head, n, d);
-        self.scopes.pop();
+        let body = self.loop_scope(&[(&i, Kind::Int), (&j, Kind::Int)], head, n, d);
         let lim = Expr::Int(self.r.range(0, 12));
         vec![
             Stmt::Raw(def),
@@ -451,33 +493,23 @@ impl Gen {
         let params: Vec<String> = (0..self.r.range(0, 3))
             .map(|_| self.fresh_name("p"))
             .collect();
-        let outer = self.enter_function();
-        self.scopes.push(Vec::new());
-        for p in &params {
-            self.declare(p, Kind::Any, false);
-        }
-        let va = if !vararg {
-            None
-        } else if self.r.chance(0.3) {
-            let t = self.fresh_name("va");
-            self.declare(&t, Kind::Any, true);
-            self.va = Some(t.clone());
-            Some(Some(t))
-        } else {
-            self.vararg = true;
-            Some(None)
-        };
-        let n = self.r.range(1, 4) as usize;
-        let mut body = self.block_in_scope(n, d);
-        body.push(self.final_return());
-        self.scopes.pop();
-        self.leave_function(outer);
-        self.declare(&h, Kind::Func, true);
-        self.scopes
-            .last_mut()
-            .and_then(|s| s.last_mut())
-            .expect("the helper")
-            .helper = Some(params.len());
+        let mut va = None;
+        let body = self.func_body((1, 4), d, |g| {
+            for p in &params {
+                g.declare(p, Kind::Any, false);
+            }
+            if vararg && g.r.chance(0.3) {
+                let t = g.fresh_name("va");
+                g.declare(&t, Kind::Any, true);
+                g.va = Some(t.clone());
+                va = Some(Some(t));
+            } else if vararg {
+                g.vararg = true;
+                va = Some(None);
+            }
+            Vec::new()
+        });
+        self.declare(&h, Kind::Func, true).helper = Some(params.len());
         let f = Func {
             params,
             vararg: va,
@@ -495,20 +527,7 @@ impl Gen {
             self.fresh_name("m"),
             self.fresh_name("p"),
         );
-        let outer = self.enter_function();
-        self.scopes.push(Vec::new());
-        self.declare("self", Kind::Rec, true);
-        self.declare(&p, Kind::Any, false);
-        let n = self.r.range(0, 2) as usize;
-        let mut body = self.block_in_scope(n, d);
-        body.push(self.final_return());
-        self.scopes.pop();
-        self.leave_function(outer);
-        let f = Func {
-            params: vec![p],
-            vararg: None,
-            body,
-        };
+        let f = self.method_func(p, d);
         let fields = self.e(Kind::Rec, d);
         let fields = if matches!(fields, Expr::Table(_)) {
             fields
@@ -547,20 +566,7 @@ impl Gen {
         };
         let m = self.fresh_name("m");
         let p = self.fresh_name("p");
-        let outer = self.enter_function();
-        self.scopes.push(Vec::new());
-        self.declare("self", Kind::Rec, true);
-        self.declare(&p, Kind::Any, false);
-        let n = self.r.range(0, 2) as usize;
-        let mut body = self.block_in_scope(n, d);
-        body.push(self.final_return());
-        self.scopes.pop();
-        self.leave_function(outer);
-        let f = Func {
-            params: vec![p],
-            vararg: None,
-            body,
-        };
+        let f = self.method_func(p, d);
         out.push(Stmt::FuncDef(r.clone(), m.clone(), true, f));
         for _ in 0..self.r.range(1, 2) {
             let v = self.fresh_name("v");
@@ -608,8 +614,8 @@ impl Gen {
                     local(&n, Expr::Int(0)),
                     Stmt::Raw(format!(
                         "for _ in string.gmatch({}, {}) do {n} = {n} + 1 if {n} > 20 then break end end",
-                        crate::ast::expr(&s),
-                        crate::ast::expr(&p)
+                        ast::expr(&s),
+                        ast::expr(&p)
                     )),
                 ];
             }
@@ -629,20 +635,7 @@ impl Gen {
         ]));
         let f = match self.helper().filter(|_| self.r.chance(0.4)) {
             Some((f, _)) => name(&f),
-            None => {
-                let outer = self.enter_function();
-                let n = self.r.range(1, 3) as usize;
-                let mut body = self.block(n, d);
-                if self.r.chance(0.6) {
-                    body.push(Stmt::Return(self.args(1, d)));
-                }
-                self.leave_function(outer);
-                Expr::Func(Box::new(Func {
-                    params: vec![],
-                    vararg: None,
-                    body,
-                }))
-            }
+            None => self.thunk(d),
         };
         let mut args = vec![f, h];
         let n = self.r.below(3);
@@ -660,10 +653,10 @@ impl Gen {
         let mut items = Vec::new();
         for _ in 0..self.r.range(1, 5) {
             items.push(match self.r.below(5) {
-                0 => crate::ast::Item::Named(self.field(), self.any(d)),
-                1 => crate::ast::Item::Pos(self.call_any(d.min(1))),
-                2 if self.vararg => crate::ast::Item::Pos(Expr::Vararg),
-                _ => crate::ast::Item::Pos(self.any(d)),
+                0 => Item::Named(self.field(), self.any(d)),
+                1 => Item::Pos(self.call_any(d.min(1))),
+                2 if self.vararg => Item::Pos(Expr::Vararg),
+                _ => Item::Pos(self.any(d)),
             });
         }
         let v = self.fresh_name("v");
@@ -709,19 +702,7 @@ impl Gen {
             args.extend(self.args(n, d));
             call("pcall", args)
         } else {
-            let outer = self.enter_function();
-            let n = self.r.range(1, 3) as usize;
-            let mut body = self.block(n, d);
-            if self.r.chance(0.6) {
-                body.push(Stmt::Return(self.args(1, d)));
-            }
-            self.leave_function(outer);
-            let f = Func {
-                params: vec![],
-                vararg: None,
-                body,
-            };
-            call("pcall", vec![Expr::Func(Box::new(f))])
+            call("pcall", vec![self.thunk(d)])
         };
         self.declare(&ok, Kind::Bool, false);
         self.declare(&e, Kind::Any, false);
@@ -771,20 +752,13 @@ impl Gen {
         }
         let co = self.fresh_name("co");
         let p = self.fresh_name("p");
-        let outer = self.enter_function();
-        self.yields = true;
-        self.scopes.push(Vec::new());
-        self.declare(&p, Kind::Any, false);
-        self.budget += 3;
-        let mut body = vec![local(
-            &self.fresh_name("y"),
-            call("coroutine.yield", self.args(1, 1)),
-        )];
-        let n = self.r.range(1, 4) as usize;
-        body.extend(self.block_in_scope(n, d));
-        body.push(self.final_return());
-        self.scopes.pop();
-        self.leave_function(outer);
+        let body = self.func_body((1, 4), d, |g| {
+            g.yields = true;
+            g.declare(&p, Kind::Any, false);
+            g.budget += 3;
+            let y = g.fresh_name("y");
+            vec![local(&y, call("coroutine.yield", g.args(1, 1)))]
+        });
         let f = Func {
             params: vec![p],
             vararg: None,
@@ -839,26 +813,17 @@ impl Gen {
                     vec![name(&y), name(&x)],
                 )]
             }
-            1 => {
+            k => {
                 let names: Vec<String> = (0..self.r.range(2, 3))
                     .map(|_| self.fresh_name("v"))
                     .collect();
-                let c = self.call_any(d);
-                for n in &names {
-                    self.declare(n, Kind::Any, false);
-                }
-                vec![Stmt::Local(
-                    names.into_iter().map(|n| (n, None)).collect(),
-                    vec![c],
-                )]
-            }
-            _ => {
-                let names: Vec<String> = (0..self.r.range(2, 3))
-                    .map(|_| self.fresh_name("v"))
-                    .collect();
-                let (t, _) = self.container(d);
-                let hi = Expr::Int(self.r.range(0, 4));
-                let c = call("table.unpack", vec![t, Expr::Int(1), hi]);
+                let c = if k == 1 {
+                    self.call_any(d)
+                } else {
+                    let (t, _) = self.container(d);
+                    let hi = Expr::Int(self.r.range(0, 4));
+                    call("table.unpack", vec![t, Expr::Int(1), hi])
+                };
                 for n in &names {
                     self.declare(n, Kind::Any, false);
                 }
@@ -881,17 +846,26 @@ impl Gen {
 
     fn stmt(&mut self, d: u32) -> Block {
         let nested = d > 0;
-        let w: Vec<u32> = (FORMS.iter())
-            .map(|&(form, _)| {
+        let w: Vec<u32> = (FORMS.iter().zip(&self.weights))
+            .map(|(&(form, _), &w)| {
                 let ok = match form {
-                    "local" | "assign" | "store" | "call" | "probe" | "global" | "multi"
-                    | "junk" | "pattern" | "ctor" | "tablib" => true,
-                    "goto" => matches!(self.conts.last(), Some(Some(_))),
-                    "break" => self.loops > 0,
-                    "coroutine" => nested || self.yields,
+                    Form::Local
+                    | Form::Assign
+                    | Form::Store
+                    | Form::Call
+                    | Form::Probe
+                    | Form::Global
+                    | Form::Multi
+                    | Form::Junk
+                    | Form::Pattern
+                    | Form::Ctor
+                    | Form::Tablib => true,
+                    Form::Goto => matches!(self.conts.last(), Some(Some(_))),
+                    Form::Break => self.loops > 0,
+                    Form::Coroutine => nested || self.yields,
                     _ => nested,
                 };
-                if ok { self.weight(form) } else { 0 }
+                if ok { w } else { 0 }
             })
             .collect();
         if w.iter().all(|&x| x == 0) {
@@ -899,20 +873,20 @@ impl Gen {
         }
         let d1 = d.saturating_sub(1);
         match FORMS[self.r.weighted(&w)].0 {
-            "local" => self.local_stmt(2),
-            "assign" => self.assign_stmt(2),
-            "store" => self.store_stmt(2),
-            "call" => {
+            Form::Local => self.local_stmt(2),
+            Form::Assign => self.assign_stmt(2),
+            Form::Store => self.store_stmt(2),
+            Form::Call => {
                 let c = self.call_any(2);
                 // A statement that starts with `(` would continue the one before it.
-                if crate::ast::expr(&c).starts_with('(') {
+                if ast::expr(&c).starts_with('(') {
                     vec![local("_", c)]
                 } else {
                     vec![Stmt::Call(c)]
                 }
             }
-            "probe" => vec![Stmt::Call(call("probe", self.args(1, 2)))],
-            "if" => {
+            Form::Probe => vec![Stmt::Call(call("probe", self.args(1, 2)))],
+            Form::If => {
                 let mut arms = vec![(self.cond(2), self.small_block(d1))];
                 if self.r.chance(0.25) {
                     arms.push((self.cond(1), self.small_block(d1)));
@@ -920,40 +894,39 @@ impl Gen {
                 let els = self.r.chance(0.4).then(|| self.small_block(d1));
                 vec![Stmt::If(arms, els)]
             }
-            "for" => self.for_stmt(d1),
-            "fordyn" => self.fordyn_stmt(d1),
-            "while" => self.while_stmt(d1),
-            "repeat" => self.repeat_stmt(d1),
-            "ipairs" => self.ipairs_stmt(d1),
-            "pairs" => self.pairs_stmt(1),
-            "iter" => self.iter_stmt(d1),
-            "closure" => self.closure_stmt(d1, false),
-            "vararg" => self.closure_stmt(d1, true),
-            "method" => self.method_stmt(d1),
-            "pcall" => self.pcall_stmt(d1),
-            "error" => self.error_stmt(1),
-            "close" => self.close_stmt(d1),
-            "coroutine" => self.coroutine_stmt(d1),
-            "global" => {
+            Form::For => self.for_stmt(d1),
+            Form::ForDyn => self.fordyn_stmt(d1),
+            Form::While => self.while_stmt(d1),
+            Form::Repeat => self.repeat_stmt(d1),
+            Form::Ipairs => self.ipairs_stmt(d1),
+            Form::Pairs => self.pairs_stmt(1),
+            Form::Iter => self.iter_stmt(d1),
+            Form::Closure => self.closure_stmt(d1, false),
+            Form::Vararg => self.closure_stmt(d1, true),
+            Form::Method => self.method_stmt(d1),
+            Form::Pcall => self.pcall_stmt(d1),
+            Form::Error => self.error_stmt(1),
+            Form::Close => self.close_stmt(d1),
+            Form::Coroutine => self.coroutine_stmt(d1),
+            Form::Global => {
                 let g = raw(format!("G{}", self.r.range(1, 3)));
                 vec![assign(g, self.any(2))]
             }
-            "multi" => self.multi_stmt(1),
-            "junk" => vec![Stmt::Raw(self.junk())],
-            "pattern" => self.pattern_stmt(2),
-            "xpcall" => self.xpcall_stmt(d1),
-            "ctor" => self.ctor_stmt(2),
-            "tablib" => self.tablib_stmt(2),
-            "return" => vec![Stmt::If(
+            Form::Multi => self.multi_stmt(1),
+            Form::Junk => vec![Stmt::Raw(self.junk())],
+            Form::Pattern => self.pattern_stmt(2),
+            Form::Xpcall => self.xpcall_stmt(d1),
+            Form::Ctor => self.ctor_stmt(2),
+            Form::Tablib => self.tablib_stmt(2),
+            Form::Return => vec![Stmt::If(
                 vec![(self.cond(2), vec![Stmt::Return(self.args(1, 2))])],
                 None,
             )],
-            "goto" => {
+            Form::Goto => {
                 let l = self.conts.last().cloned().flatten().expect("a label");
                 vec![Stmt::If(vec![(self.cond(2), vec![Stmt::Goto(l)])], None)]
             }
-            "break" => vec![Stmt::If(vec![(self.cond(2), vec![Stmt::Break])], None)],
-            form => unreachable!("{form}"),
+            Form::Break => vec![Stmt::If(vec![(self.cond(2), vec![Stmt::Break])], None)],
         }
     }
 }

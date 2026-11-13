@@ -5,13 +5,9 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use super::patch::{Integer, Kind, Once, Patch, apply_patches, cut, region_pass};
+use super::patch::{Integer, Kind, Once, Patch, SOFT, apply_patches, cut, region_pass};
 use super::problem::{Problem, less};
 use crate::rng::Rng;
-
-const SOFT: Kind = Kind::Cuts {
-    keep_newlines: true,
-};
 
 fn cuts(spans: impl IntoIterator<Item = (usize, usize)>) -> Vec<Patch> {
     (spans.into_iter())
@@ -263,7 +259,7 @@ fn is_word(c: u8) -> bool {
 }
 
 /// Maximal runs of word characters.
-fn word_runs(b: &[u8]) -> Vec<(usize, usize)> {
+pub fn word_runs(b: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
