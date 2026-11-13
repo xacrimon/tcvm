@@ -4852,3 +4852,72 @@ fn cold_arms_take_checkpoints_made_in_numeric_arms() {
         true,
     );
 }
+
+/// `src` with inlining on and a full collection at each `yielder()`.
+fn collecting_in_inlined_calls(src: &str) -> String {
+    let mut lua = crate::common::yielding_lua();
+    lua.set_jit_inline(true);
+    crate::common::run_chunks(&mut lua, src)
+}
+
+/// A call in an inlined body leaves the caller's slots that are not its
+/// homes cleared by a collection: `a`, dead at the call, is stored again
+/// when it takes `b`, which its slot held before.
+#[test]
+fn inlined_bodies_calls_clear_the_callers_slots() {
+    let got = collecting_in_inlined_calls(
+        "local gc = false
+        local function h(...) if gc then yielder() end end
+        local function mk(...) return {v = 1} end
+        local function g(x) h() return x end
+        local function run(k, ...)
+            local a = mk()
+            local t = {...}
+            local b = a
+            g(t)
+            a = b
+            return a.v + k, a.v
+        end
+        local s = 0
+        for i = 1, 20000 do
+            local r, v = run(1, i)
+            s = s + r + v
+        end
+        gc = true
+        local r, v = run('1', 0)
+        return s .. ' ' .. r .. ' ' .. v",
+    );
+    assert_eq!(got, "60000 2 1");
+}
+
+/// A call in an inlined body keeps a body register's slot state by the
+/// body's own slot, not the caller's of the same number.
+#[test]
+fn inlined_bodies_calls_clear_their_own_slots() {
+    let got = collecting_in_inlined_calls(
+        "local gc = false
+        local function h(...) if gc then yielder() end end
+        local function three(...) return {v = 1}, 2, 3 end
+        local function g(k)
+            local a, c, d = three()
+            local b = a
+            h()
+            a = b
+            return a.v + k, a.v
+        end
+        local function run(k, ...)
+            local t = {...}
+            local x, y = g(k)
+            return x + y + #t, k
+        end
+        local s = 0
+        for i = 1, 20000 do
+            local r, k = run(1)
+            s = s + r + k
+        end
+        gc = true
+        local r, k = run('1')
+        return s .. ' ' .. r .. ' ' .. k",
+    );
+    assert_eq!(got, "80000 3 1");
+}

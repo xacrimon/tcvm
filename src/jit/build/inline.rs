@@ -646,8 +646,11 @@ fn inline_site(
             b.set_def(cont, a + k as u8, v);
         }
     }
+    // A call in the body left only its homes in their slots, as `call` has it.
+    let base = b.reg_base();
     for (r, s) in slots.into_iter().enumerate() {
-        b.set_slot(cont, r, s);
+        let held = !inline.called || inline.outer_homes.contains(base + r);
+        b.set_slot(cont, r, if held { s } else { SlotState::Unknown });
     }
     b.bs[cont.idx()].reload = captured;
     for r in captured.iter() {

@@ -1755,7 +1755,7 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         for r in 0..self.nregs {
             let state = if reload.contains(r) {
                 SlotState::Lazy(resume)
-            } else if homes.contains(r) {
+            } else if homes.contains(base + r) {
                 self.slot(before, r)
             } else {
                 SlotState::Unknown
