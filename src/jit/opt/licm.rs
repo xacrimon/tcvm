@@ -1,6 +1,7 @@
 //! Loop-invariant code motion: instructions whose operands come from outside a
 //! loop, and whose memory the loop does not write, move to its preheader. Pure
-//! instructions move from anywhere in the loop. Exiting instructions and loads
+//! instructions move from anywhere in the loop, but for those defined only
+//! past a test before them. Exiting instructions and loads
 //! move only from blocks every entered iteration runs, and a load or a memory
 //! guard only until an exiting instruction stays: it may rely on the guards
 //! before it (a table's shape for a slot's offset). A moved exit leaves
@@ -134,6 +135,20 @@ fn hoist(f: &mut Func<'_>, h: Block, body: &[Block]) -> bool {
                         || f.ty(f.args(i)[0]).set.is_empty() =>
                 {
                     false
+                }
+                // As does a compare of numbers of any kinds, past the test
+                // that found numbers.
+                Op::NumCmp(_)
+                    if f.args(i)
+                        .iter()
+                        .any(|&a| !f.ty(a).within(TypeSet::NUM) || f.ty(a).set.is_empty()) =>
+                {
+                    false
+                }
+                // Its divisor is nonzero only past the guard before it, and
+                // x86-64's `div` traps on zero.
+                Op::LUDiv if !matches!(f.def_op(f.args(i)[1]), Some(Op::KI64(k)) if k != 0) => {
+                    on_spine && ordered
                 }
                 _ if e.is_pure() => true,
                 _ if !e.movable() || e.writes() || e.has(Flags::MAY_ALLOC) => false,

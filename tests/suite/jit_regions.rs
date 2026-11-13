@@ -4097,3 +4097,57 @@ fn loaded_values_outlive_their_slots() {
 "##,
     );
 }
+
+/// A compare of numbers of any kinds stays behind the test that found
+/// numbers: in the loop's preheader it would read a nil as a big integer's
+/// box. The first iteration skips the compare, so no copy of it runs first.
+#[test]
+fn number_compare_stays_behind_its_type_test() {
+    let got = result(
+        "local function f(a, b, n)
+          local c = 0
+          for i = 1, n do
+            if i > 1 and a <= b then c = c + 1 end
+          end
+          return c
+        end
+        local t = 0
+        for r = 1, 300 do
+          t = t + f(1 << 40, 2.5, 3) + f(1.5, 1 << 40, 3) + f(1 << 40, 1 << 41, 3)
+        end
+        return t .. ' ' .. tostring(pcall(f, nil, 1 << 40, 3))",
+        true,
+    );
+    assert_eq!(got, "1200 false");
+}
+
+/// An integer loop's iteration count is divided out behind the guard that
+/// its step is not zero: x86-64's `div` traps. Here the zero step is never
+/// reached, behind a branch on a value the outer loop does not change.
+/// Inlining is off so that the calls with it enter `f`'s own region.
+#[test]
+fn loop_count_division_stays_behind_its_step_guard() {
+    let mut lua = Lua::new();
+    lua.set_jit_inline(false);
+    lua.load_all();
+    let ex = start_on(
+        &mut lua,
+        "local function f(a, b, s, go, n)
+          local c = 0
+          for i = 1, n do if go then for k = a, b, s do c = c + 1 end end end
+          return c
+        end
+        local t = 0
+        for r = 1, 300 do
+          t = t + f(1, 1 << 40, 1 << 38, true, 50) + f((1 << 40) - 5, 1 << 40, 1, true, 50)
+        end
+        return t .. ' ' .. f(1, 1 << 40, 0, false, 100000) .. ' '
+          .. f((1 << 40) - 5, 1 << 40, 0, false, 100000)",
+    );
+    lua.finish(&ex).unwrap();
+    let got = lua.enter(|ctx| {
+        let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        String::from_utf8_lossy(v.get_string().expect("a string result").as_bytes()).into_owned()
+    });
+    assert_eq!(got, "150000 0 0");
+}
