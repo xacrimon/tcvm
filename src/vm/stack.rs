@@ -358,6 +358,8 @@ pub(crate) unsafe extern "C" fn stack_switch(
     // and loads at the same offsets on two stacks cost the core a flush.
     core::arch::naked_asm!(
         "sub x9, sp, #160",
+        // First: a signal's frame goes below `sp`.
+        "mov sp, x9",
         "stp x19, x20, [x9, #0]",
         "stp x21, x22, [x9, #16]",
         "stp x23, x24, [x9, #32]",
