@@ -93,6 +93,10 @@ enum Cmd {
         grep: Option<String>,
         #[arg(long, default_value = "lua")]
         lua: String,
+        /// Only test the program: exit 0 if it shows the finding, 1 if not (for external
+        /// reducers)
+        #[arg(long)]
+        check: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -297,7 +301,8 @@ fn fuzz(seed: u64, cfg: &Config) -> (generate::Program, Vec<Finding>) {
         None
     });
     let mut r = rng::Rng::new(seed ^ 0x6d6f_6465);
-    let modes = oracle::modes(&mut r);
+    let big = prog.units.iter().any(|u| u.kind.starts_with("free big"));
+    let modes = oracle::modes(&mut r, big);
     // The debug-assertions build is there for its assertions: JIT-off, everything compiled
     // at once and one drawn configuration under the verifier reach them at a third of the cost.
     let light: Vec<oracle::Mode> = {
@@ -375,7 +380,15 @@ fn hash_seed(seed: u64) -> (String, String) {
     ("TCVM_HASH_SEED".to_string(), (seed % 1000 + 1).to_string())
 }
 
-fn cmd_reduce(program: &str, what: &str, mode: &str, grep: Option<&str>, lua: &str, cfg: &Config) {
+fn cmd_reduce(
+    program: &str,
+    what: &str,
+    mode: &str,
+    grep: Option<&str>,
+    lua: &str,
+    check: bool,
+    cfg: &Config,
+) {
     // `dbg:hot`: the configuration of one binary, as a finding names it.
     let (bin, mode) = match mode.split_once(':') {
         Some((n, m)) => match cfg.bins.iter().find(|(b, _)| b == n) {
@@ -386,10 +399,19 @@ fn cmd_reduce(program: &str, what: &str, mode: &str, grep: Option<&str>, lua: &s
     };
     let mode = oracle::mode_named(mode).unwrap_or_else(|| die(&format!("no mode {mode}")));
     let seed: Option<u64> = program.parse().ok();
+    // A seed's program file, `p<SEED>.lua` or a reduction of it, keeps the seed's hash seed.
+    let file_seed = (Path::new(program).file_stem()).and_then(|s| {
+        s.to_str()?
+            .strip_prefix('p')?
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    });
     let dir = cfg.out.join("prog");
     let base = [
         ("TCVM_JIT_LOG".to_string(), "1".to_string()),
-        hash_seed(seed.unwrap_or(0)),
+        hash_seed(seed.or(file_seed).unwrap_or(0)),
     ];
     // A candidate that lost a loop's exit is not worth the full limit.
     let secs = cfg.timeout.min(2);
@@ -441,6 +463,11 @@ fn cmd_reduce(program: &str, what: &str, mode: &str, grep: Option<&str>, lua: &s
         }
     };
     let log = |s: &str| eprintln!("{s} ({} runs)", tests.get());
+    if check {
+        let text =
+            std::fs::read_to_string(program).unwrap_or_else(|e| die(&format!("{program}: {e}")));
+        std::process::exit(if fails(&text) { 0 } else { 1 });
+    }
     let text = match seed {
         Some(seed) => {
             let p = generate::Gen::new(seed).program(None);
@@ -758,7 +785,10 @@ fn cmd_cover(lo: u64, hi: u64, cfg: &Config) {
         let mut stats = Vec::new();
         for (tag, mode) in [
             ("off", oracle::off()),
-            ("hot", oracle::modes(&mut rng::Rng::new(0)).swap_remove(1)),
+            (
+                "hot",
+                oracle::modes(&mut rng::Rng::new(0), false).swap_remove(1),
+            ),
         ] {
             let st = format!("c{seed}.{tag}.stats");
             let mut env = mode.env.clone();
@@ -841,6 +871,7 @@ fn main() {
             mode,
             grep,
             lua,
+            check,
             common,
         } => cmd_reduce(
             &program,
@@ -848,6 +879,7 @@ fn main() {
             &mode,
             grep.as_deref(),
             &lua,
+            check,
             &Config::new(&common),
         ),
         Cmd::Triage { dir } => cmd_triage(dir.as_deref()),

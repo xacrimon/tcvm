@@ -128,8 +128,9 @@ pub fn off() -> Mode {
 }
 
 /// The configurations a program runs under besides JIT-off: the default thresholds, everything
-/// compiled at its first count, and a few drawn from the knobs.
-pub fn modes(r: &mut Rng) -> Vec<Mode> {
+/// compiled at its first count, and a few drawn from the knobs. `big`: the program has a unit
+/// many times the usual size, which collections at short intervals make 10 to 50 times slower.
+pub fn modes(r: &mut Rng, big: bool) -> Vec<Mode> {
     let one = "1".to_string();
     let mut out = vec![
         Mode {
@@ -168,14 +169,20 @@ pub fn modes(r: &mut Rng) -> Vec<Mode> {
         knob(0.3, "deopt", "TCVM_JIT_DEOPT_ALL", one.clone(), r);
         knob(0.4, "check", "TCVM_JIT_CHECK", one.clone(), r);
         knob(0.1, "far", "TCVM_JIT_FAR", one.clone(), r);
-        let n = *r.pick(&[1, 7, 64, 64, 1000, 1000]);
+        let n = match big {
+            true => *r.pick(&[4096, 16384, 65536]),
+            false => *r.pick(&[1, 7, 64, 64, 1000, 1000]),
+        };
         if knob(0.2, &format!("gc{n}"), "TCVM_GC_STRESS", n.to_string(), r) {
             slow = 3;
         }
         out.push(Mode { name, env: e, slow });
     }
     if r.chance(0.3) {
-        let n = *r.pick(&[1, 16, 16, 256, 256]);
+        let n = match big {
+            true => *r.pick(&[4096, 16384]),
+            false => *r.pick(&[1, 16, 16, 256, 256]),
+        };
         out.push(Mode {
             name: format!("off,gc{n}"),
             env: env(&[
@@ -433,7 +440,7 @@ mod tests {
     #[test]
     fn a_mode_is_found_again_by_its_name() {
         let mut r = Rng::new(7);
-        for m in modes(&mut r) {
+        for m in modes(&mut r, false) {
             let again = mode_named(&m.name).expect("a mode");
             let sorted = |e: &[(String, String)]| {
                 let mut e = e.to_vec();

@@ -168,7 +168,8 @@ The differences `CLAUDE.md` lists as deliberate are avoided by the generator ins
 writes `%.14g`), takes no length of a table with holes, and never yields outside a coroutine.
 A unit's header line says whether it is strict: `do -- U1 free risk=0 roles=[Num, Str, Tab] strict`.
 `free big` marks one of the 5% of free units with 60 to 150 statements, nested deeper, kept to
-the types and given more fuel per call.
+the types and given more fuel per call. A program with one is collected at longer intervals
+under GC stress (`gc4096` and up): at short ones it runs 10 to 50 times slower (#365).
 
 ## What the programs reach
 
