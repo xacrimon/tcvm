@@ -665,10 +665,11 @@ pub(crate) fn rooted(f: &Func<'_>, kept: &[Val], t: Val) -> bool {
     kept.contains(&same_reg(f, t)) || is_const(f, t)
 }
 
-/// Whether `v` is a constant, which needs no spill slot across a call.
+/// Whether `v` is a constant or shares one's register (`same_reg`), which
+/// needs no spill slot across a call.
 pub(crate) fn is_const(f: &Func<'_>, v: Val) -> bool {
     matches!(
-        f.def_op(v),
+        f.def_op(same_reg(f, v)),
         Some(
             Op::KVal(_)
                 | Op::KObj(_)
@@ -1055,4 +1056,110 @@ fn start(
     };
     reps[k].memo.insert(b, r);
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jit::ir::{BlockCall, ExitKind, List, RegionMeta};
+
+    fn inst(f: &mut Func<'_>, b: Block, op: Op, args: &[Val]) -> Val {
+        let i = f.make_inst(op, args, None, ExitTag::Type);
+        f.append(b, i);
+        f.result(i)
+    }
+
+    /// A call from `b` to resume block `r`, its snapshot naming `named`.
+    fn call(f: &mut Func<'_>, b: Block, r: Block, named: &[(u8, Val)]) -> Inst {
+        let from = f.snap_pool.len();
+        f.snap_pool.extend_from_slice(named);
+        let s = f.finish_snap(0, 0, ExitKind::After, from);
+        let op = Op::Call {
+            a: 0,
+            nargs: 0,
+            c: 1,
+            pc: 0,
+            proto: 0,
+        };
+        let t = f.make_inst(op, &[], Some(s), ExitTag::Type);
+        f.append(b, t);
+        let args = List::default();
+        f.set_edges(t, &[BlockCall { target: r, args }]);
+        f.blocks[r.idx()].resume = true;
+        let i = f.make_inst(Op::Resume { c: 1 }, &[], None, ExitTag::Type);
+        f.append(r, i);
+        t
+    }
+
+    /// The pointer of a table that is a guarded constant is live across a
+    /// call that names nothing: naming the table, which `kept_across` drops
+    /// as a constant, repeated every round.
+    #[test]
+    fn pointers_of_guarded_constant_tables_cross_calls() {
+        let mut f = Func::new(RegionMeta {
+            entry_pc: 0,
+            loop_entry: false,
+            params: 0,
+        });
+        let [e, r] = [(); 2].map(|_| f.new_block());
+        f.entry = e;
+        let k = inst(&mut f, e, Op::KObj(0), &[]);
+        let s = f.finish_snap(0, 0, ExitKind::Before, f.snap_pool.len());
+        let g = f.make_inst(Op::Guard(TypeSet::TAB), &[k], Some(s), ExitTag::Type);
+        f.append(e, g);
+        let t = f.result(g);
+        let p = inst(&mut f, e, Op::Unbox(Rep::Ptr), &[t]);
+        let c = call(&mut f, e, r, &[]);
+        inst(&mut f, r, Op::TabASize, &[p]);
+        let ret = f.make_inst(Op::Return { a: 0, n: 0 }, &[], None, ExitTag::Type);
+        f.append(r, ret);
+        call_boundaries(&mut f).unwrap();
+        assert!(f.snap_entries(c).is_empty());
+        crate::jit::ir::verify::verify(&f).unwrap();
+    }
+
+    fn term(f: &mut Func<'_>, b: Block, op: Op, args: &[Val], to: &[(Block, &[Val])]) {
+        let i = f.make_inst(op, args, None, ExitTag::Type);
+        f.append(b, i);
+        let calls: Vec<BlockCall> = (to.iter())
+            .map(|&(target, args)| BlockCall {
+                target,
+                args: f.new_vlist(args),
+            })
+            .collect();
+        f.set_edges(i, &calls);
+    }
+
+    /// A loop's parameter joining copies of one refined constant is that
+    /// constant made again where the loop starts, after the last round: live
+    /// across the loop's call as the constant whose register it shares.
+    #[test]
+    fn folded_refined_constants_cross_calls() {
+        let mut f = Func::new(RegionMeta {
+            entry_pc: 0,
+            loop_entry: false,
+            params: 0,
+        });
+        let [e, h, r, x] = [(); 4].map(|_| f.new_block());
+        f.entry = e;
+        let five = |f: &mut Func<'_>, b: Block| {
+            let k = inst(f, b, Op::KVal(0xffff_ffff_0000_0005), &[]);
+            let k = inst(f, b, Op::Refine(TypeSet::SMALL), &[k]);
+            inst(f, b, Op::Unbox(Rep::I32), &[k])
+        };
+        let u = five(&mut f, e);
+        term(&mut f, e, Op::Jump, &[], &[(h, &[u])]);
+        let p = f.add_param(h, Ty::I32);
+        call(&mut f, h, r, &[]);
+        let v = inst(&mut f, r, Op::Box, &[p]);
+        let st = f.make_inst(Op::Store(0), &[v], None, ExitTag::Type);
+        f.append(r, st);
+        let u = five(&mut f, r);
+        let c = inst(&mut f, r, Op::KB1(true), &[]);
+        term(&mut f, r, Op::Br, &[c], &[(h, &[u]), (x, &[])]);
+        term(&mut f, x, Op::Return { a: 0, n: 0 }, &[], &[]);
+        call_boundaries(&mut f).unwrap();
+        assert!(f.params(h).is_empty());
+        crate::jit::ir::verify::verify(&f).unwrap();
+    }
 }

@@ -4421,3 +4421,58 @@ fn loop_count_division_stays_behind_its_step_guard() {
     });
     assert_eq!(got, "150000 0 0");
 }
+
+/// An unboxed constant a late fold left live across a call: the third
+/// program of #340, whose region failed to compile at these counts.
+#[test]
+fn folded_constants_cross_calls_in_recompiles() {
+    let src = r##"
+    local function emit(s) io.write(s, "\n") end
+    local function tick()
+    end
+    local function reset()
+    V = {}
+    V.si = {}
+    V.sp = { 1 }
+    V.ib = {  1 << 40 }
+    for k, l in pairs(V) do n = #l end
+    end
+    do
+    reset()
+    local function f(a, b, c)
+    local function h2()
+    end
+    for i7 = 2, 1, (-1) do
+    end
+    for i10 = 0, (#("")) do
+    tick()
+    local v12 = {z = ((c) or h2), y = a, (i10 - h2)}
+    for i13 = 3, 3 do
+    tick()
+    end
+    end
+    end
+    local function via_tail(a, b, c) return f(a, b, c) end
+    local function run(LA, LB, LC, n)
+    local co = (function()
+    for i = pos + 1, n do
+    pos = i
+    local a, b, c = LA[(i - 1) % n + 1], LB[1], LC[1]
+    local s = (call(a, b, c)) .. probes
+    end
+    end)
+    while co() ~= "" do end
+    end
+    local function drive(LA, LB, LC, n)
+    pos = 0
+    while pos < n do
+    local e = pcall(run, LA, LB, LC, n)
+    end
+    end
+    call = via_tail
+    drive(V.ib, V.si, V.sp, 60)
+    end
+    return "END"
+"##;
+    compiles_hot(src, false, 1, 3);
+}
