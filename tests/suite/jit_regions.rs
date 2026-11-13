@@ -4794,3 +4794,26 @@ fn an_i64_joining_an_i32_is_truncated() {
     assert_eq!(result(src, true), "333 1 0,333 1 0,333 1 0");
     compiles_cleanly(src, true);
 }
+
+/// Inference runs to its fixpoint however far that is: a float entering a
+/// loop's rotation of 55 locals at the last takes a round for each to reach
+/// the first, which is not compiled as the integer it starts as.
+#[test]
+fn inference_follows_a_long_rotation() {
+    let vars: Vec<String> = (1..=55).map(|k| format!("v{k}")).collect();
+    let all = vars.join(", ");
+    let src = format!(
+        "local function f(a, m)
+            local {all} = {}
+            for i = 1, m do {all} = {}, v1 + 0.5 end
+            return v1, math.type(v1)
+        end
+        local s = 0
+        for i = 1, 300 do s = s + f(1, 60) end
+        local v, t = f(1, 60)
+        return s .. ' ' .. v .. ' ' .. t",
+        vec!["a"; 55].join(", "),
+        vars[1..].join(", "),
+    );
+    assert_eq!(result(&src, true), "450.0 1.5 float");
+}

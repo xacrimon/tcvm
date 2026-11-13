@@ -37,9 +37,14 @@ pub(crate) fn infer(f: &mut Func<'_>) {
             };
         }
     }
+    // A type crosses one parameter of a chain of them around a back edge per
+    // round, so the fixpoint can be any number of rounds away. Past `GROW` a
+    // parameter keeps what it had, and the rounds left are bounded by the
+    // lattice: parameters only rise, and the rest follows them in one round.
+    const GROW: u32 = 50;
     let mut changed = true;
-    let mut rounds = 0;
-    while changed && rounds < 50 {
+    let mut rounds = 0u32;
+    while changed {
         changed = false;
         rounds += 1;
         for &b in &cfg.rpo {
@@ -70,7 +75,14 @@ pub(crate) fn infer(f: &mut Func<'_>) {
                         };
                     }
                 }
-                if t != f.vals[p.idx()].ty {
+                let old = f.vals[p.idx()].ty;
+                if rounds > GROW {
+                    t.set |= old.set;
+                    if t.refine != old.refine {
+                        t.refine = crate::jit::ir::types::Refine::None;
+                    }
+                }
+                if t != old {
                     f.vals[p.idx()].ty = t;
                     changed = true;
                 }
