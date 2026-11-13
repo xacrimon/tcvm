@@ -1869,6 +1869,9 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         if ty.within(set) && !(self.deopt_all && ty.rep == Rep::Val) {
             return v;
         }
+        // An unboxed value outside `set` (a float where a table is wanted)
+        // is tested boxed, like any other.
+        let v = self.boxed(v);
         let i = self.ins_exit(Op::Guard(set), &[v], ExitTag::Type);
         self.f.result(i)
     }

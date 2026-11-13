@@ -373,6 +373,7 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         }
         ERRNNIL => {
             let v = b.reg(a);
+            let v = b.boxed(v);
             b.ins_exit(Op::Guard(TypeSet::NIL), &[v], ExitTag::Slow);
         }
         UNM => emit_unm(b, pc, a, rb),
@@ -416,9 +417,18 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, succs: &[Block]) {
         }
         JEQS | JNEQS => {
             let v = b.reg(a);
-            let k = b.proto.constants[insn.h() as usize];
-            let kv = b.konst(k);
-            let eq = b.ins(Op::SameBits, &[v, kv]);
+            let t = b.ty(v);
+            // No value that is not a string equals one.
+            let eq = if matches!(t.rep, Rep::I32 | Rep::I64 | Rep::F64)
+                || (!t.set.is_empty() && !t.set.intersects(TypeSet::STR))
+            {
+                b.ins(Op::KB1(false), &[])
+            } else {
+                let v = b.boxed(v);
+                let k = b.proto.constants[insn.h() as usize];
+                let kv = b.konst(k);
+                b.ins(Op::SameBits, &[v, kv])
+            };
             branch(b, eq, insn.op() == JEQS, succs);
         }
         RETURN0 | RETURN1 | RETURN if b.inline.is_some() && (insn.op() != RETURN || rb != 0) => {

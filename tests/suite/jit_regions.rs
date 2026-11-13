@@ -4648,3 +4648,115 @@ fn stores_at_sites_that_never_ran() {
         true,
     );
 }
+
+/// An operation that takes a boxed value is given one where the register
+/// holds an unboxed number: a type guard, a miss guard's receiver, a compare
+/// with a string constant. The sites after the failing shift never ran when
+/// their function compiles.
+#[test]
+fn unboxed_values_are_boxed_for_boxed_operands() {
+    for inline in [false, true] {
+        // A table guard on an integer and on a float.
+        compiles_cleanly(
+            r##"
+            local function set(v) v[1] = nil end
+            set({})
+            local u
+            local function f() set(0.5 + (u << 3)) end
+            local function g() set(u << 3) end
+            local n = 0
+            for i = 1, 600 do
+                if not pcall(f) then n = n + 1 end
+                if not pcall(g) then n = n + 1 end
+            end
+            return tostring(n)
+"##,
+            inline,
+        );
+        // A string guard on an integer receiver at a site that saw strings.
+        compiles_cleanly(
+            r##"
+            local function ser(v) return v:rep(2):rep(2) .. "" end
+            local s = ser("ab")
+            local u
+            local function f() return ser(u << 3) end
+            local n = 0
+            for i = 1, 600 do if not pcall(f) then n = n + 1 end end
+            return s .. n
+"##,
+            inline,
+        );
+        // A miss guard whose receiver is a length.
+        compiles_cleanly(
+            r##"
+            local u
+            local function f(c)
+                local w = u << 3
+                local v = #""
+                v[2] = c
+            end
+            local n = 0
+            for i = 1, 600 do if not pcall(f, i) then n = n + 1 end end
+            return tostring(n)
+"##,
+            inline,
+        );
+        // An integer loop's guard on a float step, and on a float start.
+        compiles_cleanly(
+            r##"
+            local function f(x) local n = 0 for i = x, 16, (-1/0) do n = n + 1 end return n end
+            local n = 0
+            for i = 1, 400 do if not pcall(f, nil) then n = n + 1 end end
+            local big = math.maxinteger
+            local function g(a)
+                for i = 0, 5, 2 do
+                    local lim = i
+                    if i == 4 then lim = big end
+                    for j = math.abs(2147483648.0), lim do
+                        a = a + 1
+                        if a > 2000 then break end
+                    end
+                end
+                return a
+            end
+            local r = 0
+            for k = 1, 300 do r = r + g(k) end
+            return n .. " " .. f(20) .. " " .. r
+"##,
+            inline,
+        );
+        // A float and an integer against a string constant.
+        compiles_cleanly(
+            r##"
+            local function f(a, b) local x = a ^ b if x == "0x10" then return x end return "no" end
+            local function g(c) return (1 << c) ~= "" end
+            local n, r = 0, ""
+            for i = 1, 400 do
+                r = f(2, 3) .. f(2.5, 3)
+                if g(i % 5) then n = n + 1 end
+            end
+            return r .. n
+"##,
+            inline,
+        );
+    }
+}
+
+/// A number is equal to no string constant, whatever its bits.
+#[test]
+fn numbers_differ_from_string_constants() {
+    agrees(
+        "local function f(n)
+            local c = 0
+            for i = 1, n do
+                local x, y = i * 2, i + 0.5
+                if x == 'a' then c = c + 1 end
+                if y ~= 'b' then c = c + 2 end
+            end
+            return c
+        end
+        local r = 0
+        for k = 1, 300 do r = r + f(100) end
+        return tostring(r)",
+    );
+}

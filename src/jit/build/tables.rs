@@ -742,7 +742,8 @@ pub(super) fn emit_get<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
 fn string_method<'gc>(b: &mut Builder<'_, 'gc>, dst: u8, site: &Site<'gc>) -> bool {
     let ty = b.ty(site.recv);
     let kinds = b.feedback(b.pc) & fb::KINDS;
-    if !(kinds == fb::STR || !ty.set.is_empty() && ty.within(TypeSet::STR)) {
+    // Feedback from another receiver does not make a known number a string.
+    if !(ty.set.intersects(TypeSet::STR) && (kinds == fb::STR || ty.within(TypeSet::STR))) {
         return false;
     }
     let ctx = b.ctx;
@@ -1388,6 +1389,7 @@ fn nil_guard(b: &mut Builder<'_, '_>, recv: Val, t: Val, v: Val, bit: Metamethod
     let s = b.snap_before();
     // The table by its root, so that GVN still merges equal guards.
     let recv = b.root_of(recv);
+    let recv = b.boxed(recv);
     b.ins_snap(Op::GuardMiss, &[v, has, recv], s, ExitTag::Bounds);
 }
 
