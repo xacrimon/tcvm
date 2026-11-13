@@ -276,6 +276,10 @@ impl ValSet {
         !had
     }
 
+    pub(crate) fn contains(&self, v: usize) -> bool {
+        self.0[v / 64] >> (v % 64) & 1 != 0
+    }
+
     pub(crate) fn remove(&mut self, v: usize) {
         self.0[v / 64] &= !(1 << (v % 64));
     }

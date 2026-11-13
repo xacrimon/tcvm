@@ -4476,3 +4476,95 @@ fn folded_constants_cross_calls_in_recompiles() {
 "##;
     compiles_hot(src, false, 1, 3);
 }
+
+/// The programs of #340, whose regions failed to compile at these counts: a
+/// pointer live across a call through chained parameters.
+#[test]
+fn chained_pointer_parameters_cross_calls() {
+    let src = r##"
+    local function f(a, b, c)
+      local t = {}
+      for i = 1, 0 do t[i] = i end
+      t[b + 0.0] = c
+      return #t, s, t[b // 1], next(t)
+    end
+    local args = {
+      { -3, 0.5, 3 }, { 1, 3, 1 }, { 2.5, -1, 1 }, { -2.5, nil, 1 << 62 },
+      { {}, coroutine.create(print), 0 / 0 }, { nil, "10", math.mininteger }, { 2147483648, nil, -(1 << 53) },
+    }
+    for _, v in ipairs(args) do
+      for i = 1, 2 do pcall(f, v[1], v[2], v[3]) end
+    end
+    return "END"
+"##;
+    compiles_at_first_count(src, true);
+}
+
+/// Through a parameter that is a constant's pointer.
+#[test]
+fn constant_pointer_parameters_cross_calls() {
+    let src = r##"
+    local function emit(s) io.write(s, "\n") end
+    local function ser(v)
+    local t = type(v)
+    if t == "" then
+    elseif t == "" then
+    elseif t == "" then 
+    elseif t == "" then 
+    else return t end
+    end
+    local function sk(v) return ser(v):sub() end
+    local function tick()
+    end
+    local function mk(name, t, mt)
+    if mt then setmetatable(t, mt) end
+    return t
+    end
+    local function reset()
+    setmetatable({}, {})
+    MT = {}
+    for _, m in ipairs({ "bnot", "" }) do
+    MT["__" .. m] = function() return sk(y) end
+    end
+    V = {}
+    V.tb = {
+    mk, mk, mk,
+    mk("", {}, MT), mk,
+    }
+    V.sn = {  }
+    V.tm = { V.tb[4], V.tb[5] }
+    for k, l in pairs(V) do l.n = #l end
+    end
+    do
+    reset()
+    local u2 = {}
+    local function f(a, b, c)
+    function u2:m3(p4)
+    for i5 = 0.0, 0.75, 0.25 do
+    for i7 = 0, 0 do
+    u2.y = (~b)
+    end
+    end
+    end
+    local v9 = u2:m3()
+    end
+    local call = f
+    local function run(LA, LB, LC, n, h)
+    for i = pos + 1, n do
+    pos = i
+    local a, b, c = LA[1], LB[i % LB.n + 1]
+    local s = (call(a, b, c)) .. probes()
+    end
+    end
+    local function drive(LA, LB, LC, n)
+    pos = 0
+    while pos < n do
+    local e = pcall(run, LA, LB, LC, n, h)
+    end
+    end
+    drive(V.sn, V.tm, V.ib, 150)
+    end
+    return "END"
+"##;
+    compiles_at_first_count(src, true);
+}

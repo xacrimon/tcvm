@@ -11,8 +11,8 @@
 
 use crate::jit::FastMap;
 use crate::jit::ir::ops::{ExitTag, Mem, Op};
-use crate::jit::ir::types::{Rep, Ty, TypeSet};
-use crate::jit::ir::verify::live_in;
+use crate::jit::ir::types::{Refine, Rep, Ty, TypeSet};
+use crate::jit::ir::verify::{ValSet, live_in};
 use crate::jit::ir::{Block, CfgInfo, Func, Inst, Val};
 use crate::jit::opt::natural_loops;
 
@@ -50,86 +50,193 @@ fn const_chain(f: &Func<'_>, v: Val) -> bool {
     op.is_pure() && !matches!(op, Op::Helper(_)) && f.args(d).iter().all(|&a| const_chain(f, a))
 }
 
-/// Pointer parameters that join unboxings are an unboxing of a table value,
-/// made where their block starts: a call keeps no raw pointer, and only a
-/// definition is made again after one. The table is one value that
+/// Pointer parameters that join tables' pointers are an unboxing of a table
+/// value, made where their block starts: a call keeps no raw pointer, and
+/// only a definition is made again after one. The table is one value that
 /// dominates the block (the receiver of a call dispatched by shape,
-/// across its bodies' calls), or a parameter joining the unboxed
-/// tables edge by edge, made when none does (branch elimination's repairs
-/// join a cloned block's table and its unboxing).
+/// across its bodies' calls), or a parameter joining the tables edge by
+/// edge, made when none does (branch elimination's repairs join a cloned
+/// block's table and its unboxing). An edge passes an unboxing, a constant's
+/// pointer or another such parameter; one that is a constant's pointer by
+/// its type is that constant.
 fn fold_ptr_params(f: &mut Func<'_>) {
     let cfg = f.cfg();
-    let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
-    let mut changed = false;
+    let mut ptrs: Vec<(Block, usize, Val)> = Vec::new();
     for &b in &cfg.rpo {
-        let ps = f.params(b).to_vec();
-        let inc = cfg.incoming(b);
-        if inc.is_empty() || !ps.iter().any(|&p| f.ty(p).rep == Rep::Ptr) {
-            continue;
+        if !cfg.incoming(b).is_empty() {
+            for (k, &p) in f.params(b).iter().enumerate() {
+                if f.ty(p).rep == Rep::Ptr {
+                    ptrs.push((b, k, p));
+                }
+            }
         }
-        let mut at = usize::from(
-            (f.insts_of(b).first()).is_some_and(|&i| matches!(f.op(i), Op::Resume { .. })),
-        );
-        let mut params = ps.clone();
-        let mut args: Vec<Vec<Val>> = (inc.iter())
+    }
+    if ptrs.is_empty() {
+        return;
+    }
+    // Only one live across a call, and those its edges pass: the others
+    // stay pointers, which join without an unboxing.
+    let live = live_in(f, &cfg.rpo);
+    let mut crosses = ValSet::new(f.vals.len());
+    let mut work: Vec<(Block, usize)> = Vec::new();
+    for &(b, k, p) in &ptrs {
+        let across =
+            (cfg.rpo.iter()).any(|r| f.blocks[r.idx()].resume && live[r.idx()].contains(p.idx()));
+        if across && crosses.insert(p.idx()) {
+            work.push((b, k));
+        }
+    }
+    while let Some((b, k)) = work.pop() {
+        for &(t, e) in cfg.incoming(b) {
+            let a = f.edge_args(t, e as usize)[k];
+            if let Some(&(ab, ak, _)) = ptrs.iter().find(|x| x.2 == a)
+                && crosses.insert(a.idx())
+            {
+                work.push((ab, ak));
+            }
+        }
+    }
+    ptrs.retain(|x| crosses.contains(x.2.idx()));
+    if ptrs.is_empty() {
+        return;
+    }
+    let konst = |f: &Func<'_>, v: Val| match f.ty(v).refine {
+        Refine::Const(k) => Some(k),
+        _ => None,
+    };
+    let unboxed = |f: &Func<'_>, v: Val| f.def_op(v) == Some(Op::Unbox(Rep::Ptr));
+    // Optimistically around cycles: a parameter leaves with one it joins.
+    let mut open: FastMap<Val, ()> = ptrs.iter().map(|&(_, _, p)| (p, ())).collect();
+    loop {
+        let n = ptrs.len();
+        ptrs.retain(|&(b, k, p)| {
+            let folds = konst(f, p).is_some()
+                || cfg.incoming(b).iter().all(|&(t, e)| {
+                    let a = f.edge_args(t, e as usize)[k];
+                    open.contains_key(&a) || konst(f, a).is_some() || unboxed(f, a)
+                });
+            if !folds {
+                open.remove(&p);
+            }
+            folds
+        });
+        if ptrs.len() == n {
+            break;
+        }
+    }
+    // The table of each parameter left that is no constant's pointer, and
+    // the parameters made to join tables, by the pointer parameter's index.
+    let mut table: FastMap<Val, Val> = FastMap::default();
+    let mut joins: Vec<(Block, usize, Val)> = Vec::new();
+    for group in ptrs.chunk_by(|x, y| x.0 == y.0) {
+        let b = group[0].0;
+        let ps = f.params(b).to_vec();
+        let args: Vec<Vec<Val>> = (cfg.incoming(b).iter())
             .map(|&(t, e)| f.edge_args(t, e as usize).to_vec())
             .collect();
-        let mut folded = vec![false; ps.len()];
-        for (k, &p) in ps.iter().enumerate() {
-            if f.ty(p).rep != Rep::Ptr {
+        for &(_, k, p) in group {
+            if konst(f, p).is_some() {
                 continue;
             }
-            let x = match unboxed_from(f, &cfg, b, k, p) {
-                Some(x) => x,
-                None => {
-                    let Some(tables) = unboxed_tables(f, &args, k, p) else {
-                        continue;
-                    };
-                    match sibling(f, &ps, &args, &tables) {
-                        Some(q) => q,
-                        None => {
-                            let set = (tables.iter().flatten())
-                                .fold(TypeSet::empty(), |s, &t| s | f.ty(t).set);
-                            let q = f.add_param(b, Ty::val(set));
-                            for (a, t) in args.iter_mut().zip(&tables) {
-                                a.push(t.unwrap_or(q));
-                            }
-                            params.push(q);
-                            q
-                        }
+            let x = unboxed_from(f, &cfg, b, k, p).or_else(|| {
+                let tables = unboxed_tables(f, &args, k, p)?;
+                sibling(f, &ps, &args, &tables)
+            });
+            let x = x.unwrap_or_else(|| {
+                let q = f.add_param(b, Ty::val(TypeSet::empty()));
+                joins.push((b, k, q));
+                q
+            });
+            table.insert(p, x);
+        }
+    }
+    // What each edge passes a joining parameter: a constant object is made
+    // where the edge leaves.
+    let mut kobjs: FastMap<(Block, u32), Val> = FastMap::default();
+    let mut passed: Vec<Vec<Val>> = Vec::with_capacity(joins.len());
+    for &(b, k, q) in &joins {
+        let p = f.params(b)[k];
+        let mut col = Vec::with_capacity(cfg.incoming(b).len());
+        for &(t, e) in cfg.incoming(b) {
+            let a = f.edge_args(t, e as usize)[k];
+            col.push(if a == p {
+                q
+            } else if unboxed(f, a) {
+                f.args(f.def_inst(a).unwrap())[0]
+            } else if let Some(&x) = table.get(&a) {
+                x
+            } else {
+                let c = konst(f, a).unwrap();
+                let from = f.insts[t.idx()].block;
+                match kobjs.get(&(from, c)) {
+                    Some(&o) => o,
+                    None => {
+                        let i = f.make_inst(Op::KObj(c), &[], None, ExitTag::Type);
+                        f.insert_before_term(from, i);
+                        let o = f.result(i);
+                        f.vals[o.idx()].ty = Ty {
+                            refine: Refine::Const(c),
+                            ..Ty::val(crate::jit::build::value_set(f.pool[c as usize]))
+                        };
+                        kobjs.insert((from, c), o);
+                        o
                     }
                 }
-            };
-            let i = f.make_inst(Op::Unbox(Rep::Ptr), &[x], None, ExitTag::Type);
-            f.insert(b, at, i);
-            at += 1;
-            let u = f.result(i);
-            f.vals[u.idx()].ty = f.vals[p.idx()].ty;
-            map.push(Val(map.len() as u32));
-            map[p.idx()] = u;
-            folded[k] = true;
+            });
         }
-        if !folded.contains(&true) {
-            continue;
-        }
-        let keep = |k: &usize| folded.get(*k).is_none_or(|&f| !f);
-        for (&(t, e), a) in inc.iter().zip(&args) {
-            let a: Vec<Val> = (0..a.len()).filter(keep).map(|k| a[k]).collect();
-            f.set_edge_args(t, e as usize, &a);
-        }
-        let ps2: Vec<Val> = (0..params.len()).filter(keep).map(|k| params[k]).collect();
-        f.set_params(b, &ps2);
-        changed = true;
+        passed.push(col);
     }
-    if changed {
-        map.resize(f.vals.len(), Val(0));
-        for (x, m) in map.iter_mut().enumerate() {
-            if m.0 == 0 && x != 0 {
-                *m = Val(x as u32);
+    // A joining parameter is of the types its edges pass, others of them
+    // included.
+    loop {
+        let mut changed = false;
+        for (&(_, _, q), col) in joins.iter().zip(&passed) {
+            let set = (col.iter()).fold(TypeSet::empty(), |s, &t| s | f.ty(t).set);
+            if set != f.ty(q).set {
+                f.vals[q.idx()].ty.set = set;
+                changed = true;
             }
         }
-        f.apply_replacements(&mut map);
+        if !changed {
+            break;
+        }
     }
+    let mut repl: Vec<(Val, Val)> = Vec::with_capacity(ptrs.len());
+    let mut join = 0;
+    for group in ptrs.chunk_by(|x, y| x.0 == y.0) {
+        let b = group[0].0;
+        let at = usize::from(
+            (f.insts_of(b).first()).is_some_and(|&i| matches!(f.op(i), Op::Resume { .. })),
+        );
+        for (n, &(_, _, p)) in group.iter().enumerate() {
+            let i = match konst(f, p) {
+                Some(c) => f.make_inst(Op::KPtr(c), &[], None, ExitTag::Type),
+                None => f.make_inst(Op::Unbox(Rep::Ptr), &[table[&p]], None, ExitTag::Type),
+            };
+            f.insert(b, at + n, i);
+            let u = f.result(i);
+            f.vals[u.idx()].ty = f.vals[p.idx()].ty;
+            repl.push((p, u));
+        }
+        let ps = f.params(b).to_vec();
+        let made = joins[join..].iter().take_while(|j| j.0 == b).count();
+        let old = ps.len() - made;
+        let keep = |k: &usize| !group.iter().any(|g| g.1 == *k);
+        for (n, &(t, e)) in cfg.incoming(b).iter().enumerate() {
+            let a = f.edge_args(t, e as usize);
+            let mut a: Vec<Val> = (0..old).filter(keep).map(|k| a[k]).collect();
+            a.extend(passed[join..join + made].iter().map(|col| col[n]));
+            f.set_edge_args(t, e as usize, &a);
+        }
+        let ps2: Vec<Val> = (0..ps.len()).filter(keep).map(|k| ps[k]).collect();
+        f.set_params(b, &ps2);
+        join += made;
+    }
+    let mut map: Vec<Val> = (0..f.vals.len() as u32).map(Val).collect();
+    for (p, u) in repl {
+        map[p.idx()] = u;
+    }
+    f.apply_replacements(&mut map);
 }
 
 /// The table value whose unboxing every edge into `b` passes as its `k`th
@@ -1160,6 +1267,141 @@ mod tests {
         term(&mut f, x, Op::Return { a: 0, n: 0 }, &[], &[]);
         call_boundaries(&mut f).unwrap();
         assert!(f.params(h).is_empty());
+        crate::jit::ir::verify::verify(&f).unwrap();
+    }
+
+    fn func() -> Func<'static> {
+        Func::new(RegionMeta {
+            entry_pc: 0,
+            loop_entry: false,
+            params: 0,
+        })
+    }
+
+    /// The use of pointer `p` after the call from `b`, then a return.
+    fn used_after_call(f: &mut Func<'_>, b: Block, r: Block, p: Val) {
+        call(f, b, r, &[]);
+        inst(f, r, Op::TabASize, &[p]);
+        term(f, r, Op::Return { a: 0, n: 0 }, &[], &[]);
+    }
+
+    /// A pointer parameter joining another one's and an unboxing folds with
+    /// it, whichever block comes first.
+    #[test]
+    fn chained_pointer_parameters_fold() {
+        let mut f = func();
+        let [e, a, b, m, n, r] = [(); 6].map(|_| f.new_block());
+        f.entry = e;
+        let t = inst(&mut f, e, Op::Load(0), &[]);
+        let c = inst(&mut f, e, Op::KB1(true), &[]);
+        term(&mut f, e, Op::Br, &[c], &[(a, &[]), (b, &[])]);
+        let ua = inst(&mut f, a, Op::Unbox(Rep::Ptr), &[t]);
+        term(&mut f, a, Op::Jump, &[], &[(m, &[ua])]);
+        let ub = inst(&mut f, b, Op::Unbox(Rep::Ptr), &[t]);
+        term(&mut f, b, Op::Br, &[c], &[(m, &[ub]), (n, &[ub])]);
+        let p = f.add_param(m, Ty::PTR);
+        term(&mut f, m, Op::Jump, &[], &[(n, &[p])]);
+        let p = f.add_param(n, Ty::PTR);
+        used_after_call(&mut f, n, r, p);
+        call_boundaries(&mut f).unwrap();
+        assert!(f.params(m).is_empty() && f.params(n).is_empty());
+        crate::jit::ir::verify::verify(&f).unwrap();
+    }
+
+    /// A pointer parameter no call resumes with stays one.
+    #[test]
+    fn pointer_parameters_dead_at_calls_stay() {
+        let mut f = func();
+        let [e, a, b, m, r] = [(); 5].map(|_| f.new_block());
+        f.entry = e;
+        let t = inst(&mut f, e, Op::Load(0), &[]);
+        let c = inst(&mut f, e, Op::KB1(true), &[]);
+        term(&mut f, e, Op::Br, &[c], &[(a, &[]), (b, &[])]);
+        let ua = inst(&mut f, a, Op::Unbox(Rep::Ptr), &[t]);
+        term(&mut f, a, Op::Jump, &[], &[(m, &[ua])]);
+        let ub = inst(&mut f, b, Op::Unbox(Rep::Ptr), &[t]);
+        term(&mut f, b, Op::Jump, &[], &[(m, &[ub])]);
+        let p = f.add_param(m, Ty::PTR);
+        inst(&mut f, m, Op::TabASize, &[p]);
+        call(&mut f, m, r, &[]);
+        term(&mut f, r, Op::Return { a: 0, n: 0 }, &[], &[]);
+        call_boundaries(&mut f).unwrap();
+        assert_eq!(f.params(m), [p]);
+        crate::jit::ir::verify::verify(&f).unwrap();
+    }
+
+    /// Pointer parameters joining each other around a loop fold together,
+    /// their tables joined the same way.
+    #[test]
+    fn pointer_parameters_around_a_loop_fold() {
+        let mut f = func();
+        let [e, h, s, j, r, x] = [(); 6].map(|_| f.new_block());
+        f.entry = e;
+        let t = inst(&mut f, e, Op::Load(0), &[]);
+        let u = inst(&mut f, e, Op::Unbox(Rep::Ptr), &[t]);
+        let c = inst(&mut f, e, Op::KB1(true), &[]);
+        term(&mut f, e, Op::Jump, &[], &[(h, &[u])]);
+        let p1 = f.add_param(h, Ty::PTR);
+        term(&mut f, h, Op::Br, &[c], &[(s, &[]), (j, &[p1])]);
+        let t = inst(&mut f, s, Op::Load(1), &[]);
+        let u = inst(&mut f, s, Op::Unbox(Rep::Ptr), &[t]);
+        term(&mut f, s, Op::Jump, &[], &[(j, &[u])]);
+        let p2 = f.add_param(j, Ty::PTR);
+        call(&mut f, j, r, &[]);
+        inst(&mut f, r, Op::TabASize, &[p2]);
+        term(&mut f, r, Op::Br, &[c], &[(h, &[p2]), (x, &[])]);
+        term(&mut f, x, Op::Return { a: 0, n: 0 }, &[], &[]);
+        call_boundaries(&mut f).unwrap();
+        let vals = |f: &Func<'_>, b: Block| f.params(b).iter().all(|&q| f.ty(q).rep == Rep::Val);
+        assert!(vals(&f, h) && vals(&f, j));
+        crate::jit::ir::verify::verify(&f).unwrap();
+    }
+
+    /// A pointer parameter that is a constant's pointer by its type is the
+    /// constant; one joining a constant's pointer and an unboxing unboxes a
+    /// parameter that joins the constant and the table.
+    #[test]
+    fn constant_pointer_parameters_fold() {
+        let k0 = Ty {
+            refine: Refine::Const(0),
+            ..Ty::PTR
+        };
+        let mut f = func();
+        f.pool.push(crate::env::Value::nil());
+        let [e, a, b, m, r] = [(); 5].map(|_| f.new_block());
+        f.entry = e;
+        let c = inst(&mut f, e, Op::KB1(true), &[]);
+        term(&mut f, e, Op::Br, &[c], &[(a, &[]), (b, &[])]);
+        let ka = inst(&mut f, a, Op::KPtr(0), &[]);
+        term(&mut f, a, Op::Jump, &[], &[(m, &[ka])]);
+        let kb = inst(&mut f, b, Op::KPtr(0), &[]);
+        term(&mut f, b, Op::Jump, &[], &[(m, &[kb])]);
+        let p = f.add_param(m, k0);
+        used_after_call(&mut f, m, r, p);
+        call_boundaries(&mut f).unwrap();
+        assert!(f.params(m).is_empty());
+        crate::jit::ir::verify::verify(&f).unwrap();
+
+        let mut f = func();
+        f.pool.push(crate::env::Value::nil());
+        let [e, a, b, m, r] = [(); 5].map(|_| f.new_block());
+        f.entry = e;
+        let t = inst(&mut f, e, Op::Load(0), &[]);
+        let c = inst(&mut f, e, Op::KB1(true), &[]);
+        term(&mut f, e, Op::Br, &[c], &[(a, &[]), (b, &[])]);
+        let ka = inst(&mut f, a, Op::KPtr(0), &[]);
+        term(&mut f, a, Op::Jump, &[], &[(m, &[ka])]);
+        let ub = inst(&mut f, b, Op::Unbox(Rep::Ptr), &[t]);
+        term(&mut f, b, Op::Jump, &[], &[(m, &[ub])]);
+        let p = f.add_param(m, Ty::PTR);
+        used_after_call(&mut f, m, r, p);
+        call_boundaries(&mut f).unwrap();
+        let q = f.params(m)[0];
+        assert_eq!(f.ty(q).rep, Rep::Val);
+        assert_eq!(
+            f.def_op(f.edge_args(f.terminator(a).unwrap(), 0)[0]),
+            Some(Op::KObj(0))
+        );
         crate::jit::ir::verify::verify(&f).unwrap();
     }
 }
