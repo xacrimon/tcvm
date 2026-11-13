@@ -203,6 +203,9 @@ impl<'cache, 'source> Parser<'cache, 'source> {
             let span = Span::new(start + e.range.start as u32, start + e.range.end as u32);
             self.error_at(span, e.message, "in this escape");
         }
+        if kind == T![malformed_number] {
+            self.error("malformed number", "not a valid numeral");
+        }
         self.expect(kind);
         Some(marker.complete(self))
     }

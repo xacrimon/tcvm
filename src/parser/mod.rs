@@ -192,9 +192,9 @@ mod tests {
     test!(paren_prefix, "test-files/paren_prefix.lua");
     test!(call_sugar, "test-files/call_sugar.lua");
 
-    // A malformed tail with no statement-recovery token before EOF (e.g. the
-    // adjacent `Float Float` from `1.2.3` / `10..20`) must yield a parse error
-    // report, not run the recovery loop past EOF and panic.
+    // A malformed tail with no statement-recovery token before EOF (e.g. a
+    // statement starting with `1.2.3`) must yield a parse error report, not
+    // run the recovery loop past EOF and panic.
     #[test]
     fn malformed_numeral_reports_without_panic() {
         for src in [
@@ -208,6 +208,38 @@ mod tests {
             let reports = parse(&mut cache, src).reports;
             assert!(!reports.is_empty(), "expected a parse error for {src:?}");
         }
+    }
+
+    // A numeral ends where llex.c's `read_numeral` ends it, so a touching
+    // keyword is part of a malformed number rather than its own token (#366).
+    // The spans are lua 5.5.1's "near" texts.
+    #[test]
+    fn numeral_touching_a_letter_is_malformed() {
+        for (src, near) in [
+            ("x = 1 if x == 1then end", "1t"),
+            ("do local x=1end", "1en"),
+            ("for i=1,3do end", "3do"),
+            ("repeat local a=1until a", "1u"),
+            ("return 2and 3", "2an"),
+            ("return 1.5or 2", "1.5o"),
+            ("return 1e5or 1", "1e5o"),
+            ("return 1.e5or 3", "1.e5o"),
+            ("return 0x1for 2", "0x1fo"),
+            ("return 1_0", "1_"),
+            ("return 3..2", "3..2"),
+            ("return 1e+", "1e+"),
+            ("return 0x", "0x"),
+            ("return 0x1p+", "0x1p+"),
+            ("return .5x", ".5x"),
+        ] {
+            let mut cache = NodeCache::new();
+            let reports = parse(&mut cache, src).reports;
+            let first = reports.first().unwrap_or_else(|| panic!("{src:?} parsed"));
+            assert_eq!(first.message, "malformed number", "{src:?}");
+            assert_eq!(&src[first.span], near, "{src:?}");
+        }
+        let src = "return 0xe-1, 1e-2, 1E+2, .5, 3., 0xA.8p1, 0x.8, 1 .. 2, 0x1P-1, 2^-1, {1,2}";
+        assert!(parse(&mut NodeCache::new(), src).reports.is_empty());
     }
 
     // A bad statement inside a block must stop recovery at the block's `end`

@@ -227,6 +227,15 @@ pub enum SyntaxKind {
     #[regex(r"0[xX]([0-9a-fA-F]+\.[0-9a-fA-F]*([pP][+-]?[0-9]+)?|\.[0-9a-fA-F]+([pP][+-]?[0-9]+)?|[0-9a-fA-F]+[pP][+-]?[0-9]+)")]
     HexFloat,
 
+    // What llex.c's `read_numeral` consumes: digits, `.`, exponent marks with
+    // their sign, and one touching letter. Lowest priority, so it wins only
+    // where it is longer than every valid numeral (`luaO_str2num` would fail).
+    #[regex(
+        r"(([0-9]|\.[0-9])([0-9a-fA-F.]|[eE][+-])*|0[xX]([0-9a-fA-F.]|[pP][+-]?)*)[a-zA-Z_]?",
+        priority = 1
+    )]
+    MalformedNumber,
+
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 3)]
     Ident,
 
@@ -408,6 +417,7 @@ macro_rules! __T {
     [hex_int] => { $crate::parser::kind::SyntaxKind::HexInt };
     [float] => { $crate::parser::kind::SyntaxKind::Float };
     [hex_float] => { $crate::parser::kind::SyntaxKind::HexFloat };
+    [malformed_number] => { $crate::parser::kind::SyntaxKind::MalformedNumber };
     ['('] => { $crate::parser::kind::SyntaxKind::LParen };
     [')'] => { $crate::parser::kind::SyntaxKind::RParen };
     ['{'] => { $crate::parser::kind::SyntaxKind::LCurly };
@@ -523,6 +533,7 @@ impl Display for SyntaxKind {
                 T![hex_int] => "hex_int",
                 T![float] => "float",
                 T![hex_float] => "hex_float",
+                T![malformed_number] => "malformed number",
                 T!['('] => "'('",
                 T![')'] => "')'",
                 T!['{'] => "'{'",

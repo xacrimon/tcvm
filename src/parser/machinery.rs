@@ -182,6 +182,7 @@ pub fn token_is_literal(token: SyntaxKind) -> bool {
             | T![hex_int]
             | T![float]
             | T![hex_float]
+            | T![malformed_number]
             | T![string]
             | T![long_string]
     )
