@@ -852,6 +852,13 @@ fn emit_arith(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction) {
     enter_join(b, slow);
     cold(b, |b| {
         let (x, y) = (l.val(b), r.val(b));
+        // A flipped form's constant was on the left: the fast path's operation
+        // commutes, the helper and the metamethod take source order.
+        let (x, y) = if imm && insn.c() & 1 != 0 {
+            (y, x)
+        } else {
+            (x, y)
+        };
         slow_arm(
             b,
             join,

@@ -748,6 +748,42 @@ fn metamethod_forms() {
     );
 }
 
+/// A constant on the left of a commutative operator stays on the left for
+/// the metamethod and for string coercion, at a site compiled on numbers.
+#[test]
+fn constant_left_operands_keep_source_order() {
+    let src = r##"
+    local function side(a, b) return type(a) == "table" and "TN" or "NT" end
+    local t = setmetatable({}, {__add = side, __mul = side, __band = side, __bor = side,
+                                __bxor = side, __sub = side, __shl = side, __div = side})
+    local fs = {
+        function(b) return 64 ~ b end, function(b) return b ~ 64 end,
+        function(b) return 3 + b end, function(b) return b + 3 end,
+        function(b) return 2.5 * b end, function(b) return b * 2.5 end,
+        function(b) return 7 & b end, function(b) return 7 | b end,
+        function(b) return 5 - b end, function(b) return b - 5 end,
+        function(b) return 1 << b end, function(b) return 2 / b end,
+    }
+    local out = {}
+    for i, f in ipairs(fs) do
+        for j = 1, 300 do f(j) end
+        local n = {NT = 0, TN = 0}
+        for j = 1, 300 do local s = f(t); n[s] = n[s] + 1 end
+        out[#out + 1] = n.NT .. "/" .. n.TN
+    end
+    local function g(b) return 10 + b end
+    for j = 1, 300 do g(j) end
+    local s = 0
+    for j = 1, 300 do s = s + g("5") end
+    out[#out + 1] = s
+    return table.concat(out, " ")
+"##;
+    assert_eq!(
+        result(src, true),
+        "300/0 0/300 300/0 0/300 300/0 0/300 300/0 300/0 300/0 0/300 300/0 300/0 4500"
+    );
+}
+
 /// Array slots holding nil: the result, or the store, inline unless the
 /// table's class has `__index` or `__newindex` at the time.
 #[test]
