@@ -211,3 +211,45 @@ fn value_expected() {
         );
     }
 }
+
+#[test]
+fn numeral_string_without_integer_value() {
+    // `interror`: a string that converts to a number is a number, so a
+    // non-integral one is "no integer representation", not a type error (#357).
+    for (src, msg) in [
+        (
+            "string.sub('x', '.1')",
+            "bad argument #2 to 'sub' (number has no integer representation)",
+        ),
+        (
+            "string.sub('x', '1e400')",
+            "bad argument #2 to 'sub' (number has no integer representation)",
+        ),
+        (
+            "string.sub('x', '9223372036854775808')",
+            "bad argument #2 to 'sub' (number has no integer representation)",
+        ),
+        (
+            "math.ult('1.5', 1)",
+            "bad argument #1 to 'ult' (number has no integer representation)",
+        ),
+        (
+            "table.concat({}, '', '0x1.8')",
+            "bad argument #3 to 'concat' (number has no integer representation)",
+        ),
+        (
+            "select('1.5', 1)",
+            "bad argument #1 to 'select' (number has no integer representation)",
+        ),
+        (
+            "string.sub('x', 'x')",
+            "bad argument #2 to 'sub' (number expected, got string)",
+        ),
+        (
+            "string.sub('x', 'inf')",
+            "bad argument #2 to 'sub' (number expected, got string)",
+        ),
+    ] {
+        assert_eq!(err(&format!("local r = {src}")), format!("c:1: {msg}"));
+    }
+}

@@ -540,7 +540,8 @@ pub(crate) fn check_integer<'gc>(
     if let Some(i) = to_integer(v) {
         return Ok(i);
     }
-    if v.get_float().is_some() {
+    // `lua_isnumber`, as `interror` uses: numeral strings count as numbers.
+    if to_number(v).is_some() {
         return Err(arg_error(
             ctx,
             fname,
