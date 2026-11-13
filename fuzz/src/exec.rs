@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -57,6 +58,11 @@ impl Run {
 /// Run `argv` in `dir` with `env` added and every inherited `TCVM_*` removed; it dies of
 /// SIGALRM past `secs`.
 pub fn run(argv: &[&str], dir: &Path, env: &[(String, String)], secs: u32) -> Run {
+    run_for(argv, dir, env, Duration::from_secs(secs as u64))
+}
+
+/// `run` with a limit finer than seconds.
+pub fn run_for(argv: &[&str], dir: &Path, env: &[(String, String)], limit: Duration) -> Run {
     let mut cmd = Command::new(argv[0]);
     // Own process group: a terminal Ctrl-C reaches only the fuzzer, so the runs in flight
     // finish instead of being recorded as SIGINT crashes.
@@ -70,10 +76,21 @@ pub fn run(argv: &[&str], dir: &Path, env: &[(String, String)], secs: u32) -> Ru
         }
     }
     cmd.envs(env.iter().map(|(k, v)| (k, v)));
-    // SAFETY: `alarm` is async-signal-safe, and an alarm survives `exec`.
+    let timer = libc::itimerval {
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: libc::timeval {
+            tv_sec: limit.as_secs() as libc::time_t,
+            tv_usec: limit.subsec_micros() as libc::suseconds_t,
+        },
+    };
+    // SAFETY: `setitimer` only arms the process's real-time timer, which survives `exec` and
+    // raises SIGALRM like `alarm`.
     unsafe {
         cmd.pre_exec(move || {
-            libc::alarm(secs);
+            libc::setitimer(libc::ITIMER_REAL, &timer, std::ptr::null_mut());
             Ok(())
         });
     }

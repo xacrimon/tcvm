@@ -93,10 +93,10 @@ enum Cmd {
         grep: Option<String>,
         #[arg(long, default_value = "lua")]
         lua: String,
-        /// Only test the program: exit 0 if it shows the finding, 1 if not (for external
-        /// reducers)
-        #[arg(long)]
-        check: bool,
+        /// Stop after this many seconds with the smallest program so far (the output file
+        /// always holds it)
+        #[arg(long, value_name = "SECS")]
+        max_time: Option<u64>,
         #[command(flatten)]
         common: Common,
     },
@@ -386,9 +386,10 @@ fn cmd_reduce(
     mode: &str,
     grep: Option<&str>,
     lua: &str,
-    check: bool,
+    max_time: Option<u64>,
     cfg: &Config,
 ) {
+    let start = std::time::Instant::now();
     // `dbg:hot`: the configuration of one binary, as a finding names it.
     let (bin, mode) = match mode.split_once(':') {
         Some((n, m)) => match cfg.bins.iter().find(|(b, _)| b == n) {
@@ -408,89 +409,93 @@ fn cmd_reduce(
             .parse()
             .ok()
     });
-    let dir = cfg.out.join("prog");
     let base = [
         ("TCVM_JIT_LOG".to_string(), "1".to_string()),
         hash_seed(seed.or(file_seed).unwrap_or(0)),
     ];
-    // A candidate that lost a loop's exit is not worth the full limit.
-    let secs = cfg.timeout.min(2);
-    let tests = std::cell::Cell::new(0u32);
+    let dirs: Vec<PathBuf> = (0..cfg.jobs)
+        .map(|w| {
+            let d = cfg.out.join(format!("reduce/w{w}"));
+            std::fs::create_dir_all(&d).expect("a worker's directory");
+            d
+        })
+        .collect();
     let has = |line: &str| grep.is_none_or(|g| line.contains(g));
-    let fails = |text: &str| {
-        tests.set(tests.get() + 1);
-        let file = "reduce.lua";
+    let test = |text: &str, w: usize, limit: std::time::Duration| {
+        let (dir, file) = (&dirs[w], "reduce.lua");
         std::fs::write(dir.join(file), text).expect("the candidate's file");
+        let timed_out = std::cell::Cell::new(false);
         let tcvm = |m: &oracle::Mode| {
             let env: Vec<(String, String)> = base.iter().chain(&m.env).cloned().collect();
-            run(&[bin, "-f", file], &dir, &env, secs * m.slow)
+            let r = exec::run_for(&[bin, "-f", file], dir, &env, limit * m.slow);
+            timed_out.set(timed_out.get() || r.status == Status::Timeout);
+            r
         };
         let off = tcvm(&oracle::off());
-        if !off.ok() || !off.stdout.ends_with("END\n") {
-            return false;
-        }
-        match what {
-            "ref" => {
-                let r = run(&[lua, file], &dir, &[], secs);
-                if !r.ok() || !r.stdout.ends_with("END\n") {
-                    return false;
+        let interesting = off.ok()
+            && off.stdout.ends_with("END\n")
+            && match what {
+                "ref" => {
+                    let r = exec::run_for(&[lua, file], dir, &[], limit);
+                    timed_out.set(timed_out.get() || r.status == Status::Timeout);
+                    let strict: Vec<String> = (text.lines())
+                        .filter(|l| l.starts_with("do -- U") && l.ends_with(" strict"))
+                        .filter_map(|l| l.split_whitespace().nth(2).map(str::to_string))
+                        .collect();
+                    r.ok() && r.stdout.ends_with("END\n") && {
+                        let (a, b) = (
+                            oracle::strict_lines(&r.stdout, &strict, &cfg.accepted),
+                            oracle::strict_lines(&off.stdout, &strict, &cfg.accepted),
+                        );
+                        oracle::first_diff(&a, &b).is_some_and(|(w, g)| has(&w) || has(&g))
+                    }
                 }
-                let strict: Vec<String> = (text.lines())
-                    .filter(|l| l.starts_with("do -- U") && l.ends_with(" strict"))
-                    .filter_map(|l| l.split_whitespace().nth(2).map(str::to_string))
-                    .collect();
-                let (a, b) = (
-                    oracle::strict_lines(&r.stdout, &strict, &cfg.accepted),
-                    oracle::strict_lines(&off.stdout, &strict, &cfg.accepted),
-                );
-                oracle::first_diff(&a, &b).is_some_and(|(w, g)| has(&w) || has(&g))
-            }
-            "crash" => (0..2).any(|_| {
-                let r = tcvm(&mode);
-                matches!(r.status, Status::Signal(_)) && grep.is_none_or(|g| r.stderr.contains(g))
-            }),
-            "diverges" => {
-                // Twice: some findings depend on timing.
-                (0..2).any(|_| {
+                "crash" => {
+                    let r = tcvm(&mode);
+                    matches!(r.status, Status::Signal(_))
+                        && grep.is_none_or(|g| r.stderr.contains(g))
+                }
+                "diverges" => {
                     let r = tcvm(&mode);
                     match oracle::first_diff(&off.stdout, &r.stdout) {
                         Some((w, g)) => has(&w) || has(&g),
                         None => !r.ok() && grep.is_none(),
                     }
-                })
-            }
-            _ => oracle::internal_errors(&tcvm(&mode)).iter().any(|l| has(l)),
+                }
+                _ => oracle::internal_errors(&tcvm(&mode)).iter().any(|l| has(l)),
+            };
+        reduce::Outcome {
+            interesting,
+            timed_out: timed_out.get(),
         }
     };
-    let log = |s: &str| eprintln!("{s} ({} runs)", tests.get());
-    if check {
-        let text =
-            std::fs::read_to_string(program).unwrap_or_else(|e| die(&format!("{program}: {e}")));
-        std::process::exit(if fails(&text) { 0 } else { 1 });
-    }
     let text = match seed {
-        Some(seed) => {
-            let p = generate::Gen::new(seed).program(None);
-            if !fails(&p.text()) {
-                die("the program does not show the finding");
-            }
-            reduce::program(p, &fails, &log).text()
-        }
+        Some(seed) => generate::Gen::new(seed).program(None).text(),
         None => {
-            let text = std::fs::read_to_string(program)
-                .unwrap_or_else(|e| die(&format!("{program}: {e}")));
-            if !fails(&text) {
-                die("the program does not show the finding");
-            }
-            text
+            std::fs::read_to_string(program).unwrap_or_else(|e| die(&format!("{program}: {e}")))
         }
     };
-    let text = reduce::lines(&text, &fails, &log);
     let out = match seed {
         Some(seed) => cfg.out.join(format!("prog/p{seed}.min.lua")),
         None => PathBuf::from(format!("{}.min.lua", program.trim_end_matches(".lua"))),
     };
-    std::fs::write(&out, text).expect("the reduced program");
+    let log = |s: &str| eprintln!("{s} [{:.0}s]", start.elapsed().as_secs_f64());
+    let save = |text: &str| std::fs::write(&out, text).expect("the reduced program");
+    let options = reduce::Options {
+        workers: cfg.jobs,
+        timeout_cap: cfg.timeout as f64,
+        deadline: max_time.map(|s| start + std::time::Duration::from_secs(s)),
+        log: &log,
+        save: &save,
+    };
+    let (text, evidence) = reduce::reduce(&text, &test, &options).unwrap_or_else(|e| die(&e));
+    if evidence.runs > 0 {
+        eprintln!(
+            "the result reproduced on {} of {} final replays",
+            evidence.interesting, evidence.runs
+        );
+    }
+    save(&text);
     println!("{}", out.display());
 }
 
@@ -871,7 +876,7 @@ fn main() {
             mode,
             grep,
             lua,
-            check,
+            max_time,
             common,
         } => cmd_reduce(
             &program,
@@ -879,7 +884,7 @@ fn main() {
             &mode,
             grep.as_deref(),
             &lua,
-            check,
+            max_time,
             &Config::new(&common),
         ),
         Cmd::Triage { dir } => cmd_triage(dir.as_deref()),

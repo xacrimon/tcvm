@@ -1,4 +1,4 @@
-//! The Lua programs the generator builds and the reducer shrinks, and their text.
+//! The Lua programs the generator builds, and their text.
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
