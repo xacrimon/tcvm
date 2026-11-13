@@ -1146,14 +1146,6 @@ fn trans_store<'gc>(
         let s = b.snap_before();
         b.ins_snap(Op::GuardFalse, &[has], s, ExitTag::Slow);
     }
-    // Nil adds nothing, so it fits whatever the new slot holds.
-    let v = match b.ty(v).set.intersects(TypeSet::NIL) {
-        true => v,
-        false => match fitted(b, to, from.slot_count(), v) {
-            Some(v) => v,
-            None => return newindex(b, recv, key, v, false),
-        },
-    };
     let join = b.new_block();
     // Storing nil to an absent key adds nothing.
     let set = b.ty(v).set;
@@ -1163,6 +1155,13 @@ fn trans_store<'gc>(
         b.jump(join);
         b.switch_to(store);
     }
+    // Past the nil test: nil fits whatever the new slot holds, any other
+    // value only the slot's kind and tracked shape.
+    let Some(v) = fitted(b, to, from.slot_count(), v) else {
+        newindex(b, recv, key, v, false);
+        b.jump(join);
+        return enter_join(b, join);
+    };
     // A full spill cell grows in the generic store.
     let full = loc.spilled().then(|| {
         let room = b.ins(Op::TabHasRoom(loc.raw()), &[t]);

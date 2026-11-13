@@ -4568,3 +4568,57 @@ fn constant_pointer_parameters_cross_calls() {
 "##;
     compiles_at_first_count(src, true);
 }
+
+/// `src`'s string result with real calls: each function is its own region.
+fn calling(src: &str) -> String {
+    let mut lua = Lua::new();
+    lua.set_jit_inline(false);
+    lua.load_all();
+    let ex = start_on(&mut lua, src);
+    lua.finish(&ex)
+        .unwrap_or_else(|e| panic!("{src:?} failed: {e:?}"));
+    lua.enter(|ctx| {
+        let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        String::from_utf8_lossy(v.get_string().expect("a string result").as_bytes()).into_owned()
+    })
+}
+
+/// A store that adds a key guards a value that may be nil to the new slot's
+/// kind and tracked shape as it does any other: a read of the slot trusts
+/// both.
+#[test]
+fn transition_stores_of_untyped_values() {
+    // A float into a slot of small integers.
+    assert_eq!(
+        calling(
+            "local function f(b) local o = {}; o.x = b; local v = o.x; return v < 1 end
+            for i = 1, 600 do f(i % 3 + 1) end
+            return tostring(f(1e308))"
+        ),
+        "false"
+    );
+    // A big integer into a slot of floats.
+    assert_eq!(
+        calling(
+            "local function d(a) local t = {}; t.e = a; a = t.e; return a * 0 end
+            for i = 1, 600 do d(0.5) end
+            local r = d(1 << 31)
+            return math.type(r) .. ' ' .. r"
+        ),
+        "integer 0"
+    );
+    // A table of another shape into a slot tracking one: the store through
+    // the reloaded table would land in `a`.
+    assert_eq!(
+        calling(
+            "local head = {id = 0}
+            local function mk(nx) local n = {}; n.next = nx; return n end
+            local function poke(n) n.next.id = 9 end
+            for i = 1, 600 do poke(mk(head)) end
+            local other = {a = 1, id = 2}
+            poke(mk(other))
+            return other.a .. ' ' .. other.id"
+        ),
+        "1 9"
+    );
+}
