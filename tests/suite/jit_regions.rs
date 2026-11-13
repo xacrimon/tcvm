@@ -694,6 +694,44 @@ fn builtin_intrinsics() {
     );
 }
 
+/// `assert()` without an argument raises in compiled code as well: there is
+/// no first argument to test, in the frame or past its end.
+#[test]
+fn assert_without_arguments() {
+    let src = r##"
+    local function f()
+        local t = {1, 2, 3, 4, 5, 6}
+        local x = assert()
+        return x
+    end
+    local function g() assert() end
+    local function h() return assert() end
+    local n, msg = 0
+    for i = 1, 3000 do
+        for _, fn in ipairs({f, g, h}) do
+            local ok, e = pcall(fn)
+            if ok then n = n + 1 else msg = e end
+        end
+    end
+    return n .. " " .. msg
+"##;
+    for inline in [true, false] {
+        let mut lua = Lua::new();
+        lua.set_jit_inline(inline);
+        lua.load_all();
+        let ex = start_on(&mut lua, src);
+        lua.finish(&ex).unwrap();
+        lua.enter(|ctx| {
+            let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+            assert_eq!(
+                String::from_utf8_lossy(v.get_string().expect("a string").as_bytes()),
+                "0 c:8: bad argument #1 to 'assert' (value expected)"
+            );
+        });
+        assert_eq!(lua.jit_internal_errors(), 0);
+    }
+}
+
 /// The metamethod forms (`ARITH_MM`, `_MM_R`, `_MMI` either side) call the
 /// operand class's metamethod; a table without it and a number metatable
 /// set after compiling take the handlers.

@@ -305,7 +305,8 @@ pub(super) fn emit(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, callee: 
     };
     match intr {
         Intrinsic::Select => return select(b, pc, a, nb, c, f, callee, tail),
-        Intrinsic::Assert if nb != 0 && c != 0 && !(tail && nb > 2) => {
+        // Without an argument the builtin raises.
+        Intrinsic::Assert if nb > 1 && c != 0 && !(tail && nb > 2) => {
             return assert(b, a, nb - 1, c, f, callee);
         }
         Intrinsic::Assert => return Emitted::No,
