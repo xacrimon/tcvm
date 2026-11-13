@@ -23,12 +23,10 @@ repository.workspace = true
 
 [features]
 default = ["lib-all", "jit", "nightly"]
-# Needs `nightly`. TODO: what happens now if we enable jit without nightly?
 jit = []
 nightly = ["hashbrown/nightly"]
 tcvm-dev = []
-# The parser as public API, for the fuzzer's reducer; visibility only.
-parser-api = []
+tcvm-dev-parser = []
 lib-all = [
     "lib-coroutine", "lib-debug", "lib-io",
     "lib-math", "lib-os", "lib-package",

@@ -25,7 +25,7 @@ pub fn parse(cache: &mut NodeCache<'static>, source: &str) -> Parse {
 
 /// The tokens of `source` with their byte ranges, as the parser sees them: no whitespace or
 /// comments, and `invalid` for what does not lex.
-#[cfg(feature = "parser-api")]
+#[cfg(feature = "tcvm-dev-parser")]
 pub fn lex(source: &str) -> Vec<(kind::SyntaxKind, std::ops::Range<usize>)> {
     use logos::Logos;
     (kind::SyntaxKind::lexer(source).spanned())

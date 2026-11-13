@@ -23,9 +23,9 @@ pub mod env;
 pub(crate) mod instruction;
 pub(crate) mod jit;
 pub mod lua;
-#[cfg(feature = "parser-api")]
+#[cfg(feature = "tcvm-dev-parser")]
 pub mod parser;
-#[cfg(not(feature = "parser-api"))]
+#[cfg(not(feature = "tcvm-dev-parser"))]
 pub(crate) mod parser;
 pub(crate) mod utils;
 pub mod vm;
