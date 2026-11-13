@@ -23,6 +23,16 @@ pub fn parse(cache: &mut NodeCache<'static>, source: &str) -> Parse {
     Parser::new(cache, source).run()
 }
 
+/// The tokens of `source` with their byte ranges, as the parser sees them: no whitespace or
+/// comments, and `invalid` for what does not lex.
+#[cfg(feature = "parser-api")]
+pub fn lex(source: &str) -> Vec<(kind::SyntaxKind, std::ops::Range<usize>)> {
+    use logos::Logos;
+    (kind::SyntaxKind::lexer(source).spanned())
+        .map(|(k, r)| (k.unwrap_or(T![invalid]), r))
+        .collect()
+}
+
 /// Render `reports` against `source`, which is labelled `name` (a chunk id
 /// such as `[string "..."]`), with ANSI colors when `color`.
 pub(crate) fn render_reports(

@@ -23,6 +23,9 @@ pub mod env;
 pub(crate) mod instruction;
 pub(crate) mod jit;
 pub mod lua;
+#[cfg(feature = "parser-api")]
+pub mod parser;
+#[cfg(not(feature = "parser-api"))]
 pub(crate) mod parser;
 pub(crate) mod utils;
 pub mod vm;
