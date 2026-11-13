@@ -298,6 +298,16 @@ fn fuzz(seed: u64, cfg: &Config) -> (generate::Program, Vec<Finding>) {
     });
     let mut r = rng::Rng::new(seed ^ 0x6d6f_6465);
     let modes = oracle::modes(&mut r);
+    // The debug-assertions build is there for its assertions: JIT-off, everything compiled
+    // at once and one drawn configuration under the verifier reach them at a third of the cost.
+    let light: Vec<oracle::Mode> = {
+        let mut drawn = oracle::mode_named(&modes[2].name).expect("a drawn mode");
+        if !drawn.name.contains("check") {
+            drawn.name.push_str(",check");
+            drawn.env.push(("TCVM_JIT_CHECK".into(), "1".into()));
+        }
+        vec![oracle::mode_named("hot").expect("hot"), drawn]
+    };
     let base = [
         ("TCVM_JIT_LOG".to_string(), "1".to_string()),
         hash_seed(seed),
@@ -331,7 +341,7 @@ fn fuzz(seed: u64, cfg: &Config) -> (generate::Program, Vec<Finding>) {
                 add("ref", name, "off", unit, sig, d);
             }
         }
-        for m in &modes {
+        for m in if name == "dbg" { &light } else { &modes } {
             let r = go(m);
             for l in oracle::internal_errors(&r) {
                 let msg = l.split_once("failed: ").map_or(l.as_str(), |x| x.1);

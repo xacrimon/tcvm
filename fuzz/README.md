@@ -94,10 +94,13 @@ tcvm-fuzz run --bin rel=target/release/tcvm-cli --bin dbg=target/dbg/release/tcv
 ```
 
 Without `--bin`, a run takes `rel=target/release/tcvm-cli` and, where it is built,
-`dbg=target/dbg/release/tcvm-cli`. Each binary is compared with itself only. A build with debug
-assertions checks the interpreter's and the collector's invariants as it runs, which a release
-build compiles out; it is slower, so a run with both does about half as many seeds. With
-several binaries the configurations in `summary.tsv` carry the binary's name (`dbg:hot`).
+`dbg=target/dbg/release/tcvm-cli`. Each binary is compared with itself only. A binary named
+`dbg` runs JIT-off, `hot` and the first drawn configuration with `check` added, not every
+configuration: what it is for is its assertions, and those reach them at a third of the cost. A
+build with debug assertions checks the interpreter's and the collector's invariants as it runs,
+which a release build compiles out; a run with both does about 60% of the seeds of one with the
+release build alone. With several binaries the configurations in `summary.tsv` carry the
+binary's name (`dbg:hot`).
 
 ## Looking at a finding
 
