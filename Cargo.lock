@@ -629,6 +629,7 @@ dependencies = [
  "libc",
  "logos",
  "paste",
+ "rand",
  "rand_core",
  "rand_pcg",
  "tcvm",

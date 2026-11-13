@@ -189,6 +189,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashSet;
 
+    use rand::{RngExt, SeedableRng};
+    use rand_pcg::Pcg64;
+
     use super::*;
 
     thread_local! {
@@ -223,13 +226,8 @@ mod tests {
     /// constantly.
     #[test]
     fn reused_address() {
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        let mut rand = |n: usize| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state as usize % n
-        };
+        let mut rng = Pcg64::seed_from_u64(0);
+        let mut rand = |n: usize| rng.random_range(0..n);
         let mut t: Part<'_, Addr, Global> = RawTable::new_in(Global);
         let (mut live, mut free) = (Vec::new(), Vec::new());
         let v = Value::boolean(true);

@@ -1903,20 +1903,20 @@ fn best_asize(bins: &[u32; MAX_ABITS], n: u32) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use rand::{RngExt, SeedableRng};
+    use rand_pcg::Pcg64;
+
     use super::*;
 
     #[test]
     fn count_array_bins_like_count_int() {
-        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rng = Pcg64::seed_from_u64(0);
         for len in (0..40).chain([63, 64, 65, 129, 1000, 4097]) {
             for density in [0, 1, 2, 4] {
                 let array: Vec<Value> = (0..len)
-                    .map(|_| {
-                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                        match (seed >> 33) % 4 < density {
-                            true => Value::boolean(true),
-                            false => Value::nil(),
-                        }
+                    .map(|_| match rng.random_ratio(density, 4) {
+                        true => Value::boolean(true),
+                        false => Value::nil(),
                     })
                     .collect();
                 let (mut by_key, mut by_bin) = ([0; MAX_ABITS], [0; MAX_ABITS]);
