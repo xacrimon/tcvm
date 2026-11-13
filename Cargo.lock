@@ -650,7 +650,9 @@ name = "tcvm-fuzz"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "cstree",
  "libc",
+ "tcvm",
 ]
 
 [[package]]

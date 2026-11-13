@@ -1,5 +1,6 @@
 //! xoshiro256**, seeded through splitmix64: a program is a function of its seed alone.
 
+#[derive(Clone)]
 pub struct Rng([u64; 4]);
 
 impl Rng {

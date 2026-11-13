@@ -139,13 +139,19 @@ tcvm-fuzz reduce 20131 --what crash --mode hc1,hl1,deopt --grep "stack overflow"
 `crash` keeps a candidate while the configuration dies of a signal and JIT-off does not;
 `--grep` then matches the crash's stderr.
 
-This writes `prog/p<seed>.min.lua` in the output directory. It removes whole units, then
-statements, then replaces expressions by their operands, and at last removes lines of the
-text. `--grep TEXT` keeps it on one finding where a program shows several: the differing
-line, or the JIT log's error, must contain the text. Give `reduce` a file instead of a seed
-to shrink by lines only.
+This writes `prog/p<seed>.min.lua` in the output directory (`FILE.min.lua` for a file), and
+rewrites it on every improvement. `--grep TEXT` keeps it on one finding where a program shows
+several: the differing line, the JIT log's error, or the crash's stderr must contain the text.
+`--max-time SECS` stops it with the smallest program so far.
 
-The reduced program still carries most of the prelude. It is small enough to finish by hand.
+The reducer is shrinkray's (`src/reduce/`): grammar passes on tcvm's own parser (delete runs of
+children, lift a node to a descendant, substitute the smallest node of the same kind, delete
+declarations with their last user) and text and token passes (line and token blocks, brackets,
+integers, names, whitespace), scheduled in tiers until nothing helps, then once more from the
+original below that result. Candidates are tested on `--jobs` workers and taken in order, so a
+reduction does not depend on their number. Smaller is fewer tokens, then fewer bytes; deletions
+keep line breaks. A finding that does not always reproduce is detected, and candidates are then
+adopted on repeated runs (the final replays say how reliably the result reproduces).
 
 ## Differences from reference Lua that are accepted
 
