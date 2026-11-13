@@ -2349,6 +2349,31 @@ fn tail_miss_overflow_is_raised_in_the_callee() {
     );
 }
 
+/// Float equality reads its operands' low halves only: on x86-64 a negation
+/// and an `abs` are packed operations on literals next to each other in the
+/// pool, which leave the neighbour's bits in the upper half of the result.
+#[test]
+fn float_equality_ignores_the_upper_lane() {
+    let src = "local function f(x)
+          local y, z = -x, math.abs(x)
+          local n = 0
+          if y == 0 then n = n + 1 end
+          if z == 0 then n = n + 10 end
+          if y ~= -z then n = n + 100 end
+          if y == -z then n = n + 1000 end
+          return n
+        end
+        local function g(x) local y = -x return y == 0 end
+        local r = 0
+        for i = 1, 3000 do
+          r = r + f(i + 0.5)
+          if g(1.5) then r = r + 1 end
+        end
+        return tostring(r)";
+    agrees(src);
+    agrees_calling(src);
+}
+
 /// A region a dependency invalidated, called next through its register
 /// entry by a compiled caller (`h` changes the method `g` folded): its dead
 /// entry stores the parameters before the interpreter runs the function

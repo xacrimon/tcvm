@@ -88,9 +88,12 @@ impl<'a> Em<'a> {
         match how {
             FCmp::Ord => self.a.fcmp(x, y),
             FCmp::Rev => self.a.fcmp(y, x),
+            // The mask is a NaN or zero, so `PF` is the result. Scalar: a
+            // register's upper lane holds anything (a packed literal's
+            // neighbour, a call's result).
             FCmp::Eq => {
                 self.a.fcmp_eq(FS, x, y);
-                self.a.ftest(FS);
+                self.a.fcmp(FS, FS);
             }
         }
     }
@@ -690,8 +693,8 @@ impl<'a> Em<'a> {
             FUn(op) => {
                 let (d, n) = (self.fr(i, 0), self.fr(i, 1));
                 match op {
-                    FUnOp::Neg => self.a.fbit(FBit::Xor, d, n, Mem::K(1 << 63)),
-                    FUnOp::Abs => self.a.fbit(FBit::And, d, n, Mem::K(!(1 << 63))),
+                    FUnOp::Neg => self.a.fbit(FBit::Xor, d, n, Mem::K2(1 << 63)),
+                    FUnOp::Abs => self.a.fbit(FBit::And, d, n, Mem::K2(!(1 << 63))),
                     FUnOp::Sqrt => self.a.fbin(FBin::Sqrt, d, n, n),
                     FUnOp::Floor => self.a.fround(d, n, 1),
                     FUnOp::Ceil => self.a.fround(d, n, 2),
@@ -1274,7 +1277,7 @@ impl<'a> Em<'a> {
         self.a.fcmp(d, FS);
         self.a.jcc(Cond::Ne, call);
         self.a.jcc(Cond::P, call);
-        self.a.fbit(FBit::And, d, x, Mem::K(1 << 63));
+        self.a.fbit(FBit::And, d, x, Mem::K2(1 << 63));
         self.a.jmp(back);
         self.a.bind(call);
         let t = self.links.trampoline_of(crate::jit::helpers::address(

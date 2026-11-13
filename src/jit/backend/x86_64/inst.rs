@@ -52,7 +52,7 @@ pub(crate) enum FCmp {
     Ord,
     /// `vucomisd b, a`, for `<` and `<=`.
     Rev,
-    /// An equality mask tested: `Ne` where equal and ordered.
+    /// An equality mask compared with itself: `P` where equal and ordered.
     Eq,
 }
 

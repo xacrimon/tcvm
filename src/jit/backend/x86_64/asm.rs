@@ -129,6 +129,9 @@ pub(crate) enum Mem {
     L(Label),
     /// The pooled 64-bit literal.
     K(u64),
+    /// The pooled 128-bit literal with a zero upper half, for a packed
+    /// operation, which reads 16 bytes.
+    K2(u64),
 }
 
 /// The `r/m` operand of an instruction.
@@ -178,9 +181,11 @@ pub(crate) struct Asm {
     fixups: Vec<Fixup>,
     /// `call`/`jmp rel32` to a fixed address: (the instruction, target).
     externs: Vec<(u32, usize)>,
-    /// 64-bit literals by label, emitted after the code.
+    /// 64-bit literals by label, emitted after the code; then the 128-bit
+    /// ones, by their lower halves.
     literals: Vec<(Label, u64)>,
-    lit_index: std::collections::HashMap<u64, Label>,
+    wide: Vec<(Label, u64)>,
+    lit_index: std::collections::HashMap<(u64, bool), Label>,
     /// Where the last unconditional jump ended.
     jump_end: u32,
 }
@@ -252,33 +257,40 @@ impl Asm {
         self.code.extend(v.to_le_bytes());
     }
 
-    /// The label of a pooled 64-bit literal.
-    pub(crate) fn literal(&mut self, v: u64) -> Label {
-        if let Some(&l) = self.lit_index.get(&v) {
+    /// The label of a pooled 64-bit literal, or of `Mem::K2`'s when `wide`.
+    fn pooled(&mut self, v: u64, wide: bool) -> Label {
+        if let Some(&l) = self.lit_index.get(&(v, wide)) {
             return l;
         }
         let l = self.new_label();
-        self.literals.push((l, v));
-        self.lit_index.insert(v, l);
+        if wide {
+            self.wide.push((l, v));
+        } else {
+            self.literals.push((l, v));
+        }
+        self.lit_index.insert((v, wide), l);
         l
     }
 
     /// An upper bound of the finished code's length.
     pub(crate) fn max_len(&self) -> usize {
-        self.code.len() + 8 + 8 * self.literals.len() + 8
+        self.code.len() + 8 + 8 * self.literals.len() + 16 * self.wide.len()
     }
 
     /// Emit the literal pool, resolve every branch for code placed at
     /// `base`, and hand back the code.
     pub(crate) fn finish(mut self, base: usize) -> Result<Vec<u8>, AsmError> {
-        if !self.literals.is_empty() {
+        if !self.literals.is_empty() || !self.wide.is_empty() {
             self.align(8);
             for (l, v) in std::mem::take(&mut self.literals) {
                 self.bind(l);
                 self.quad(v);
             }
-            // A packed operation reads 16 bytes of its literal.
-            self.quad(0);
+            for (l, v) in std::mem::take(&mut self.wide) {
+                self.bind(l);
+                self.quad(v);
+                self.quad(0);
+            }
         }
         for fx in &self.fixups {
             let target = self.labels[fx.label.0 as usize];
@@ -306,7 +318,8 @@ impl Asm {
 
     fn mem(&mut self, m: Mem) -> Mem {
         match m {
-            Mem::K(v) => Mem::L(self.literal(v)),
+            Mem::K(v) => Mem::L(self.pooled(v, false)),
+            Mem::K2(v) => Mem::L(self.pooled(v, true)),
             m => m,
         }
     }
@@ -356,7 +369,7 @@ impl Asm {
                 });
                 self.code.extend([0; 4]);
             }
-            Rm::M(Mem::K(_)) => unreachable!("an unpooled literal"),
+            Rm::M(Mem::K(_) | Mem::K2(_)) => unreachable!("an unpooled literal"),
         }
     }
 
@@ -654,6 +667,7 @@ impl Asm {
         self.vex(PF2, M0F, false, op as u8, d.0, n.0, m, 0);
     }
 
+    /// Packed: a literal operand is a `Mem::K2`.
     pub(crate) fn fbit(&mut self, op: FBit, d: Xmm, n: Xmm, m: impl Into<Rm>) {
         self.vex(P66, M0F, false, op as u8, d.0, n.0, m, 0);
     }
@@ -678,11 +692,6 @@ impl Asm {
     pub(crate) fn fcmp_eq(&mut self, d: Xmm, n: Xmm, m: Xmm) {
         self.vex(PF2, M0F, false, 0xc2, d.0, n.0, m, 1);
         self.b(0);
-    }
-
-    /// `vptest a, a`: `ZF` when `a` is zero.
-    pub(crate) fn ftest(&mut self, a: Xmm) {
-        self.vex(P66, M0F38, false, 0x17, a.0, 0, a, 0);
     }
 
     /// `d = (f64) s`, with no dependency on what `d` held.
@@ -909,7 +918,6 @@ mod tests {
             bytes(|a| a.fcmp_eq(Xmm(15), Xmm(0), Xmm(1))),
             [0xc5, 0x7b, 0xc2, 0xf9, 0x00]
         );
-        assert_eq!(bytes(|a| a.ftest(Xmm(15))), [0xc4, 0x42, 0x79, 0x17, 0xff]);
         assert_eq!(
             bytes(|a| a.cvt_to_int(Sz::Q, RAX, Xmm(1))),
             [0xc4, 0xe1, 0xfb, 0x2c, 0xc1]
@@ -939,5 +947,24 @@ mod tests {
         // `cmp rax, [rip + 1]`: the pool is aligned past the `ret`.
         assert_eq!(code[8..16], [0x48, 0x3b, 0x05, 1, 0, 0, 0, 0xc3]);
         assert_eq!(code[16..24], 0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(code.len(), 24);
+    }
+
+    #[test]
+    fn packed_literals_are_16_bytes() {
+        // The same value as a 64-bit literal and as a packed operand, then
+        // a second packed one: `vxorpd`, `cmp`, `vandpd` and 3 of padding.
+        let code = bytes(|a| {
+            a.fbit(FBit::Xor, Xmm(0), Xmm(1), Mem::K2(1 << 63));
+            a.cmp(Sz::Q, RAX, Mem::K(1 << 63));
+            a.fbit(FBit::And, Xmm(0), Xmm(1), Mem::K2(!(1 << 63)));
+        });
+        assert_eq!(code[..8], [0xc5, 0xf1, 0x57, 0x05, 24, 0, 0, 0]);
+        assert_eq!(code[8..15], [0x48, 0x3b, 0x05, 9, 0, 0, 0]);
+        assert_eq!(code[15..23], [0xc5, 0xf1, 0x54, 0x05, 25, 0, 0, 0]);
+        let pool: Vec<u64> = (code[24..].chunks(8))
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(pool, [1 << 63, 1 << 63, 0, !(1 << 63), 0]);
     }
 }

@@ -42,8 +42,8 @@ pub(super) fn int_cond(cc: Cc) -> Cond {
 /// unordered, except `ne`.
 pub(super) fn float_test(cc: Cc) -> (FCmp, Cond) {
     match cc {
-        Cc::Eq => (FCmp::Eq, Cond::Ne),
-        Cc::Ne => (FCmp::Eq, Cond::E),
+        Cc::Eq => (FCmp::Eq, Cond::P),
+        Cc::Ne => (FCmp::Eq, Cond::Np),
         Cc::Lt => (FCmp::Rev, Cond::A),
         Cc::Le => (FCmp::Rev, Cond::Ae),
         Cc::Gt => (FCmp::Ord, Cond::A),
