@@ -1793,6 +1793,67 @@ fn float_immediates_reach_compare_metamethods() {
     );
 }
 
+/// A loop prepared in code compiled when its site had seen only float loops
+/// stays an integer loop when its init and step are integers.
+#[test]
+fn integer_loops_at_sites_that_saw_float_loops() {
+    let src = r##"
+    local function g(x, n, s)
+        local c, last = 0
+        for j = 1, n do
+            for i = x, 3, s do last = i end
+            if math.type(last) == "integer" then c = c + 1 end
+        end
+        return c .. ":" .. tostring(last)
+    end
+    local function h(a) local last; for i = a, 3000 do last = i end return last end
+    local out = {g(1.0, 100000, 1), g(1, 1000, 1), g(1, 1000, 1.0), g(1.0, 1000, 1.0),
+                 h(1.0), h(1), h(2990), math.type(h(1))}
+    return table.concat(out, " ")
+"##;
+    assert_eq!(
+        result(src, true),
+        "0:3.0 1000:3 0:3.0 0:3.0 3000.0 3000 3000 integer"
+    );
+}
+
+/// The same where the function compiles after its first call, a float loop.
+#[test]
+fn integer_loops_after_one_float_loop() {
+    compiles_at_first_count(
+        "local function f(b) local last; for i = b, 1 do last = i end; return last end
+        return f(0.5) .. ' ' .. f(1) .. ' ' .. math.type(f(1))",
+        true,
+    );
+}
+
+/// A compiled float loop's entry is a JIT word, whose form no FORPREP
+/// rewrites: integer loops there compile it as an integer loop, and float
+/// loops after those leave it to the interpreter, neither exiting again
+/// and again.
+#[test]
+fn loops_of_both_kinds_at_one_site_settle() {
+    let src = "local function f(a, b, c) local s = 0 for i = a, b, c do s = s + i end return s end
+        local r = 0
+        for k = 1, 2000 do r = r + f(1.0, 10.0, 1.0) end
+        for k = 1, 2000 do r = r + f(1, 10, 1) end
+        for k = 1, 2000 do r = r + f(1.0, 10.0, 1.0) end
+        return tostring(r)";
+    let mut lua = Lua::new();
+    lua.set_stats(true);
+    lua.load_all();
+    let ex = start_on(&mut lua, src);
+    lua.finish(&ex).unwrap();
+    let got = lua.enter(|ctx| {
+        let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        String::from_utf8_lossy(v.get_string().expect("a string result").as_bytes()).into_owned()
+    });
+    assert_eq!(got, "330000.0");
+    let stats = lua.stats();
+    assert!(count(&stats, "jit exit Type") <= 20, "{stats}");
+    assert!(count(&stats, "jit recompiled") <= 2, "{stats}");
+}
+
 /// Results of compiled callees in registers: none, one (stored, in its slot
 /// already, a float, a constant), two and three into one and two wanted,
 /// varargs, deep chains and returns through the interpreter.

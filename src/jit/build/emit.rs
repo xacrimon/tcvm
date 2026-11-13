@@ -179,6 +179,9 @@ fn loop_kind(b: &Builder<'_, '_>, pc: u32) -> Option<BcOp> {
         (true, true) => None,
         (false, true) => Some(BcOp::FORLOOP_F),
         _ if seen & fb::BIGINT != 0 => Some(BcOp::FORLOOP),
+        // Only compiled float code that met integers records them: the
+        // form is stale, and compiling it again would exit on each of them.
+        (true, false) if insn.op() == BcOp::FORLOOP_F => Some(BcOp::FORLOOP_I),
         _ => Some(insn.op()),
     }
 }
@@ -2449,6 +2452,24 @@ fn emit_forprep(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
             b.br(skip, skip_to, fall);
         }
         Some(BcOp::FORLOOP_F) => {
+            // Integer init and step are an integer loop, whatever the site
+            // saw before: the interpreter prepares it and records its kind.
+            if !is_float(b, init) && !is_float(b, step) {
+                let unknown: Vec<Val> = [init, step]
+                    .into_iter()
+                    .filter(|&v| {
+                        let t = b.ty(v);
+                        t.rep == Rep::Val && (t.set.is_empty() || !t.within(TypeSet::INT))
+                    })
+                    .collect();
+                if unknown.is_empty() {
+                    b.deopt(ExitTag::Type);
+                    return;
+                }
+                let float = all_in(b, TypeSet::INT, &unknown);
+                b.deopt(ExitTag::Type);
+                enter_join(b, float);
+            }
             let (i, l, s) = (any_f64(b, init), any_f64(b, limit), any_f64(b, step));
             let zero = b.kf64(0.0);
             let nz = b.ins(Op::FCmp(Cc::Ne), &[s, zero]);
