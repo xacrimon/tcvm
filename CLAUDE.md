@@ -24,7 +24,7 @@ The default `nightly` feature is the tail-call dispatch in the preserve-none ABI
 it the crate builds on stable (1.100+) with a trampoline (`vm/abi.rs`, `dispatch::call_handler`).
 The `tcvm-dev` feature holds everything that exists for development only: the IR verifier and
 allocation checker, dumps, timing, the test modes and every `TCVM_*` knob but `TCVM_JIT=off`, plus
-the `Lua` test hooks (`set_jit_inline`, `stop_gc_stress`, `jit_internal_errors`). A plain release
+the `Lua` test hooks (`set_jit_inline`, `set_jit_hot`, `stop_gc_stress`, `jit_internal_errors`). A plain release
 build has none of it; the tools under `tools/` need the dev build.
 Workspace: `tcvm` (root), `derive/` (`#[derive(Collect)]`), `cli/` (`tcvm-cli`), `fuzz/` (`tcvm-fuzz`). Toolchain is pinned nightly (`rust-toolchain.toml`, the nightly 1.100 branched from), edition 2024; nightly features are listed in `src/lib.rs`.
 

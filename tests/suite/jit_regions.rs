@@ -6,6 +6,13 @@ use tcvm::{Context, Lua, RuntimeError, StepResult};
 
 use crate::common::start_on;
 
+/// The lib's `jit` cfg (`build.rs`): no JIT on stable or on other targets.
+const JIT: bool = cfg!(all(
+    feature = "jit",
+    feature = "nightly",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+));
+
 /// `src`'s string result with the JIT on or off.
 fn result(src: &str, jit: bool) -> String {
     let mut lua = Lua::new();
@@ -40,6 +47,52 @@ fn compiles_cleanly(src: &str, inline: bool) {
     });
     assert_eq!(got, result(src, false), "{src}");
     assert_eq!(lua.jit_internal_errors(), 0, "{src}");
+}
+
+/// `compiles_cleanly` with every region compiled at its first count and at
+/// least one compiled; the run's stats.
+fn compiles_at_first_count(src: &str, inline: bool) -> String {
+    compiles_hot(src, inline, 1, 1)
+}
+
+/// `compiles_at_first_count` at these hot counts (`Lua::set_jit_hot`).
+fn compiles_hot(src: &str, inline: bool, call: u16, r#loop: u16) -> String {
+    let mut lua = Lua::new();
+    lua.set_jit_hot(call, r#loop);
+    lua.set_jit_inline(inline);
+    lua.set_stats(true);
+    lua.load_all();
+    let ex = start_on(&mut lua, src);
+    lua.finish(&ex)
+        .unwrap_or_else(|e| panic!("{src:?} failed: {e:?}"));
+    let got = lua.enter(|ctx| {
+        let v: Value = ctx.fetch(&ex).take_result(ctx).expect("one result");
+        String::from_utf8_lossy(v.get_string().expect("a string result").as_bytes()).into_owned()
+    });
+    assert_eq!(got, result(src, false), "{src}");
+    assert_eq!(lua.jit_internal_errors(), 0, "{src}");
+    let stats = lua.stats();
+    assert!(!JIT || stats.contains("jit compiled "), "{src}\n{stats}");
+    stats
+}
+
+/// `key`'s count in `stats`.
+fn count(stats: &str, key: &str) -> u64 {
+    (stats.lines())
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or(0)
+}
+
+#[test]
+fn hot_counts_of_one_compile_at_the_first_count() {
+    let src = "local function f(a) return a + 1 end
+        local s = 0 for i = 1, 3 do s = f(s) end return tostring(s)";
+    let stats = compiles_at_first_count(src, false);
+    if JIT {
+        // The chunk and `f`.
+        assert_eq!(count(&stats, "jit compiled FUNC"), 2, "{stats}");
+        assert_eq!(count(&stats, "jit compiled FORLOOP_I"), 1, "{stats}");
+    }
 }
 
 /// `agrees` with inlining off, for tests of real calls: what the inliner takes

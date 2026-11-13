@@ -306,6 +306,31 @@ impl Lua {
         }
     }
 
+    /// The invocations of a function and the iterations of a loop before
+    /// compiling, from now on (`TCVM_JIT_HOT_CALL`, `TCVM_JIT_HOT_LOOP`): 1
+    /// compiles at the first count.
+    #[cfg(feature = "tcvm-dev")]
+    pub fn set_jit_hot(&mut self, call: u16, r#loop: u16) {
+        cfg_select! {
+            jit => self.arena.mutate_root(|_, root| {
+                let jit = &mut root.jit;
+                jit.config.dev.hot_call =
+                    call.max(1).checked_next_power_of_two().unwrap_or(1 << 15);
+                jit.config.dev.hot_loop = r#loop.max(1);
+                // `jit_hot` parks the mask while the JIT is off.
+                if jit.config.enabled {
+                    jit.call_mask.set(jit.config.hot_call() as u64 - 1);
+                }
+                for counter in &jit.hot {
+                    counter.set(jit.config.hot_loop());
+                }
+            }),
+            _ => {
+                let _ = (call, r#loop);
+            }
+        }
+    }
+
     /// Force a full garbage-collection cycle (mark + sweep) to completion.
     /// Exposed mainly as a GC-soundness test/debug hook; a real
     /// `collectgarbage("collect")` would route here.
