@@ -134,9 +134,9 @@ fn polish_passes() -> Vec<Pass> {
 /// made none) is set aside; set-aside passes run to completion before the reduction ends.
 const PROBATION_BUDGET: u64 = 25;
 
-/// The initial cuts' watcher looks at a pass every this many tests per worker (shrinkray: every
-/// 5 seconds), so it does not depend on timing.
-const WATCH_TESTS_PER_WORKER: u64 = 100;
+/// The initial cuts' watcher looks at a pass every this many tests (shrinkray: every 5 seconds),
+/// so it depends neither on timing nor on the number of workers.
+const WATCH_TESTS: u64 = 1000;
 
 struct Reducer {
     rng: Rng,
@@ -183,7 +183,7 @@ impl Reducer {
         let started = p.current().to_string();
         p.control = Control {
             budget: use_budget.then_some(PROBATION_BUDGET),
-            watch: watch.then(|| Watch::new(WATCH_TESTS_PER_WORKER * p.workers() as u64, &started)),
+            watch: watch.then(|| Watch::new(WATCH_TESTS, &started)),
             ..Control::default()
         };
         (pass.run)(p, &mut self.rng);
@@ -324,7 +324,30 @@ pub fn reduce<'a>(
     test: &'a Test<'a>,
     options: &Options<'a>,
 ) -> Result<(String, nondet::Evidence), String> {
-    let mut oracle = Oracle::new(initial.to_string(), test, options);
+    let pool = problem::Pool::default();
+    // The workers stop when the reduction does, panicking or not.
+    struct Stop<'p>(&'p problem::Pool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+    std::thread::scope(|s| {
+        for w in 0..options.workers.max(1) {
+            let pool = &pool;
+            s.spawn(move || pool.work(w, test));
+        }
+        let _stop = Stop(&pool);
+        run(initial, &pool, options)
+    })
+}
+
+fn run<'a>(
+    initial: &str,
+    pool: &'a problem::Pool,
+    options: &Options<'a>,
+) -> Result<(String, nondet::Evidence), String> {
+    let mut oracle = Oracle::new(initial.to_string(), pool, options);
     oracle.setup()?;
     let rng = Rng::new(SEED);
     Reducer::new(rng.clone()).reduce(&mut Problem::new(&mut oracle));

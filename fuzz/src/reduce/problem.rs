@@ -2,13 +2,15 @@
 //! what every view of a reduction shares (the test, its results by candidate, the
 //! nondeterminism policy, the time limit, and the incumbent with its history); a `Problem` is
 //! one view, the reduction itself or a restart from the original below the first fixpoint.
-//! Candidates are tested in batches on worker threads, and a batch's results are taken in
-//! candidate order, so a reduction does not depend on the number of workers or on timing.
+//! Candidates are tested in batches on a pool of worker threads, and a batch's results are taken
+//! in candidate order, so a reduction does not depend on the number of workers or on timing. A
+//! batch can be submitted ahead of the one before it finishing (speculatively, behind it in the
+//! queue) and cancelled, its processes killed, when it turns out to be built on a stale state.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use super::nondet::{
@@ -16,6 +18,7 @@ use super::nondet::{
     Verdict,
 };
 use super::timeout::Timeout;
+pub use crate::exec::Cancel;
 
 /// One run of the test.
 #[derive(Clone, Copy, Debug)]
@@ -25,8 +28,8 @@ pub struct Outcome {
 }
 
 /// The test: whether `text` shows the finding, run as worker `w` with each process limited to
-/// the duration.
-pub type Test<'a> = dyn Fn(&str, usize, Duration) -> Outcome + Sync + 'a;
+/// the duration and stopped by the `Cancel`.
+pub type Test<'a> = dyn Fn(&str, usize, Duration, &Cancel) -> Outcome + Sync + 'a;
 
 /// Tokens, then bytes, then the text: fewer tokens is smaller, comments and whitespace count
 /// only as bytes.
@@ -66,8 +69,12 @@ impl Ledger {
 }
 
 pub struct Oracle<'a> {
-    test: &'a Test<'a>,
+    pool: &'a Pool,
     pub workers: usize,
+    /// Batches submitted, for their place in the queue.
+    seq: u64,
+    /// Bumped when results of earlier batches stop meaning what they did (the policy changed).
+    epoch: u64,
     ledgers: HashMap<(usize, u64), Ledger>,
     pub policy: Policy,
     pub timeout: Timeout,
@@ -84,8 +91,14 @@ pub struct Oracle<'a> {
     deadline: Option<Instant>,
 }
 
+/// Below this many items, `parallel` runs them on the calling thread: spawning costs more.
+const INLINE: usize = 64;
+
 /// Run `f(i, worker)` for `i` in `0..n` on `workers` threads; results in order of `i`.
-fn parallel<T: Send>(workers: usize, n: usize, f: impl Fn(usize, usize) -> T + Sync) -> Vec<T> {
+pub fn parallel<T: Send>(workers: usize, n: usize, f: impl Fn(usize, usize) -> T + Sync) -> Vec<T> {
+    if n <= INLINE {
+        return (0..n).map(|i| f(i, 0)).collect();
+    }
     let next = AtomicUsize::new(0);
     let out: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
     std::thread::scope(|s| {
@@ -114,11 +127,148 @@ struct Timed {
     secs: f64,
 }
 
+enum Work {
+    /// One run, as a replay.
+    Plain,
+    /// A candidate's runs: one, or the gauntlet under the policy.
+    Eval {
+        ledger: Ledger,
+        policy: Option<Arc<Policy>>,
+    },
+}
+
+struct Job {
+    text: Arc<String>,
+    work: Work,
+    limit: Duration,
+    /// The limit as the time policy chose it, for cached timeouts.
+    used: f64,
+    cancel: Arc<Cancel>,
+    index: usize,
+    reply: mpsc::Sender<Done>,
+}
+
+struct Done {
+    index: usize,
+    verdict: bool,
+    ledger: Ledger,
+    runs: Vec<Timed>,
+}
+
+/// The workers' queue: synchronous batches first, then speculative ones, each in the order they
+/// were submitted.
+#[derive(Default)]
+pub struct Pool {
+    state: Mutex<Queue>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct Queue {
+    /// By (speculative, batch, index).
+    jobs: BTreeMap<(bool, u64, usize), Job>,
+    shutdown: bool,
+}
+
+impl Pool {
+    fn push(&self, speculative: bool, seq: u64, jobs: Vec<Job>) {
+        let mut st = self.state.lock().expect("the queue");
+        for j in jobs {
+            st.jobs.insert((speculative, seq, j.index), j);
+        }
+        self.ready.notify_all();
+    }
+
+    pub fn shutdown(&self) {
+        self.state.lock().expect("the queue").shutdown = true;
+        self.ready.notify_all();
+    }
+
+    /// A worker's loop, until `shutdown`.
+    pub fn work(&self, w: usize, test: &Test) {
+        loop {
+            let job = {
+                let mut st = self.state.lock().expect("the queue");
+                loop {
+                    if st.shutdown {
+                        return;
+                    }
+                    if let Some((_, j)) = st.jobs.pop_first() {
+                        break j;
+                    }
+                    st = self.ready.wait(st).expect("the queue");
+                }
+            };
+            if job.cancel.cancelled() {
+                continue;
+            }
+            let mut runs = Vec::new();
+            let run = |runs: &mut Vec<Timed>| {
+                let start = Instant::now();
+                let outcome = test(&job.text, w, job.limit, &job.cancel);
+                runs.push(Timed {
+                    outcome,
+                    secs: start.elapsed().as_secs_f64(),
+                });
+                outcome
+            };
+            let (verdict, ledger) = match job.work {
+                Work::Plain => (run(&mut runs).interesting, Ledger::default()),
+                Work::Eval {
+                    mut ledger,
+                    policy: Some(policy),
+                } => {
+                    let r = Oracle::gauntlet_runs(&policy, &mut ledger, &mut runs, |r| {
+                        run(r).interesting
+                    });
+                    (r, ledger)
+                }
+                Work::Eval {
+                    mut ledger,
+                    policy: None,
+                } => {
+                    let o = run(&mut runs);
+                    ledger.evidence.record(o.interesting);
+                    ledger.verdict = Some(o.interesting);
+                    ledger.timed_out_at = o.timed_out.then_some(job.used);
+                    (o.interesting, ledger)
+                }
+            };
+            if job.cancel.cancelled() {
+                continue;
+            }
+            // A cancelled batch's receiver may be gone.
+            let _ = job.reply.send(Done {
+                index: job.index,
+                verdict,
+                ledger,
+                runs,
+            });
+        }
+    }
+}
+
+/// A submitted batch.
+pub struct Ticket {
+    texts: Vec<String>,
+    answered: Vec<bool>,
+    out: Vec<Option<bool>>,
+    keys: Vec<(usize, u64)>,
+    jobs: Vec<usize>,
+    job_of: Vec<usize>,
+    rx: mpsc::Receiver<Done>,
+    cancel: Arc<Cancel>,
+    used: f64,
+    epoch: u64,
+}
+
 impl<'a> Oracle<'a> {
-    pub fn new(initial: String, test: &'a Test<'a>, o: &super::Options<'a>) -> Oracle<'a> {
+    pub fn new(initial: String, pool: &'a Pool, o: &super::Options<'a>) -> Oracle<'a> {
         Oracle {
-            test,
+            pool,
             workers: o.workers.max(1),
+            seq: 0,
+            epoch: 0,
             ledgers: HashMap::new(),
             policy: Policy::default(),
             timeout: Timeout::new(o.timeout_cap),
@@ -159,18 +309,30 @@ impl<'a> Oracle<'a> {
         }
     }
 
-    /// Run `texts` once each, in parallel.
+    /// Run `texts` once each, in parallel, ahead of every queued batch.
     fn run_all(&mut self, texts: &[&str]) -> Vec<Outcome> {
-        let (secs, used) = self.secs();
-        let test = self.test;
-        let runs = parallel(self.workers, texts.len(), |i, w| {
-            let start = Instant::now();
-            let outcome = test(texts[i], w, secs);
-            Timed {
-                outcome,
-                secs: start.elapsed().as_secs_f64(),
-            }
-        });
+        let (limit, used) = self.secs();
+        let (reply, rx) = mpsc::channel();
+        let cancel = Arc::new(Cancel::default());
+        let jobs = (texts.iter().enumerate())
+            .map(|(index, t)| Job {
+                text: Arc::new(t.to_string()),
+                work: Work::Plain,
+                limit,
+                used,
+                cancel: cancel.clone(),
+                index,
+                reply: reply.clone(),
+            })
+            .collect();
+        self.seq += 1;
+        self.pool.push(false, self.seq, jobs);
+        let mut runs: Vec<Option<Timed>> = (0..texts.len()).map(|_| None).collect();
+        for _ in 0..texts.len() {
+            let mut d = rx.recv().expect("a worker's result");
+            runs[d.index] = d.runs.pop();
+        }
+        let runs: Vec<Timed> = runs.into_iter().map(|r| r.expect("every run")).collect();
         self.record(&runs, used);
         runs.iter().map(|r| r.outcome).collect()
     }
@@ -220,6 +382,7 @@ impl<'a> Oracle<'a> {
             return;
         }
         self.policy.active = true;
+        self.epoch += 1;
         self.log(&format!(
             "nondeterministic: the incumbent reproduced on {} of {} replays; candidates are \
              confirmed by repeated runs from now on",
@@ -378,6 +541,7 @@ impl<'a> Oracle<'a> {
     /// more of later candidates and back up to the newest test case that clears the gauntlet.
     fn recover(&mut self) {
         self.policy.record_false_accept();
+        self.epoch += 1;
         let i = self.policy.incumbent;
         self.log(&format!(
             "the incumbent reproduces less often than expected ({} of {} replays); candidates \
@@ -401,24 +565,12 @@ impl<'a> Oracle<'a> {
     /// sweep a miss rejects it), a hit starts the gauntlet, and an accept tops the ledger up
     /// while the extra runs could still raise the anchor.
     fn gauntlet_runs(
-        test: &Test,
         policy: &Policy,
         ledger: &mut Ledger,
-        text: &str,
-        w: usize,
-        secs: Duration,
         runs: &mut Vec<Timed>,
+        mut run: impl FnMut(&mut Vec<Timed>) -> bool,
     ) -> bool {
         let min_hits = *ledger.min_hits.get_or_insert(policy.min_hits);
-        let run = |runs: &mut Vec<Timed>| {
-            let start = Instant::now();
-            let outcome = test(text, w, secs);
-            runs.push(Timed {
-                outcome,
-                secs: start.elapsed().as_secs_f64(),
-            });
-            outcome.interesting
-        };
         let hit = run(runs);
         ledger.evidence.record(hit);
         if !hit && !policy.confirming {
@@ -464,20 +616,22 @@ impl<'a> Oracle<'a> {
         }
     }
 
-    /// Whether each of `texts` is interesting, tested in parallel. `filter` answers some without
-    /// a run (`Some`); `adopt` is called in order for each interesting one.
-    fn interesting(
+    /// Submit `texts` for testing; `answers` holds those known without a run.
+    fn submit(
         &mut self,
-        texts: &[String],
-        filter: impl Fn(&str) -> Option<bool>,
-        mut adopt: impl FnMut(&mut Self, &str, Option<Evidence>),
-    ) -> (Vec<bool>, usize) {
-        self.maybe_verify();
-        let answered: Vec<bool> = texts.iter().map(|t| filter(t).is_some()).collect();
-        let mut out: Vec<Option<bool>> = texts.iter().map(|t| filter(t)).collect();
-        for (i, t) in texts.iter().enumerate() {
+        texts: Vec<String>,
+        answers: Vec<Option<bool>>,
+        speculative: bool,
+    ) -> Ticket {
+        let answered: Vec<bool> = answers.iter().map(Option::is_some).collect();
+        let mut out = answers;
+        let keys: Vec<(usize, u64)> = parallel(self.workers, texts.len(), |i, _| match out[i] {
+            Some(_) => (0, 0),
+            None => cache_key(&texts[i]),
+        });
+        for i in 0..texts.len() {
             if out[i].is_none()
-                && let Some(l) = self.ledgers.get(&cache_key(t))
+                && let Some(l) = self.ledgers.get(&keys[i])
             {
                 out[i] = self.latched(l);
             }
@@ -488,63 +642,91 @@ impl<'a> Oracle<'a> {
         let mut job_of = vec![usize::MAX; texts.len()];
         for i in 0..texts.len() {
             if out[i].is_none() {
-                job_of[i] = *seen.entry(cache_key(&texts[i])).or_insert_with(|| {
+                job_of[i] = *seen.entry(keys[i]).or_insert_with(|| {
                     jobs.push(i);
                     jobs.len() - 1
                 });
             }
         }
-        let (secs, used) = self.secs();
-        let ledgers: Vec<Ledger> = (jobs.iter())
-            .map(|&i| {
-                self.ledgers
-                    .get(&cache_key(&texts[i]))
-                    .cloned()
-                    .unwrap_or_default()
+        let (limit, used) = self.secs();
+        let policy = self.policy.active.then(|| Arc::new(self.policy.clone()));
+        let (reply, rx) = mpsc::channel();
+        let cancel = Arc::new(Cancel::default());
+        let queued = (jobs.iter().enumerate())
+            .map(|(j, &i)| Job {
+                text: Arc::new(texts[i].clone()),
+                work: Work::Eval {
+                    ledger: self.ledgers.get(&keys[i]).cloned().unwrap_or_default(),
+                    policy: policy.clone(),
+                },
+                limit,
+                used,
+                cancel: cancel.clone(),
+                index: j,
+                reply: reply.clone(),
             })
             .collect();
-        let (test, policy) = (self.test, self.policy.clone());
-        let results = parallel(self.workers, jobs.len(), |j, w| {
-            let text = &texts[jobs[j]];
-            let mut ledger = ledgers[j].clone();
-            let mut runs = Vec::new();
-            let r = if policy.active {
-                Self::gauntlet_runs(test, &policy, &mut ledger, text, w, secs, &mut runs)
-            } else {
-                let start = Instant::now();
-                let outcome = test(text, w, secs);
-                runs.push(Timed {
-                    outcome,
-                    secs: start.elapsed().as_secs_f64(),
-                });
-                ledger.evidence.record(outcome.interesting);
-                ledger.verdict = Some(outcome.interesting);
-                ledger.timed_out_at = outcome.timed_out.then_some(used);
-                outcome.interesting
-            };
-            (r, ledger, runs)
-        });
-        let tested = jobs.len();
-        let mut verdicts = Vec::with_capacity(jobs.len());
-        for (j, (r, ledger, runs)) in results.into_iter().enumerate() {
-            self.record(&runs, used);
-            self.policy.replay_calls += runs.len().saturating_sub(1) as u64;
-            self.ledgers.insert(cache_key(&texts[jobs[j]]), ledger);
-            verdicts.push(r);
+        self.seq += 1;
+        self.pool.push(speculative, self.seq, queued);
+        Ticket {
+            texts,
+            answered,
+            out,
+            keys,
+            jobs,
+            job_of,
+            rx,
+            cancel,
+            used,
+            epoch: self.epoch,
         }
-        let mut result = Vec::with_capacity(texts.len());
-        for i in 0..texts.len() {
-            let r = out[i].unwrap_or_else(|| verdicts[job_of[i]]);
-            if r && !answered[i] {
+    }
+
+    /// Workers skip a cancelled batch's queued jobs when they come to them.
+    pub fn cancel(&mut self, t: Ticket) {
+        t.cancel.cancel();
+    }
+
+    /// Wait for a batch and take its results in order, calling `adopt` for each interesting one;
+    /// `None` when the policy changed since it was submitted.
+    fn finish(
+        &mut self,
+        t: Ticket,
+        mut adopt: impl FnMut(&mut Self, &str, Option<Evidence>),
+    ) -> Option<(Vec<bool>, usize)> {
+        self.maybe_verify();
+        if t.epoch != self.epoch {
+            self.cancel(t);
+            return None;
+        }
+        let mut done: Vec<Option<Done>> = (0..t.jobs.len()).map(|_| None).collect();
+        for _ in 0..t.jobs.len() {
+            let d = t.rx.recv().expect("a worker's result");
+            let i = d.index;
+            done[i] = Some(d);
+        }
+        let tested = t.jobs.len();
+        let mut verdicts = Vec::with_capacity(tested);
+        for (j, d) in done.into_iter().enumerate() {
+            let d = d.expect("every job ran");
+            self.record(&d.runs, t.used);
+            self.policy.replay_calls += d.runs.len().saturating_sub(1) as u64;
+            self.ledgers.insert(t.keys[t.jobs[j]], d.ledger);
+            verdicts.push(d.verdict);
+        }
+        let mut result = Vec::with_capacity(t.texts.len());
+        for i in 0..t.texts.len() {
+            let r = t.out[i].unwrap_or_else(|| verdicts[t.job_of[i]]);
+            if r && !t.answered[i] {
                 let unselected = (self.policy.active)
-                    .then(|| self.ledgers.get(&cache_key(&texts[i])))
+                    .then(|| self.ledgers.get(&t.keys[i]))
                     .flatten()
                     .and_then(|l| l.accepted_at.map(|_| l.unselected()));
-                adopt(self, &texts[i], unselected);
+                adopt(self, &t.texts[i], unselected);
             }
             result.push(r);
         }
-        (result, tested)
+        Some((result, tested))
     }
 
     /// Adopt `text` into the incumbent if it is smaller.
@@ -581,10 +763,12 @@ impl<'a> Oracle<'a> {
         } else if !self.policy.confirming {
             // A fixpoint reached with fast sweeps is no certificate.
             self.policy.confirming = true;
+            self.epoch += 1;
             self.log("confirmation sweep");
             return true;
         } else {
             self.policy.confirming = false;
+            self.epoch += 1;
             let mut e = Evidence::default();
             let text = self.incumbent.clone();
             for o in self.run_all(&vec![text.as_str(); ANCHOR_SEED_RUNS as usize]) {
@@ -684,6 +868,35 @@ struct Restart {
     fixpoint: String,
 }
 
+/// A batch a view submitted, with the current test case it was built against.
+pub struct Pending {
+    ticket: Ticket,
+    current: String,
+    rejected: usize,
+}
+
+/// The candidates a view answers without a run: the current test case, and in a restart the
+/// original (interesting) and anything not below the fixpoint (not).
+pub struct Filter {
+    current: String,
+    restart: Option<(String, (usize, usize), String)>,
+}
+
+impl Filter {
+    pub fn check(&self, t: &str) -> Option<bool> {
+        if t == self.current {
+            return Some(true);
+        }
+        match &self.restart {
+            Some((original, ..)) if t == original => Some(true),
+            Some((_, key, fixpoint)) if (sort_key(t), t) >= (*key, fixpoint.as_str()) => {
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl<'o, 'a> Problem<'o, 'a> {
     pub fn new(oracle: &'o mut Oracle<'a>) -> Problem<'o, 'a> {
         Problem {
@@ -721,36 +934,76 @@ impl<'o, 'a> Problem<'o, 'a> {
         self.oracle.workers
     }
 
-    /// Whether each of `texts` is interesting, adopting in order each one smaller than the
-    /// current test case; with the number of tests run.
-    pub fn test(&mut self, texts: &[String]) -> (Vec<bool>, usize) {
-        let current = self.current().to_string();
-        let restart = self
-            .restart
-            .as_ref()
-            .map(|r| (r.original.clone(), r.fixpoint.clone()));
-        let filter = |t: &str| {
-            if t == current {
-                return Some(true);
-            }
-            match &restart {
-                Some((original, _)) if t == original => Some(true),
-                Some((_, fixpoint)) if !less(t, fixpoint) => Some(false),
-                _ => None,
-            }
-        };
+    /// What answers a candidate without a run.
+    pub fn filter(&self) -> Filter {
+        Filter {
+            current: self.current().to_string(),
+            restart: (self.restart.as_ref()).map(|r| {
+                (
+                    r.original.clone(),
+                    sort_key(&r.fixpoint),
+                    r.fixpoint.clone(),
+                )
+            }),
+        }
+    }
+
+    /// Candidates the filter rejected before they were tested count against a pass's budget.
+    pub fn note_rejected(&mut self, n: usize) {
+        if n > 0 {
+            let now = self.current().to_string();
+            self.control.observe(n, false, &now);
+        }
+    }
+
+    /// Submit `texts` for testing; `speculative` ones queue behind the others.
+    pub fn submit(&mut self, texts: Vec<String>, speculative: bool) -> Pending {
+        let filter = self.filter();
+        let answers = parallel(self.oracle.workers, texts.len(), |i, _| {
+            filter.check(&texts[i])
+        });
+        let rejected = answers.iter().filter(|a| **a == Some(false)).count();
+        Pending {
+            ticket: self.oracle.submit(texts, answers, speculative),
+            current: self.current().to_string(),
+            rejected,
+        }
+    }
+
+    pub fn cancel(&mut self, p: Pending) {
+        self.oracle.cancel(p.ticket);
+    }
+
+    /// Whether each submitted text is interesting, adopting in order each one smaller than the
+    /// current test case; with the number of tests run. `None` when the current test case or
+    /// the policy changed since the batch was submitted.
+    pub fn finish(&mut self, p: Pending) -> Option<(Vec<bool>, usize)> {
+        if p.current != self.current() {
+            self.cancel(p);
+            return None;
+        }
         let mut view = self.restart.as_mut().map(|r| &mut r.current);
-        let (r, tested) = self.oracle.interesting(texts, filter, |o, t, unselected| {
+        let (r, tested) = self.oracle.finish(p.ticket, |o, t, unselected| {
             o.improve(t, unselected);
             if let Some(c) = view.as_deref_mut()
                 && less(t, c)
             {
                 *c = t.to_string();
             }
-        });
+        })?;
         let now = self.current().to_string();
-        self.control.observe(tested, now != current, &now);
-        (r, tested)
+        self.control
+            .observe(tested + p.rejected, now != p.current, &now);
+        Some((r, tested))
+    }
+
+    pub fn test(&mut self, texts: &[String]) -> (Vec<bool>, usize) {
+        loop {
+            let p = self.submit(texts.to_vec(), false);
+            if let Some(r) = self.finish(p) {
+                return r;
+            }
+        }
     }
 
     pub fn cancelled(&self) -> bool {
