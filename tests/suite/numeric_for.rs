@@ -138,3 +138,20 @@ fn loop_variable_is_a_fresh_upvalue_per_iteration() {
         "3 1/integer 2/integer 3/integer"
     );
 }
+
+#[test]
+fn and_or_header_with_non_local_operand() {
+    // The left operand of `and`/`or` is loaded into its control slot and freed
+    // as a temp by the short-circuit test; that slot must be the top temp (#367).
+    assert_eq!(
+        trace(
+            "local t = {b = 3}\n\
+             g = nil\n\
+             for i = 1, t.y or 2 do p(i) end\n\
+             for i = t.y or 3, t.b and 4 do p(i) end\n\
+             for i = g or 5, (t.y and 1 or 9), t.b or 1 do p(i) end\n\
+             for i = #t or 1, 0 do p(i) end"
+        ),
+        "7 1/integer 2/integer 3/integer 4/integer 5/integer 8/integer"
+    );
+}

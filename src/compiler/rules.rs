@@ -4677,21 +4677,31 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
 
         let limit_expr = item.end().ok_or_else(|| ice("for_num without limit"))?;
 
-        // FORPREP requires the control triple in consecutive registers.
-        let base = ctx.alloc_register()?;
-        let limit_reg = ctx.alloc_register()?;
-        let step_reg = ctx.alloc_register()?;
+        // FORPREP requires the control triple in consecutive registers. Like
+        // call arguments, each is built in place at `freereg` rather than
+        // reserved ahead: a hint below `freereg` is not the top temp, and an
+        // `and`/`or` operand freed from it would break LIFO order.
+        let base = RegisterIndex(ctx.chunk.freereg);
+        if base.0.checked_add(3).is_none() {
+            return Err(ctx.limit_err("registers", MAX_REGISTERS));
+        }
+        let limit_reg = RegisterIndex(base.0 + 1);
+        let step_reg = RegisterIndex(base.0 + 2);
 
-        // Each sub-MOVE path frees the source temp, so freereg settles at
-        // step_reg+1 when this block finishes (asserted below).
         let init = compile_expr_to_reg(ctx, init_expr, Some(base))?;
         if init != base {
+            while ctx.chunk.freereg <= base.0 {
+                ctx.alloc_register()?;
+            }
             ctx.emit(Instruction::mov(base, init));
             ctx.free_reg(init);
         }
 
         let limit = compile_expr_to_reg(ctx, limit_expr, Some(limit_reg))?;
         if limit != limit_reg {
+            while ctx.chunk.freereg <= limit_reg.0 {
+                ctx.alloc_register()?;
+            }
             ctx.emit(Instruction::mov(limit_reg, limit));
             ctx.free_reg(limit);
         }
@@ -4699,11 +4709,15 @@ fn compile_for_num(ctx: &mut Ctx, item: ForNum) -> Result<(), CompileError> {
         if let Some(step_expr) = item.step() {
             let step = compile_expr_to_reg(ctx, step_expr, Some(step_reg))?;
             if step != step_reg {
+                while ctx.chunk.freereg <= step_reg.0 {
+                    ctx.alloc_register()?;
+                }
                 ctx.emit(Instruction::mov(step_reg, step));
                 ctx.free_reg(step);
             }
         } else {
             // Default step = 1
+            ctx.alloc_register()?;
             let one_idx = ctx.alloc_constant(Value::integer(ctx.ctx.mutation(), 1))?;
             ctx.emit(Instruction::load(step_reg, KIdx(one_idx)));
         }
