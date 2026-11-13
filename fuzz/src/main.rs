@@ -421,13 +421,13 @@ fn cmd_reduce(
         })
         .collect();
     let has = |line: &str| grep.is_none_or(|g| line.contains(g));
-    let test = |text: &str, w: usize, limit: std::time::Duration| {
+    let test = |text: &str, w: usize, limit: std::time::Duration, cancel: &exec::Cancel| {
         let (dir, file) = (&dirs[w], "reduce.lua");
         std::fs::write(dir.join(file), text).expect("the candidate's file");
         let timed_out = std::cell::Cell::new(false);
         let tcvm = |m: &oracle::Mode| {
             let env: Vec<(String, String)> = base.iter().chain(&m.env).cloned().collect();
-            let r = exec::run_for(&[bin, "-f", file], dir, &env, limit * m.slow);
+            let r = exec::run_for(&[bin, "-f", file], dir, &env, limit * m.slow, Some(cancel));
             timed_out.set(timed_out.get() || r.status == Status::Timeout);
             r
         };
@@ -436,7 +436,7 @@ fn cmd_reduce(
             && off.stdout.ends_with("END\n")
             && match what {
                 "ref" => {
-                    let r = exec::run_for(&[lua, file], dir, &[], limit);
+                    let r = exec::run_for(&[lua, file], dir, &[], limit, Some(cancel));
                     timed_out.set(timed_out.get() || r.status == Status::Timeout);
                     let strict: Vec<String> = (text.lines())
                         .filter(|l| l.starts_with("do -- U") && l.ends_with(" strict"))

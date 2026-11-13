@@ -4,7 +4,7 @@
 //! ones of a window are merged in candidate order: the largest prefix that still combines into a
 //! reduction is kept, the first one after it dropped, and the rest merged again.
 
-use super::problem::{Problem, less};
+use super::problem::{Pending, Problem, less, parallel};
 use crate::rng::Rng;
 
 /// How a pass's patches are applied. Every patch of a pass is of the same kind.
@@ -111,13 +111,9 @@ impl Kind<'_> {
     }
 }
 
-/// When nothing in a pass succeeds, an `early_abort` pass stops after this many candidates, or
-/// 3 per byte of the test case.
-const MIN_PATCH_ATTEMPTS: usize = 250;
-
-/// Patches tested per window, per worker: a window waits for its slowest test, and a larger
-/// one lets the other workers go on meanwhile.
-const WINDOW_PER_WORKER: usize = 4;
+/// Patches per window. Merges happen within a window, so its size is part of what a pass does
+/// and does not depend on the number of workers.
+const WINDOW: usize = 64;
 
 /// The combination of a pass's patches accepted so far, against the test case the pass started
 /// from: shrinkray's `PatchApplier`.
@@ -136,34 +132,35 @@ impl<'s> Applier<'s> {
         }
     }
 
-    /// The text to test for `patch` on top of what was accepted; `None` when it conflicts or
-    /// changes nothing.
-    fn candidate(&self, p: &Problem, patch: &Patch) -> Option<String> {
-        let combined = self.kind.combine(&[&self.current, patch])?;
-        if combined == self.current {
-            return None;
-        }
-        let text = self.kind.apply(&combined, &self.initial);
-        (text != p.current()).then_some(text)
+    /// What `patch` on top of what was accepted comes to, for each of `patches`, in parallel.
+    fn candidates(&self, p: &Problem, patches: &[Patch]) -> Vec<Candidate> {
+        let filter = p.filter();
+        parallel(p.workers(), patches.len(), |i, _| {
+            let Some(combined) = self.kind.combine(&[&self.current, &patches[i]]) else {
+                return Candidate::Conflict;
+            };
+            if combined == self.current {
+                return Candidate::Applied;
+            }
+            let text = self.kind.apply(&combined, &self.initial);
+            match filter.check(&text) {
+                Some(true) => Candidate::Applied,
+                Some(false) => Candidate::Rejected,
+                None => Candidate::Text(text),
+            }
+        })
     }
 
-    /// Test `patches` in parallel and merge the interesting ones; which of them were merged.
-    pub fn try_patches(&mut self, p: &mut Problem, patches: &[Patch]) -> Vec<bool> {
-        let mut texts = Vec::new();
-        let mut of = Vec::new();
-        for (i, patch) in patches.iter().enumerate() {
-            if let Some(t) = self.candidate(p, patch) {
-                texts.push(t);
-                of.push(i);
-            }
-        }
+    /// Test `patches`, whose candidates are `texts`, and merge the interesting ones; which of
+    /// them were merged.
+    fn try_texts(&mut self, p: &mut Problem, patches: &[Patch], texts: Vec<String>) -> Vec<bool> {
         let (ok, _) = p.test(&texts);
-        let mut queue: Vec<usize> = of
-            .iter()
-            .zip(&ok)
-            .filter(|(_, ok)| **ok)
-            .map(|(&i, _)| i)
-            .collect();
+        self.merge(p, patches, &ok)
+    }
+
+    /// Merge the patches whose candidates were interesting (`ok`); which of them were merged.
+    fn merge(&mut self, p: &mut Problem, patches: &[Patch], ok: &[bool]) -> Vec<bool> {
+        let mut queue: Vec<usize> = (0..patches.len()).filter(|&i| ok[i]).collect();
         let mut merged = vec![false; patches.len()];
         while !queue.is_empty() {
             // Shrinkray probes prefix lengths one test at a time; every prefix in one batch keeps
@@ -177,9 +174,9 @@ impl<'s> Applier<'s> {
                     prefixes.push((k + 1, c));
                 }
             }
-            let texts: Vec<String> = (prefixes.iter())
-                .map(|(_, c)| self.kind.apply(c, &self.initial))
-                .collect();
+            let texts: Vec<String> = parallel(p.workers(), prefixes.len(), |j, _| {
+                self.kind.apply(&prefixes[j].1, &self.initial)
+            });
             let current = p.current().to_string();
             // Only texts no larger than the current test case can be reductions.
             let candidates: Vec<String> = (texts.iter())
@@ -200,25 +197,113 @@ impl<'s> Applier<'s> {
             }
             queue.drain(..(k + 1).min(n));
         }
+        merged
+    }
+
+    /// The next window from `patches[at..]`: up to `size` patches with something to test, their
+    /// candidates, the position after them, and how many were skipped as rejected. Candidates
+    /// are built a chunk at a time, the chunk doubling while it yields too few.
+    fn window(
+        &self,
+        p: &Problem,
+        patches: &[Patch],
+        mut at: usize,
+        size: usize,
+    ) -> (Vec<Patch>, Vec<String>, usize, usize) {
+        let (mut window, mut texts, mut rejected) = (Vec::new(), Vec::new(), 0);
+        let mut chunk = size;
+        while at < patches.len() && window.len() < size {
+            let end = (at + chunk).min(patches.len());
+            for c in self.candidates(p, &patches[at..end]) {
+                if window.len() == size {
+                    break;
+                }
+                at += 1;
+                match c {
+                    Candidate::Text(t) => {
+                        window.push(patches[at - 1].clone());
+                        texts.push(t);
+                    }
+                    Candidate::Rejected => rejected += 1,
+                    Candidate::Applied | Candidate::Conflict => {}
+                }
+            }
+            chunk *= 2;
+        }
+        (window, texts, at, rejected)
+    }
+
+    /// Test `patches` in parallel and merge the interesting ones; which of them were applied.
+    pub fn try_patches(&mut self, p: &mut Problem, patches: &[Patch]) -> Vec<bool> {
+        let cands = self.candidates(p, patches);
+        let mut window = Vec::new();
+        let mut texts = Vec::new();
+        let mut of = Vec::new();
+        let mut rejected = 0;
+        for (i, c) in cands.into_iter().enumerate() {
+            match c {
+                Candidate::Text(t) => {
+                    window.push(patches[i].clone());
+                    texts.push(t);
+                    of.push(i);
+                }
+                Candidate::Rejected => rejected += 1,
+                Candidate::Applied | Candidate::Conflict => {}
+            }
+        }
+        p.note_rejected(rejected);
+        let tested = self.try_texts(p, &window, texts);
+        let mut out = vec![false; patches.len()];
+        for (j, &i) in of.iter().enumerate() {
+            out[i] = tested[j];
+        }
         // A patch the combination already holds, or whose result is the current test case,
         // counts as applied.
         for (i, patch) in patches.iter().enumerate() {
-            if !of.contains(&i) && self.kind.combine(&[&self.current, patch]).is_some() {
-                merged[i] = true;
+            if !of.contains(&i)
+                && let Some(combined) = self.kind.combine(&[&self.current, patch])
+            {
+                out[i] = combined == self.current
+                    || self.kind.apply(&combined, &self.initial) == p.current();
             }
         }
-        merged
+        out
     }
 }
 
-/// Try `patches`, adopting any that reduce the test case.
-pub fn apply_patches(
-    p: &mut Problem,
-    rng: &mut Rng,
-    kind: Kind,
+enum Candidate {
+    Conflict,
+    /// Changes nothing, or is known to be interesting.
+    Applied,
+    /// Known not to be interesting.
+    Rejected,
+    Text(String),
+}
+
+/// A window of a pass's patches, built against the state the pass was in, tested or being
+/// tested.
+struct Window {
     patches: Vec<Patch>,
-    early_abort: bool,
-) {
+    pending: Pending,
+    /// The position after its last patch, and the candidates it skipped as rejected.
+    end: usize,
+    rejected: usize,
+    /// What the applier had accepted when it was built.
+    base: Patch,
+    /// Its candidates' number and bytes.
+    queued: (usize, usize),
+}
+
+/// Speculation stops at this many queued candidates, or this many bytes of them.
+const MAX_AHEAD: usize = 50_000;
+const MAX_AHEAD_BYTES: usize = 256 << 20;
+
+/// Try `patches`, adopting any that reduce the test case. While one window is tested, the next
+/// ones are built and queued on the assumption that it changes nothing; a window that does
+/// change something cancels them. How far ahead it goes only decides which tests run sooner,
+/// never what the pass does: it starts at one window and doubles with each window that changed
+/// nothing.
+pub fn apply_patches(p: &mut Problem, rng: &mut Rng, kind: Kind, patches: Vec<Patch>) {
     if patches.is_empty() {
         return;
     }
@@ -241,30 +326,65 @@ pub fn apply_patches(
         patches.swap(i, rng.below(i + 1));
     }
     patches.sort_by_key(|q| std::cmp::Reverse(kind.size(q)));
-    let give_up_after = MIN_PATCH_ATTEMPTS.max(3 * p.current().len());
     let mut applier = Applier::new(kind, p);
-    let mut any_success = false;
+    let size = WINDOW;
+    let mut ahead = size;
+    let mut windows: std::collections::VecDeque<Window> = std::collections::VecDeque::new();
     let mut next = 0;
-    while next < patches.len() && !p.cancelled() {
-        if early_abort && !any_success && next >= give_up_after {
-            return;
+    let cancel_all = |p: &mut Problem, windows: &mut std::collections::VecDeque<Window>| {
+        for w in windows.drain(..) {
+            p.cancel(w.pending);
         }
-        // A window of patches with something to test.
-        let mut window = Vec::new();
-        while next < patches.len() && window.len() < WINDOW_PER_WORKER * p.workers() {
-            if early_abort && !any_success && next >= give_up_after {
-                break;
+    };
+    while !p.cancelled() {
+        // Build and submit windows up to `ahead` candidates past the one tested next.
+        let mut at = windows.back().map_or(next, |w| w.end);
+        let (mut queued, mut bytes) =
+            (windows.iter().skip(1)).fold((0, 0), |(n, b), w| (n + w.queued.0, b + w.queued.1));
+        while at < patches.len()
+            && (windows.is_empty() || (queued < ahead && bytes < MAX_AHEAD_BYTES))
+        {
+            let (window, texts, end, rejected) = applier.window(p, &patches, at, size);
+            let these = (texts.len(), texts.iter().map(String::len).sum::<usize>());
+            if !windows.is_empty() {
+                queued += these.0;
+                bytes += these.1;
             }
-            if applier.candidate(p, &patches[next]).is_some() {
-                window.push(patches[next].clone());
-            }
-            next += 1;
+            let pending = p.submit(texts, !windows.is_empty());
+            windows.push_back(Window {
+                patches: window,
+                pending,
+                end,
+                rejected,
+                base: applier.current.clone(),
+                queued: these,
+            });
+            at = end;
         }
-        if window.is_empty() {
+        let Some(w) = windows.pop_front() else {
+            break;
+        };
+        if w.base != applier.current {
+            p.cancel(w.pending);
+            cancel_all(p, &mut windows);
             continue;
         }
-        any_success |= applier.try_patches(p, &window).iter().any(|&m| m);
+        p.note_rejected(w.rejected);
+        let before = (p.current().to_string(), applier.current.clone());
+        let Some((ok, _)) = p.finish(w.pending) else {
+            cancel_all(p, &mut windows);
+            continue;
+        };
+        next = w.end;
+        applier.merge(p, &w.patches, &ok);
+        if (p.current(), &applier.current) != (before.0.as_str(), &before.1) {
+            cancel_all(p, &mut windows);
+            ahead = size;
+        } else {
+            ahead = (2 * ahead).min(MAX_AHEAD);
+        }
     }
+    cancel_all(p, &mut windows);
 }
 
 /// A search over one region's replacement: the next value to try given whether the last one

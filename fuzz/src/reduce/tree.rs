@@ -388,7 +388,7 @@ fn orphaned_declaration_cuts(root: &Node, source: &str) -> Vec<Patch> {
 fn cut_pass(p: &mut Problem, rng: &mut Rng, cuts: fn(&Node, &str) -> Vec<Patch>) {
     let source = p.current().to_string();
     if let Some(root) = parse(&source) {
-        apply_patches(p, rng, SOFT, cuts(&root, &source), false);
+        apply_patches(p, rng, SOFT, cuts(&root, &source));
     }
 }
 
@@ -408,7 +408,7 @@ pub fn substitute_nodes(p: &mut Problem, rng: &mut Rng) {
     let source = p.current().to_string();
     if let Some(root) = parse(&source) {
         let patches = minimal_substitutions(&root, &source);
-        apply_patches(p, rng, Kind::Replace, patches, false);
+        apply_patches(p, rng, Kind::Replace, patches);
     }
 }
 

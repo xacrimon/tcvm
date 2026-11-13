@@ -59,7 +59,7 @@ pub fn cut_comments(p: &mut Problem, rng: &mut Rng) {
         }
         gap_start = e;
     }
-    apply_patches(p, rng, SOFT, cuts(spans), false);
+    apply_patches(p, rng, SOFT, cuts(spans));
 }
 
 fn brace_intervals(b: &[u8], open: u8, close: u8) -> Vec<(usize, usize)> {
@@ -99,7 +99,7 @@ pub fn hollow(p: &mut Problem, rng: &mut Rng) {
         group.sort_by_key(|&(s, e)| (e - s, s));
         spans.extend(group);
     }
-    apply_patches(p, rng, SOFT, cuts(spans), false);
+    apply_patches(p, rng, SOFT, cuts(spans));
 }
 
 /// Remove a bracket pair and keep what it held.
@@ -110,7 +110,7 @@ pub fn debracket(p: &mut Problem, rng: &mut Rng) {
         .flat_map(|(o, c)| brace_intervals(&b, o, c))
         .map(|(u, v)| vec![cut(u - 1, u), cut(v, v + 1)])
         .collect();
-    apply_patches(p, rng, SOFT, patches, false);
+    apply_patches(p, rng, SOFT, patches);
 }
 
 /// `{A{B}C}` to `{B}`: delete a brace group's contents around one of its children.
@@ -143,7 +143,7 @@ pub fn lift_braces(p: &mut Problem, rng: &mut Rng) {
         q.retain(|(s, e, _)| s < e);
     }
     patches.retain(|q| !q.is_empty());
-    apply_patches(p, rng, SOFT, patches, false);
+    apply_patches(p, rng, SOFT, patches);
 }
 
 /// Delete runs of `min..=max` elements of the text split at `sep`, at every offset.
@@ -162,7 +162,7 @@ pub fn block_deletion(p: &mut Problem, rng: &mut Rng, sep: &str, min: usize, max
             }
         }
     }
-    apply_patches(p, rng, Kind::Split(sep), patches, false);
+    apply_patches(p, rng, Kind::Split(sep), patches);
 }
 
 /// Delete every copy of a repeated line at once.
@@ -176,7 +176,7 @@ pub fn delete_duplicate_lines(p: &mut Problem, rng: &mut Rng) {
         .filter(|ix| ix.len() > 1)
         .map(|ix| ix.into_iter().map(|i| cut(i, i + 1)).collect())
         .collect();
-    apply_patches(p, rng, Kind::Split("\n"), patches, false);
+    apply_patches(p, rng, Kind::Split("\n"), patches);
 }
 
 /// Delete runs of `min..=max` tokens.
@@ -196,7 +196,7 @@ pub fn token_block_deletion(p: &mut Problem, rng: &mut Rng, min: usize, max: usi
             }
         }
     }
-    apply_patches(p, rng, SOFT, cuts(spans), false);
+    apply_patches(p, rng, SOFT, cuts(spans));
 }
 
 /// For each token text that occurs more than once: delete up to the first occurrence, from
@@ -215,7 +215,7 @@ pub fn token_spans(p: &mut Problem, rng: &mut Rng) {
         spans.extend(ix.windows(2).map(|w| (toks[w[0]].start, toks[w[1]].start)));
         spans.push((toks[ix[ix.len() - 1]].start, text.len()));
     }
-    apply_patches(p, rng, SOFT, cuts(spans), false);
+    apply_patches(p, rng, SOFT, cuts(spans));
 }
 
 /// The spaces starting each line.
@@ -228,7 +228,7 @@ pub fn remove_indents(p: &mut Problem, rng: &mut Rng) {
             spans.push((i + 1, j));
         }
     }
-    apply_patches(p, rng, SOFT, cuts(spans), false);
+    apply_patches(p, rng, SOFT, cuts(spans));
 }
 
 /// Each whitespace run, whole and less its first character.
@@ -248,14 +248,14 @@ pub fn remove_whitespace(p: &mut Problem, rng: &mut Rng) {
             }
         }
     }
-    apply_patches(p, rng, SOFT, cuts(spans), false);
+    apply_patches(p, rng, SOFT, cuts(spans));
 }
 
 /// Every deletion of 1 to 10 bytes.
 pub fn short_deletions(p: &mut Problem, rng: &mut Rng) {
     let n = p.current().len();
     let spans = (0..n).flat_map(|i| (i + 1..(i + 11).min(n + 1)).map(move |j| (i, j)));
-    apply_patches(p, rng, SOFT, cuts(spans), false);
+    apply_patches(p, rng, SOFT, cuts(spans));
 }
 
 fn is_word(c: u8) -> bool {
@@ -454,7 +454,7 @@ pub fn lexeme_based_deletions(p: &mut Problem, rng: &mut Rng) {
         iv.sort_by_key(|&(s, e)| std::cmp::Reverse((e - s, s)));
         spans.extend(iv.into_iter().filter(|(s, e)| e - s >= 8));
     }
-    apply_patches(p, rng, SOFT, cuts(spans), false);
+    apply_patches(p, rng, SOFT, cuts(spans));
 }
 
 /// Shrinkray's ordering of single words: shorter, then digits before lowercase before
@@ -483,56 +483,35 @@ fn identifier_spans(b: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// Rename each name to a smaller one: another name of the file or the first unused lowercase
-/// and uppercase letter, the first interesting one in order.
-pub fn normalize_identifiers(p: &mut Problem, _: &mut Rng) {
+/// and uppercase letter. Shrinkray tries one name at a time, the first interesting replacement
+/// in order; here every rename is a patch, so they are tried in parallel and merged, and two
+/// renames of one name conflict.
+pub fn normalize_identifiers(p: &mut Problem, rng: &mut Rng) {
     let text = p.current().to_string();
     let b = text.as_bytes();
-    let mut ids: Vec<String> = (identifier_spans(b).into_iter())
-        .map(|(s, e)| text[s..e].to_string())
+    let mut ids: Vec<&str> = (identifier_spans(b).into_iter())
+        .map(|(s, e)| &text[s..e])
         .collect();
     ids.sort();
     ids.dedup();
-    let mut replacements = ids.clone();
+    let mut replacements: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
     for range in ['a'..='z', 'A'..='Z'] {
         if let Some(c) = range.map(String::from).find(|c| !replacements.contains(c)) {
             replacements.push(c);
         }
     }
-    replacements.sort_by_key(|r| word_key(r));
-    ids.sort_by_key(|t| std::cmp::Reverse(word_key(t)));
+    let mut spans: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+    for (s, e) in word_runs(b) {
+        spans.entry(&text[s..e]).or_default().push((s, e));
+    }
+    let mut patches = Vec::new();
     for t in ids {
-        if p.cancelled() {
-            return;
-        }
-        let source = p.current().to_string();
-        let sb = source.as_bytes();
-        let spans: Vec<(usize, usize)> = (word_runs(sb).into_iter())
-            .filter(|&(s, e)| source[s..e] == t)
-            .collect();
-        if spans.is_empty() {
-            continue;
-        }
-        let attempts: Vec<String> = (replacements.iter())
-            .filter(|r| word_key(r) < word_key(&t))
-            .map(|r| {
-                let mut out = String::with_capacity(source.len());
-                let mut prev = 0;
-                for &(s, e) in &spans {
-                    out.push_str(&source[prev..s]);
-                    out.push_str(r);
-                    prev = e;
-                }
-                out.push_str(&source[prev..]);
-                out
-            })
-            .collect();
-        // The first interesting one in order: windows of the workers' size.
-        for window in attempts.chunks(p.workers()) {
-            if p.test(window).0.iter().any(|&ok| ok) {
-                break;
-            }
+        let Some(at) = spans.get(t) else { continue };
+        for r in replacements.iter().filter(|r| word_key(r) < word_key(t)) {
+            patches.push(at.iter().map(|&(s, e)| (s, e, r.clone())).collect());
         }
     }
+    apply_patches(p, rng, Kind::Replace, patches);
 }
 
 /// Insertion sort of the lines, a swap kept when interesting and smaller.
@@ -566,7 +545,7 @@ pub fn simplify_brackets(p: &mut Problem, rng: &mut Rng) {
             patches.push(replaced);
         }
     }
-    apply_patches(p, rng, Kind::Replace, patches, false);
+    apply_patches(p, rng, Kind::Replace, patches);
 }
 
 #[cfg(test)]
