@@ -4760,3 +4760,37 @@ fn numbers_differ_from_string_constants() {
         return tostring(r)",
     );
 }
+
+/// A join narrowed to `i32` truncates an `i64` argument of small values, not
+/// unboxing its bits: the widened `math.floor`'s result of a small integer,
+/// joined with the loop's index.
+#[test]
+fn an_i64_joining_an_i32_is_truncated() {
+    let src = r##"
+        local floor = math.floor
+        local function fl(x) return floor(x) end
+        for _ = 1, 50 do fl(1 << 40) end
+        local t = {}
+        local function main(n)
+            local s = 0
+            for i = 1, n do
+                local v = 0
+                if i % 3 == 0 then v = 1 end
+                local k = 0
+                if i % 7 == 0 then k = 0 end
+                local w
+                if k == 0 then w = fl(v) else w = i end
+                t[i] = w
+                s = s + w
+            end
+            return s
+        end
+        local r = {}
+        for _ = 1, 3 do
+            r[#r + 1] = main(1000) .. ' ' .. tostring(t[3]) .. ' ' .. tostring(t[4])
+        end
+        return table.concat(r, ',')
+"##;
+    assert_eq!(result(src, true), "333 1 0,333 1 0,333 1 0");
+    compiles_cleanly(src, true);
+}

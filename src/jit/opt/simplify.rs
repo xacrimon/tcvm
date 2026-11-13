@@ -538,6 +538,7 @@ fn fold_arith(f: &mut Func<'_>, i: Inst, op: Op, args: &[Val]) -> bool {
         }),
         IToL => int(0).map(KI64),
         LToI => int(0).and_then(small),
+        LTrunc => int(0).map(|x| KI32(x as i32)),
         IToF | LToF => int(0).map(|x| KF64((x as f64).to_bits())),
         FAdd => flt(0).zip(flt(1)).map(|(x, y)| KF64((x + y).to_bits())),
         FSub => flt(0).zip(flt(1)).map(|(x, y)| KF64((x - y).to_bits())),
@@ -716,7 +717,11 @@ fn reduce(f: &mut Func<'_>, b: Block, k: usize, i: Inst, op: Op, args: &[Val]) -
                 return Changed;
             }
             (FFloor | FCeil, Some((IToF | LToF | FFloor | FCeil, _))) => return To(x),
-            (LToI, Some((IToL, z))) => return To(z),
+            (LToI | LTrunc, Some((IToL, z))) => return To(z),
+            (LTrunc, Some((Unbox(Rep::I64), z))) => {
+                become_op(f, i, Unbox(Rep::I32), &[z]);
+                return Changed;
+            }
             (LToF, Some((IToL, z))) => {
                 become_op(f, i, IToF, &[z]);
                 return Changed;

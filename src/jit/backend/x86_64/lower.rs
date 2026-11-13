@@ -162,7 +162,7 @@ impl Select for Lower<'_, '_> {
                 }
             }
             // The operand's register (`alias`).
-            Op::Refine(_) => {}
+            Op::Refine(_) | Op::LTrunc => {}
             Op::Unbox(rep) => {
                 let x = args[0];
                 let r = res.unwrap();

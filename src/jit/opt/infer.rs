@@ -224,14 +224,16 @@ pub(crate) fn convert(f: &mut Func<'_>, a: Val, rep: Rep, at: Block) -> Val {
         return a;
     }
     if let Some(Op::Box) = f.def_op(a) {
+        // What it boxes converts; an unboxing would take the box's bits
+        // for another representation's.
         let x = f.args(f.def_inst(a).unwrap())[0];
-        if f.vals[x.idx()].ty.rep == rep {
-            return x;
-        }
+        return convert(f, x, rep, at);
     }
     let op = match (ty.rep, rep) {
         (Rep::I32, Rep::I64) => Op::IToL,
         (Rep::I32, Rep::F64) => Op::IToF,
+        (Rep::I64, Rep::F64) => Op::LToF,
+        (Rep::I64, Rep::I32) if ty.within(TypeSet::SMALL) => Op::LTrunc,
         (Rep::Val, r) => {
             if let Some(Op::KVal(bits)) = f.def_op(a) {
                 let v: crate::env::value::Value<'_> =
@@ -254,7 +256,8 @@ pub(crate) fn convert(f: &mut Func<'_>, a: Val, rep: Rep, at: Block) -> Val {
         | (Rep::I32, Rep::Val)
         | (Rep::F64, Rep::Val)
         | (Rep::B1, Rep::Val) => Op::Box,
-        _ => Op::Unbox(rep),
+        // Contained: the compile fails (`tier::compile_caught`).
+        (from, to) => panic!("no conversion from {} to {}", from.name(), to.name()),
     };
     let i = f.make_inst(op, &[a], None, ExitTag::Type);
     f.insert_before_term(at, i);
@@ -284,4 +287,59 @@ pub(crate) fn legalize(f: &mut Func<'_>) -> bool {
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jit::ir::RegionMeta;
+
+    /// A block ending in a return, and an i64 of type `set` in it.
+    fn i64_of(set: TypeSet) -> (Func<'static>, Block, Val) {
+        let mut f = Func::new(RegionMeta {
+            entry_pc: 0,
+            loop_entry: false,
+            params: 0,
+        });
+        let b = f.new_block();
+        f.entry = b;
+        let k = f.make_inst(Op::KI64(1 << 40), &[], None, ExitTag::Type);
+        f.append(b, k);
+        let v = f.result(k);
+        f.vals[v.idx()].ty.set = set;
+        let ret = f.make_inst(Op::Return { a: 0, n: 0 }, &[], None, ExitTag::Type);
+        f.append(b, ret);
+        (f, b, v)
+    }
+
+    #[test]
+    fn an_i64_converts_to_f64_and_a_small_one_to_i32() {
+        let (mut f, b, v) = i64_of(TypeSet::SMALL);
+        let x = convert(&mut f, v, Rep::F64, b);
+        assert_eq!(f.def_op(x), Some(Op::LToF));
+        let x = convert(&mut f, v, Rep::I32, b);
+        assert_eq!(f.def_op(x), Some(Op::LTrunc));
+    }
+
+    /// The box of an i64 is no i32's: an unboxing would take its bits for one.
+    #[test]
+    #[should_panic(expected = "no conversion from i64 to i32")]
+    fn a_boxed_i64_that_may_be_big_does_not_convert_to_i32() {
+        let (mut f, b, v) = i64_of(TypeSet::INT);
+        let bx = f.make_inst(Op::Box, &[v], None, ExitTag::Type);
+        f.insert_before_term(b, bx);
+        let bv = f.result(bx);
+        convert(&mut f, bv, Rep::I32, b);
+    }
+
+    #[test]
+    #[should_panic(expected = "no conversion from f64 to i32")]
+    fn an_f64_does_not_convert_to_i32() {
+        let (mut f, b, _) = i64_of(TypeSet::INT);
+        let k = f.make_inst(Op::KF64(0), &[], None, ExitTag::Type);
+        f.insert_before_term(b, k);
+        let v = f.result(k);
+        convert(&mut f, v, Rep::F64, b);
+        convert(&mut f, v, Rep::I32, b);
+    }
 }

@@ -652,6 +652,8 @@ pub(crate) enum Op {
     LToF,
     /// Exits when outside i32.
     LToI,
+    /// The i32 of an i64 whose values are all small: its low word.
+    LTrunc,
 
     // --- f64 ------------------------------------------------------------------
     FAdd,
@@ -1199,7 +1201,7 @@ impl Op {
                 ..args[0]
             },
             IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | INeg | IAnd | IOr | IXor | INot
-            | IShl | IShr | IDivFloor | IModFloor | IRem | IAsr | IUMulShr(_) | LToI
+            | IShl | IShr | IDivFloor | IModFloor | IRem | IAsr | IUMulShr(_) | LToI | LTrunc
             | FToIExact => Ty::I32,
             IToF | LToF | FAdd | FSub | FMul | FDiv | FNeg | FAbs | FSqrt | FFloor | FCeil
             | FIDiv | ToF64(_) => Ty::F64,

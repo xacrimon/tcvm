@@ -2526,10 +2526,13 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
                     changed = true;
                     continue;
                 }
-                // An i64 into an i32 parameter would need an exit, which has
-                // no snapshot here: the parameter stays.
+                // An i64 not known small into an i32 parameter would need
+                // an exit, which has no snapshot here: the parameter stays.
                 let narrows = |s: Val| {
-                    f.vals[s.idx()].ty.rep == Rep::I64 && f.vals[p.idx()].ty.rep == Rep::I32
+                    let t = f.vals[s.idx()].ty;
+                    t.rep == Rep::I64
+                        && f.vals[p.idx()].ty.rep == Rep::I32
+                        && !t.within(TypeSet::SMALL)
                 };
                 if trivial
                     && let Some(s) = same
@@ -2593,7 +2596,7 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
                     continue;
                 }
                 let rep = f.vals[p.idx()].ty.rep;
-                let op = conversion(f.vals[s.idx()].ty.rep, rep);
+                let op = conversion(f.vals[s.idx()].ty, rep);
                 let i = f.make_inst(op, &[s], None, ExitTag::Type);
                 f.insert(b, at, i);
                 at += 1;
@@ -2631,14 +2634,18 @@ pub(crate) fn remove_trivial_params(f: &mut Func<'_>) {
     }
 }
 
-/// The operation converting `from` to `to`.
-pub(crate) fn conversion(from: Rep, to: Rep) -> Op {
-    match (from, to) {
-        (_, Rep::Val) => Op::Box,
+/// The operation converting a value of type `from` to `to`, which exits
+/// nowhere; a pair without one fails the compile.
+pub(crate) fn conversion(from: Ty, to: Rep) -> Op {
+    match (from.rep, to) {
+        (Rep::I32 | Rep::I64 | Rep::F64 | Rep::B1, Rep::Val) => Op::Box,
         (Rep::I32, Rep::I64) => Op::IToL,
         (Rep::I32, Rep::F64) => Op::IToF,
-        (Rep::I64, Rep::I32) => Op::LToI,
-        (_, rep) => Op::Unbox(rep),
+        (Rep::I64, Rep::F64) => Op::LToF,
+        (Rep::I64, Rep::I32) if from.within(TypeSet::SMALL) => Op::LTrunc,
+        (Rep::Val, rep) if rep != Rep::Val => Op::Unbox(rep),
+        // Contained: the compile fails (`tier::compile_caught`).
+        (from, to) => panic!("no conversion from {} to {}", from.name(), to.name()),
     }
 }
 

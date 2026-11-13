@@ -454,7 +454,7 @@ impl<'a, 'gc> Lower<'a, 'gc> {
             match self.f.op(i) {
                 Op::Guard(_) | Op::Refine(_) => v = self.f.args(i)[0],
                 Op::Unbox(Rep::I32) => v = self.f.args(i)[0],
-                Op::LToI => v = self.f.args(i)[0],
+                Op::LToI | Op::LTrunc => v = self.f.args(i)[0],
                 Op::Box if self.in_d[v.idx()] => v = self.f.args(i)[0],
                 Op::Unbox(Rep::F64) => {
                     let x = self.alias(self.f.args(i)[0]);
