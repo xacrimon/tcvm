@@ -1,7 +1,9 @@
 //! `TCVM_STATS=FILE`: what a run reached, written when its `Lua` drops. One
-//! line per count, sorted: `op NAME N` for the interpreter's dispatches of an
-//! opcode (compiled code dispatches none), and `jit …` for the JIT's events.
-//! The fuzzer reads it to see what its programs exercise.
+//! line per count, sorted: `op NAME N` for the interpreter's dispatches of
+//! every opcode (compiled code dispatches none; an opcode never dispatched is
+//! listed with 0, so a reader learns the opcodes from the file), and `jit …`
+//! for the JIT's events. The fuzzer reads it to see what its programs
+//! exercise.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -40,17 +42,21 @@ impl Stats {
     }
 
     /// Count one `key` event.
+    #[cfg(jit)]
     pub(crate) fn event(&self, key: impl FnOnce() -> String) {
-        if self.on.get() {
-            *self.events.borrow_mut().entry(key()).or_insert(0) += 1;
+        self.count(1, key);
+    }
+
+    #[cfg(jit)]
+    pub(crate) fn count(&self, n: u64, key: impl FnOnce() -> String) {
+        if self.on.get() && n > 0 {
+            *self.events.borrow_mut().entry(key()).or_insert(0) += n;
         }
     }
 
     pub(crate) fn report(&self) -> String {
         let mut lines: Vec<String> = (Op::ALL.iter())
-            .map(|&op| (op, self.ops[op as u8 as usize].get()))
-            .filter(|&(_, n)| n > 0)
-            .map(|(op, n)| format!("op {} {n}", op.name()))
+            .map(|&op| format!("op {} {}", op.name(), self.ops[op as u8 as usize].get()))
             .collect();
         lines.extend((self.events.borrow().iter()).map(|(key, n)| format!("{key} {n}")));
         lines.sort();

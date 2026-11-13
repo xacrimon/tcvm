@@ -45,7 +45,12 @@ fn interpreted_dispatches_are_counted() {
 fn compiled_code_dispatches_nothing() {
     let (got, stats) = counted(SUM, true);
     assert_eq!(got, "500500");
-    if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+    // The lib's `jit` cfg (`build.rs`): no JIT on stable or on other targets.
+    if cfg!(all(
+        feature = "jit",
+        feature = "nightly",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )) {
         assert_eq!(count(&stats, "jit compiled FORLOOP_I"), 1, "{stats}");
         assert!(count(&stats, "op FORLOOP_I") < 1000, "{stats}");
     }
@@ -57,5 +62,7 @@ fn nothing_is_counted_until_asked() {
     lua.load_all();
     let ex = start_on(&mut lua, SUM);
     lua.finish(&ex).unwrap();
-    assert_eq!(lua.stats(), "");
+    let stats = lua.stats();
+    assert!(stats.contains("op FORLOOP_I 0\n"), "{stats}");
+    assert!(stats.lines().all(|l| l.ends_with(" 0")), "{stats}");
 }

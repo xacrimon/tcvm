@@ -127,11 +127,28 @@ enum Stage {
 pub(crate) struct Times {
     last: std::time::Instant,
     stages: [u128; 5],
-    /// Each pass's share of `Passes` in nanoseconds, summed over its runs.
-    pass: Vec<(&'static str, u128)>,
-    /// The runs of each pass that changed the function (`TCVM_STATS`).
-    changed: Vec<(&'static str, u32)>,
+    /// Each pass's share of `Passes` in nanoseconds, summed over its runs, and
+    /// how many of the runs changed the function (`TCVM_STATS`).
+    pass: Vec<(&'static str, u128, u32)>,
 }
+
+/// What a pass returns: a `bool` says whether it changed the function.
+trait PassResult {
+    #[cfg_attr(not(feature = "tcvm-dev"), expect(dead_code))]
+    fn changed(&self) -> bool {
+        false
+    }
+}
+
+impl PassResult for bool {
+    fn changed(&self) -> bool {
+        *self
+    }
+}
+
+impl PassResult for () {}
+impl<T> PassResult for Option<T> {}
+impl<T, E> PassResult for Result<T, E> {}
 
 #[cfg(not(feature = "tcvm-dev"))]
 pub(crate) struct Times;
@@ -143,7 +160,6 @@ impl Times {
             last: std::time::Instant::now(),
             stages: [0; 5],
             pass: Vec::new(),
-            changed: Vec::new(),
         }
     }
 
@@ -154,21 +170,14 @@ impl Times {
         self.last = now;
     }
 
-    /// Run `f` as the pass `name`, adding its time; a pass that returns
-    /// `true` changed the function.
-    fn timed<T: 'static>(&mut self, name: &'static str, f: impl FnOnce() -> T) -> T {
+    /// Run `f` as the pass `name`, adding its time.
+    fn timed<T: PassResult>(&mut self, name: &'static str, f: impl FnOnce() -> T) -> T {
         let t = std::time::Instant::now();
         let r = f();
-        let ns = t.elapsed().as_nanos();
-        if (&r as &dyn std::any::Any).downcast_ref::<bool>() == Some(&true) {
-            match self.changed.iter_mut().find(|(n, _)| *n == name) {
-                Some((_, x)) => *x += 1,
-                None => self.changed.push((name, 1)),
-            }
-        }
-        match self.pass.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, x)) => *x += ns,
-            None => self.pass.push((name, ns)),
+        let (ns, changed) = (t.elapsed().as_nanos(), r.changed() as u32);
+        match self.pass.iter_mut().find(|(n, ..)| *n == name) {
+            Some((_, x, c)) => (*x, *c) = (*x + ns, *c + changed),
+            None => self.pass.push((name, ns, changed)),
         }
         r
     }
@@ -181,7 +190,7 @@ impl Times {
     }
 
     #[inline(always)]
-    fn timed<T: 'static>(&mut self, _: &'static str, f: impl FnOnce() -> T) -> T {
+    fn timed<T: PassResult>(&mut self, _: &'static str, f: impl FnOnce() -> T) -> T {
         f()
     }
 }
@@ -640,10 +649,8 @@ pub(crate) fn compile<'gc>(
     #[cfg(feature = "tcvm-dev")]
     times.mark(Stage::Emit);
     #[cfg(feature = "tcvm-dev")]
-    for &(name, n) in &times.changed {
-        for _ in 0..n {
-            ctx.runtime().stats.event(|| format!("jit pass {name}"));
-        }
+    for &(name, _, changed) in &times.pass {
+        (ctx.runtime().stats).count(changed as u64, || format!("jit pass {name}"));
     }
     #[cfg(feature = "tcvm-dev")]
     if config.dev.time {
@@ -659,7 +666,7 @@ pub(crate) fn compile<'gc>(
             times
                 .pass
                 .iter()
-                .map(|(n, ns)| format!("{n} {:.1}", *ns as f64 / 1000.0))
+                .map(|(n, ns, _)| format!("{n} {:.1}", *ns as f64 / 1000.0))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
