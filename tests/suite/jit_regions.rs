@@ -4622,3 +4622,29 @@ fn transition_stores_of_untyped_values() {
         "1 9"
     );
 }
+
+/// A field store the interpreter never ran (the value's load raises) takes
+/// its shapes from the receiver's earlier sites: one the receiver left since
+/// is dropped, and one no table left yet is stored to by the helper.
+#[test]
+fn stores_at_sites_that_never_ran() {
+    // `o` left `{}` at `o.z`, so no shape remains to test at `o.x`.
+    compiles_cleanly(
+        "local function f(a) local o = {}; o.z = 1; o.x = a.x; return o end
+        local function run(n) for i = 1, n do f(i) end end
+        local n = 0
+        for i = 1, 600 do if not pcall(run, 5) then n = n + 1 end end
+        return tostring(n)",
+        true,
+    );
+    // `{x}` has the edge to `{x, y}` from `q`'s constructor, and is stable.
+    compiles_cleanly(
+        "local q = {x = 1, y = 2}
+        local function f(a) local o = {x = 1}; local _ = o.x; o.y = a.z; return o end
+        local function run(n) for i = 1, n do f(i) end end
+        local n = 0
+        for i = 1, 600 do if not pcall(run, 5) then n = n + 1 end end
+        return tostring(n)",
+        true,
+    );
+}

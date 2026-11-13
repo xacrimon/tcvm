@@ -914,12 +914,19 @@ fn site_shapes<'gc>(
     if v.len() > MAX || v.iter().any(|s| s.is_dict()) {
         return None;
     }
-    let known = b.known.recv_shapes.entry(b.root_of(recv)).or_default();
-    for &s in known.iter() {
-        if v.len() < MAX && !has(&v, s) && !s.is_deprecated() {
+    let root = b.root_of(recv);
+    let now = b.known_shapes(recv);
+    let earlier = b.known.recv_shapes.get(&root).cloned().unwrap_or_default();
+    for s in earlier {
+        // One the receiver left since, by a store that added a key, is none
+        // it has here.
+        let k = b.intern_shape(s);
+        let left = now.is_some_and(|n| !n.contains(k));
+        if v.len() < MAX && !has(&v, s) && !s.is_deprecated() && !left {
             v.push(s);
         }
     }
+    let known = b.known.recv_shapes.entry(root).or_default();
     for &s in &v {
         if !has(known, s) {
             known.push(s);
@@ -1072,14 +1079,16 @@ pub(super) fn emit_set<'gc>(b: &mut Builder<'_, 'gc>, insn: Instruction) {
                     };
                     Way::Store(SlotLoc::new(s, slot).raw(), s.field(slot).as_word(), k)
                 }
-                (None, Some(to)) if !to.is_dict() => Way::Unique(n),
+                // A shape no table left yet (the site never ran) is stable,
+                // and a compiled move would not mark it.
+                (None, Some(to)) if !to.is_dict() && !s.is_stable() => Way::Unique(n),
                 (None, _) => Way::Helper,
             };
             dispatch(b, t, &shapes, way, |b, s| {
                 match (s.find_slot(ks), s.prop_child(mc, ks)) {
                     _ if tells(s) || !stores_inline(s, ks) => newindex(b, recv, key, v, false),
                     (Some(slot), _) => own_store(b, recv, key, s, t, SlotLoc::new(s, slot), kid, v),
-                    (None, Some(to)) if !to.is_dict() => {
+                    (None, Some(to)) if !to.is_dict() && !s.is_stable() => {
                         let loc = SlotLoc::new(to, s.slot_count());
                         trans_store(b, recv, key, s, to, t, loc, kid, v);
                     }

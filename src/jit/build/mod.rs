@@ -1483,8 +1483,10 @@ impl<'a, 'gc> Builder<'a, 'gc> {
         let mut ents = self.blame();
         // A shape guard names the table it tested: an upvalue's is in no
         // register.
-        if self.f.insts[i.idx()].tag == ExitTag::Shape {
-            let t = self.root_of(self.f.args(i)[0]);
+        if self.f.insts[i.idx()].tag == ExitTag::Shape
+            && let Some(&t) = self.f.args(i).first()
+        {
+            let t = self.root_of(t);
             if self.ty(t).rep == Rep::Val || matches!(self.f.def_op(t), Some(Op::KPtr(_))) {
                 ents.push((crate::jit::ir::BLAME_TESTED, t));
             }
