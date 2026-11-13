@@ -2051,7 +2051,11 @@ fn emit_cmp_imm(b: &mut Builder<'_, '_>, pc: u32, insn: Instruction, succs: &[Bl
             };
             // The metamethod takes the operands in source order.
             cold(b, |b| {
-                let kv = b.konst(Value::small(k as i32));
+                let kv = b.konst(if insn.cmp_imm().is_float() {
+                    Value::float(k as f64)
+                } else {
+                    Value::small(k as i32)
+                });
                 let args = if swap { [kv, x] } else { [x, kv] };
                 let f = metamethod(b, bit, &args);
                 let res = mm_call(b, f, &args);

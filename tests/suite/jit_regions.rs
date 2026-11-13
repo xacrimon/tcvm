@@ -1726,6 +1726,37 @@ fn int_compares_against_float_constants() {
     );
 }
 
+/// A compare with a float literal hands `__lt`/`__le` a float, on the side
+/// the source has it.
+#[test]
+fn float_immediates_reach_compare_metamethods() {
+    let src = r##"
+    local kinds = {}
+    local function rec(a, b)
+        local k = (math.type(a) or type(a)) .. "," .. (math.type(b) or type(b))
+        kinds[k] = (kinds[k] or 0) + 1
+        return true
+    end
+    local t = setmetatable({}, {__lt = rec, __le = rec})
+    local seen = {}
+    local function f(x)
+        if x < 1.0 then seen.lt = (seen.lt or 0) + 1 end
+        if x > 2.0 then seen.gt = (seen.gt or 0) + 1 end
+        if x <= 3.0 then seen.le = (seen.le or 0) + 1 end
+        if x >= 4 then seen.ge = (seen.ge or 0) + 1 end
+    end
+    for i = 1, 3000 do f(t) end
+    local out = {}
+    for k, v in pairs(kinds) do out[#out + 1] = k .. "=" .. v end
+    table.sort(out)
+    return table.concat(out, " ") .. " " .. seen.lt + seen.gt + seen.le + seen.ge
+"##;
+    assert_eq!(
+        result(src, true),
+        "float,table=3000 integer,table=3000 table,float=6000 12000"
+    );
+}
+
 /// Results of compiled callees in registers: none, one (stored, in its slot
 /// already, a float, a constant), two and three into one and two wanted,
 /// varargs, deep chains and returns through the interpreter.
