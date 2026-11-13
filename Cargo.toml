@@ -52,20 +52,20 @@ tcvm-derive = { path = "derive", version = "0.1.0" }
 hashbrown = { version = "0.17.1", default-features = false, features = ["allocator-api2"] }
 allocator-api2 = { version = "0.2.21", default-features = false, features = ["alloc"] }
 foldhash = { version = "0.2.0", default-features = false }
-bitflags = "2.11.1"
+bitflags = "2.13.2"
 logos = "0.16.1"
 cstree = "0.14.0"
-thiserror = "2.0.18"
+thiserror = "2.0.21"
 ariadne = "0.6.0"
 rand_pcg = { version = "0.10.2", optional = true }
 rand_core = { version = "0.10.1", optional = true }
-getrandom = { version = "0.4.2", optional = true }
-libc = "0.2.186"
+getrandom = { version = "0.4.3", optional = true }
+libc = "0.2.191"
 
 [dev-dependencies]
 tcvm = { path = ".", default-features = false, features = ["tcvm-dev"] }
 paste = "1.0.15"
-insta = "1.47.2"
+insta = "1.49.0"
 rand = { version = "0.10", default-features = false }
 rand_pcg = "0.10.2"
 
