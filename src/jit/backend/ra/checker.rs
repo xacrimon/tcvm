@@ -543,7 +543,8 @@ impl CheckerState {
                 // according to the move semantics in the step
                 // function below.
             }
-            &CheckerInst::Remat { vreg, from, .. } => {
+            // Before the edit only: it may write over its own source.
+            &CheckerInst::Remat { vreg, from, .. } if pos == InstPosition::Before => {
                 if let Some((alloc, src)) = from {
                     let ok = src.is_some_and(|s| {
                         self.get_value(&alloc)
@@ -555,6 +556,7 @@ impl CheckerState {
                     }
                 }
             }
+            &CheckerInst::Remat { .. } => {}
         }
         Ok(())
     }
