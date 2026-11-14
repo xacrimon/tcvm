@@ -485,6 +485,7 @@ impl<'a> Em<'a> {
             Remat::AndImm { src: sv, imm } => {
                 let d = gpr(r);
                 match (src.as_reg(), src.as_stack(), self.v.remat[sv as usize]) {
+                    (Some(s), _, _) if gpr(s) == d => {}
                     (Some(s), _, _) => self.a.mov(d, gpr(s)),
                     (None, Some(slot), _) => self.a.load(Sz::Q, d, spill(slot.index())),
                     (None, None, Remat::Slot(slot)) => {

@@ -1191,7 +1191,10 @@ impl Ra {
             }
         };
         while !ms.is_empty() {
-            if let Some(k) = (0..ms.len()).find(|&k| !ms.iter().any(|m| m.from == ms[k].to)) {
+            // A remat into its own source reads it before writing.
+            if let Some(k) =
+                (0..ms.len()).find(|&k| !ms.iter().any(|m| m.from == ms[k].to && m.to != ms[k].to))
+            {
                 put(ms.swap_remove(k));
                 continue;
             }
