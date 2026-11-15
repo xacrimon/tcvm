@@ -19,9 +19,6 @@ pub(crate) enum SRep {
     I64,
     F64,
     B1,
-    /// A call site's only: the raw pointer of a heap object whose value tag
-    /// is the entry's `reg`.
-    Ptr,
 }
 
 /// Where a snapshot entry's value is.
@@ -167,8 +164,7 @@ impl<'a> SnapView<'a> {
             1 => SRep::I32,
             2 => SRep::I64,
             3 => SRep::F64,
-            4 => SRep::B1,
-            _ => SRep::Ptr,
+            _ => SRep::B1,
         };
         let loc = match w >> 11 & 7 {
             0 => Loc::Reg(index as u8),

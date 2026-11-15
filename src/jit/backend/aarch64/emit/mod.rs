@@ -10,9 +10,7 @@ use crate::jit::backend::aarch64::asm::{
     Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
 };
 use crate::jit::backend::aarch64::inst::{MInst, MOp};
-use crate::jit::backend::emit::{
-    Emitted, ExitOut, FastEntry, Selected, SiteOut, Src, rotate_loops, thread_jumps,
-};
+use crate::jit::backend::emit::{Emitted, ExitOut, Selected, Src, rotate_loops, thread_jumps};
 use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
 use crate::jit::backend::reg::{Allocation, Block, Inst, PReg, RegClass};
 use crate::jit::backend::vcode::{Remat, VCode};
@@ -28,12 +26,8 @@ macro_rules! addr {
     };
 }
 
-mod call;
-mod iter;
-
 struct Em<'a> {
     a: Asm,
-    s: &'a Selected,
     v: &'a VCode<MInst>,
     out: &'a Output,
     frame: u32,
@@ -46,23 +40,7 @@ struct Em<'a> {
     /// The moves of the edges that do not fall through: where the stub is,
     /// the branch and its edge, and where the stub goes on to.
     stubs: Vec<(Label, usize, usize, Label)>,
-    /// By block, for the resume blocks.
-    resume: Vec<Option<call::ResumeLabels>>,
-    ool: Vec<call::Ool>,
-    /// The calls' sites, with their return addresses and miss paths.
-    sites: Vec<call::Site>,
-    /// The patch points and where each jumps once the region is invalid.
-    lazy: Vec<(Label, Label)>,
-    /// `tail_level`'s level path, shared; whether anything uses it.
-    level_tail: (Label, bool),
     rt: u64,
-    /// The address of the function's bytecode.
-    code: u64,
-    /// The parameters a function region takes in registers.
-    nreg: u8,
-    /// Its prototype's address and the entry a call of it from here takes,
-    /// its parameters in registers.
-    own: Option<(u64, Label)>,
 }
 
 fn gpr(p: PReg) -> Gpr {
@@ -80,65 +58,8 @@ fn spill_off(slot: usize) -> i32 {
     (FRAME_SPILLS + 8 * slot) as i32
 }
 
-/// The fast entry past its arity and native stack checks, for a caller that
-/// proved them.
-const KNOWN_ENTRY: usize = 24;
-
-/// A fast entry's known entry, from it: the one that loads the parameters
-/// from their slots, or with `regs` the one past those loads.
-pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
-    KNOWN_ENTRY + if regs { 4 * nparams.min(8) as usize } else { 0 }
-}
-
-/// A trampoline: a C call of `target` that keeps x1-x15, d0-d7 and d16-d30
-/// (x0 or d0, the result's, left out) behind a frame record that keeps the
-/// frame chain walkable; and its frame's size.
-pub(crate) fn trampoline(target: usize, float: bool) -> (Asm, u32) {
-    let ints = (float as u8..16).map(Gpr);
-    let floats = (!float as u8..8).chain(16..31).map(Fpr);
-    let frame = (16 + 8 * (ints.len() + floats.clone().count()) as u64).next_multiple_of(16);
-    let mut a = Asm::new();
-    a.sub_imm(Sz::X, SP, SP, frame);
-    a.stp(FP, LR, SP, 0);
-    a.mov_sp(FP, SP);
-    for load in [false, true] {
-        let mut off = 16;
-        for x in ints.clone() {
-            match load {
-                false => a.str(x, SP, off),
-                true => a.ldr(x, SP, off),
-            }
-            off += 8;
-        }
-        for d in floats.clone() {
-            match load {
-                false => a.str_d(d, SP, off),
-                true => a.ldr_d(d, SP, off),
-            }
-            off += 8;
-        }
-        if !load {
-            a.bl_far(target);
-        }
-    }
-    a.ldp(FP, LR, SP, 0);
-    a.add_imm(Sz::X, SP, SP, frame);
-    a.ret();
-    (a, frame as u32)
-}
-
-/// `rt` is the runtime's address, which helpers take, and `code` that of
-/// the function's bytecode; `window` is how many slots the frame needs where
-/// that is more than its prototype's, else 0.
-pub(crate) fn emit(
-    s: &Selected,
-    out: &Output,
-    rt: u64,
-    code: u64,
-    fast: Option<FastEntry>,
-    invalidable: bool,
-    window: u16,
-) -> Result<Emitted, Bail> {
+/// `rt` is the runtime's address, which helpers take.
+pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail> {
     if out.num_spillslots > MAX_SPILLS {
         return Err(Bail::TooLarge);
     }
@@ -153,16 +74,7 @@ pub(crate) fn emit(
         region_word: a.new_label(),
         frame: ((FRAME_SPILLS + 8 * out.num_spillslots) as u32).next_multiple_of(16),
         stubs: Vec::new(),
-        resume: Vec::new(),
-        ool: Vec::new(),
-        sites: Vec::new(),
-        lazy: Vec::new(),
-        level_tail: (a.new_label(), false),
         rt,
-        code,
-        nreg: fast.map_or(0, |fe| fe.num_params.min(8)),
-        own: None,
-        s,
         v: &s.vcode,
         out,
         a,
@@ -170,10 +82,6 @@ pub(crate) fn emit(
     em.a.bind(em.region_word);
     em.a.emit(0);
     em.a.emit(0);
-    for b in &s.vcode.blocks {
-        let r = b.resume.then(|| em.resume_labels());
-        em.resume.push(r);
-    }
     let kept = |b: &u32| !skip[*b as usize];
     let mut laid: Vec<u32> = s.layout.emit.iter().copied().filter(kept).collect();
     let hot = s.layout.emit[..s.layout.hot]
@@ -182,7 +90,6 @@ pub(crate) fn emit(
         .count();
     let loops = &s.layout.loops;
     let tops = rotate_loops(&s.vcode, loops, &em.labels, &em.dest, &mut laid, hot);
-    let entries = fast.map(|fe| em.fast_entry(fe, laid.first() == Some(&0)));
     for (at, &b) in laid.iter().enumerate() {
         let next = laid.get(at + 1).map(|&x| em.labels[x as usize]);
         // A rotated loop's top, past the jump into its header: padding
@@ -191,13 +98,8 @@ pub(crate) fn emit(
             em.a.align(16);
         }
         em.a.bind(em.labels[b as usize]);
-        let resume = s.vcode.blocks[b as usize].resume;
-        let insts = out.block_insts_and_edits(&s.vcode, Block::new(b as usize));
-        for (k, ie) in insts.enumerate() {
+        for ie in out.block_insts_and_edits(&s.vcode, Block::new(b as usize)) {
             match ie {
-                // A fast callee's `ret` lands at the `Resume`, past anything
-                // before it.
-                InstOrEdit::Edit(_) if resume && k == 0 => bug!("a move before a call's resume"),
                 InstOrEdit::Edit(e) => em.edit(e),
                 InstOrEdit::Inst(i) => em.inst(i.index(), b as usize, next),
             }
@@ -211,17 +113,12 @@ pub(crate) fn emit(
         }
         em.a.b(to);
     }
-    for o in std::mem::take(&mut em.ool) {
-        em.out_of_line(o);
-    }
-    if let (Some(fe), Some(e)) = (fast, entries) {
-        em.fast_stubs(fe, e);
-    }
-    if invalidable {
-        em.dead_entry();
-    }
-    let dispatch = em.dispatch_entry(window);
-    em.level_tail_stub();
+    // Where dispatch enters: through `level_enter`, which returns to
+    // `level_land`, on to the entry block.
+    let dispatch = em.a.new_label();
+    em.a.bind(dispatch);
+    em.a.adr(X16, em.labels[0]);
+    em.a.b_far(addr!(abi::level_enter));
     // One stub per exit and the region's exit trampoline, which they share.
     let exit_region = em.a.new_label();
     for k in 0..em.exit_labels.len() {
@@ -235,19 +132,7 @@ pub(crate) fn emit(
     em.a.orr_shift(Sz::X, X16, X17, X16, Shift::Lsl, 48);
     em.a.b_far(addr!(abi::exit_common));
     let at = |l: Label| em.a.label_offset(l) as u32;
-    let sites = std::mem::take(&mut em.sites);
-    let sites = (sites.into_iter())
-        .map(|(keys, miss, site)| SiteOut {
-            keys: keys.iter().map(|&(l, level)| (at(l), level)).collect(),
-            miss: at(miss),
-            ..site
-        })
-        .collect();
-    let lazy = em.lazy.iter().map(|&(x, y)| (at(x), at(y))).collect();
     Ok(Emitted {
-        sites,
-        lazy,
-        fast: entries.map(|e| at(e.fast)),
         entry: at(dispatch),
         num_spills: out.num_spillslots as u32,
         frame_size: em.frame,
@@ -270,7 +155,6 @@ fn exit_out(s: &Selected, out: &Output, k: usize) -> ExitOut {
                     consts.push(w);
                     Loc::Const(consts.len() as u32 - 1)
                 }
-                Src::Home => bug!("an exit's entry in its frame slot"),
                 Src::Operand(k) => {
                     let al = allocs[(e.own + k as u32) as usize];
                     match (al.as_reg(), al.as_stack()) {
@@ -395,42 +279,6 @@ impl<'a> Em<'a> {
         // A value left for the allocator to make where used has no code.
         let unmade = self.allocs(i).first().is_some_and(|a| a.is_none());
         match m.op {
-            MOp::CallLua => self.call(i, block, next),
-            MOp::Dispatch => {
-                let (word, pc) = self.s.dispatches[imm as usize];
-                self.a.ldp(FP, LR, SP, 0);
-                self.a.add_imm(Sz::X, SP, SP, self.frame as u64);
-                self.a.ldr_lit(INSN, word);
-                self.a.ldr_lit(PC, self.code + (pc as u64 + 1) * 8);
-                self.a.ldr_lit(X16, self.rt);
-                self.a.ldr(X16, X16, (word & 0xff) as i32 * 8);
-                self.tail_level();
-            }
-            MOp::VarargAt => {
-                // The extras end at the header, their count in its first
-                // word's upper bits: extra k is at base - 32 - 8 * nv + 8 * k,
-                // read only when k < nv.
-                let d = self.r(i, 0);
-                self.a.ldr(X16, BASE, -32);
-                self.a.lsr_imm(Sz::X, X16, X16, 48);
-                self.a.cmp_imm(Sz::W, X16, imm);
-                self.a.lsl_imm(Sz::W, X16, X16, 3);
-                self.a.sub(Sz::X, X16, BASE, X16);
-                self.a.ldr(d, X16, 8 * imm as i32 - 32);
-                self.a.mov_imm(X17, NIL);
-                self.a.csel(Sz::X, d, d, X17, Cond::Hi);
-            }
-            MOp::TailEnter => self.tail_enter(self.r(i, 0), imm),
-            MOp::FnFits => {
-                let (d, f) = (self.r(i, 0), self.r(i, 1));
-                self.a.ldrb(X16, f, crate::jit::layout::FN_MAX_STACK as i32);
-                self.a.add_shift(Sz::X, X16, BASE, X16, Shift::Lsl, 3);
-                self.a
-                    .ldr(X17, THREAD, crate::jit::layout::THREAD_STACK_END as i32);
-                self.a.cmp(Sz::X, X16, X17);
-                self.a.cset(Sz::W, d, Cond::Ls);
-            }
-            MOp::Resume => self.on_resume(i, block),
             MOp::Entry => {
                 self.a.sub_imm(Sz::X, SP, SP, self.frame as u64);
                 self.a.stp(FP, LR, SP, 0);
@@ -443,7 +291,6 @@ impl<'a> Em<'a> {
             MOp::StrSlot => self.a.str(self.r(i, 0), BASE, imm as i32 * 8),
             MOp::Ldr if sz == Sz::W => self.a.ldr_w(self.r(i, 0), self.r(i, 1), imm as i32),
             MOp::Ldr => self.a.ldr(self.r(i, 0), self.r(i, 1), imm as i32),
-            MOp::Ldrb => self.a.ldrb(self.r(i, 0), self.r(i, 1), imm as i32),
             MOp::Str => self.a.str(self.r(i, 0), self.r(i, 1), imm as i32),
             MOp::LdrIdx | MOp::StrIdx => {
                 let ext = if m.cc == 1 { Extend::Uxtw } else { Extend::Lsl };
@@ -452,9 +299,6 @@ impl<'a> Em<'a> {
                     MOp::LdrIdx => self.a.ldr_idx(t, n, x, ext, true),
                     _ => self.a.str_idx(t, n, x, ext, true),
                 }
-            }
-            MOp::ArrNext | MOp::NamedNext | MOp::NamedKey | MOp::NamedVal | MOp::HashKeys => {
-                self.step(i, m)
             }
             MOp::MovBase => self.a.mov(self.r(i, 0), BASE),
             MOp::Uxtw => self.a.mov_w(self.r(i, 0), self.r(i, 1)),
@@ -478,15 +322,6 @@ impl<'a> Em<'a> {
             MOp::NegsR => self.a.negs(sz, self.r(i, 0), self.r(i, 1)),
             MOp::FNeg => self.a.fneg(self.fr(i, 0), self.fr(i, 1)),
             MOp::Frintm => self.a.frintm(self.fr(i, 0), self.fr(i, 1)),
-            MOp::Frintp => self.a.frintp(self.fr(i, 0), self.fr(i, 1)),
-            MOp::FAbs => self.a.fabs(self.fr(i, 0), self.fr(i, 1)),
-            MOp::FSqrt => self.a.fsqrt(self.fr(i, 0), self.fr(i, 1)),
-            MOp::Fcvtzs => self.a.fcvtzs(sz, self.r(i, 0), self.fr(i, 1)),
-            MOp::Fcsel => {
-                // SAFETY: selection wrote an `asm::Cond`.
-                let cc: Cond = unsafe { std::mem::transmute(m.cc) };
-                (self.a).fcsel(self.fr(i, 0), self.fr(i, 1), self.fr(i, 2), cc)
-            }
             MOp::AndImm => self.a.and_imm(sz, self.r(i, 0), self.r(i, 1), imm),
             MOp::TstImm => self.a.tst_imm(sz, self.r(i, 0), imm),
             MOp::AddRR => self.a.add(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
@@ -545,12 +380,7 @@ impl<'a> Em<'a> {
                 self.a.b_cond(cc, self.exit_labels[imm as usize]);
             }
             MOp::BExit => self.a.b(self.exit_labels[imm as usize]),
-            MOp::LazyExit => {
-                let at = self.a.new_label();
-                self.a.patch_point(at);
-                self.lazy.push((at, self.exit_labels[imm as usize]));
-            }
-            MOp::Call | MOp::CallCold => {
+            MOp::Call => {
                 let h = Helper::of(imm as u16);
                 let info = h.info();
                 for (k, c) in info.ctx.iter().enumerate() {
@@ -563,14 +393,7 @@ impl<'a> Em<'a> {
                 if info.imm {
                     self.a.mov_imm(Gpr(info.ctx.len() as u8), imm >> 16);
                 }
-                let to = crate::jit::helpers::address(h);
-                self.a.bl_far(match m.op {
-                    MOp::Call => to,
-                    _ => match self.s.tramps.iter().find(|t| t.0 == to) {
-                        Some(t) => t.1,
-                        None => bug!("{h:?} has no trampoline"),
-                    },
-                });
+                self.a.bl_far(crate::jit::helpers::address(h));
             }
             MOp::Ret => {
                 // To a compiled caller, or to `level_land` for a frame

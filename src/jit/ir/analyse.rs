@@ -21,8 +21,6 @@ pub(crate) struct Analysis {
     /// entry edge.
     pub(crate) guarded: Vec<Val>,
     block_of: Vec<Block>,
-    /// Lazy exits stay (`Graph::invalidable`).
-    lazy: bool,
 }
 
 /// Whether an instruction stays with no use of its value.
@@ -36,7 +34,7 @@ pub(crate) fn has_effect(i: &Inst) -> bool {
 
 impl Analysis {
     pub(crate) fn live(&self, v: Val, i: &Inst) -> bool {
-        self.uses[v.idx()] != 0 || (has_effect(i) && (i.op != Op::LazyExit || self.lazy))
+        self.uses[v.idx()] != 0 || has_effect(i)
     }
 
     /// Liveness and use counts.
@@ -44,11 +42,8 @@ impl Analysis {
         self.uses.clear();
         self.uses.resize(g.insts.len(), 0);
         self.work.clear();
-        self.lazy = g.invalidable;
-        self.work.extend((0..g.insts.len() as u32).filter(|&v| {
-            let i = &g.insts[v as usize];
-            has_effect(i) && (i.op != Op::LazyExit || g.invalidable)
-        }));
+        self.work
+            .extend((0..g.insts.len() as u32).filter(|&v| has_effect(&g.insts[v as usize])));
         // A loop's entry state is where what copy 1 puts on its entry edge
         // leaves to.
         for l in &g.loops {

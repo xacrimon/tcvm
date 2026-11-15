@@ -360,29 +360,8 @@ impl Emitter {
                 match (d.op, i.op) {
                     (IToF, FToIExact) => Some(Val(d.a)),
                     (IToF, _) => Some(self.op1(SExt32, Rep::I64, Val(d.a))),
-                    // The conversion and back: a float that is no `I32`
-                    // (a NaN, a fraction, one out of range) differs.
-                    (_, FToIExact) if self.lowered => {
-                        let x = self.op1(FToI, Rep::I32, a);
-                        let back = self.op1(IToF, Rep::F64, x);
-                        let same = self.cmp(FCmp, Cc::Eq, back, a);
-                        Some(self.emit(Guard, Rep::I32, i.aux, same.0, i.b, x.0))
-                    }
                     _ => None,
                 }
-            }
-            // `-MIN` leaves the representation.
-            AbsOvf if self.lowered => {
-                let min = match i.rep {
-                    Rep::I32 => self.kint(i.rep, i32::MIN as i64),
-                    _ => self.kint(i.rep, i64::MIN),
-                };
-                let fits = self.cmp(Cmp, Cc::Ne, a, min);
-                let x = self.emit(Guard, i.rep, i.aux, fits.0, i.b, a.0);
-                let zero = self.kint(i.rep, 0);
-                let neg = self.cmp(Cmp, Cc::Lt, x, zero);
-                let minus = self.op1(Neg, i.rep, x);
-                Some(self.emit(Select, i.rep, 0, neg.0, minus.0, x.0))
             }
             LToI => {
                 if let Some(x) = self.ki(a) {
@@ -409,9 +388,7 @@ impl Emitter {
             GetIndex | SetIndex => self.index(i),
             K32 | K64 | KF64 | KObj | Base | Load | Store | LoadIdx | StoreIdx | SlotLoad
             | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr
-            | AbsOvf | FMod | CallHelper | CallHelperCold | CallEntry | Resume | Dispatch
-            | ArrNext | NamedNext | NamedKey | NamedVal | HashKeys | CallArgs | Arg | TailEnter
-            | FnFits | VarargAt => None,
+            | AbsOvf | FMod | CallHelper => None,
             Truthy => self.truthy(a),
         }
     }

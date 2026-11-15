@@ -331,12 +331,6 @@ impl<'gc> ThreadState<'gc> {
                     let p = crate::jit::spill_addr(fp, i as usize) as *const Value<'gc>;
                     cc.trace(unsafe { &*p });
                 }
-                // The heap does not move: the object is traced as its value.
-                (Loc::Spill(i), SRep::Ptr) => {
-                    let p = crate::jit::spill_addr(fp, i as usize) as *const u64;
-                    let v = unsafe { Value::of_pointer(e.reg as u64, *p) };
-                    cc.trace(&v);
-                }
                 (Loc::Slot(r), _) => homes.insert(r as usize),
                 _ => {}
             }

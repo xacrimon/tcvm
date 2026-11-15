@@ -442,17 +442,6 @@ ops! {
     Store       Both Field  (Ptr Any Imm)     None [] [BY_FIELD] [];
     LoadIdx     Both Field  (Ptr I64 Opt)     Dyn  [BY_FIELD] [] [];
     StoreIdx    Both Field  (Ptr I64 Any)     None [] [BY_FIELD] [];
-    // A generic `for`'s steps over a table (its lock), each a declared
-    // sequence. `ArrNext`: the index of the first array slot at or after
-    // `b` that is not nil, or the array part's size. `NamedNext`: that of
-    // the first such named slot, the metatable's skipped, or -1. `NamedKey`
-    // and `NamedVal`: the key and the value of named slot `b`. `HashKeys`:
-    // the key counts of the hash parts in `b` (`HASH_*`) or'd.
-    ArrNext     Both No     (Ptr I32 No)      I32  [ARR_SIZE ARR_ITEMS] [] [];
-    NamedNext   Both No     (Ptr I32 No)      I32  [SHAPE FIELD] [] [];
-    NamedKey    Both No     (Ptr I32 No)      Val  [SHAPE] [] [];
-    NamedVal    Both No     (Ptr I32 No)      Val  [SHAPE FIELD] [] [];
-    HashKeys    Both No     (Ptr Imm No)      I64  [FIELD ARR_ITEMS] [] [];
     // The frame's base, which frame fields are loaded from.
     Base        Both No     (No No No)        Ptr  [] [] [];
     SlotLoad    Both Slot   (No No No)        Val  [SLOT] [] [];
@@ -525,38 +514,9 @@ ops! {
     Jump        Both No     (Blk No No)       None [] [] [TERMINATOR];
     Br          Both No     (B1 Blk Blk)      None [] [] [TERMINATOR];
     Ret         Both No     (Imm Imm No)      None [SLOT] [] [TERMINATOR];
-    // The Lua call protocol. The callee and its arguments are in its slots;
-    // the state's values live on in the frame, and the collector clears the
-    // slots it does not name. `c`, a byte each: where results land (the
-    // `CALL`'s `a`), the argument count, the `CALL`'s `c`, and the header's
-    // slot, which is the first but for a metamethod's call, staged past the
-    // frame's registers. `Resume` is first in the call's successor: the
-    // first result when it has a value, else the results in their slots.
-    // Leave for the interpreter's handler of the instruction at pc `c`,
-    // whose word is `a` (low) and `b`: what is live is in its slots.
-    Dispatch    Both No     (Imm Imm Imm)     None [SLOT] [] [TERMINATOR];
-    CallEntry   Both No     (Fs Blk Imm)      None [ALL] [ALL] [CALLS TERMINATOR];
-    // The frame's extra argument `a`, nil past their count.
-    VarargAt    Both No     (Imm No No)       Val  [FRAME] [] [];
-    // Replace the frame by one of the Lua closure without varargs `a` (its
-    // lock), whose `b` arguments are in `R[0..]`: nothing of this frame is
-    // left to close. `FnFits`: whether such a closure's window fits the
-    // stack from this frame's base.
-    TailEnter   Both No     (Ptr Imm No)      None [SLOT] [] [TERMINATOR];
-    FnFits      Both No     (Ptr No No)       B1   [FRAME] [] [];
-    // The call that ends the block is of a Lua closure without varargs
-    // whose prototype's address is pool word `c`: these are its first
-    // arguments, passed in registers. `Arg`: parameter `a` of a function
-    // region, which such a caller passes so and every other entry loads.
-    CallArgs    Both No     (Vals Len Imm)    None [] [] [CALLS PINNED];
-    Arg         Both No     (Imm No No)       Val  [] [] [PINNED];
-    Resume      Both No     (Imm No No)       Dyn  [] [SLOT] [PINNED];
 
     // A C call of the helper in `aux` (`HELPERS`), its immediate in `c`.
     CallHelper  Both Helper (Vals Len Imm)    Dyn  [] [] [CALLS];
-    // The same call from a cold block, of a helper that does not allocate:
-    // it keeps every register but its result's.
-    CallHelperCold Both Helper (Vals Len Imm) Dyn  [] [] [CALLS];
 
     // Unit ops: optimized as wholes, lowered by copy 1.
     CheckType   H    SetTag (Val Fs No)       Dyn  [] [] [EXITS];

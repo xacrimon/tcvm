@@ -267,21 +267,9 @@ pub(crate) fn compile<'gc>(
     high.reset(false);
     let pool = &mut scratch.pool;
     pool.words.clear();
-    let crate::jit::build::Built {
-        shapes,
-        deps,
-        missing,
-        window,
-        protos,
-    } = {
-        use crate::jit::layout::{METRICS, NUMBER_MT_SLOT, rt_read, type_mt_cell};
-        let links = crate::jit::build::Links {
-            metrics: rt_read(ctx, METRICS) as u64,
-            number_mt: rt_read(ctx, type_mt_cell(NUMBER_MT_SLOT)) as u64,
-            next_fn: Value::function(ctx.next_fn()).to_raw(),
-            ipairs_iter: Value::function(ctx.ipairs_iter()).to_raw(),
-        };
-        crate::jit::build::build(high, pool, &cfg, closure.proto, pc, links)
+    let (shapes, missing) = {
+        let metrics = crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64;
+        crate::jit::build::build(high, pool, &cfg, closure.proto, pc, metrics)
     };
     #[cfg(feature = "tcvm-dev")]
     for op in missing {
@@ -307,10 +295,7 @@ pub(crate) fn compile<'gc>(
     // A region that only leaves does no work: none of its loops comes
     // around and nothing returns.
     let around = |b: &crate::jit::ir::Block| low.g.block(*b).npreds > low.g.block(*b).nfwd;
-    let returns = (low.g.insts.iter()).any(|i| {
-        use crate::jit::ir::ops::Op;
-        matches!(i.op, Op::Ret | Op::Dispatch | Op::CallEntry | Op::TailEnter)
-    });
+    let returns = (low.g.insts.iter()).any(|i| i.op == crate::jit::ir::ops::Op::Ret);
     if !low.g.order.iter().any(around) && !returns {
         return Err(Bail::Useless);
     }
@@ -353,32 +338,11 @@ pub(crate) fn compile<'gc>(
         }
     }
     mark!(3);
-    let rt = crate::jit::layout::rt_word(ctx) as u64;
-    // A function region of a prototype without varargs is what a compiled
-    // caller's `blr` can enter.
-    let enterable =
-        cfg.code[pc as usize].op() == crate::instruction::Op::FUNC && !closure.proto.is_vararg;
-    let fast = enterable.then_some(crate::jit::backend::emit::FastEntry {
-        num_params: closure.proto.num_params,
-        max_stack: window.max(closure.proto.max_stack_size as u16),
-        proto: closure.proto.ptr.as_ptr() as u64,
-    });
-    sel.tramps.clear();
-    for i in &low.g.insts {
-        if i.op == crate::jit::ir::ops::Op::CallHelperCold {
-            let h = crate::jit::ir::ops::Helper::of(i.aux);
-            let to = crate::jit::helpers::address(h);
-            let float = h.info().ret == crate::jit::ir::types::Rep::F64;
-            sel.tramps.push((to, ctx.jit().trampoline(to, float)?));
-        }
-    }
-    let code = closure.code as u64;
-    let mut em = target::emit::emit(sel, out, rt, code, fast, !deps.is_empty(), window)?;
+    let mut em = target::emit::emit(sel, out, crate::jit::layout::rt_word(ctx) as u64)?;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc.reserve(em.asm.max_len())?;
     let start = block.rx();
     let entry = start.wrapping_add(em.entry as usize);
-    let fast_entry = (em.fast).map_or(std::ptr::null(), |at| start.wrapping_add(at as usize));
     let code = (em.asm)
         .finish(start as usize)
         .unwrap_or_else(|e| crate::jit::bug!("assembler: {e:?}"));
@@ -447,36 +411,6 @@ pub(crate) fn compile<'gc>(
             NO_BLAME,
         ));
     }
-    // The sites, their snapshots after the exits'.
-    let mut sites: Vec<crate::jit::region::Site> = Vec::new();
-    for site in &mut em.sites {
-        for s in &mut site.entries {
-            if let Loc::Const(c) = s.loc {
-                let w = site.consts[c as usize];
-                let k = consts.iter().position(|&x| x == w).unwrap_or_else(|| {
-                    consts.push(w);
-                    consts.len() - 1
-                });
-                s.loc = Loc::Const(k as u32);
-            }
-        }
-        let at = snaps.len() as u32;
-        let after = crate::jit::ir::ops::ExitKind::After;
-        encode_snap(&mut snaps, after, 0, &[], &site.entries);
-        sites.extend(
-            site.keys
-                .iter()
-                .map(|&(key, level)| crate::jit::region::Site {
-                    key,
-                    snap: at,
-                    hdr: site.hdr,
-                    pc_after: site.pc_after,
-                    level,
-                    miss: site.miss,
-                }),
-        );
-    }
-    sites.sort_unstable_by_key(|s| s.key);
     let mut nest = Vec::new();
     if cfg.code[pc as usize].op() != crate::instruction::Op::FUNC {
         let mut l = cfg.loop_of[cfg.block_of[pc as usize] as usize];
@@ -491,7 +425,7 @@ pub(crate) fn compile<'gc>(
             code: block,
             _alloc: alloc,
             entry,
-            fast_entry,
+            fast_entry: std::ptr::null(),
             // SAFETY: the words of values the builder read from live objects.
             pool: (pool.words.iter())
                 .map(|&w| unsafe { Value::from_raw(w) })
@@ -505,18 +439,18 @@ pub(crate) fn compile<'gc>(
             entry_regs: Box::new([]),
             entry_fails: std::cell::Cell::new(0),
             proto: closure.proto,
-            protos: protos.into_boxed_slice(),
+            protos: Box::new([]),
             site_protos: Box::new([]),
             entry_pc: pc,
-            window,
+            window: 0,
             nest: nest.into_boxed_slice(),
             num_spills: em.num_spills,
             #[cfg(target_arch = "aarch64")]
             frame_size: em.frame_size,
             retired: std::cell::Cell::new(false),
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
-            sites: sites.into_boxed_slice(),
-            lazy: std::mem::take(&mut em.lazy).into_boxed_slice(),
+            sites: Box::new([]),
+            lazy: Box::new([]),
             landings: Box::new([]),
             invalidated: std::cell::Cell::new(false),
         },
@@ -525,15 +459,6 @@ pub(crate) fn compile<'gc>(
         em.region_word as usize,
         crate::dmm::Gc::as_ptr(region) as u64,
     );
-    for (on, groups) in deps {
-        match on {
-            crate::jit::build::DepOn::Class(c) => {
-                let bits = crate::env::MetamethodBits::from_bits_retain(groups as u32);
-                c.depend(ctx.mutation(), region, bits);
-            }
-            crate::jit::build::DepOn::Shape(s) => s.depend(ctx.mutation(), region, groups),
-        }
-    }
     Ok(region)
 }
 

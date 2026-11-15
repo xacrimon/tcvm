@@ -27,8 +27,7 @@ fn aux_key(i: &Inst) -> u16 {
 /// A heap key's index among the versions: the heaps by their bit, then
 /// the frame slots, then the indexed fields' slots.
 const SLOT_KEYS: u32 = 16;
-// A frame's slots, and those of a call staged past them.
-const FIELD_KEYS: u32 = SLOT_KEYS + 256 + 16;
+const FIELD_KEYS: u32 = SLOT_KEYS + 256;
 
 /// A memory access as the number table keys it: its kind, field or slot,
 /// base and index, and for a store the value it leaves there. A load and
@@ -461,7 +460,7 @@ impl Emitter {
             }
         } else if !info.writes.is_empty() {
             self.kill(info.writes);
-        } else if matches!(i.op, Op::CallHelper | Op::CallHelperCold) {
+        } else if i.op == Op::CallHelper {
             // An allocation moves the collector's counter.
             let h = Helper::of(i.aux).info();
             let gc = if h.flags.contains(Flags::ALLOCS) {
@@ -529,7 +528,6 @@ impl Emitter {
                 Fact::of(TypeSet::TAB)
             }
             (Op::BoxI32, _) => Fact::of(TypeSet::SMALL),
-            (Op::NamedKey, _) => Fact::of(TypeSet::STR),
             (Op::BoxF64, _) => Fact::of(TypeSet::FLOAT),
             (Op::BoxI64, _) => Fact::of(TypeSet::INT),
             (Op::Select, Rep::Val | Rep::Ptr) => of(i.b).join(of(i.c)),
@@ -737,18 +735,6 @@ impl Emitter {
         self.g.extra.extend(args.iter().map(|v| v.0));
         let n = args.len() as u32;
         self.emit(Op::CallHelper, h.info().ret, h as u16, at, n, imm)
-    }
-
-    /// `call` in a cold block, keeping the registers: nothing lives in one
-    /// across a collection, so not of a helper that allocates.
-    pub(crate) fn call_cold(&mut self, h: Helper, imm: u32, args: &[Val]) -> Val {
-        if h.info().flags.contains(Flags::ALLOCS) {
-            bug!("{h:?} allocates: its call cannot keep the registers");
-        }
-        let at = self.g.extra.len() as u32;
-        self.g.extra.extend(args.iter().map(|v| v.0));
-        let n = args.len() as u32;
-        self.emit(Op::CallHelperCold, h.info().ret, h as u16, at, n, imm)
     }
 
     /// Check that the `Val` is in `set`, leaving with `tag` to `fs`

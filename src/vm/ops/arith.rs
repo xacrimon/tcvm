@@ -190,7 +190,7 @@ family! {
 }
 
 /// The metamethod of an arithmetic kind.
-pub(crate) const fn kind_mm(kind: ArithKind) -> MetamethodBits {
+const fn kind_mm(kind: ArithKind) -> MetamethodBits {
     match kind {
         ArithKind::Add => MetamethodBits::ADD,
         ArithKind::Sub => MetamethodBits::SUB,

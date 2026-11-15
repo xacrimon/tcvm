@@ -310,7 +310,6 @@ fn entry_value<'gc>(mc: &crate::dmm::Mutation<'gc>, rep: SRep, w: u64) -> Value<
         SRep::I64 => Value::integer(mc, w as i64),
         SRep::F64 => Value::float(f64::from_bits(w)),
         SRep::B1 => Value::boolean(w & 1 != 0),
-        SRep::Ptr => crate::jit::bug!("a raw pointer in an exit's snapshot"),
     }
 }
 
@@ -592,7 +591,8 @@ fn set_fast<'gc>(ctx: Context<'gc>, proto: &Prototype<'gc>, st: &mut JitState<'g
 /// The known entry (the target's `known_offset`) of a prototype of
 /// `nparams` parameters whose fast entry is `fast`, none without one.
 pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> Option<usize> {
-    (fast != 0).then(|| fast + crate::jit::backend::target::emit::known_offset(regs, nparams))
+    let _ = (regs, nparams);
+    (fast != 0).then(|| crate::jit::bug!("a fast entry before stage 3 brings direct calls back"))
 }
 
 /// Where a direct tail call branches while its callee has no fast entry.

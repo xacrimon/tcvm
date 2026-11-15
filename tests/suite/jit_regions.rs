@@ -4484,6 +4484,7 @@ fn folded_constants_cross_calls_in_recompiles() {
 /// The programs of #340, whose regions failed to compile at these counts: a
 /// pointer live across a call through chained parameters.
 #[test]
+#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn chained_pointer_parameters_cross_calls() {
     let src = r##"
     local function f(a, b, c)

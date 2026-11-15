@@ -6,7 +6,7 @@
 
 use super::emit::Emitter;
 use super::fields::Field;
-use super::ops::{Cc, ExitKind, ExitTag, HELPER_FAIL_VAL, Helper, Op};
+use super::ops::{Cc, ExitTag, HELPER_FAIL_VAL, Helper, Op};
 use super::types::{Rep, TypeSet};
 use super::{BlockFlags, Inst, Val};
 use crate::env::MetamethodBits;
@@ -89,10 +89,10 @@ impl Emitter {
         self.unless(nil, |e| e.no_mm(t, bit, tag, state));
     }
 
-    /// The store's barrier, unless the value (`NONE` for a shape) is never
-    /// a heap object: the helper where the table is not gray.
+    /// The store's barrier, unless the value is never a heap object: the
+    /// helper where the table is not gray.
     pub(crate) fn barrier(&mut self, t: Val, v: Val) {
-        if !v.is_none() && !self.fact(v).set.intersects(TypeSet::HEAP) {
+        if !self.fact(v).set.intersects(TypeSet::HEAP) {
             return;
         }
         let header = self.load(Field::GcHeader, t, 0);
@@ -101,19 +101,8 @@ impl Emitter {
         let zero = self.k64(Rep::I64, 0);
         let due = self.cmp(Op::Cmp, Cc::Eq, gray, zero);
         self.unless(due, |e| {
-            e.call_cold(Helper::Barrier, 0, &[t]);
+            e.call(Helper::Barrier, 0, &[t]);
         });
-    }
-
-    /// A lazy exit past the instruction `state` is before, which wrote no
-    /// register: after a call or a table write, where a dependency may have
-    /// broken.
-    pub(crate) fn lazy_after(&mut self, state: Val) {
-        let parent = Val(self.g.inst(state).c);
-        let (pc, entries) = self.g.entries(state);
-        let entries: Vec<(u32, Val)> = entries.iter().map(|e| (e[0], Val(e[1]))).collect();
-        let after = self.frame_state(pc, ExitKind::After, parent, &entries);
-        self.emit(Op::LazyExit, Rep::None, 0, after.0, 0, 0);
     }
 
     /// `recv[key] = v`, generic.
@@ -141,7 +130,6 @@ impl Emitter {
                 self.helped(Helper::Index, 0, &[recv, key], state)
             } else {
                 self.helped(Helper::NewIndex, 1, &[recv, key, v], state);
-                self.lazy_after(state);
                 Val::NONE
             });
         }

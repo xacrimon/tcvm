@@ -18,38 +18,6 @@ pub(crate) enum Src {
     Operand(u16),
     /// A boxed constant.
     Const(u64),
-    /// A call site's: the register's frame slot holds it.
-    Home,
-}
-
-/// A call of the code: what the frame keeps across it, for the collector.
-pub(crate) struct CallSite {
-    /// Its entries, `Selected::entries[at..at + len]`; one with register
-    /// `TRACED` is a value no register of the frame names.
-    pub(crate) at: u32,
-    pub(crate) len: u32,
-    /// The call's block and instruction.
-    pub(crate) block: u32,
-    pub(crate) inst: u32,
-    /// The arguments in registers, the instruction's first operands; the
-    /// address of a known callee's prototype (else 0) and its parameter
-    /// count.
-    pub(crate) args: u8,
-    pub(crate) nparams: u8,
-    pub(crate) known: u64,
-}
-
-pub(crate) const TRACED: u8 = 255;
-
-/// A call site after allocation: its return addresses (with whether each
-/// is a level's), its slow path, and its entries.
-pub(crate) struct SiteOut {
-    pub(crate) keys: Vec<(u32, bool)>,
-    pub(crate) miss: u32,
-    pub(crate) entries: Vec<SnapEntry>,
-    pub(crate) consts: Vec<u64>,
-    pub(crate) hdr: u16,
-    pub(crate) pc_after: u64,
 }
 
 /// An exit of the code: the frame it rebuilds, from its frame state.
@@ -69,12 +37,6 @@ pub(crate) struct Selected {
     pub(crate) vcode: VCode<MInst>,
     pub(crate) exits: Vec<Exit>,
     pub(crate) entries: Vec<(u8, SRep, Src)>,
-    pub(crate) sites: Vec<CallSite>,
-    /// The instructions left to the interpreter's handlers: word and pc.
-    pub(crate) dispatches: Vec<(u64, u32)>,
-    /// The helpers called cold and their trampolines, which `compile`
-    /// makes: addresses.
-    pub(crate) tramps: Vec<(usize, usize)>,
     pub(crate) layout: Layout,
 }
 
@@ -84,9 +46,6 @@ impl Default for Selected {
             vcode: VCode::new(),
             exits: Vec::new(),
             entries: Vec::new(),
-            sites: Vec::new(),
-            dispatches: Vec::new(),
-            tramps: Vec::new(),
             layout: Layout::default(),
         }
     }
@@ -101,34 +60,18 @@ pub(crate) struct ExitOut {
     pub(crate) consts: Vec<u64>,
 }
 
-/// What a function region's fast entry checks: its prototype's parameter
-/// count and stack window.
-#[derive(Clone, Copy)]
-pub(crate) struct FastEntry {
-    pub(crate) num_params: u8,
-    pub(crate) max_stack: u16,
-    /// The prototype's address: a call of it from its own code is direct.
-    pub(crate) proto: u64,
-}
-
 /// The machine code of a region, before its address is known. Places are
 /// byte offsets into it.
 pub(crate) struct Emitted {
     pub(crate) asm: Asm,
     /// Where the interpreter enters (`JIT_ENTRY`/`JIT_LOOP`).
     pub(crate) entry: u32,
-    /// Where a compiled caller enters, for a region with a fast entry.
-    pub(crate) fast: Option<u32>,
     pub(crate) num_spills: u32,
     /// Bytes of the native frame.
     pub(crate) frame_size: u32,
     /// The 8-byte word holding the region pointer.
     pub(crate) region_word: u32,
     pub(crate) exits: Vec<ExitOut>,
-    pub(crate) sites: Vec<SiteOut>,
-    /// What `Region::invalidate` writes: (patch point, jump target), the
-    /// entry's first.
-    pub(crate) lazy: Vec<(u32, u32)>,
 }
 
 /// Loop rotation (V8's `ComputeAssemblyOrder`, with any exiting block as the

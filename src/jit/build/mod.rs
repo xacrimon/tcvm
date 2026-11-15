@@ -5,10 +5,7 @@
 //! are final specialises as it is emitted; one that hangs on a loop
 //! parameter stays generic, carrying what its feedback speculates.
 
-mod calls;
 pub(crate) mod cfg;
-mod intrinsics;
-mod iter;
 mod tables;
 
 use cfg::{Cfg, RegSet};
@@ -20,7 +17,6 @@ use crate::instruction::{ArithKind, Family, Instruction, Op as Bc};
 use crate::jit::compile::Bail;
 use crate::jit::feedback as fb;
 use crate::jit::ir::emit::Emitter;
-use crate::jit::ir::fields::Field;
 use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, HELPER_FAIL_VAL, Heaps, Helper, Op};
 use crate::jit::ir::table::{self, Key};
 use crate::jit::ir::types::{Fact, FactFlags, Rep, TypeSet};
@@ -95,41 +91,6 @@ struct RLoop {
     params: Vec<(u8, Val)>,
 }
 
-/// What a region assumes, and of whom (`jit::deps`).
-#[derive(Clone, Copy)]
-pub(crate) enum DepOn<'gc> {
-    /// A class keeps the metamethod bits as they are.
-    Class(crate::env::shape::MtCache<'gc>),
-    /// A watched holder keeps its shape, or a slot its value
-    /// (`deps::SHAPE_GROUP`, `deps::slot_group`).
-    Shape(crate::env::Shape<'gc>),
-}
-
-/// What `build` hands on besides the graph: the shapes the code compares
-/// with, what it assumes, and the instructions it has no code for.
-pub(crate) struct Built<'gc> {
-    pub(crate) shapes: Vec<crate::env::Shape<'gc>>,
-    pub(crate) deps: Vec<(DepOn<'gc>, u64)>,
-    pub(crate) missing: Vec<Bc>,
-    /// The slots the frame needs where that is more than its prototype's
-    /// (a call staged past its registers), else 0.
-    pub(crate) window: u16,
-    /// The prototypes of known callees, whose addresses the code holds.
-    pub(crate) protos: Vec<Gc<'gc, Prototype<'gc>>>,
-}
-
-/// Addresses in the runtime the code reads from.
-pub(crate) struct Links {
-    /// The arena's metrics, where the collector's counters are.
-    pub(crate) metrics: u64,
-    /// The cell of the numbers' metatable.
-    pub(crate) number_mt: u64,
-    /// The values of the `next` that `pairs` returns and of `ipairs`'s
-    /// iterator.
-    pub(crate) next_fn: u64,
-    pub(crate) ipairs_iter: u64,
-}
-
 struct Builder<'a, 'gc> {
     e: &'a mut Emitter,
     pool: &'a mut Pool,
@@ -149,12 +110,9 @@ struct Builder<'a, 'gc> {
     state: Val,
     /// The shapes the code compares with, which the region keeps alive.
     shapes: Vec<crate::env::Shape<'gc>>,
-    deps: Vec<(DepOn<'gc>, u64)>,
-    links: Links,
-    window: u16,
-    protos: Vec<Gc<'gc, Prototype<'gc>>>,
-    /// The parameters a function region takes in registers (`Op::Arg`).
-    nreg: u8,
+    /// The address of the arena's metrics, where the collector's counters
+    /// are.
+    metrics: u64,
     /// The instructions compiled as a deopt for want of code.
     missing: Vec<Bc>,
 }
@@ -167,8 +125,8 @@ pub(crate) fn build<'gc>(
     cfg: &Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
-    links: Links,
-) -> Built<'gc> {
+    metrics: u64,
+) -> (Vec<crate::env::Shape<'gc>>, Vec<Bc>) {
     let nb = cfg.blocks.len();
     let root = cfg.block_of[entry_pc as usize];
     let (rpo, order) = cfg::rpo_of(&cfg.blocks, root);
@@ -185,18 +143,14 @@ pub(crate) fn build<'gc>(
         pc: entry_pc,
         state: Val::NONE,
         shapes: Vec::new(),
-        deps: Vec::new(),
-        links,
-        window: 0,
-        protos: Vec::new(),
-        // As `compile` gives the region a fast entry.
-        nreg: match cfg.code[entry_pc as usize].op() == Bc::FUNC && !proto.is_vararg {
-            true => proto.num_params.min(8),
-            false => 0,
-        },
+        metrics,
         missing: Vec::new(),
     };
-    if !b.find_loops(root, &rpo, &order) {
+    // A captured register lives in its slot, which the closures holding it
+    // read and write: registers here are values only.
+    if cfg.captured != RegSet::EMPTY {
+        b.e.bail(Bail::Unsupported("captured registers"));
+    } else if !b.find_loops(root, &rpo, &order) {
         b.e.bail(Bail::Unsupported("irreducible control flow"));
     }
     b.blocks = (0..nb).map(|_| b.e.new_block()).collect();
@@ -206,17 +160,10 @@ pub(crate) fn build<'gc>(
         }
         b.block(bb, bb == root, entry_pc);
     }
-    b.e.g.invalidable = !b.deps.is_empty();
-    Built {
-        shapes: b.shapes,
-        deps: b.deps,
-        missing: b.missing,
-        window: b.window,
-        protos: b.protos,
-    }
+    (b.shapes, b.missing)
 }
 
-impl<'gc> Builder<'_, 'gc> {
+impl Builder<'_, '_> {
     /// The loops of the control flow from `root`; false where it is
     /// irreducible.
     fn find_loops(&mut self, root: u32, rpo: &[u32], order: &[usize]) -> bool {
@@ -320,22 +267,6 @@ impl<'gc> Builder<'_, 'gc> {
                             assigned.insert(a + 3);
                         }
                         Bc::JTSET | Bc::JFSET => assigned.insert(a),
-                        // A callee may write the captured registers, which
-                        // are read again after it.
-                        Bc::CALL
-                        | Bc::CALL_R0
-                        | Bc::CALL_R1
-                        | Bc::CALLS
-                        | Bc::CALLS_R0
-                        | Bc::CALLS_R1
-                        | Bc::ARITH_MM
-                        | Bc::ARITH_MM_R
-                        | Bc::ARITH_MMI => assigned.union(&self.cfg.captured),
-                        // The iterator's call, and `next`'s position.
-                        Bc::TFORCALL | Bc::TFORCALL_NEXT | Bc::TFORCALL_IPAIRS => {
-                            assigned.union(&self.cfg.captured);
-                            assigned.insert(a + 3);
-                        }
                         _ => {}
                     }
                 }
@@ -351,35 +282,8 @@ impl<'gc> Builder<'_, 'gc> {
         Val(self.e.table.get(Key::reg(r as u32)))
     }
 
-    /// A captured register's slot holds its value at every moment: the
-    /// closures holding its cell read it there, and write it there while
-    /// they run, which is during a call (`calls.rs` reads it again after).
     fn set(&mut self, r: u8, v: Val) {
         self.e.table.set(Key::reg(r as u32), v.0);
-        if self.cfg.captured.contains(r as usize) {
-            self.e.emit(Op::SlotStore, Rep::None, r as u16, v.0, 0, 0);
-        }
-    }
-
-    /// Leave for the interpreter past its threshold, after the instruction
-    /// at `pc`, which allocated: it collects.
-    fn gc_check(&mut self, pc: u32) {
-        let metrics = self.e.k64(Rep::Ptr, self.links.metrics);
-        let used = self.e.load(Field::GcUsed, metrics, 0);
-        let limit = self.e.load(Field::GcLimit, metrics, 0);
-        let below = self.e.cmp(Op::Cmp, Cc::Lo, used, limit);
-        let after = self.state_at(pc + 1);
-        let tag = ExitTag::Gc as u16;
-        self.e
-            .emit(Op::Guard, Rep::None, tag, below.0, after.0, u32::MAX);
-    }
-
-    /// The frame's flags in `mask`.
-    fn frame_flags(&mut self, mask: u64) -> Val {
-        let base = self.e.emit(Op::Base, Rep::Ptr, 0, 0, 0, 0);
-        let flags = self.e.load(Field::FrameFlags, base, 0);
-        let mask = self.e.k64(Rep::I64, mask);
-        self.e.op2(Op::And, Rep::I64, flags, mask)
     }
 
     fn live(&self, pc: u32) -> RegSet {
@@ -397,7 +301,6 @@ impl<'gc> Builder<'_, 'gc> {
 
     fn state_at(&mut self, pc: u32) -> Val {
         let entries: Vec<(u32, Val)> = (self.live(pc).iter())
-            .filter(|&r| !self.reg(r as u8).is_none())
             .map(|r| {
                 let v = self.reg(r as u8);
                 let home = self.e.slot_holds(r as u16, v);
@@ -406,37 +309,6 @@ impl<'gc> Builder<'_, 'gc> {
             .collect();
         self.e
             .frame_state(pc, ExitKind::Before, Val::NONE, &entries)
-    }
-
-    /// Assume `class` keeps `bits` as they are now.
-    fn depend_class(
-        &mut self,
-        class: crate::env::shape::MtCache<'gc>,
-        bits: crate::env::MetamethodBits,
-    ) {
-        self.deps.push((DepOn::Class(class), bits.bits() as u64));
-    }
-
-    /// A lazy exit to before the instruction at `pc`, a successor of the
-    /// one being emitted.
-    fn lazy_exit(&mut self, pc: u32) {
-        let s = self.state_at(pc);
-        self.e.emit(Op::LazyExit, Rep::None, 0, s.0, 0, 0);
-    }
-
-    /// Leave for the interpreter's handler of the instruction being
-    /// emitted, with what is live stored: for one that ends the frame, or
-    /// replaces it.
-    fn dispatch(&mut self) {
-        for r in self.live(self.pc).iter() {
-            let v = self.reg(r as u8);
-            if !v.is_none() && !self.e.slot_holds(r as u16, v) {
-                self.e.emit(Op::SlotStore, Rep::None, r as u16, v.0, 0, 0);
-            }
-        }
-        let word = self.cfg.code[self.pc as usize].raw();
-        let (lo, hi) = (word as u32, (word >> 32) as u32);
-        self.e.emit(Op::Dispatch, Rep::None, 0, lo, hi, self.pc);
     }
 
     fn deopt(&mut self, tag: ExitTag) {
@@ -477,9 +349,7 @@ impl<'gc> Builder<'_, 'gc> {
             let k = self.e.next_pred(head);
             for n in 0..self.loops[l].params.len() {
                 let (r, p) = self.loops[l].params[n];
-                // A register left without a value (a call's, above its
-                // results) is live only by the liveness's caution.
-                let v = Some(self.reg(r)).filter(|v| !v.is_none()).unwrap_or(p);
+                let v = self.reg(r);
                 self.e.set_input(p, k, v);
             }
             return head;
@@ -527,10 +397,7 @@ impl<'gc> Builder<'_, 'gc> {
         (self.bb, self.pc, self.state) = (bb, start, Val::NONE);
         if root {
             for r in self.live(start).iter() {
-                let v = match r < self.nreg as usize {
-                    true => self.e.emit(Op::Arg, Rep::Val, 0, r as u32, 0, 0),
-                    false => self.e.emit(Op::SlotLoad, Rep::Val, r as u16, 0, 0, 0),
-                };
+                let v = self.e.emit(Op::SlotLoad, Rep::Val, r as u16, 0, 0, 0);
                 self.set(r as u8, v);
             }
         } else {
@@ -554,7 +421,7 @@ impl<'gc> Builder<'_, 'gc> {
             for r in live.iter().filter(|&r| assigned.contains(r)) {
                 let v = self.reg(r as u8);
                 let p = self.e.param(Rep::Val, Some(pending), &[v]);
-                self.e.table.set(Key::reg(r as u32), p.0);
+                self.set(r as u8, p);
                 self.loops[l].params.push((r as u8, p));
             }
             self.state = Val::NONE;
@@ -604,11 +471,8 @@ impl<'gc> Builder<'_, 'gc> {
             let key = Key::reg(r as u32);
             vals.clear();
             vals.extend((0..npreds).map(|k| Val(self.e.table.pred_value(key, k))));
-            // Liveness takes a conditional write (`JTSET`) for a read: a
-            // register some path never gave a value has none to read.
             if vals.iter().any(|v| v.is_none()) {
-                self.e.table.set(key, Val::NONE.0);
-                continue;
+                crate::jit::bug!("r{r} is live into pc {pc} without a value");
             }
             if closed.contains(r) || vals.iter().any(|&v| v != vals[0]) {
                 let p = self.e.param(Rep::Val, None, &vals);
@@ -704,24 +568,6 @@ impl<'gc> Builder<'_, 'gc> {
                 let (x, y) = (self.reg(b), self.reg(i.c()));
                 let v = self.helped(Helper::Concat, 0, &[x, y]);
                 self.set(a, v);
-            }
-            ARITH_MM | ARITH_MM_R | ARITH_MMI => self.arith_mm(pc, i),
-            VARARGPREP => self.varargprep(pc),
-            VARARG => self.vararg(i),
-            VARARGGET => {
-                let key = self.reg(i.c());
-                let v = self.e.call(Helper::VarargGet, 0, &[key]);
-                self.set(a, v);
-            }
-            TFORPREP => self.tforprep(pc, i, jump.or(fall).unwrap()),
-            // With the `TFORLOOP` after it, as the interpreter takes them.
-            TFORCALL_NEXT => self.tforcall_next(i, fall.unwrap(), jump.unwrap()),
-            TFORCALL_IPAIRS => self.tforcall_ipairs(i, fall.unwrap(), jump.unwrap()),
-            TFORCALL => self.tforcall(pc, i),
-            TFORLOOP => {
-                let v = self.reg(a + crate::instruction::TFOR_VARS);
-                let end = self.e.is_nil(v);
-                self.br(end, fall.unwrap(), jump.unwrap());
             }
             NEWTABLE => self.newtable(pc, i),
             SETLIST => self.setlist(i),
@@ -821,20 +667,15 @@ impl<'gc> Builder<'_, 'gc> {
                     self.br(c, fall, jump)
                 }
             }
-            // Results up to `top`: the interpreter's.
-            RETURN if b == 0 => self.dispatch(),
-            RETURN => {
+            RETURN if b != 0 => {
                 // What a return would close is the interpreter's to close: a
                 // frame entered mid-way may have it.
-                // Open upvalues of its own registers it closes itself.
-                use crate::vm::frame::flag::{HAS_OPEN, HAS_TBC};
-                let captures = self.cfg.captured != RegSet::EMPTY;
-                let mask = if captures {
-                    HAS_TBC
-                } else {
-                    HAS_OPEN | HAS_TBC
-                };
-                let set = self.frame_flags(mask);
+                let base = self.e.emit(Op::Base, Rep::Ptr, 0, 0, 0, 0);
+                let field = crate::jit::ir::fields::Field::FrameFlags as u16;
+                let flags = self.e.emit(Op::Load, Rep::I64, field, base.0, u32::MAX, 0);
+                let mask = crate::vm::frame::flag::HAS_OPEN | crate::vm::frame::flag::HAS_TBC;
+                let mask = self.e.k64(Rep::I64, mask);
+                let set = self.e.op2(Op::And, Rep::I64, flags, mask);
                 let zero = self.e.k64(Rep::I64, 0);
                 let none = self.e.cmp(Op::Cmp, Cc::Eq, set, zero);
                 let state = self.state();
@@ -844,13 +685,6 @@ impl<'gc> Builder<'_, 'gc> {
                 for r in a..a + b - 1 {
                     let v = self.reg(r);
                     self.e.emit(Op::SlotStore, Rep::None, r as u16, v.0, 0, 0);
-                }
-                if captures {
-                    let open = self.frame_flags(HAS_OPEN);
-                    let any = self.e.cmp(Op::Cmp, Cc::Ne, open, zero);
-                    self.e.unless(any, |e| {
-                        e.call(Helper::Close, 0, &[]);
-                    });
                 }
                 self.e
                     .emit(Op::Ret, Rep::None, 0, a as u32, b as u32 - 1, 0);
@@ -968,18 +802,7 @@ impl<'gc> Builder<'_, 'gc> {
                 }
                 _ => match i.op().unquickened() {
                     GETFIELD | GETTABUP | GETTABUP_REF => self.getfield(i),
-                    SELF => self.self_(i),
-                    CLOSURE => self.closure_new(pc, i),
-                    CLOSE => self.close(i),
-                    TAILCALL => self.tailcall(i),
                     SETFIELD | SETTABUP | SETTABUP_REF => self.setfield(i),
-                    _ if matches!(
-                        i.op(),
-                        CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1
-                    ) =>
-                    {
-                        self.call(pc, i)
-                    }
                     _ => self.deopt(ExitTag::Unsupported),
                 },
             },

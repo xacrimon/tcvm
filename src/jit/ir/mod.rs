@@ -161,9 +161,6 @@ pub(crate) struct Graph {
     /// The opened blocks in emission order: a block comes after its forward
     /// predecessors.
     pub(crate) order: Vec<Block>,
-    /// The region assumes something that may stop holding: its lazy exits
-    /// stay.
-    pub(crate) invalidable: bool,
 }
 
 impl Graph {
@@ -175,7 +172,6 @@ impl Graph {
         self.preds.clear();
         self.loops.clear();
         self.order.clear();
-        self.invalidable = false;
     }
 
     #[inline]
@@ -369,13 +365,12 @@ impl Graph {
                 Op::KObj => matches!(i.rep, Rep::Val | Rep::Ptr),
                 Op::Load | Op::LoadIdx => i.rep == fields::Field::info(i.aux).rep,
                 Op::Select | Op::Param => i.rep != Rep::None,
-                Op::CallHelper | Op::CallHelperCold => {
+                Op::CallHelper => {
                     let h = &ops::HELPERS[i.aux as usize];
                     let reps = self.run(i.a, i.b).iter().map(|&v| rep_of(v));
                     i.rep == h.ret && reps.eq(h.args.iter().copied())
                 }
                 Op::CheckType => i.rep == set.unboxed(),
-                Op::Resume => matches!(i.rep, Rep::Val | Rep::None),
                 _ => false,
             },
         };

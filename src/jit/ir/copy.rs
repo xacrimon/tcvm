@@ -126,7 +126,6 @@ impl Copy {
         self.pending.resize(g.blocks.len(), NONE);
         self.edges.clear();
         self.vals.clear();
-        e.g.invalidable = g.invalidable;
         for l in &g.loops {
             e.new_loop(self.blocks[l.header.idx()], l.parent, l.writes, Val::NONE);
         }
@@ -203,35 +202,14 @@ impl Copy {
                         }
                         break;
                     }
-                    Op::CallEntry => {
-                        let state = self.map[i.a as usize];
-                        let to = self.edge(g, a, e, b, Block(i.b), 0);
-                        e.emit(Op::CallEntry, Rep::None, 0, state.0, to.0, i.c);
-                        break;
-                    }
-                    Op::CallHelper | Op::CallHelperCold => {
+                    Op::CallHelper => {
                         self.scratch.clear();
                         for &x in g.run(i.a, i.b) {
                             let v = self.map[x as usize];
                             let v = Copy::convert(e, v, g.rep(Val(x)), TypeSet::ANY, Val::NONE);
                             self.scratch.push(v);
                         }
-                        let h = super::ops::Helper::of(i.aux);
-                        match i.op {
-                            Op::CallHelper => e.call(h, i.c, &self.scratch),
-                            _ => e.call_cold(h, i.c, &self.scratch),
-                        }
-                    }
-                    Op::CallArgs => {
-                        self.scratch.clear();
-                        for &x in g.run(i.a, i.b) {
-                            let v = self.map[x as usize];
-                            let v = Copy::convert(e, v, Rep::Val, TypeSet::ANY, Val::NONE);
-                            self.scratch.push(v);
-                        }
-                        let at = e.g.extra.len() as u32;
-                        e.g.extra.extend(self.scratch.iter().map(|v| v.0));
-                        e.emit(Op::CallArgs, Rep::None, 0, at, i.b, i.c)
+                        e.call(super::ops::Helper::of(i.aux), i.c, &self.scratch)
                     }
                     Op::SetIndex => {
                         let [recv, key, v] = [0, 1, 2].map(|k| {
