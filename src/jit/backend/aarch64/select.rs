@@ -3,7 +3,8 @@
 //! its branch or guard reads the flags. An op is one instruction, except
 //! the flag-coupled pairs and `MulOvf`.
 
-use crate::env::value::{SMALL_INT, Value};
+use crate::env::value::{PAYLOAD_MASK, SMALL_INT, Value};
+use crate::jit::backend::aarch64::abi;
 use crate::jit::backend::aarch64::asm::{Cond, Sz};
 use crate::jit::backend::aarch64::inst::{MInst, MOp, Role};
 use crate::jit::backend::emit::{Exit, Selected, Src};
@@ -13,9 +14,9 @@ use crate::jit::backend::reg::{
 use crate::jit::backend::vcode::Remat;
 use crate::jit::bug;
 use crate::jit::compile::Bail;
-use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, Op};
+use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, Heaps, Helper, Op};
 use crate::jit::ir::types::Rep;
-use crate::jit::ir::{Block, Graph, HOME, Val};
+use crate::jit::ir::{Block, Graph, HOME, Pool, Val};
 use crate::jit::region::SRep;
 
 const NONE: u32 = u32::MAX;
@@ -60,7 +61,7 @@ pub(crate) struct Select {
     /// Each value's virtual register.
     vreg: Vec<u32>,
     /// The instructions, last first, each with its run of `ops`.
-    insts: Vec<(MInst, u32, u32)>,
+    insts: Vec<(MInst, u32, u32, PRegSet)>,
     ops: Vec<Operand>,
     /// Per block of the layout: its run of `insts`, and the arguments its
     /// terminator passes each successor, a run of `args`.
@@ -73,12 +74,13 @@ pub(crate) struct Select {
 
 struct Sel<'a> {
     g: &'a Graph,
+    pool: &'a Pool,
     s: &'a mut Select,
     out: &'a mut Selected,
 }
 
 impl Select {
-    pub(crate) fn run(&mut self, g: &Graph, out: &mut Selected) -> Result<(), Bail> {
+    pub(crate) fn run(&mut self, g: &Graph, pool: &Pool, out: &mut Selected) -> Result<(), Bail> {
         out.layout.of(g);
         out.vcode.clear();
         out.exits.clear();
@@ -92,12 +94,23 @@ impl Select {
         self.bail = None;
         self.stored.clear();
         self.stored.resize(256, false);
-        for i in g.insts.iter().filter(|i| i.op == Op::SlotStore) {
-            self.stored[i.aux as usize] = true;
+        for i in &g.insts {
+            match i.op {
+                Op::SlotStore => self.stored[i.aux as usize] = true,
+                Op::CallHelper if Helper::of(i.aux).info().writes.contains(Heaps::SLOT) => {
+                    self.stored.fill(true)
+                }
+                _ => {}
+            }
         }
         let n = out.layout.order.len();
         self.blocks.resize(n, (0, 0, 0, [0; 2]));
-        let mut sel = Sel { g, s: self, out };
+        let mut sel = Sel {
+            g,
+            pool,
+            s: self,
+            out,
+        };
         for pos in (0..n).rev() {
             let b = sel.out.layout.order[pos];
             let d = g.block(b);
@@ -187,7 +200,7 @@ impl Sel<'_> {
             sz,
             imm,
         };
-        self.s.insts.push((i, at, regs.len() as u32));
+        (self.s.insts).push((i, at, regs.len() as u32, PRegSet::empty()));
     }
 
     fn op(&mut self, op: MOp, sz: Sz, imm: u64, regs: &[VReg]) {
@@ -221,6 +234,7 @@ impl Sel<'_> {
             // A constant is written boxed, by the exit.
             let k = match (i.op, i.rep) {
                 (Op::K64, Rep::Val) => Some((SRep::Val, i.k64())),
+                (Op::KObj, Rep::Val) => Some((SRep::Val, self.pool.words[i.a as usize])),
                 (Op::K32, Rep::I32) => Some((SRep::Val, Value::small(i.a as i32).to_raw())),
                 (Op::K32, _) => Some((SRep::Val, Value::boolean(i.a != 0).to_raw())),
                 (Op::KF64, _) => Some((SRep::Val, Value::float(f64::from_bits(i.k64())).to_raw())),
@@ -263,7 +277,7 @@ impl Sel<'_> {
             imm: exit,
         };
         let n = self.s.ops.len() as u32 - first;
-        self.s.insts.push((i, first, n));
+        self.s.insts.push((i, first, n, PRegSet::empty()));
     }
 
     /// The condition code a branch on `c` takes.
@@ -330,11 +344,22 @@ impl Sel<'_> {
                     self.s.bail = Some(Bail::Unsupported("a compare as a value"));
                 }
             }
-            K32 | K64 | KF64 => {
+            K32 | K64 | KF64 | KObj => {
                 let Some(d) = self.def(v) else { return };
                 let (op, remat) = match i.op {
                     K32 => (MOp::MovImm, Remat::Int(i.a as u64)),
                     K64 => (MOp::MovImm, Remat::Int(i.k64())),
+                    // The heap is non-moving: the object's word is a constant,
+                    // and its pointer the word's payload.
+                    KObj => {
+                        let w = self.pool.words[i.a as usize];
+                        let w = if i.rep == Rep::Ptr {
+                            w & PAYLOAD_MASK
+                        } else {
+                            w
+                        };
+                        (MOp::MovImm, Remat::Int(w))
+                    }
                     _ => (MOp::FImm, Remat::Float(i.k64())),
                 };
                 self.out.vcode.remat[d.vreg()] = remat;
@@ -436,6 +461,41 @@ impl Sel<'_> {
                 self.pass(pos, 1, here, Block(i.c));
             }
             Ret => self.op(MOp::Ret, Sz::X, i.a as u64 | (i.b as u64) << 8, &[]),
+            CallHelper => {
+                let h = Helper::of(i.aux).info();
+                let at = self.s.ops.len() as u32;
+                let mut clobbers = abi::caller_saved();
+                if let Some(d) = self.def(v) {
+                    let p = match i.rep {
+                        Rep::F64 => abi::preg_float(0),
+                        _ => abi::preg_int(0),
+                    };
+                    clobbers.remove(p);
+                    self.s.ops.push(Operand::reg_fixed_def(d, p));
+                }
+                // Integers after the pinned registers and the immediate.
+                let (mut ints, mut floats) = (h.ctx.len() as u8 + h.imm as u8, 0);
+                for k in 0..i.b {
+                    let x = Val(self.g.run(i.a, i.b)[k as usize]);
+                    let p = if self.g.rep(x) == Rep::F64 {
+                        floats += 1;
+                        abi::preg_float(floats - 1)
+                    } else {
+                        ints += 1;
+                        abi::preg_int(ints - 1)
+                    };
+                    let x = self.reg(x);
+                    self.s.ops.push(Operand::reg_fixed_use(x, p));
+                }
+                let m = MInst {
+                    op: MOp::Call,
+                    cc: 0,
+                    sz: Sz::X,
+                    imm: i.aux as u64 | (i.c as u64) << 16,
+                };
+                let n = self.s.ops.len() as u32 - at;
+                self.s.insts.push((m, at, n, clobbers));
+            }
             BoxI32 => {
                 let Some(d) = self.def(v) else { return };
                 // Whatever the upper half held, it is the tag's ones now.
@@ -494,9 +554,9 @@ impl Sel<'_> {
             }
             let (at, end, args, nargs) = self.s.blocks[pos];
             for k in (at..end).rev() {
-                let (i, ops, len) = self.s.insts[k as usize];
+                let (i, ops, len, clobbers) = self.s.insts[k as usize];
                 let ops = &self.s.ops[ops as usize..(ops + len) as usize];
-                let at = self.out.vcode.push(i, ops, PRegSet::empty());
+                let at = self.out.vcode.push(i, ops, clobbers);
                 if matches!(i.op, MOp::BCondExit | MOp::BExit) {
                     self.out.exits[i.imm as usize].inst = at.index() as u32;
                 }

@@ -202,6 +202,15 @@ impl Copy {
                         }
                         break;
                     }
+                    Op::CallHelper => {
+                        self.scratch.clear();
+                        for &x in g.run(i.a, i.b) {
+                            let v = self.map[x as usize];
+                            let v = Copy::convert(e, v, g.rep(Val(x)), TypeSet::ANY, Val::NONE);
+                            self.scratch.push(v);
+                        }
+                        e.call(super::ops::Helper::of(i.aux), i.c, &self.scratch)
+                    }
                     _ => self.inst(g, e, i),
                 };
                 if e.cur.is_none() {

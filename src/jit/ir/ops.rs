@@ -373,6 +373,8 @@ pub(crate) enum Aux {
     Kind,
     /// An `ExitKind`.
     Exit,
+    /// A `Helper`.
+    Helper,
 }
 
 pub(crate) struct OpInfo {
@@ -509,6 +511,9 @@ ops! {
     Br          Both No     (B1 Blk Blk)      None [] [] [TERMINATOR];
     Ret         Both No     (Imm Imm No)      None [SLOT] [] [TERMINATOR];
 
+    // A C call of the helper in `aux` (`HELPERS`), its immediate in `c`.
+    CallHelper  Both Helper (Vals Len Imm)    Dyn  [] [] [CALLS];
+
     // Unit ops: optimized as wholes, lowered by copy 1.
     CheckType   H    SetTag (Val Fs No)       Dyn  [] [] [EXITS];
     IsType      H    Set    (Val No No)       B1   [] [] [];
@@ -573,6 +578,8 @@ pub(crate) enum Ctx {
 pub(crate) struct HelperInfo {
     pub(crate) name: &'static str,
     pub(crate) ctx: &'static [Ctx],
+    /// Whether an immediate follows the pinned registers.
+    pub(crate) imm: bool,
     pub(crate) args: &'static [Rep],
     pub(crate) ret: Rep,
     pub(crate) reads: Heaps,
@@ -588,7 +595,7 @@ const STACK: &[Ctx] = &[Ctx::Thread, Ctx::Base];
 const THREAD: &[Ctx] = &[Ctx::Rt, Ctx::Thread];
 
 macro_rules! helpers {
-    ($($name:ident $ctx:ident ($($arg:ident)*) $ret:ident
+    ($($name:ident $ctx:ident $imm:literal ($($arg:ident)*) $ret:ident
         [$($r:ident)*] [$($w:ident)*] [$($f:ident)*];)*) => {
         /// Rust routines a region calls with the C ABI (`jit::helpers`).
         #[repr(u8)]
@@ -598,6 +605,7 @@ macro_rules! helpers {
         pub(crate) static HELPERS: [HelperInfo; [$(Helper::$name),*].len()] = [$(HelperInfo {
             name: stringify!($name),
             ctx: $ctx,
+            imm: $imm != 0,
             args: &[$(Rep::$arg),*],
             ret: Rep::$ret,
             reads: Heaps::from_bits_retain(0 $(| Heaps::$r.bits())*),
@@ -607,75 +615,82 @@ macro_rules! helpers {
     };
 }
 
-// name, pinned registers, (operands), result, [reads] [writes] [flags].
+// name, pinned registers, whether an immediate follows them, (operands),
+// result, [reads] [writes] [flags].
 // A `Val` result is `HELPER_FAIL_VAL` where the interpreter must run the
 // instruction. The immediates are their callers': an `ArithKind`, registers,
 // a prototype's index.
 helpers! {
     // Lua's float `%`, and libm called directly.
-    FMod         NONE   (F64 F64)     F64  [] [] [];
-    Sin          NONE   (F64)         F64  [] [] [];
-    Cos          NONE   (F64)         F64  [] [] [];
-    Tan          NONE   (F64)         F64  [] [] [];
-    Asin         NONE   (F64)         F64  [] [] [];
-    Acos         NONE   (F64)         F64  [] [] [];
-    Exp          NONE   (F64)         F64  [] [] [];
-    Log          NONE   (F64)         F64  [] [] [];
-    Log2         NONE   (F64)         F64  [] [] [];
-    Log10        NONE   (F64)         F64  [] [] [];
-    Pow          NONE   (F64 F64)     F64  [] [] [];
-    Atan2        NONE   (F64 F64)     F64  [] [] [];
-    LibmFmod     NONE   (F64 F64)     F64  [] [] [];
+    FMod         NONE   0 (F64 F64)     F64  [] [] [];
+    Sin          NONE   0 (F64)         F64  [] [] [];
+    Cos          NONE   0 (F64)         F64  [] [] [];
+    Tan          NONE   0 (F64)         F64  [] [] [];
+    Asin         NONE   0 (F64)         F64  [] [] [];
+    Acos         NONE   0 (F64)         F64  [] [] [];
+    Exp          NONE   0 (F64)         F64  [] [] [];
+    Log          NONE   0 (F64)         F64  [] [] [];
+    Log2         NONE   0 (F64)         F64  [] [] [];
+    Log10        NONE   0 (F64)         F64  [] [] [];
+    Pow          NONE   0 (F64 F64)     F64  [] [] [];
+    Atan2        NONE   0 (F64 F64)     F64  [] [] [];
+    LibmFmod     NONE   0 (F64 F64)     F64  [] [] [];
     // Arithmetic of numbers and numeric strings; integers out of i32 are
     // boxed.
-    ArithCoerce  RT     (Val Val)     Val  [] [] [ALLOCS];
-    Unm          RT     (Val)         Val  [] [] [ALLOCS];
-    BNot         RT     (Val)         Val  [] [] [ALLOCS];
+    ArithCoerce  RT     1 (Val Val)     Val  [] [] [ALLOCS];
+    Unm          RT     0 (Val)         Val  [] [] [ALLOCS];
+    BNot         RT     0 (Val)         Val  [] [] [ALLOCS];
     // A metamethod lookup moves a table off a stale class or adopts a
     // metatable's class.
-    Len          RT     (Val)         Val  [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];
-    Concat       RT     (Val Val)     Val  [] [] [ALLOCS];
-    UpvalBarrier THREAD (Ptr)         None [] [GC] [];
+    Len          RT     0 (Val)         Val  [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];
+    Concat       RT     0 (Val Val)     Val  [] [] [ALLOCS];
+    UpvalBarrier THREAD 0 (Ptr)         None [] [GC] [];
     // New open upvalues join the thread's list.
-    Closure      FRAME  ()            Val  [SLOT] [FRAME] [ALLOCS];
-    ClosureOf    FRAME  (Ptr)         Val  [SLOT] [] [ALLOCS];
-    Close        FRAME  ()            None [SLOT FRAME] [UPVAL FRAME] [];
-    NewTable     RT     (I64)         Val  [] [] [ALLOCS];
-    SetList      FRAME  ()            None [SLOT FRAME] [FIELD ARR GC] [ALLOCS];
-    VarargGet    BASE   (Val)         Val  [] [] [ALLOCS];
-    VarargTable  BASE   ()            Val  [] [SLOT] [ALLOCS];
-    TforNext     BASE   ()            Val  [SLOT FIELD ARR SHAPE] [SLOT] [ALLOCS];
-    TforIpairs   RT     (Val Val)     Val  [ARR FIELD META] [] [];
-    TopArgs      STACK  ()            I32  [FRAME] [] [];
-    VarargAll    STACK  ()            Val  [FRAME] [SLOT FRAME] [];
-    Mm           RT     (Val Val)     Val  [LOOKUP] [LOOKUP] [ALLOCS];
-    IndexFn      RT     (Val Val)     Val  [LOOKUP] [LOOKUP] [ALLOCS];
-    NewIndexFn   RT     (Val Val)     Val  [LOOKUP] [LOOKUP] [ALLOCS];
+    Closure      FRAME  1 ()            Val  [SLOT] [FRAME] [ALLOCS];
+    ClosureOf    FRAME  1 (Ptr)         Val  [SLOT] [] [ALLOCS];
+    Close        FRAME  1 ()            None [SLOT FRAME] [UPVAL FRAME] [];
+    NewTable     RT     0 (I64)         Val  [] [] [ALLOCS];
+    SetList      FRAME  1 ()            None [SLOT FRAME] [FIELD ARR GC] [ALLOCS];
+    VarargGet    BASE   0 (Val)         Val  [] [] [ALLOCS];
+    VarargTable  BASE   1 ()            Val  [] [SLOT] [ALLOCS];
+    TforNext     BASE   1 ()            Val  [SLOT FIELD ARR SHAPE] [SLOT] [ALLOCS];
+    TforIpairs   RT     0 (Val Val)     Val  [ARR FIELD META] [] [];
+    TopArgs      STACK  1 ()            I32  [FRAME] [] [];
+    VarargAll    STACK  1 ()            Val  [FRAME] [SLOT FRAME] [];
+    Mm           RT     1 (Val Val)     Val  [LOOKUP] [LOOKUP] [ALLOCS];
+    IndexFn      RT     0 (Val Val)     Val  [LOOKUP] [LOOKUP] [ALLOCS];
+    NewIndexFn   RT     0 (Val Val)     Val  [LOOKUP] [LOOKUP] [ALLOCS];
     // Fails rather than refresh a stale class.
-    Index        RT     (Val Val)     Val  [FIELD ARR LOOKUP] [] [];
-    GetStr       NONE   (Val Val)     Val  [FIELD LOOKUP] [] [];
+    Index        RT     0 (Val Val)     Val  [FIELD ARR LOOKUP] [] [];
+    GetStr       NONE   0 (Val Val)     Val  [FIELD LOOKUP] [] [];
     // Stores that touch table memory alone: a metamethod fails them rather
     // than run, and an allocation never collects.
-    SetStr       RT     (Val Val Val) Val  [TABLE] [TABLE] [ALLOCS];
-    NewIndex     RT     (Val Val Val) Val  [TABLE] [TABLE] [ALLOCS];
-    Type         RT     (Val)         Val  [] [] [ALLOCS];
-    GetMetatable RT     (Val)         Val  [FIELD LOOKUP] [] [];
-    SetMetatable RT     (Val Val)     Val  [TABLE] [TABLE] [ALLOCS];
-    RawGet       NONE   (Val Val)     Val  [FIELD ARR SHAPE] [] [];
-    RawSet       RT     (Val Val Val) Val  [TABLE] [TABLE] [ALLOCS];
-    RawEqual     NONE   (Val Val)     I32  [] [] [];
-    RawLen       RT     (Val)         Val  [FIELD ARR] [] [ALLOCS];
-    ToString     RT     (Val)         Val  [LOOKUP] [LOOKUP] [ALLOCS];
-    ToNumber     RT     (Val)         Val  [] [] [ALLOCS];
-    StrSub       RT     (Ptr I32 I32) Val  [] [] [ALLOCS];
-    StrByte      NONE   (Ptr I32)     Val  [] [] [];
-    TInsert      RT     (Val Val)     Val  [TABLE] [TABLE] [ALLOCS];
-    TRemove      RT     (Val)         Val  [TABLE] [TABLE] [ALLOCS];
+    SetStr       RT     0 (Val Val Val) Val  [TABLE] [TABLE] [ALLOCS];
+    NewIndex     RT     1 (Val Val Val) Val  [TABLE] [TABLE] [ALLOCS];
+    Type         RT     0 (Val)         Val  [] [] [ALLOCS];
+    GetMetatable RT     0 (Val)         Val  [FIELD LOOKUP] [] [];
+    SetMetatable RT     0 (Val Val)     Val  [TABLE] [TABLE] [ALLOCS];
+    RawGet       NONE   0 (Val Val)     Val  [FIELD ARR SHAPE] [] [];
+    RawSet       RT     0 (Val Val Val) Val  [TABLE] [TABLE] [ALLOCS];
+    RawEqual     NONE   0 (Val Val)     I32  [] [] [];
+    RawLen       RT     0 (Val)         Val  [FIELD ARR] [] [ALLOCS];
+    ToString     RT     0 (Val)         Val  [LOOKUP] [LOOKUP] [ALLOCS];
+    ToNumber     RT     0 (Val)         Val  [] [] [ALLOCS];
+    StrSub       RT     0 (Ptr I32 I32) Val  [] [] [ALLOCS];
+    StrByte      NONE   0 (Ptr I32)     Val  [] [] [];
+    TInsert      RT     0 (Val Val)     Val  [TABLE] [TABLE] [ALLOCS];
+    TRemove      RT     0 (Val)         Val  [TABLE] [TABLE] [ALLOCS];
 }
 
 impl Helper {
     #[inline]
     pub(crate) fn info(self) -> &'static HelperInfo {
         &HELPERS[self as usize]
+    }
+
+    pub(crate) fn of(aux: u16) -> Helper {
+        assert!((aux as usize) < HELPERS.len());
+        // SAFETY: a `repr(u8)` enum with a variant per row.
+        unsafe { std::mem::transmute(aux as u8) }
     }
 }

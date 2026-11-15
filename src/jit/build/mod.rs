@@ -16,10 +16,10 @@ use crate::instruction::{ArithKind, Family, Instruction, Op as Bc};
 use crate::jit::compile::Bail;
 use crate::jit::feedback as fb;
 use crate::jit::ir::emit::Emitter;
-use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, Heaps, Op};
+use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, HELPER_FAIL_VAL, Heaps, Helper, Op};
 use crate::jit::ir::table::{self, Key};
 use crate::jit::ir::types::{Fact, FactFlags, Rep, TypeSet};
-use crate::jit::ir::{Block, BlockFlags, HOME, Loop, Val};
+use crate::jit::ir::{Block, BlockFlags, HOME, Loop, Pool, Val};
 
 /// The number kind a generic op takes an operand as where its fact does not
 /// say: what the site's form or feedback saw. In the op's `aux`, three bits
@@ -79,6 +79,7 @@ struct RLoop {
 
 struct Builder<'a, 'gc> {
     e: &'a mut Emitter,
+    pool: &'a mut Pool,
     cfg: &'a Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     loops: Vec<RLoop>,
@@ -99,6 +100,7 @@ struct Builder<'a, 'gc> {
 /// reset. A region the builder cannot make sets the emitter's bail.
 pub(crate) fn build<'gc>(
     e: &mut Emitter,
+    pool: &mut Pool,
     cfg: &Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
@@ -108,6 +110,7 @@ pub(crate) fn build<'gc>(
     let (rpo, order) = cfg::rpo_of(&cfg.blocks, root);
     let mut b = Builder {
         e,
+        pool,
         cfg,
         proto,
         loops: Vec::new(),
@@ -288,9 +291,32 @@ impl Builder<'_, '_> {
         self.e.emit(Op::Deopt, Rep::None, tag as u16, s.0, 0, 0);
     }
 
-    fn konst(&mut self, v: Value<'_>) -> Option<Val> {
-        let heap = TypeSet::HEAP.contains(TypeSet::of(v));
-        (!heap).then(|| self.e.k64(Rep::Val, v.to_raw()))
+    fn konst(&mut self, v: Value<'_>) -> Val {
+        let set = TypeSet::of(v);
+        if TypeSet::HEAP.contains(set) {
+            let k = self.pool.intern(v.to_raw());
+            self.e.emit(Op::KObj, Rep::Val, set.bits(), k, 0, 0)
+        } else {
+            self.e.k64(Rep::Val, v.to_raw())
+        }
+    }
+
+    /// A helper's result, or an exit where it failed: the interpreter runs
+    /// the instruction, which the helper left untouched.
+    fn helped(&mut self, h: Helper, imm: u32, args: &[Val]) -> Val {
+        let state = self.state();
+        let r = self.e.call(h, imm, args);
+        let fail = self.e.k64(Rep::I64, HELPER_FAIL_VAL);
+        let ok = self.e.cmp(Op::Cmp, Cc::Ne, r, fail);
+        self.e.emit(
+            Op::Guard,
+            Rep::None,
+            ExitTag::Mm as u16,
+            ok.0,
+            state.0,
+            u32::MAX,
+        );
+        r
     }
 
     // --- blocks -----------------------------------------------------------
@@ -513,10 +539,20 @@ impl Builder<'_, '_> {
                 let v = self.reg(b);
                 self.set(a, v);
             }
-            LOAD => match self.konst(self.proto.constants[i.d() as usize]) {
-                Some(v) => self.set(a, v),
-                None => self.deopt(ExitTag::Unsupported),
-            },
+            LOAD => {
+                let v = self.konst(self.proto.constants[i.d() as usize]);
+                self.set(a, v);
+            }
+            CONCAT => {
+                let (x, y) = (self.reg(b), self.reg(i.c()));
+                let v = self.helped(Helper::Concat, 0, &[x, y]);
+                self.set(a, v);
+            }
+            LEN => {
+                let x = self.reg(b);
+                let v = self.helped(Helper::Len, 0, &[x]);
+                self.set(a, v);
+            }
             LOADI => {
                 let v = self.e.k64(Rep::Val, Value::small(i.imm()).to_raw());
                 self.set(a, v);
@@ -580,7 +616,7 @@ impl Builder<'_, '_> {
                         } else {
                             Some(Value::float(i.imm_float()))
                         };
-                        let Some(k) = k.and_then(|k| self.konst(k)) else {
+                        let Some(k) = k.map(|k| self.konst(k)) else {
                             return self.deopt(ExitTag::Unsupported);
                         };
                         if info.reversed { (k, reg) } else { (reg, k) }
@@ -609,7 +645,7 @@ impl Builder<'_, '_> {
                             } else {
                                 i32::try_from(k).ok().map(Value::small)
                             };
-                            match k.and_then(|k| self.konst(k)) {
+                            match k.map(|k| self.konst(k)) {
                                 Some(k) => (cc, k),
                                 None => return self.deopt(ExitTag::Unsupported),
                             }

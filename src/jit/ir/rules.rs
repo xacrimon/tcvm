@@ -483,7 +483,7 @@ impl Emitter {
             }
             K32 | K64 | KF64 | KObj | Load | Store | LoadIdx | StoreIdx | SlotLoad | SlotStore
             | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr | AbsOvf
-            | FMod | Unm | Truthy => None,
+            | FMod | Unm | Truthy | CallHelper => None,
         }
     }
 

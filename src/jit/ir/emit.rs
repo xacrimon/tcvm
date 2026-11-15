@@ -5,7 +5,7 @@
 //! the instruction makes known.
 
 use super::fields::Field;
-use super::ops::{Arg, Aux, Cc, Dialect, ExitKind, ExitTag, Flags, Heaps, Op};
+use super::ops::{Arg, Aux, Cc, Dialect, ExitKind, ExitTag, Flags, Heaps, Helper, Op};
 use super::table::{self, Key, Snap, Table};
 use super::types::{Fact, FactFlags, Rep, TypeSet};
 use super::{Block, BlockData, BlockFlags, Graph, Inst, Loop, LoopData, Val};
@@ -459,6 +459,8 @@ impl Emitter {
             }
         } else if !info.writes.is_empty() {
             self.kill(info.writes);
+        } else if i.op == Op::CallHelper {
+            self.kill(Helper::of(i.aux).info().writes);
         }
         if numbered && let Err(s) = self.number(&i) {
             slot = s;
@@ -713,6 +715,14 @@ impl Emitter {
             Rep::I32 | Rep::B1 => self.k32(rep, x as u32),
             _ => self.k64(rep, x as u64),
         }
+    }
+
+    /// A C call of `h` with `args`, and `imm` where it takes an immediate.
+    pub(crate) fn call(&mut self, h: Helper, imm: u32, args: &[Val]) -> Val {
+        let at = self.g.extra.len() as u32;
+        self.g.extra.extend(args.iter().map(|v| v.0));
+        let n = args.len() as u32;
+        self.emit(Op::CallHelper, h.info().ret, h as u16, at, n, imm)
     }
 
     /// Check that the `Val` is in `set`, leaving with `tag` to `fs`

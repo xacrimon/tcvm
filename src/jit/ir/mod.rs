@@ -128,6 +128,23 @@ pub(crate) struct LoopData {
     pub(crate) entry_state: Val,
 }
 
+/// The heap values a compile's graphs name by index (`KObj`), as raw words:
+/// the region keeps them alive once installed, and nothing collects before.
+#[derive(Default)]
+pub(crate) struct Pool {
+    pub(crate) words: Vec<u64>,
+}
+
+impl Pool {
+    pub(crate) fn intern(&mut self, w: u64) -> u32 {
+        let at = self.words.iter().position(|&x| x == w).unwrap_or_else(|| {
+            self.words.push(w);
+            self.words.len() - 1
+        });
+        at as u32
+    }
+}
+
 /// Everything is appended; a graph is recycled by `reset`.
 #[derive(Default)]
 pub(crate) struct Graph {
@@ -347,6 +364,11 @@ impl Graph {
                 Op::KObj => matches!(i.rep, Rep::Val | Rep::Ptr),
                 Op::Load | Op::LoadIdx => i.rep == fields::Field::info(i.aux).rep,
                 Op::Select | Op::Param => i.rep != Rep::None,
+                Op::CallHelper => {
+                    let h = &ops::HELPERS[i.aux as usize];
+                    let reps = self.run(i.a, i.b).iter().map(|&v| rep_of(v));
+                    i.rep == h.ret && reps.eq(h.args.iter().copied())
+                }
                 Op::CheckType => i.rep == set.unboxed(),
                 _ => false,
             },

@@ -84,6 +84,9 @@ mops! {
     // values follow as operands the allocator may leave anywhere.
     BCondExit ();
     BExit     ();
+    // A C call of helper `imm & 0xffff` with immediate `imm >> 16`: its
+    // operands are fixed to the argument registers past the pinned ones.
+    Call      ();
     // Return `imm >> 8` results from `R[imm & 0xff..]`.
     Ret       ();
 }

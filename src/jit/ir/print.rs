@@ -74,6 +74,13 @@ impl Graph {
             Aux::Field => _ = write!(o, ".f{}", i.aux),
             Aux::Kind => _ = write!(o, ".{}", KINDS[i.aux as usize & 15]),
             Aux::Exit => o.push_str(if i.aux == 0 { ".before" } else { ".after" }),
+            Aux::Helper => {
+                let _ = write!(
+                    o,
+                    ".{}",
+                    super::ops::HELPERS[i.aux as usize].name.to_lowercase()
+                );
+            }
         }
         // A generic op's speculated operand kinds.
         if matches!(i.op, Op::Arith | Op::Compare) {

@@ -197,6 +197,7 @@ pub(crate) struct Scratch {
     pub(crate) copy: crate::jit::ir::copy::Copy,
     pub(crate) select: crate::jit::backend::target::select::Select,
     pub(crate) selected: crate::jit::backend::emit::Selected,
+    pub(crate) pool: crate::jit::ir::Pool,
 }
 
 /// A graph as a pass left it: dumped, and verified where asked.
@@ -264,7 +265,9 @@ pub(crate) fn compile<'gc>(
     let scratch = &mut *ctx.jit().scratch.borrow_mut();
     let high = &mut scratch.high;
     high.reset(false);
-    crate::jit::build::build(high, &cfg, closure.proto, pc);
+    let pool = &mut scratch.pool;
+    pool.words.clear();
+    crate::jit::build::build(high, pool, &cfg, closure.proto, pc);
     high.finish();
     stage(config, closure, pc, "build", high);
     if let Some(why) = high.bail {
@@ -292,7 +295,7 @@ pub(crate) fn compile<'gc>(
     }
     mark!(1);
     let sel = &mut scratch.selected;
-    scratch.select.run(&low.g, sel)?;
+    scratch.select.run(&low.g, pool, sel)?;
     mark!(2);
     let out = &(ctx.jit().ra.borrow_mut())
         .run(&sel.vcode, &sel.layout.emit, sel.layout.hot)
@@ -329,7 +332,7 @@ pub(crate) fn compile<'gc>(
         }
     }
     mark!(3);
-    let mut em = target::emit::emit(sel, out)?;
+    let mut em = target::emit::emit(sel, out, crate::jit::layout::rt_word(ctx) as u64)?;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc.reserve(em.asm.max_len())?;
     let start = block.rx();
@@ -417,7 +420,10 @@ pub(crate) fn compile<'gc>(
             _alloc: alloc,
             entry,
             fast_entry: std::ptr::null(),
-            pool: Box::new([]),
+            // SAFETY: the words of values the builder read from live objects.
+            pool: (pool.words.iter())
+                .map(|&w| unsafe { Value::from_raw(w) })
+                .collect(),
             shapes: Box::new([]),
             exits: exits.into_boxed_slice(),
             #[cfg(feature = "tcvm-dev")]

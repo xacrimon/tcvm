@@ -3,7 +3,9 @@
 //! entry, the exit stubs and the region's exit trampoline.
 
 use crate::env::value::NIL;
-use crate::jit::backend::aarch64::abi::{self, BASE, FRAME_SPILLS, INSN, MAX_SPILLS, PC, X16, X17};
+use crate::jit::backend::aarch64::abi::{
+    self, BASE, FRAME_SPILLS, INSN, MAX_SPILLS, PC, THREAD, X16, X17,
+};
 use crate::jit::backend::aarch64::asm::{
     Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
 };
@@ -14,6 +16,7 @@ use crate::jit::backend::reg::{Allocation, Block, Inst, PReg, RegClass};
 use crate::jit::backend::vcode::{Remat, VCode};
 use crate::jit::bug;
 use crate::jit::compile::Bail;
+use crate::jit::ir::ops::{Ctx, Helper};
 use crate::jit::region::{Loc, SnapEntry};
 
 /// The address of a routine the code branches to.
@@ -35,6 +38,7 @@ struct Em<'a> {
     /// The moves of the edges that do not fall through: where the stub is,
     /// the branch and its edge, and where the stub goes on to.
     stubs: Vec<(Label, usize, usize, Label)>,
+    rt: u64,
 }
 
 fn gpr(p: PReg) -> Gpr {
@@ -52,7 +56,8 @@ fn spill_off(slot: usize) -> i32 {
     (FRAME_SPILLS + 8 * slot) as i32
 }
 
-pub(crate) fn emit(s: &Selected, out: &Output) -> Result<Emitted, Bail> {
+/// `rt` is the runtime's address, which helpers take.
+pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail> {
     if out.num_spillslots > MAX_SPILLS {
         return Err(Bail::TooLarge);
     }
@@ -63,6 +68,7 @@ pub(crate) fn emit(s: &Selected, out: &Output) -> Result<Emitted, Bail> {
         region_word: a.new_label(),
         frame: ((FRAME_SPILLS + 8 * out.num_spillslots) as u32).next_multiple_of(16),
         stubs: Vec::new(),
+        rt,
         v: &s.vcode,
         out,
         a,
@@ -321,6 +327,21 @@ impl<'a> Em<'a> {
                 self.a.b_cond(cc, self.exit_labels[imm as usize]);
             }
             MOp::BExit => self.a.b(self.exit_labels[imm as usize]),
+            MOp::Call => {
+                let h = Helper::of(imm as u16);
+                let info = h.info();
+                for (k, c) in info.ctx.iter().enumerate() {
+                    match c {
+                        Ctx::Rt => self.a.mov_imm(Gpr(k as u8), self.rt),
+                        Ctx::Thread => self.a.mov(Gpr(k as u8), THREAD),
+                        Ctx::Base => self.a.mov(Gpr(k as u8), BASE),
+                    }
+                }
+                if info.imm {
+                    self.a.mov_imm(Gpr(info.ctx.len() as u8), imm >> 16);
+                }
+                self.a.bl_far(crate::jit::helpers::address(h));
+            }
             MOp::Ret => {
                 // To a compiled caller, or to `level_land` for a frame
                 // dispatch entered; a tagged return address is a deep one's.
