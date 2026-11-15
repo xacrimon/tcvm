@@ -74,6 +74,33 @@ impl Analysis {
         }
     }
 
+    /// The kind of the numeric loop an op is of, as its rule will decide
+    /// it (`forloop::kind_of`, `Emitter::for_step`).
+    fn loop_kind(&self, g: &Graph, i: &Inst) -> Spec {
+        let by = |v: u32| {
+            let set = self.ty[v as usize];
+            if set.is_empty() {
+                None
+            } else if TypeSet::SMALL.contains(set) {
+                Some(Spec::I32)
+            } else if TypeSet::FLOAT.contains(set) {
+                Some(Spec::F64)
+            } else {
+                None
+            }
+        };
+        let speculated = Spec::of(i.aux);
+        match i.op {
+            Op::ForStart | Op::ForStep => super::forloop::kind_of(by(i.a), by(i.b), speculated),
+            // The step's kind is the loop's.
+            Op::ForNext => by(i.b).unwrap_or(speculated),
+            _ => {
+                let r = g.run(i.a, i.b);
+                super::forloop::kind_of(by(r[0]), by(r[2]), speculated)
+            }
+        }
+    }
+
     /// Resolve the loop parameters of a high-level graph, once: a parameter
     /// takes the type its uses demand when they agree, one of them runs on
     /// every iteration, and every value coming around the loop has it; its
@@ -134,7 +161,21 @@ impl Analysis {
                 Op::SetIndex if i.aux & ARRAY != 0 => want(g.run(i.a, i.b)[1], TypeSet::SMALL),
                 Op::GetIndex | Op::SetIndex => {}
                 // Only number demands are resolved: a receiver's is none.
-                Op::GetField | Op::SetField => {}
+                Op::GetField | Op::SetField | Op::Concat | Op::Len => {}
+                // An integer loop takes its operands as small integers; a
+                // float loop converts what it is given.
+                // The counter is held as the loop's kind.
+                Op::ForMore => want(g.run(i.a, i.b)[0], Spec::of(i.aux).set()),
+                Op::ForNext => want(i.a, Spec::of(i.aux).set()),
+                Op::ForStart | Op::ForStep | Op::ForLimit | Op::ForSkip => {
+                    if Spec::of(i.aux) == Spec::I32 {
+                        g.uses(i, |u| {
+                            if g.rep(u) == Rep::Val {
+                                want(u.0, TypeSet::SMALL)
+                            }
+                        });
+                    }
+                }
                 // No other op asks a type of an operand it would check.
                 Op::K32
                 | Op::K64
@@ -246,6 +287,11 @@ impl Analysis {
                         }
                     }
                     Op::Unm if g.facts[v].pending() => self.kind(i, 0).set(),
+                    Op::ForStart | Op::ForStep | Op::ForLimit | Op::ForNext
+                        if g.facts[v].pending() =>
+                    {
+                        self.loop_kind(g, i).set()
+                    }
                     Op::Param | Op::Arith | Op::Unm => g.facts[v].set,
                     // Every other op's type is its fact's.
                     Op::K32
@@ -334,7 +380,15 @@ impl Analysis {
                     | Op::GetIndex
                     | Op::SetIndex
                     | Op::GetField
-                    | Op::SetField => g.facts[v].set,
+                    | Op::SetField
+                    | Op::Concat
+                    | Op::Len
+                    | Op::ForStart
+                    | Op::ForStep
+                    | Op::ForLimit
+                    | Op::ForSkip
+                    | Op::ForMore
+                    | Op::ForNext => g.facts[v].set,
                 };
             }
             let mut dropped = false;

@@ -77,6 +77,7 @@ impl Graph {
             Aux::Array if i.aux & super::access::ARRAY != 0 => o.push_str(".array"),
             Aux::Array => {}
             Aux::Site => _ = write!(o, ".s{}", i.aux),
+            Aux::Loop => o.push_str(if i.aux == 0 { ".int" } else { ".float" }),
             Aux::SetArm => {
                 o.push('.');
                 TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits()).print(o);
@@ -193,7 +194,15 @@ impl Graph {
             | Op::GetIndex
             | Op::SetIndex
             | Op::GetField
-            | Op::SetField => {
+            | Op::SetField
+            | Op::Concat
+            | Op::Len
+            | Op::ForStart
+            | Op::ForStep
+            | Op::ForLimit
+            | Op::ForSkip
+            | Op::ForMore
+            | Op::ForNext => {
                 for (k, kind) in info.args.iter().enumerate() {
                     let w = i.args()[k];
                     match kind {

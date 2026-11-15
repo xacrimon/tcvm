@@ -169,8 +169,13 @@ pub(crate) fn verify(g: &Graph, lowered: bool) -> Result<(), String> {
                 }
             }
             // Its operand is typed by definition: nothing else names what
-            // makes the pointer one.
-            Op::UnboxPtr if g.facts[i.a as usize].set.unboxed() != Rep::Ptr => {
+            // makes the pointer one. An operand nothing can be stands where
+            // nothing runs: an arm a later fact ruled out, kept by a copy
+            // that cannot fold its branch.
+            Op::UnboxPtr
+                if g.facts[i.a as usize].set.unboxed() != Rep::Ptr
+                    && !g.facts[i.a as usize].set.is_empty() =>
+            {
                 return Err(format!("v{v}: unchecked unbox of an untyped value"));
             }
             Op::UnboxPtr => {}
@@ -283,7 +288,15 @@ pub(crate) fn verify(g: &Graph, lowered: bool) -> Result<(), String> {
             | Op::GetIndex
             | Op::SetIndex
             | Op::GetField
-            | Op::SetField => {}
+            | Op::SetField
+            | Op::Concat
+            | Op::Len
+            | Op::ForStart
+            | Op::ForStep
+            | Op::ForLimit
+            | Op::ForSkip
+            | Op::ForMore
+            | Op::ForNext => {}
         }
         let mut bad = None;
         if i.op != Op::Param {

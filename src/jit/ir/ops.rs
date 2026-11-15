@@ -403,6 +403,8 @@ pub(crate) enum Aux {
     Array,
     /// A site record's index (`sites`).
     Site,
+    /// A numeric loop's speculated kind, a `Spec`.
+    Loop,
 }
 
 /// The bit of a `Proved`'s `aux` that says it stands in its branch's false
@@ -683,6 +685,26 @@ ops! {
     // the interpreter's, so they write what a table store does at most.
     GetField    H    Site   (Val Fs No)       Val      Rep    No        [FIELD ARR LOOKUP] [] [EXITS CALLS PLAIN];
     SetField    H    Site   (Val Val Fs)      None     Rep    No        [FIELD ARR LOOKUP] [TABLE] [EXITS CALLS PLAIN];
+    // `a .. b` of strings and numbers; anything else is the interpreter's.
+    Concat      H    No     (Val Val Fs)      Val      STR    No        [] [] [EXITS CALLS ALLOCS PLAIN];
+    // `#a`: only the helper an operand that is no string and no table
+    // takes looks a metamethod up, which may move a table off a stale class.
+    Len         H    No     (Val Fs No)       Val      INT    No        [FIELD ARR LOOKUP] [LOOKUP] [EXITS CALLS ALLOCS PLAIN];
+    // A numeric `for`, its kind (`aux`: the speculated one) decided by its
+    // start and step. Before the loop, of start `x`, limit `n`, step `s`:
+    // `x` and `s` as the loop's kind (a zero step leaves), the last value
+    // the counter takes (an integer loop) or the limit (a float loop), and
+    // whether the loop runs no iteration.
+    ForStart    H    Loop   (Val Val Fs)      Val      Rep    No        [] [] [EXITS GENERIC PLAIN];
+    ForStep     H    Loop   (Val Val Fs)      Val      Rep    No        [] [] [EXITS GENERIC PLAIN];
+    ForLimit    H    Loop   (Vals Len Fs)     Val      Rep    No        [] [] [EXITS GENERIC];
+    ForSkip     H    Loop   (Vals Len Fs)     B1       Rep    No        [] [] [EXITS GENERIC];
+    // In the loop, of the counter, the last value or limit, and the step,
+    // whose kind is the loop's: whether it goes around again (what is not
+    // typed yet is checked: a loop region enters at the body), and the
+    // counter's next value.
+    ForMore     H    Loop   (Vals Len Fs)     B1       Rep    No        [] [] [EXITS GENERIC];
+    ForNext     H    Loop   (Val Val No)      Val      Rep    No        [] [] [GENERIC PLAIN];
 }
 
 impl Op {
@@ -793,8 +815,8 @@ helpers! {
     BNot         RT     0 (Val)         Val  ANY [] [] [ALLOCS];
     // A metamethod lookup moves a table off a stale class or adopts a
     // metatable's class.
-    Len          RT     0 (Val)         Val  ANY [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];
-    Concat       RT     0 (Val Val)     Val  ANY [] [] [ALLOCS];
+    Len          RT     0 (Val)         Val  INT [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];
+    Concat       RT     0 (Val Val)     Val  STR [] [] [ALLOCS];
     UpvalBarrier THREAD 0 (Ptr)         None ANY [] [GC] [];
     // The backward barrier of a table that is not gray.
     Barrier      RT     0 (Ptr)         None ANY [] [GC] [];
@@ -828,7 +850,7 @@ helpers! {
     RawGet       NONE   0 (Val Val)     Val  ANY [FIELD ARR SHAPE] [] [];
     RawSet       RT     0 (Val Val Val) Val  ANY [TABLE] [TABLE] [ALLOCS];
     RawEqual     NONE   0 (Val Val)     I32  ANY [] [] [];
-    RawLen       RT     0 (Val)         Val  ANY [FIELD ARR] [] [ALLOCS];
+    RawLen       RT     0 (Val)         Val  INT [FIELD ARR] [] [ALLOCS];
     ToString     RT     0 (Val)         Val  ANY [LOOKUP] [LOOKUP] [ALLOCS];
     ToNumber     RT     0 (Val)         Val  ANY [] [] [ALLOCS];
     StrSub       RT     0 (Ptr I32 I32) Val  ANY [] [] [ALLOCS];

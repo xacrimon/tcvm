@@ -769,6 +769,9 @@ impl<'gc> TableState<'gc> {
         core::mem::offset_of!(TableState<'static>, spill_cap);
     #[cfg(jit)]
     pub(crate) const ARRAY_OFFSET: usize = core::mem::offset_of!(TableState<'static>, array);
+    /// The length hint, a `u32`.
+    #[cfg(jit)]
+    pub(crate) const LEN_HINT_OFFSET: usize = core::mem::offset_of!(TableState<'static>, len_hint);
     #[cfg(jit)]
     pub(crate) const ASIZE_OFFSET: usize = core::mem::offset_of!(TableState<'static>, asize);
     /// The `aux` cell, null when there is none, and in it how many keys

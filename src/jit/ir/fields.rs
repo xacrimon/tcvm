@@ -46,6 +46,16 @@ fields! {
     Spill    layout::T_SPILL,  8 Ptr ANY SHAPE     false;
     Array    layout::T_ARRAY,  8 Ptr ANY ARR_SIZE  false;
     ASize    layout::T_ASIZE,  4 I32 ANY ARR_SIZE  false;
+    // Where a table's length was last found: only a hint, which the code
+    // reading it checks, so the slow search's write of it is no write here;
+    // a store to the array makes the next length read it again.
+    LenHint  layout::T_LEN_HINT, 4 I32 ANY ARR_ITEMS false;
+    // A table's hash-part cell (null without one), and from it how many
+    // integer keys it holds.
+    Aux      layout::T_AUX,    8 Ptr ANY ARR_SIZE  false;
+    AuxInts  layout::AUX_INTS, 8 I64 ANY ARR_SIZE  false;
+    // A string's length in bytes, from its payload.
+    StrLen   crate::env::LuaString::LEN_OFFSET, 8 I64 ANY IMMUTABLE false;
     // A named slot in the table, and one in its spill array (from that).
     Inline   layout::T_INLINE, 8 Val ANY FIELD     true;
     Spilled  0,                8 Val ANY FIELD     true;

@@ -212,21 +212,15 @@ impl Copy {
                         }
                         e.call_with(super::ops::Helper::of(i.aux), &self.scratch)
                     }
-                    Op::SetIndex => {
-                        let [recv, key, v] = [0, 1, 2].map(|k| {
+                    // Three boxed operands in the extra pool, and a state.
+                    Op::SetIndex | Op::ForLimit | Op::ForSkip | Op::ForMore => {
+                        let run = [0, 1, 2].map(|k| {
                             let x = self.map[g.run(i.a, i.b)[k] as usize];
-                            Copy::convert(e, x, Rep::Val, TypeSet::ANY, Val::NONE)
+                            Copy::convert(e, x, Rep::Val, TypeSet::ANY, Val::NONE).0
                         });
                         let at = e.g.extra.len() as u32;
-                        e.g.extra.extend([recv.0, key.0, v.0]);
-                        e.lower(
-                            Op::SetIndex,
-                            Rep::None,
-                            i.aux,
-                            at,
-                            3,
-                            self.map[i.c as usize].0,
-                        )
+                        e.g.extra.extend(run);
+                        e.lower(i.op, i.rep, i.aux, at, 3, self.map[i.c as usize].0)
                     }
                     _ if i.op.has(Flags::PLAIN) => self.inst(g, e, i),
                     _ => bug!("{:?} has no copy", i.op),

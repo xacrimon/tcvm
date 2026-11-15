@@ -5056,3 +5056,123 @@ fn globals_and_list_walks_read_fields() {
     compiles_cleanly(src, false);
     compiles_at_first_count(src, false);
 }
+
+/// `#` of strings, of arrays grown by appends, sized exactly, with a hole,
+/// with integer keys past the array and shrinking, of a table with `__len`,
+/// and of a site that sees both strings and tables.
+#[test]
+fn lengths_of_strings_and_tables() {
+    let src = "-- lengths: strings, grown arrays, exact arrays, holes, hash integer keys, __len
+        local out = {}
+        local strs = {'', 'a', 'hello', ('x'):rep(300)}
+        local s = 0
+        for i = 1, 4000 do s = s + #strs[i % 4 + 1] end
+        out[#out + 1] = s
+        local grown = {}
+        for i = 1, 3000 do grown[#grown + 1] = i end
+        out[#out + 1] = #grown
+        local exact = {1, 2, 3, 4, 5, 6, 7, 8}
+        s = 0
+        for i = 1, 3000 do s = s + #exact end
+        out[#out + 1] = s
+        local holed = {1, 2, 3, nil, 5, 6, 7, 8}
+        s = 0
+        for i = 1, 3000 do local n = #holed; s = s + ((n == 8 or n == 3) and 1 or 0) end
+        out[#out + 1] = s
+        local hashed = {1, 2, 3, 4}
+        hashed[5] = 5 hashed[6] = 6 hashed[100] = 100
+        s = 0
+        for i = 1, 3000 do s = s + #hashed end
+        out[#out + 1] = s
+        local shrink = {}
+        for i = 1, 64 do shrink[i] = i end
+        s = 0
+        for i = 1, 3000 do
+          if i % 100 == 0 and #shrink > 1 then shrink[#shrink] = nil end
+          s = s + #shrink
+        end
+        out[#out + 1] = s
+        local meta = setmetatable({1, 2, 3}, {__len = function() return 42 end})
+        s = 0
+        for i = 1, 300 do s = s + #meta end
+        out[#out + 1] = s
+        local mixed = {'abc', {1, 2}, 'de', {1, 2, 3, 4}}
+        s = 0
+        for i = 1, 4000 do s = s + #mixed[i % 4 + 1] end
+        out[#out + 1] = s
+        local empty = {}
+        s = 0
+        for i = 1, 3000 do s = s + #empty end
+        out[#out + 1] = s
+        return table.concat(out, ' ')";
+    assert_eq!(
+        result(src, false),
+        "306000 3000 24000 3000 18000 148470 12600 11000 0"
+    );
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}
+
+/// Integer loops by 1, -1, a constant and a variable step, nested with the
+/// outer counter as the inner start, loops that run no iteration, float
+/// loops from integer and float starts, a float limit of an integer loop,
+/// a site that sees both kinds, and a zero step.
+#[test]
+fn numeric_loops_of_each_kind() {
+    let src = "-- numeric loops of both kinds
+        local out = {}
+        local s = 0
+        for i = 1, 3000 do s = s + i end
+        for i = 3000, 1, -1 do s = s - 1 end
+        for i = 1, 3000, 3 do s = s + i end
+        out[#out + 1] = s
+        local step = 7
+        s = 0
+        for r = 1, 300 do for i = r, 3000, step do s = s + i end end
+        out[#out + 1] = s
+        s = 0
+        for i = 1, 60 do for j = i, 60 do s = s + j end end
+        out[#out + 1] = s
+        s = 0
+        for r = 1, 3000 do for i = 5, 1 do s = s + 1 end for i = 1, 5, -1 do s = s + 1 end end
+        out[#out + 1] = s
+        s = 0
+        for x = 0.5, 3000 do s = s + x end
+        for x = 1, 300.5, 0.25 do s = s + x end
+        for x = 10.0, 1, -0.5 do s = s + x end
+        out[#out + 1] = s
+        s = 0
+        for i = 1, 2999.5 do s = s + i end
+        out[#out + 1] = math.type(s) .. s
+        local kinds = {1, 1.0}
+        s = 0
+        for r = 1, 200 do for i = kinds[r % 2 + 1], 10 do s = s + i end end
+        out[#out + 1] = s
+        local ok, err = pcall(function() local z = 0 for r = 1, 300 do for i = 1, 10, z do end end end)
+        out[#out + 1] = tostring(ok) .. ':' .. tostring(err):gsub('^.-:%d+: ', '')
+        return table.concat(out, ' ')";
+    assert_eq!(
+        result(src, false),
+        "5998000 192298186 73810 0 4680853.75 integer4498500 11000.0 false:'for' step is zero"
+    );
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}
+
+/// Strings and numbers concatenated in a loop; a table is the
+/// interpreter's error.
+#[test]
+fn concatenation_in_loops() {
+    let src = "local s, n = '', 0
+        for i = 1, 3000 do
+          s = 'k' .. i
+          n = n + #s
+          s = s .. 1.5 .. 'x'
+          n = n + #s
+        end
+        local ok, err = pcall(function() local t for i = 1, 300 do t = 'a' .. {} end end)
+        return n .. ' ' .. s .. ' ' .. tostring(ok)";
+    assert_eq!(result(src, false), "39786 k30001.5x false");
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}

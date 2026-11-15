@@ -33,7 +33,8 @@ fn aux_key(i: &Inst) -> u16 {
         | Aux::Exit
         | Aux::Helper
         | Aux::Array
-        | Aux::Site => i.aux,
+        | Aux::Site
+        | Aux::Loop => i.aux,
     }
 }
 
@@ -518,6 +519,7 @@ impl Emitter {
         match i.op {
             Op::GetIndex | Op::SetIndex => self.index(&i),
             Op::GetField | Op::SetField => self.field(&i),
+            Op::Len => self.len_rewrite(&i),
             Op::Barrier => self.barrier_rewrite(&i),
             Op::BoxI64 => self.box_rewrite(&i),
             Op::UnboxI64 => self.unbox_rewrite(&i),
@@ -540,6 +542,13 @@ impl Emitter {
             | Op::Arith
             | Op::Unm
             | Op::Compare
+            | Op::Concat
+            | Op::ForStart
+            | Op::ForStep
+            | Op::ForLimit
+            | Op::ForSkip
+            | Op::ForMore
+            | Op::ForNext
             | Op::Truthy => self.append(i),
             Op::K32
             | Op::K64
@@ -758,7 +767,15 @@ impl Emitter {
             | Op::GetIndex
             | Op::SetIndex
             | Op::GetField
-            | Op::SetField => {}
+            | Op::SetField
+            | Op::Concat
+            | Op::Len
+            | Op::ForStart
+            | Op::ForStep
+            | Op::ForLimit
+            | Op::ForSkip
+            | Op::ForMore
+            | Op::ForNext => {}
         }
         if i.op.has(Flags::TERMINATOR) {
             let (succs, n) = self.g.succs(&i);

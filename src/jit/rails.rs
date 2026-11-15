@@ -18,7 +18,8 @@ const OPS_BOTH: &str = "\
 const OPS_HIGH: &str = "\
     CheckType IsType BoxI64 UnboxI64 ToF64 DivFloor ModFloor LuaShl LuaShr \
     FToIExact FToLExact LToI AbsOvf FIDiv FMod Barrier NewTable GcCheck Arith Unm Compare Truthy \
-    GetIndex SetIndex GetField SetField";
+    GetIndex SetIndex GetField SetField Concat Len ForStart ForStep ForLimit ForSkip \
+    ForMore ForNext";
 const OPS_LOW: &str = "";
 
 #[test]

@@ -566,8 +566,14 @@ impl Builder<'_, '_> {
             }
             CONCAT => {
                 let (x, y) = (self.reg(b), self.reg(i.c()));
-                let v = self.helped(Helper::Concat, 0, &[x, y]);
+                let s = self.state();
+                let v = self.e.emit(Op::Concat, Rep::Val, 0, x.0, y.0, s.0);
                 self.set(a, v);
+                // It allocates: past the collector's threshold the code
+                // leaves after the instruction.
+                let after = self.state_at(pc + 1);
+                let tag = ExitTag::Gc as u16;
+                self.e.emit(Op::GcCheck, Rep::None, tag, after.0, 0, 0);
             }
             NEWTABLE => self.newtable(pc, i),
             SETLIST => self.setlist(i),
@@ -590,7 +596,9 @@ impl Builder<'_, '_> {
             }
             LEN => {
                 let x = self.reg(b);
-                let v = self.helped(Helper::Len, 0, &[x]);
+                let s = self.state();
+                // Lowered here where the operand's fact is final.
+                let v = self.e.lower(Op::Len, Rep::Val, 0, x.0, s.0, 0);
                 self.set(a, v);
             }
             LOADI => {
@@ -713,9 +721,9 @@ impl Builder<'_, '_> {
                 if (ints && floats) || seen & fb::BIGINT != 0 {
                     self.deopt(ExitTag::Unsupported)
                 } else if floats || (op == FORLOOP_F && !ints) {
-                    self.forloop_f(a, exit, back)
+                    self.forloop(a, Spec::F64, exit, back)
                 } else {
-                    self.forloop_i(a, exit, back)
+                    self.forloop(a, Spec::I32, exit, back)
                 }
             }
             _ => match info.family {
@@ -809,148 +817,60 @@ impl Builder<'_, '_> {
         }
     }
 
-    /// The f64 of a loop value in a float loop: a small integer converts.
-    fn loop_f64(&mut self, v: Val, state: Val) -> Val {
-        if Spec::by_fact(self.e.fact(v)) == Some(Spec::I32) {
-            let x = self.e.check_type(v, TypeSet::SMALL, ExitTag::Type, state);
-            self.e.op1(Op::IToF, Rep::F64, x)
-        } else {
-            self.e.check_type(v, TypeSet::FLOAT, ExitTag::Type, state)
-        }
-    }
-
-    /// `FORPREP`, as the kind its loop has been: after it `R[a]` is the last
-    /// value the control variable takes (the limit, in a float loop),
-    /// `R[a+1]` the step, `R[a+2]` the variable and `R[a+3]` its copy.
+    /// `FORPREP`: after it `R[a]` is the last value the control variable
+    /// takes (the limit, in a float loop), `R[a+1]` the step, `R[a+2]` the
+    /// variable and `R[a+3]` its copy. The loop's kind is its values' where
+    /// they say; this is the one its form and its feedback speculate.
     fn forprep(&mut self, pc: u32, i: Instruction, body: u32, skip: u32) {
         let a = i.a();
         let at = (pc as i64 + i.branch_offset() as i64) as usize;
         let fb_of = |pc: usize| self.proto.feedback.bits(pc);
         let seen = (fb_of(pc as usize) | fb_of(at)) & fb::KINDS;
-        let (init, limit, step) = (self.reg(a), self.reg(a + 1), self.reg(a + 2));
-        let state = self.state();
-        let form = self.cfg.code[at].op();
-        let zero_step = ExitTag::Slow as u16;
-        if form == Bc::FORLOOP_I && seen & !fb::SMALL == 0 {
-            let small =
-                |s: &mut Self, v: Val| s.e.check_type(v, TypeSet::SMALL, ExitTag::Type, state);
-            let (i0, l, st) = (small(self, init), small(self, limit), small(self, step));
-            let zero = self.e.k32(Rep::I32, 0);
-            // A zero step raises.
-            let moves = self.e.cmp(Op::Cmp, Cc::Ne, st, zero);
-            (self.e).emit(Op::Guard, Rep::None, zero_step, moves.0, state.0, u32::MAX);
-            // last = init + (limit - init) / step * step: exact where the
-            // loop runs, when the quotient is not negative; unused where it
-            // does not.
-            let wide = |s: &mut Self, v: Val| s.e.op1(Op::SExt32, Rep::I64, v);
-            let (i64_, l64, s64) = (wide(self, i0), wide(self, l), wide(self, st));
-            let span = self.e.op2(Op::Sub, Rep::I64, l64, i64_);
-            let count = self.e.op2(Op::SDiv, Rep::I64, span, s64);
-            let off = self.e.op2(Op::Mul, Rep::I64, count, s64);
-            let last = self.e.op2(Op::Add, Rep::I64, i64_, off);
-            let last = self.e.op1(Op::Trunc32, Rep::I32, last);
-            let last = self.e.op1(Op::BoxI32, Rep::Val, last);
-            let up = self.e.cmp(Op::Cmp, Cc::Gt, st, zero);
-            let (over, under) = (
-                self.e.cmp(Op::Cmp, Cc::Gt, i0, l),
-                self.e.cmp(Op::Cmp, Cc::Lt, i0, l),
-            );
-            let past = self.e.emit(Op::Select, Rep::B1, 0, up.0, over.0, under.0);
-            self.set(a, last);
-            self.set(a + 1, step);
-            self.set(a + 2, init);
-            self.set(a + 3, init);
-            self.br(past, skip, body);
-        } else if form == Bc::FORLOOP_F && seen & !(fb::FLOAT | fb::SMALL) == 0 {
-            // Integer init and step are an integer loop, whatever ran before.
-            let int = |s: &Self, v: Val| Spec::by_fact(s.e.fact(v)) == Some(Spec::I32);
-            if int(self, init) && int(self, step) {
-                return self.deopt(ExitTag::Type);
-            }
-            let (i0, l, st) = (
-                self.loop_f64(init, state),
-                self.loop_f64(limit, state),
-                self.loop_f64(step, state),
-            );
-            let zero = self.e.kf64(0.0);
-            let moves = self.e.cmp(Op::FCmp, Cc::Ne, st, zero);
-            (self.e).emit(Op::Guard, Rep::None, zero_step, moves.0, state.0, u32::MAX);
-            let up = self.e.cmp(Op::FCmp, Cc::Gt, st, zero);
-            let (over, under) = (
-                self.e.cmp(Op::FCmp, Cc::Lt, l, i0),
-                self.e.cmp(Op::FCmp, Cc::Lt, i0, l),
-            );
-            let past = self.e.emit(Op::Select, Rep::B1, 0, up.0, over.0, under.0);
-            let boxed = |s: &mut Self, v: Val| s.e.op1(Op::BoxF64, Rep::Val, v);
-            let (lv, sv, iv) = (boxed(self, l), boxed(self, st), boxed(self, i0));
-            self.set(a, lv);
-            self.set(a + 1, sv);
-            self.set(a + 2, iv);
-            self.set(a + 3, iv);
-            self.br(past, skip, body);
-        } else if form == Bc::FORLOOP && seen == 0 {
+        let kind = match self.cfg.code[at].op() {
+            Bc::FORLOOP_I if seen & !fb::SMALL == 0 => Spec::I32,
+            Bc::FORLOOP_F if seen & !(fb::FLOAT | fb::SMALL) == 0 => Spec::F64,
             // The loop never ran: its kind is not known yet.
-            self.deopt(ExitTag::NeverRan)
-        } else {
-            self.deopt(ExitTag::Unsupported)
-        }
+            Bc::FORLOOP if seen == 0 => return self.deopt(ExitTag::NeverRan),
+            _ => return self.deopt(ExitTag::Unsupported),
+        };
+        let (init, limit, step) = (self.reg(a), self.reg(a + 1), self.reg(a + 2));
+        let (state, aux) = (self.state(), kind as u16);
+        let start = (self.e).emit(Op::ForStart, Rep::Val, aux, init.0, step.0, state.0);
+        let by = (self.e).emit(Op::ForStep, Rep::Val, aux, init.0, step.0, state.0);
+        let three = |e: &mut Emitter, op: Op, rep: Rep| {
+            let at = e.g.extra.len() as u32;
+            e.g.extra.extend([init.0, limit.0, step.0]);
+            e.emit(op, rep, aux, at, 3, state.0)
+        };
+        let last = three(self.e, Op::ForLimit, Rep::Val);
+        let past = three(self.e, Op::ForSkip, Rep::B1);
+        self.set(a, last);
+        self.set(a + 1, by);
+        self.set(a + 2, start);
+        self.set(a + 3, start);
+        self.br(past, skip, body);
     }
 
-    /// `FORLOOP_I`: around while the control variable is not the last value.
-    fn forloop_i(&mut self, a: u8, exit: u32, back: u32) {
-        let state = self.state();
-        let small = |s: &mut Self, r: u8| {
-            let v = s.reg(r);
-            s.e.check_type(v, TypeSet::SMALL, ExitTag::Type, state)
-        };
-        let (last, step, idx) = (small(self, a), small(self, a + 1), small(self, a + 2));
-        let go = self.e.cmp(Op::Cmp, Cc::Ne, idx, last);
-        if self.e.known(go).is_some() {
-            return self.deopt(ExitTag::Unsupported);
-        }
-        // The step is taken on the edge back: `idx` walks to `last` exactly,
-        // so it stays in range.
-        let edge = self.e.new_block();
-        let out = self.target(exit);
-        self.e.br(go, edge, out);
-        let lp = self.ir_loop(self.bb);
-        self.e.begin(edge, lp, 0, BlockFlags::empty());
-        let next = self.e.op2(Op::Add, Rep::I32, idx, step);
-        let next = self.e.op1(Op::BoxI32, Rep::Val, next);
-        self.set(a + 2, next);
-        self.set(a + 3, next);
-        self.jump(back);
-    }
-
-    /// `FORLOOP_F`: the float loop steps, and goes around while the control
-    /// variable is within the limit, on the step's side.
-    fn forloop_f(&mut self, a: u8, exit: u32, back: u32) {
-        let state = self.state();
-        let float = |s: &mut Self, r: u8| {
-            let v = s.reg(r);
-            s.e.check_type(v, TypeSet::FLOAT, ExitTag::Type, state)
-        };
-        let (lim, step, idx) = (float(self, a), float(self, a + 1), float(self, a + 2));
-        let next = self.e.op2(Op::FAdd, Rep::F64, idx, step);
-        let zero = self.e.kf64(0.0);
-        let up = self.e.cmp(Op::FCmp, Cc::Gt, step, zero);
-        let (below, above) = (
-            self.e.cmp(Op::FCmp, Cc::Le, next, lim),
-            self.e.cmp(Op::FCmp, Cc::Le, lim, next),
-        );
-        let go = self.e.emit(Op::Select, Rep::B1, 0, up.0, below.0, above.0);
-        match self.e.known(go) {
+    /// `FORLOOP`: around while the loop has more to do, the step taken on
+    /// the edge back. `kind` is what its form and feedback speculate.
+    fn forloop(&mut self, a: u8, kind: Spec, exit: u32, back: u32) {
+        let (state, aux) = (self.state(), kind as u16);
+        let (last, step, idx) = (self.reg(a), self.reg(a + 1), self.reg(a + 2));
+        let at = self.e.g.extra.len() as u32;
+        self.e.g.extra.extend([idx.0, last.0, step.0]);
+        let more = self.e.emit(Op::ForMore, Rep::B1, aux, at, 3, state.0);
+        match self.e.known(more) {
             Some(true) => {}
             Some(false) => return self.jump(exit),
             None => {
                 let edge = self.e.new_block();
                 let out = self.target(exit);
-                self.e.br(go, edge, out);
+                self.e.br(more, edge, out);
                 let lp = self.ir_loop(self.bb);
                 self.e.begin(edge, lp, 0, BlockFlags::empty());
             }
         }
-        let next = self.e.op1(Op::BoxF64, Rep::Val, next);
+        let next = self.e.emit(Op::ForNext, Rep::Val, aux, idx.0, step.0, 0);
         self.set(a + 2, next);
         self.set(a + 3, next);
         self.jump(back);

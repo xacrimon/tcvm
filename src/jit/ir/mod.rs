@@ -12,6 +12,7 @@ pub(crate) mod analyse;
 pub(crate) mod copy;
 pub(crate) mod emit;
 pub(crate) mod fields;
+pub(crate) mod forloop;
 pub(crate) mod ops;
 #[cfg(feature = "tcvm-dev")]
 mod print;
@@ -406,7 +407,7 @@ impl Graph {
             ops::Aux::SetArm => i.aux & !(any | ops::SET_ARM) == 0,
             ops::Aux::Field => (i.aux as usize) < fields::FIELDS.len(),
             ops::Aux::Helper => (i.aux as usize) < ops::HELPERS.len(),
-            ops::Aux::Exit | ops::Aux::Array => i.aux < 2,
+            ops::Aux::Exit | ops::Aux::Array | ops::Aux::Loop => i.aux < 2,
             // A tag's, a slot's and a kind's own types check theirs.
             ops::Aux::No | ops::Aux::SetTag | ops::Aux::Tag | ops::Aux::Slot | ops::Aux::Kind => {
                 true

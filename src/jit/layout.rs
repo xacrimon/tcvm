@@ -76,6 +76,7 @@ pub(crate) const T_SPILL: usize = T_STATE + TableState::SPILL_OFFSET;
 pub(crate) const T_SPILL_CAP: usize = T_STATE + TableState::SPILL_CAP_OFFSET;
 pub(crate) const T_ARRAY: usize = T_STATE + TableState::ARRAY_OFFSET;
 pub(crate) const T_ASIZE: usize = T_STATE + TableState::ASIZE_OFFSET;
+pub(crate) const T_LEN_HINT: usize = T_STATE + TableState::LEN_HINT_OFFSET;
 /// A table's `aux` cell (null without one), and from it how many keys
 /// each hash part holds.
 pub(crate) const T_AUX: usize = T_STATE + TableState::AUX_OFFSET;

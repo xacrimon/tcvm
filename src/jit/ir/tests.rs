@@ -795,6 +795,8 @@ fn table_columns() {
             ("CheckType", FactOf::AuxSet),
             ("BoxI64", FactOf::Set(TypeSet::INT)),
             ("NewTable", FactOf::Set(TypeSet::TAB)),
+            ("Concat", FactOf::Set(TypeSet::STR)),
+            ("Len", FactOf::Set(TypeSet::INT)),
         ]
     );
     let mem: Vec<(&str, Mem)> = (OPS.iter())
@@ -825,14 +827,17 @@ fn table_columns() {
             "Jump",
             "Br",
             "CallHelper",
-            "SetIndex"
+            "SetIndex",
+            "ForLimit",
+            "ForSkip",
+            "ForMore"
         ]
     );
     let tab: Vec<&str> = (super::ops::HELPERS.iter())
         .filter(|h| h.fact != TypeSet::ANY)
         .map(|h| h.name)
         .collect();
-    assert_eq!(tab, ["BoxInt", "NewTable"]);
+    assert_eq!(tab, ["Len", "Concat", "BoxInt", "NewTable", "RawLen"]);
 }
 
 /// How many instructions of `op` the graph has.
@@ -1338,6 +1343,213 @@ mod fields {
         assert_eq!((t.op(v), t.e().g.blocks.len()), (Op::GetField, 2));
         let k = t.e().next_pred(head);
         t.e().set_input(recv, k, v);
+        t.jump(head);
+    }
+}
+
+mod lengths_and_loops {
+    use super::super::forloop::kind_of;
+    use super::super::types::{Fact, FactFlags};
+    use super::*;
+    use crate::env::value::Value;
+    use crate::jit::build::Spec;
+
+    fn inputs(t: &T, v: Val) -> Vec<Op> {
+        let ins = t.e().g.inputs(v).to_vec();
+        ins.iter().map(|&x| t.op(Val(x))).collect()
+    }
+
+    fn len(t: &T, v: Val) -> Val {
+        t.e().lower(Op::Len, Rep::Val, 0, v.0, t.fs.0, 0)
+    }
+
+    #[test]
+    fn concat_is_its_helper() {
+        let t = start(true);
+        let v = t.emit(Op::Concat, Rep::Val, 0, t.slot(0), t.slot(1), t.fs);
+        assert_eq!((t.op(v), t.set(v)), (Op::CallHelper, TypeSet::STR));
+        assert_eq!(count(&t, Op::Guard), 1);
+        t.done();
+    }
+
+    #[test]
+    fn lengths() {
+        use Op::*;
+        // A string: one load.
+        let t = start(true);
+        let s = t.slot(0);
+        t.check(s, TypeSet::STR, ExitTag::Type);
+        let n = len(&t, s);
+        assert_eq!(
+            (t.op(n), count(&t, Br), count(&t, CallHelper)),
+            (BoxI32, 0, 0)
+        );
+        t.done();
+        // A table: the class's test, then the hint's six branches, their
+        // indices and the hash part read as what the branches proved; the
+        // search where the hint does not name the border.
+        let t = start(true);
+        let table = t.slot(0);
+        t.check(table, TypeSet::TAB, ExitTag::Type);
+        let n = len(&t, table);
+        let lengths = vec![BoxI32, BoxI32, BoxI32, CallHelper];
+        assert_eq!((t.op(n), inputs(&t, n)), (Param, lengths));
+        assert_eq!((count(&t, Br), count(&t, Proved)), (7, 4));
+        assert_eq!((count(&t, LoadIdx), count(&t, CallHelper)), (2, 1));
+        t.done();
+        // Anything: a string, a table, or the helper's.
+        let t = start(true);
+        let n = len(&t, t.slot(0));
+        assert_eq!(
+            (t.op(n), inputs(&t, n)),
+            (Param, vec![BoxI32, Param, CallHelper])
+        );
+        assert_eq!((count(&t, Br), count(&t, CallHelper)), (9, 2));
+        assert_eq!(t.set(n), TypeSet::INT);
+        t.done();
+    }
+
+    fn small(t: &T, k: i32) -> Val {
+        t.e().k64(Rep::Val, Value::small(k).to_raw())
+    }
+
+    /// The four preparation ops of start `x`, limit `n` and step `s`.
+    fn prep(t: &T, kind: Spec, x: Val, n: Val, s: Val) -> [Val; 4] {
+        let aux = kind as u16;
+        let three = |op: Op, rep: Rep| {
+            let mut e = t.e();
+            let at = e.g.extra.len() as u32;
+            e.g.extra.extend([x.0, n.0, s.0]);
+            e.emit(op, rep, aux, at, 3, t.fs.0)
+        };
+        [
+            t.emit(Op::ForStart, Rep::Val, aux, x, s, t.fs),
+            t.emit(Op::ForStep, Rep::Val, aux, x, s, t.fs),
+            three(Op::ForLimit, Rep::Val),
+            three(Op::ForSkip, Rep::B1),
+        ]
+    }
+
+    #[test]
+    fn loop_kinds() {
+        use Spec::{F64, I32};
+        assert_eq!(kind_of(Some(I32), Some(I32), F64), I32);
+        assert_eq!(kind_of(Some(I32), Some(F64), I32), F64);
+        assert_eq!(kind_of(Some(F64), Some(I32), I32), F64);
+        assert_eq!(kind_of(None, Some(I32), F64), F64);
+        assert_eq!(kind_of(Some(F64), None, I32), I32);
+    }
+
+    #[test]
+    fn loop_preparation() {
+        use Op::*;
+        // An integer loop by a constant 1: the limit is the last value and
+        // one compare says whether it runs.
+        let t = start(true);
+        let [x, s, last, skip] = prep(&t, Spec::I32, t.slot(0), t.slot(1), small(&t, 1));
+        assert_eq!((t.set(x), t.op(skip)), (TypeSet::SMALL, Cmp));
+        assert_eq!(
+            (t.inst(s).k64(), count(&t, SDiv), count(&t, Select)),
+            (Value::small(1).to_raw(), 0, 0)
+        );
+        assert_eq!(t.set(last), TypeSet::SMALL);
+        t.done();
+        // By a step not known: it is checked not zero, the last value
+        // computed, the side chosen.
+        let t = start(true);
+        let [_, s, last, skip] = prep(&t, Spec::I32, t.slot(0), t.slot(1), t.slot(2));
+        assert_eq!(
+            (t.set(s), t.op(last), t.op(skip)),
+            (TypeSet::SMALL, BoxI32, Select)
+        );
+        assert_eq!(count(&t, SDiv), 1);
+        let slow = |i: &&Inst| i.op == Guard && i.aux == ExitTag::Slow as u16;
+        assert_eq!(t.e().g.insts.iter().filter(slow).count(), 1);
+        t.done();
+        // A float loop: what is known a small integer converts, the rest
+        // is checked a float.
+        let t = start(true);
+        let [x, s, limit, skip] = prep(&t, Spec::F64, t.slot(0), t.slot(1), small(&t, 1));
+        assert_eq!(
+            (t.set(x), t.set(limit), t.op(skip)),
+            (TypeSet::FLOAT, TypeSet::FLOAT, FCmp)
+        );
+        // The constant step is the float it converts to.
+        assert_eq!((t.set(s), count(&t, IToF)), (TypeSet::FLOAT, 0));
+        t.done();
+        // The values decide where they can: a float start makes a float
+        // loop of an integer speculation.
+        let t = start(true);
+        let f = t.check(t.slot(0), TypeSet::FLOAT, ExitTag::Type);
+        let start_ = t.op1(BoxF64, Rep::Val, f);
+        let [x, ..] = prep(&t, Spec::I32, start_, t.slot(1), small(&t, 2));
+        assert_eq!(x, start_);
+        t.done();
+    }
+
+    /// `ForMore` of counter `i`, last value or limit `n` and step `s`, then
+    /// `ForNext`.
+    fn step(t: &T, kind: Spec, i: Val, n: Val, s: Val) -> [Val; 2] {
+        let aux = kind as u16;
+        let more = {
+            let mut e = t.e();
+            let at = e.g.extra.len() as u32;
+            e.g.extra.extend([i.0, n.0, s.0]);
+            e.emit(Op::ForMore, Rep::B1, aux, at, 3, t.fs.0)
+        };
+        [more, t.emit(Op::ForNext, Rep::Val, aux, i, s, Val(0))]
+    }
+
+    #[test]
+    fn loop_steps() {
+        use Op::*;
+        // A region entered at the loop's body: nothing types the three, so
+        // each is checked as the speculated kind, once.
+        let t = start(true);
+        let [more, next] = step(&t, Spec::I32, t.slot(0), t.slot(1), t.slot(2));
+        assert_eq!(
+            (t.op(more), t.set(next), count(&t, Guard)),
+            (Cmp, TypeSet::SMALL, 3)
+        );
+        assert_eq!(count(&t, Add), 1);
+        t.done();
+        // The step's kind is the loop's, whatever is speculated: a float
+        // loop steps once, for the test and for the next value.
+        let t = start(true);
+        let f = |r: u16| {
+            let x = t.check(t.slot(r), TypeSet::FLOAT, ExitTag::Type);
+            t.op1(BoxF64, Rep::Val, x)
+        };
+        let [more, next] = step(&t, Spec::I32, f(0), f(1), f(2));
+        assert_eq!((t.op(more), t.set(next)), (Select, TypeSet::FLOAT));
+        assert_eq!((count(&t, FAdd), count(&t, Guard)), (1, 3));
+        t.done();
+    }
+
+    /// Operands whose type is not final leave the ops as they are.
+    #[test]
+    fn pending_loops_wait() {
+        let t = start(false);
+        let first = t.slot(0);
+        let head = {
+            let mut e = t.e();
+            let head = e.new_block();
+            e.jump(head);
+            let lp = e.new_loop(head, Loop::NONE, Heaps::ALL, t.fs);
+            assert!(e.begin(head, lp, 1, BlockFlags::LOOP_HEADER));
+            head
+        };
+        let pending = Fact {
+            set: TypeSet::ANY,
+            flags: FactFlags::PENDING,
+        };
+        let x = t.e().param(Rep::Val, Some(pending), &[first]);
+        let ops = prep(&t, Spec::I32, x, t.slot(1), small(&t, 1));
+        let got = ops.map(|v| t.op(v));
+        assert_eq!(got, [Op::ForStart, Op::ForStep, Op::ForLimit, Op::ForSkip]);
+        assert!(t.e().fact(ops[0]).pending());
+        let k = t.e().next_pred(head);
+        t.e().set_input(x, k, ops[0]);
         t.jump(head);
     }
 }

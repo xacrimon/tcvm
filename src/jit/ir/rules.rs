@@ -411,37 +411,69 @@ impl Emitter {
                 Some(self.op1(FFloor, Rep::F64, q))
             }
             Arith | Compare | Unm => self.specialise(i),
-            // Only a constant condition folds: a folded branch's. In its arm
-            // the condition is always known, and that is what it stands for.
+            // It folds where its branch is gone: on a constant condition, a
+            // folded branch's, and on one known here though no branch on
+            // it stands above (a copy folds a branch on a condition a guard
+            // settled). Under its branch the condition is always known, and
+            // that is what it stands for.
             Proved => {
+                let arm = i.aux & super::ops::SET_ARM == 0;
                 let k = *self.g.inst(a);
-                if k.op != K32 {
-                    return None;
-                }
-                let set = TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits());
+                let constant = k.op == K32;
+                let truth = match self.known(a) {
+                    Some(t) if constant || !self.under_branch(a) => t,
+                    _ => return None,
+                };
                 // In the arm not taken nothing runs.
-                if (k.a != 0) == (i.aux & super::ops::SET_ARM != 0) {
+                if truth != arm {
                     return Some(c);
                 }
+                let set = TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits());
                 // A pointer needs what types it; a number is read out of
                 // the word as it is.
                 match self.typed(c, set) {
                     Some(v) => Some(v),
                     None if self.lowered && set.unboxed() == Rep::Ptr => {
-                        bug!("nothing types {c:?} once its branch is gone")
+                        if constant {
+                            bug!("nothing types {c:?} once its branch is gone")
+                        }
+                        // Left for the verifier to name.
+                        None
                     }
                     None => Some(c),
                 }
             }
             K32 | K64 | KF64 | KObj | Base | Thread | Load | Store | LoadIdx | StoreIdx
             | SlotLoad | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret
-            | CallHelper | GetIndex | SetIndex | GetField | SetField | Barrier => None,
+            | CallHelper | GetIndex | SetIndex | GetField | SetField | Barrier | Len => None,
+            Concat => (self.lowered).then(|| self.helped(Helper::Concat, 0, &[a, b], c)),
+            ForStart | ForStep | ForLimit | ForSkip => self.for_prep(i),
+            ForMore | ForNext => self.for_step(i),
             AbsOvf => self.lowered.then(|| self.abs_lower(i)),
             LuaShl | LuaShr => self.lowered.then(|| self.shift_lower(i)),
             FMod => (self.lowered).then(|| self.call(Helper::FMod, 0, &[a, b])),
             NewTable => (self.lowered).then(|| self.call(Helper::NewTable, 0, &[a])),
             GcCheck => self.lowered.then(|| self.gc_check_lower(i)),
             Truthy => self.truthy(a),
+        }
+    }
+
+    /// Whether the open block is reached only through an edge of a branch
+    /// on `cond`: which edge is the verifier's to check.
+    fn under_branch(&self, cond: Val) -> bool {
+        let mut at = self.cur;
+        loop {
+            let d = self.g.block(at);
+            if d.npreds == 1 {
+                let t = self.g.term(self.g.preds(at)[0]);
+                if t.op == Op::Br && t.a == cond.0 && t.b != t.c {
+                    return true;
+                }
+            }
+            if d.idom == at {
+                return false;
+            }
+            at = d.idom;
         }
     }
 

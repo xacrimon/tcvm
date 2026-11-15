@@ -362,4 +362,146 @@ impl Emitter {
         }
         self.join(on);
     }
+
+    /// The rewrite of `Len`, the operand's fact final: an arm per kind it
+    /// leaves, a string's and a table's inline, the helper's for the rest.
+    pub(super) fn len_rewrite(&mut self, i: &Inst) -> Val {
+        let (v, fs) = (Val(i.a), Val(i.b));
+        let has = self.fact(v);
+        if has.pending() {
+            return self.append(*i);
+        }
+        let kinds = [TypeSet::STR, TypeSet::TAB].map(|k| has.set.intersects(k).then_some(k));
+        let n = kinds.iter().flatten().count();
+        let outside = !(TypeSet::STR | TypeSet::TAB).contains(has.set);
+        let mut on = self.new_join::<1>();
+        // The test whose false arm is open.
+        let mut failed = None;
+        for (at, k) in kinds.into_iter().flatten().enumerate() {
+            let last = at + 1 == n;
+            let p = match failed {
+                Some(c) if last && !outside => self.proved(c, false, v, k),
+                None if last && !outside => v,
+                _ => {
+                    let c = self.emit(Op::IsType, Rep::B1, k.bits(), v.0, 0, 0);
+                    let (yes, no) = self.fork(c, false, false);
+                    if self.arm(yes) {
+                        let p = self.proved(c, true, v, k);
+                        let r = self.len_of(p, k, fs);
+                        self.leave(&mut on, [r]);
+                    }
+                    if !self.arm(no) {
+                        break;
+                    }
+                    failed = Some(c);
+                    continue;
+                }
+            };
+            let r = self.len_of(p, k, fs);
+            self.leave(&mut on, [r]);
+        }
+        if !self.cur.is_none() {
+            let r = self.helped(Helper::Len, 0, &[v], fs);
+            self.leave(&mut on, [r]);
+        }
+        self.join(on).map_or(Val::NONE, |[r]| r)
+    }
+
+    /// The length of `v`, known here a string or a table: read through
+    /// what types it (the check again where nothing does).
+    fn len_of(&mut self, v: Val, k: TypeSet, fs: Val) -> Val {
+        let p = self.check_type(v, k, ExitTag::Type, fs);
+        if k == TypeSet::STR {
+            // A string's length fits a small integer.
+            let n = self.load(Field::StrLen, p, 0);
+            let n = self.op1(Op::Trunc32, Rep::I32, n);
+            return self.op1(Op::BoxI32, Rep::Val, n);
+        }
+        self.table_len(v, p, fs)
+    }
+
+    /// `#t` without `__len`, as the interpreter has it inline: the hinted
+    /// element filled and the next one nil, or the hint at the array's end
+    /// with no integer key past it; else the search, in a cold arm.
+    fn table_len(&mut self, v: Val, t: Val, fs: Val) -> Val {
+        use Op::*;
+        self.no_mm(t, MetamethodBits::LEN, ExitTag::Mm, fs);
+        let small = |e: &mut Self, x: Val| e.op1(BoxI32, Rep::Val, x);
+        let one = self.k32(Rep::I32, 1);
+        let n = self.load(Field::ASize, t, 0);
+        let big = self.cmp(Cmp, Cc::Hi, n, one);
+        let (mut slow, mut done) = (self.new_join::<0>(), self.new_join::<1>());
+        let nil = self.k64(Rep::Val, NIL);
+        let hinted = self.fork_or_leave(big, false, &mut slow, []);
+        let item = Field::Item as u16;
+        'inline: {
+            if !self.arm(hinted) {
+                break 'inline;
+            }
+            let last = self.op2(Sub, Rep::I32, n, one);
+            let h = self.load(Field::LenHint, t, 0);
+            let zero = self.k32(Rep::I32, 0);
+            let unset = self.cmp(Cmp, Cc::Eq, h, zero);
+            let h = self.emit(Select, Rep::I32, 0, unset.0, one.0, h.0);
+            let past = self.cmp(Cmp, Cc::Hi, h, last);
+            let h = self.emit(Select, Rep::I32, 0, past.0, last.0, h.0);
+            let arr = self.load(Field::Array, t, 0);
+            // The indices are in range by the branches, not by a guard.
+            let at = self.proved(big, true, h, TypeSet::ANY);
+            let at = self.op1(ZExt32, Rep::I64, at);
+            let x = self.emit(LoadIdx, Rep::Val, item, arr.0, at.0, u32::MAX);
+            let filled = self.cmp(Cmp, Cc::Ne, x, nil);
+            let filled = self.fork_or_leave(filled, false, &mut slow, []);
+            if !self.arm(filled) {
+                break 'inline;
+            }
+            let ends = self.cmp(Cmp, Cc::Eq, h, last);
+            let (at_end, inner) = self.fork(ends, false, false);
+            if self.arm(inner) {
+                let next = self.op2(Add, Rep::I32, h, one);
+                let next = self.proved(ends, false, next, TypeSet::ANY);
+                let next = self.op1(ZExt32, Rep::I64, next);
+                let y = self.emit(LoadIdx, Rep::Val, item, arr.0, next.0, u32::MAX);
+                let border = self.cmp(Cmp, Cc::Eq, y, nil);
+                let (yes, no) = self.fork(border, false, false);
+                if self.arm(yes) {
+                    let r = small(self, h);
+                    self.leave(&mut done, [r]);
+                }
+                if self.arm(no) {
+                    self.leave(&mut slow, []);
+                }
+            }
+            if self.arm(at_end) {
+                let aux = self.load(Field::Aux, t, 0);
+                let null = self.k64(Rep::Ptr, 0);
+                let bare = self.cmp(Cmp, Cc::Eq, aux, null);
+                let (yes, hashed) = self.fork(bare, false, false);
+                if self.arm(yes) {
+                    let r = small(self, last);
+                    self.leave(&mut done, [r]);
+                }
+                if self.arm(hashed) {
+                    let aux = self.proved(bare, false, aux, TypeSet::ANY);
+                    let ints = self.load(Field::AuxInts, aux, 0);
+                    let zero = self.k64(Rep::I64, 0);
+                    let empty = self.cmp(Cmp, Cc::Eq, ints, zero);
+                    let (yes, no) = self.fork(empty, false, false);
+                    if self.arm(yes) {
+                        let r = small(self, last);
+                        self.leave(&mut done, [r]);
+                    }
+                    if self.arm(no) {
+                        self.leave(&mut slow, []);
+                    }
+                }
+            }
+        }
+        // The search looks no metamethod up and has a length for any table.
+        if self.join(slow).is_some() {
+            let r = self.call(Helper::RawLen, 0, &[v]);
+            self.leave(&mut done, [r]);
+        }
+        self.join(done).map_or(Val::NONE, |[r]| r)
+    }
 }
