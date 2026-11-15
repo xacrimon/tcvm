@@ -54,6 +54,8 @@ fields! {
     ClassBits crate::env::MtCache::BITS_OFFSET, I32 ANY META false;
     // The frame's function, from the base: its closure under header flags.
     FrameFn  -32,              Val FUN FRAME     false;
+    // The frame's flags (`vm::frame::flag`), from the base.
+    FrameFlags -24,            I64 ANY FRAME     false;
     // A Lua closure's upvalues, from the closure (the offset is the
     // runtime's, `compile::upvalues_offset`): a value, or a shared cell.
     Upval    0,                Val ANY IMMUTABLE true;
@@ -61,6 +63,10 @@ fields! {
     // Where a cell's value is (a stack slot while open), and the value there.
     CellAt   crate::env::function::UpvalueCell::V_OFFSET, Ptr ANY UPVAL false;
     CellValue 0,               Val ANY UPVAL     false;
+    // The collector's allocation counter and its threshold, from the
+    // arena's metrics.
+    GcUsed   layout::GC_CHECK, I64 ANY GC        false;
+    GcLimit  layout::GC_CHECK + 8, I64 ANY GC    false;
 }
 
 impl Field {

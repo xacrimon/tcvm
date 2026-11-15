@@ -289,6 +289,12 @@ impl<'a> Em<'a> {
                 let cc: Cond = unsafe { std::mem::transmute(m.cc) };
                 self.a.cset(Sz::W, self.r(i, 0), cc)
             }
+            MOp::Csel => {
+                // SAFETY: selection wrote an `asm::Cond`.
+                let cc: Cond = unsafe { std::mem::transmute(m.cc) };
+                self.a
+                    .csel(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2), cc)
+            }
             MOp::AndRR => self.a.and(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::OrrRR => self.a.orr(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::AndImm => self.a.and_imm(sz, self.r(i, 0), self.r(i, 1), imm),

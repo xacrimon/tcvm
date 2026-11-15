@@ -461,7 +461,14 @@ impl Emitter {
         } else if !info.writes.is_empty() {
             self.kill(info.writes);
         } else if i.op == Op::CallHelper {
-            self.kill(Helper::of(i.aux).info().writes);
+            // An allocation moves the collector's counter.
+            let h = Helper::of(i.aux).info();
+            let gc = if h.flags.contains(Flags::ALLOCS) {
+                Heaps::GC
+            } else {
+                Heaps::empty()
+            };
+            self.kill(h.writes | gc);
         }
         if numbered && let Err(s) = self.number(&i) {
             slot = s;
@@ -517,6 +524,9 @@ impl Emitter {
             })),
             (Op::KObj | Op::BoxPtr, _) => Fact::of(TypeSet::from_bits_retain(i.aux)),
             (Op::Load | Op::LoadIdx, Rep::Val) => Fact::of(Field::info(i.aux).set),
+            (Op::CallHelper, Rep::Val) if i.aux == Helper::NewTable as u16 => {
+                Fact::of(TypeSet::TAB)
+            }
             (Op::BoxI32, _) => Fact::of(TypeSet::SMALL),
             (Op::BoxF64, _) => Fact::of(TypeSet::FLOAT),
             (Op::BoxI64, _) => Fact::of(TypeSet::INT),

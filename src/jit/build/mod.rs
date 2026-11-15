@@ -97,6 +97,9 @@ struct Builder<'a, 'gc> {
     state: Val,
     /// The shapes the code compares with, which the region keeps alive.
     shapes: Vec<crate::env::Shape<'gc>>,
+    /// The address of the arena's metrics, where the collector's counters
+    /// are.
+    metrics: u64,
     /// The instructions compiled as a deopt for want of code.
     missing: Vec<Bc>,
 }
@@ -109,6 +112,7 @@ pub(crate) fn build<'gc>(
     cfg: &Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
+    metrics: u64,
 ) -> (Vec<crate::env::Shape<'gc>>, Vec<Bc>) {
     let nb = cfg.blocks.len();
     let root = cfg.block_of[entry_pc as usize];
@@ -126,6 +130,7 @@ pub(crate) fn build<'gc>(
         pc: entry_pc,
         state: Val::NONE,
         shapes: Vec::new(),
+        metrics,
         missing: Vec::new(),
     };
     // A captured register lives in its slot, which the closures holding it
@@ -558,6 +563,7 @@ impl Builder<'_, '_> {
                 let v = self.helped(Helper::Concat, 0, &[x, y]);
                 self.set(a, v);
             }
+            NEWTABLE => self.newtable(pc, i),
             GETTABLE => self.gettable(pc, i),
             SETTABLE => self.settable(pc, i),
             GETUPVAL | GETUPVAL_REF => self.getupval(i),
@@ -578,6 +584,91 @@ impl Builder<'_, '_> {
                 }
             }
             JMP | JMP_BACK => self.jump(fall.unwrap()),
+            LFALSESKIP => {
+                let v = self.konst(Value::boolean(false));
+                self.set(a, v);
+                self.jump(fall.unwrap());
+            }
+            NOT => {
+                let v = self.reg(b);
+                let t = self.e.emit(Op::Truthy, Rep::B1, 0, v.0, 0, 0);
+                let (no, yes) = (
+                    self.konst(Value::boolean(false)),
+                    self.konst(Value::boolean(true)),
+                );
+                let r = self.e.emit(Op::Select, Rep::Val, 0, t.0, no.0, yes.0);
+                self.set(a, r);
+            }
+            JT | JF => {
+                let v = self.reg(a);
+                let t = self.e.emit(Op::Truthy, Rep::B1, 0, v.0, 0, 0);
+                let (fall, jump) = (fall.unwrap(), jump.unwrap());
+                if op == JT {
+                    self.br(t, jump, fall)
+                } else {
+                    self.br(t, fall, jump)
+                }
+            }
+            // The register is written on the edge taken only.
+            JTSET | JFSET => {
+                let v = self.reg(b);
+                let t = self.e.emit(Op::Truthy, Rep::B1, 0, v.0, 0, 0);
+                let (fall, jump) = (fall.unwrap(), jump.unwrap());
+                match self.e.known(t) {
+                    Some(k) if k == (op == JTSET) => {
+                        self.set(a, v);
+                        self.jump(jump);
+                    }
+                    Some(_) => self.jump(fall),
+                    None => {
+                        let edge = self.e.new_block();
+                        let out = self.target(fall);
+                        if op == JTSET {
+                            self.e.br(t, edge, out);
+                        } else {
+                            self.e.br(t, out, edge);
+                        }
+                        let lp = self.ir_loop(self.bb);
+                        self.e.begin(edge, lp, 0, BlockFlags::empty());
+                        self.set(a, v);
+                        self.jump(jump);
+                    }
+                }
+            }
+            JEQS | JNEQS => {
+                // A string is equal to nothing but itself.
+                let k = self.konst(self.proto.constants[i.h() as usize]);
+                let x = self.reg(a);
+                let c = self.e.cmp(Op::Cmp, Cc::Eq, x, k);
+                let (fall, jump) = (fall.unwrap(), jump.unwrap());
+                if op == JEQS {
+                    self.br(c, jump, fall)
+                } else {
+                    self.br(c, fall, jump)
+                }
+            }
+            RETURN if b != 0 => {
+                // What a return would close is the interpreter's to close: a
+                // frame entered mid-way may have it.
+                let base = self.e.emit(Op::Base, Rep::Ptr, 0, 0, 0, 0);
+                let field = crate::jit::ir::fields::Field::FrameFlags as u16;
+                let flags = self.e.emit(Op::Load, Rep::I64, field, base.0, u32::MAX, 0);
+                let mask = crate::vm::frame::flag::HAS_OPEN | crate::vm::frame::flag::HAS_TBC;
+                let mask = self.e.k64(Rep::I64, mask);
+                let set = self.e.op2(Op::And, Rep::I64, flags, mask);
+                let zero = self.e.k64(Rep::I64, 0);
+                let none = self.e.cmp(Op::Cmp, Cc::Eq, set, zero);
+                let state = self.state();
+                let tag = ExitTag::Unsupported as u16;
+                self.e
+                    .emit(Op::Guard, Rep::None, tag, none.0, state.0, u32::MAX);
+                for r in a..a + b - 1 {
+                    let v = self.reg(r);
+                    self.e.emit(Op::SlotStore, Rep::None, r as u16, v.0, 0, 0);
+                }
+                self.e
+                    .emit(Op::Ret, Rep::None, 0, a as u32, b as u32 - 1, 0);
+            }
             RETURN0 => {
                 self.e.emit(Op::Ret, Rep::None, 0, 0, 0, 0);
             }
@@ -639,14 +730,39 @@ impl Builder<'_, '_> {
                         self.set(a, v);
                     }
                 }
-                Family::CmpReg | Family::CmpImm => {
+                f if matches!(f, Family::CmpReg | Family::CmpImm)
+                    || matches!(i.generic_op(), JEQI | JNEQI) =>
+                {
                     let x = self.reg(a);
+                    let (fall, jump) = (fall.unwrap(), jump.unwrap());
+                    if matches!(i.generic_op(), JEQ | JNEQ) {
+                        // Nil, booleans, strings, functions and threads are
+                        // equal only to themselves.
+                        let y = self.reg(b);
+                        let bits = TypeSet::NIL
+                            | TypeSet::BOOL
+                            | TypeSet::STR
+                            | TypeSet::FUN
+                            | TypeSet::THR;
+                        let by_bits = [x, y].iter().any(|&v| {
+                            let f = self.e.fact(v);
+                            !f.pending() && bits.contains(f.set)
+                        });
+                        if by_bits {
+                            let c = self.e.cmp(Op::Cmp, Cc::Eq, x, y);
+                            return match i.generic_op() {
+                                JEQ => self.br(c, jump, fall),
+                                _ => self.br(c, fall, jump),
+                            };
+                        }
+                    }
                     let (cc, y) = match i.generic_op() {
                         JLT | JNLT => (Cc::Lt, self.reg(b)),
                         JLE | JNLE => (Cc::Le, self.reg(b)),
                         JEQ | JNEQ => (Cc::Eq, self.reg(b)),
                         g => {
                             let cc = match g {
+                                JEQI | JNEQI => Cc::Eq,
                                 JLTI | JNLTI => Cc::Lt,
                                 JLEI | JNLEI => Cc::Le,
                                 JGTI | JNGTI => Cc::Gt,
@@ -668,7 +784,6 @@ impl Builder<'_, '_> {
                     let Some(c) = self.generic(Op::Compare, Rep::B1, cc as u16, x, y) else {
                         return;
                     };
-                    let (fall, jump) = (fall.unwrap(), jump.unwrap());
                     match i.generic_op().branch_sense() {
                         Some(false) => self.br(c, fall, jump),
                         _ => self.br(c, jump, fall),

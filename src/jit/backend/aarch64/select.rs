@@ -360,6 +360,13 @@ impl Sel<'_> {
                 self.push(MOp::Cset, Sz::W, cc, 0, &[d]);
                 self.compare(v);
             }
+            Select if i.rep != Rep::F64 => {
+                let Some(d) = self.def(v) else { return };
+                let cc = self.cond(a);
+                let (x, y) = (self.reg(b), self.reg(Val(i.c)));
+                self.push(MOp::Csel, w, cc, 0, &[d, x, y]);
+                self.compare(a);
+            }
             Base => {
                 let Some(d) = self.def(v) else { return };
                 self.op(MOp::MovBase, Sz::X, 0, &[d]);

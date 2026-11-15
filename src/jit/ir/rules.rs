@@ -478,7 +478,8 @@ impl Emitter {
             }
             K32 | K64 | KF64 | KObj | Base | Load | Store | LoadIdx | StoreIdx | SlotLoad
             | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr
-            | AbsOvf | FMod | Unm | Truthy | CallHelper => None,
+            | AbsOvf | FMod | Unm | CallHelper => None,
+            Truthy => self.truthy(a),
         }
     }
 
@@ -543,6 +544,27 @@ impl Emitter {
         let top = self.op2(Sar, Rep::I64, v, k);
         let want = self.k64(Rep::I64, (tag as i64 - 8) as u64);
         Some(self.cmp(Cmp, Cc::Eq, top, want))
+    }
+
+    /// Whether the `Val` is neither nil nor false, once its fact is final:
+    /// decided by the fact, or lowered a compare.
+    fn truthy(&mut self, v: Val) -> Option<Val> {
+        let f = self.fact(v);
+        if f.pending() {
+            None
+        } else if !f.set.intersects(TypeSet::FALSY) {
+            Some(self.k32(Rep::B1, 1))
+        } else if TypeSet::FALSY.contains(f.set) {
+            Some(self.k32(Rep::B1, 0))
+        } else if self.lowered {
+            // Nil and false are the two words from nil on.
+            let nil = self.k64(Rep::I64, crate::env::value::NIL);
+            let from = self.op2(Op::Sub, Rep::I64, v, nil);
+            let two = self.k64(Rep::I64, 2);
+            Some(self.cmp(Op::Cmp, Cc::Hs, from, two))
+        } else {
+            None
+        }
     }
 
     fn is_const(&self, v: Val) -> bool {

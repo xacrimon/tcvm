@@ -58,6 +58,8 @@ mops! {
     MovBase   (D);
     Uxtw      (D U);
     Cset      (D);
+    // The first register where `cc` holds, else the second.
+    Csel      (D U U);
     AndRR     (D U U);
     OrrRR     (D U U);
     AndImm    (D U);

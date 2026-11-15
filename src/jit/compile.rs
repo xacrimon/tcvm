@@ -267,7 +267,10 @@ pub(crate) fn compile<'gc>(
     high.reset(false);
     let pool = &mut scratch.pool;
     pool.words.clear();
-    let (shapes, missing) = crate::jit::build::build(high, pool, &cfg, closure.proto, pc);
+    let (shapes, missing) = {
+        let metrics = crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64;
+        crate::jit::build::build(high, pool, &cfg, closure.proto, pc, metrics)
+    };
     #[cfg(feature = "tcvm-dev")]
     for op in missing {
         (ctx.runtime().stats).count(1, || format!("jit unsupported {}", op.name()));
