@@ -177,7 +177,7 @@ impl Drop for ThreadStack {
 #[repr(C)]
 pub(crate) struct EntryRecord {
     /// The frame record of the code that started the level: its frame
-    /// pointer and the return address (tagged in bit 0 for a `br` return).
+    /// pointer and the return address.
     pub(crate) fp: usize,
     pub(crate) lr: usize,
     /// The record of the level below, 0 for the bottom level's.
@@ -185,9 +185,7 @@ pub(crate) struct EntryRecord {
     /// The base of the level's first frame: frames below it are the
     /// compiled caller's. 0 for the bottom level.
     pub(crate) first: usize,
-    /// `ThreadState::native_deep` of the level below.
-    pub(crate) deep: usize,
-    _pad: usize,
+    _pad: [usize; 2],
     /// x22 to x25 of the code that started the level, x22 its `BASE`
     /// (`abi::jit_level`).
     pub(crate) x: [usize; 4],
@@ -229,7 +227,6 @@ pub(crate) mod rec {
     use super::EntryRecord;
     pub(crate) const SIZE: usize = size_of::<EntryRecord>();
     pub(crate) const PREV: usize = offset_of!(EntryRecord, prev);
-    pub(crate) const DEEP: usize = offset_of!(EntryRecord, deep);
     pub(crate) const X: usize = offset_of!(EntryRecord, x);
     const _: () = assert!(SIZE == 80 && PREV == 16 && X == 48);
 }

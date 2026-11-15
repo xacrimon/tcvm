@@ -257,10 +257,6 @@ fn pop_levels(t: &mut ThreadState<'_>, level: usize) {
         // SAFETY: the thread's records chain from `t.record`, and `level` is
         // one of them.
         let r = unsafe { &*(t.record as *const crate::vm::stack::EntryRecord) };
-        #[cfg(target_arch = "aarch64")]
-        {
-            t.native_deep = r.deep;
-        }
         t.record = r.prev;
     }
 }

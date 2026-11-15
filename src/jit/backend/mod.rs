@@ -15,7 +15,7 @@
 //! - `target::abi`: the allocator's registers (`ra_env`, `allocatable`), the
 //!   registers calls pass arguments in (`REG_ARGS`), the exit's register
 //!   image (`EXIT_REGS`, `IMAGE_SPILLS`, `image_index`), the frame's spill
-//!   slots (`spill_addr`), a return address's tag (`RA_TAG`),
+//!   slots (`spill_addr`),
 //!   `stack_pointer`, register names for the dumps (`reg_name`), and the stubs
 //!   between compiled code, the interpreter's handlers and levels
 //!   (`dispatch_entry`, `level_jump`, `level_land`, `level_return_addr`,

@@ -4,16 +4,12 @@
 //!
 //! Handlers run with the level's record above `rsp` and `level_return`'s
 //! address pushed below it, which the bottom level's last handler returns
-//! to. Compiled code never tags a return address (`RA_TAG`): every call is a
-//! `call` and every return a `ret`.
+//! to.
 
 use crate::jit::backend::reg::{PReg, PRegSet, RegClass};
 use crate::jit::backend::x86_64::asm::{
     Gpr, R8, R9, R10, R11, R12, R13, R14, R15, RAX, RBX, RCX, RDI, RDX, RSI, Xmm,
 };
-
-/// The bit of a return address that marks a return by branch: none here.
-pub(crate) const RA_TAG: usize = 0;
 
 /// Words of the register image `exit_common` writes: the allocatable
 /// integer registers in `INT_IMAGE` order, xmm0-xmm15, then the region's

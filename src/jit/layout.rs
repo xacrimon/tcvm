@@ -21,9 +21,6 @@ pub(crate) const EXIT_REGS: usize = JIT + offset_of!(JitRuntime, exit_regs);
 pub(crate) const RECORD: usize = offset_of!(crate::env::thread::ThreadState<'static>, record);
 pub(crate) const NATIVE_LIMIT: usize =
     offset_of!(crate::env::thread::ThreadState<'static>, native_limit);
-#[cfg(target_arch = "aarch64")]
-pub(crate) const NATIVE_DEEP: usize =
-    offset_of!(crate::env::thread::ThreadState<'static>, native_deep);
 /// The running thread's pointer, from `rt`: where x86-64, whose handlers
 /// take no `thread`, finds it.
 #[cfg(target_arch = "x86_64")]

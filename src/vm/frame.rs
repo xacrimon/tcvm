@@ -520,12 +520,7 @@ impl<'gc> Walk<'gc> {
             self.cross = false;
             // SAFETY: the thread's records chain from `ts.record`.
             let r = unsafe { &*(self.rec as *const EntryRecord) };
-            self.compiled = Some((
-                r.fp,
-                r.lr & !crate::jit::RA_TAG,
-                r.base() as *mut Value<'gc>,
-                true,
-            ));
+            self.compiled = Some((r.fp, r.lr, r.base() as *mut Value<'gc>, true));
             self.rec = r.prev;
             self.level = r.prev;
         }
@@ -553,7 +548,7 @@ impl<'gc> Walk<'gc> {
             };
             let lr = *((fp + 8) as *const usize);
             let next = (lr != crate::vm::stack::level_land())
-                .then(|| (*(fp as *const usize), lr & !crate::jit::RA_TAG, base, false));
+                .then(|| (*(fp as *const usize), lr, base, false));
             (f, next)
         };
         self.compiled = next;

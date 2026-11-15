@@ -16,9 +16,6 @@ pub(crate) fn spill_addr(fp: usize, i: usize) -> usize {
     fp + FRAME_SPILLS + 8 * i
 }
 
-/// The bit of a return address that marks a return by branch (`RAS_STACK`).
-pub(crate) const RA_TAG: usize = 1;
-
 /// How many arguments a call passes in registers, x0 up.
 pub(crate) const REG_ARGS: u8 = 8;
 
@@ -231,13 +228,6 @@ pub(crate) unsafe extern "C" fn exit_common() {
     )
 }
 
-/// Native stack below a level's start past which fast calls branch with a
-/// tagged return address instead of `blr`, and return with `br`: the M4's
-/// return address stack holds 48 to 64 entries (a chain of 64 returns runs at
-/// three times the cycles of one of 48, the tagged returns at 1.05), and the
-/// median region frame is 32 bytes.
-pub(crate) const RAS_STACK: usize = 1536;
-
 /// Start a level for compiled code: entered by `bl` or `b` with the return
 /// address in x30, the handler to run in x16, the base of the level's first
 /// frame in x17 and the handler's arguments in x20-x25. Pushes an entry record
@@ -250,25 +240,18 @@ pub(crate) unsafe extern "C" fn jit_level() {
         "sub sp, sp, #{size}",
         "stp x29, x30, [sp, #0]",
         "ldr x9, [x25, #{record}]",
-        "ldr x10, [x25, #{deep}]",
         "stp x9, x17, [sp, #{prev}]",
-        "str x10, [sp, #{deep_saved}]",
         "stp x22, x23, [sp, #{x}]",
         "stp x24, x25, [sp, #{x} + 16]",
         "mov x29, sp",
         "str x29, [x25, #{record}]",
-        "sub x9, x29, #{ras}",
-        "str x9, [x25, #{deep}]",
         "ldr x30, [x23, #{level_ret}]",
         "br x16",
         size = const crate::vm::stack::rec::SIZE,
         prev = const crate::vm::stack::rec::PREV,
-        deep_saved = const crate::vm::stack::rec::DEEP,
         x = const crate::vm::stack::rec::X,
         record = const crate::jit::layout::RECORD,
-        deep = const crate::jit::layout::NATIVE_DEEP,
         level_ret = const crate::jit::layout::LEVEL_RET,
-        ras = const RAS_STACK,
     )
 }
 
@@ -301,18 +284,14 @@ pub(crate) unsafe extern "C" fn level_return() {
         "nop",
         "ldr x9, [sp, #{x} + 24]",
         "ldr x10, [sp, #{prev}]",
-        "ldr x11, [sp, #{deep_saved}]",
         "str x10, [x9, #{record}]",
-        "str x11, [x9, #{deep}]",
         "ldp x29, x30, [sp], #{size}",
         "ret",
         ".cfi_endproc",
         size = const crate::vm::stack::rec::SIZE,
         prev = const crate::vm::stack::rec::PREV,
-        deep_saved = const crate::vm::stack::rec::DEEP,
         x = const crate::vm::stack::rec::X,
         record = const crate::jit::layout::RECORD,
-        deep = const crate::jit::layout::NATIVE_DEEP,
     )
 }
 
@@ -346,15 +325,14 @@ pub(crate) unsafe extern "C" fn direct_miss() {
 }
 
 /// A fast callee's entry checks failed: on to its caller's slow path, which
-/// the caller's site table names by the return address in x30 (tagged or
-/// not). Every path here has the arguments in the callee's slots, and the
+/// the caller's site table names by the return address in x30. Every path here has the arguments in the callee's slots, and the
 /// pinned registers and `insn` are callee-saved.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn call_miss() {
     core::arch::naked_asm!(
         "stp x29, x30, [sp, #-16]!",
         "mov x29, sp",
-        "and x0, x30, #~1",
+        "mov x0, x30",
         "bl {target}",
         "mov x16, x0",
         "ldp x29, x30, [sp], #16",
@@ -428,24 +406,16 @@ pub(crate) extern "rust-preserve-none" fn ret_to_native<'gc>(
         "ldr x0, [x21]",
         "1:",
         "ldr x10, [x9, #{prev}]",
-        "ldr x11, [x9, #{deep_saved}]",
         "str x10, [x25, #{record}]",
-        "str x11, [x25, #{deep}]",
         "ldp x22, x23, [x9, #{x}]",
         "ldp x24, x25, [x9, #{x} + 16]",
         "ldp x29, x30, [x9, #0]",
         "add sp, x9, #{size}",
-        "tbnz x30, #0, 2f",
         "ret",
-        "2:",
-        "and x30, x30, #~1",
-        "br x30",
         size = const crate::vm::stack::rec::SIZE,
         prev = const crate::vm::stack::rec::PREV,
-        deep_saved = const crate::vm::stack::rec::DEEP,
         x = const crate::vm::stack::rec::X,
         record = const crate::jit::layout::RECORD,
-        deep = const crate::jit::layout::NATIVE_DEEP,
     )
 }
 

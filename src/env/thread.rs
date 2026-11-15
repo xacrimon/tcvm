@@ -114,11 +114,6 @@ pub struct ThreadState<'gc> {
     /// stack's end plus headroom for natives.
     #[cfg(jit)]
     pub(crate) native_limit: usize,
-    /// Fast calls with the stack pointer below this branch with a tagged return
-    /// address instead of `blr`: this level's return address stack is full from
-    /// here.
-    #[cfg(all(jit, target_arch = "aarch64"))]
-    pub(crate) native_deep: usize,
     /// The frame pointer and return address of the compiled code a native runs
     /// for through `jit_call_native`: its frame's caller while the frame
     /// returns through `ret_shim`.
@@ -633,8 +628,6 @@ impl<'gc> Thread<'gc> {
             record: 0,
             #[cfg(jit)]
             native_limit: 0,
-            #[cfg(all(jit, target_arch = "aarch64"))]
-            native_deep: 0,
             #[cfg(jit)]
             shim: [0; 2],
             entry: None,
