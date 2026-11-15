@@ -89,10 +89,10 @@ impl Emitter {
         self.unless(nil, |e| e.no_mm(t, bit, tag, state));
     }
 
-    /// The store's barrier, unless the value is never a heap object: the
-    /// helper where the table is not gray.
+    /// The store's barrier, unless the value (`NONE` for a shape) is never
+    /// a heap object: the helper where the table is not gray.
     pub(crate) fn barrier(&mut self, t: Val, v: Val) {
-        if !self.fact(v).set.intersects(TypeSet::HEAP) {
+        if !v.is_none() && !self.fact(v).set.intersects(TypeSet::HEAP) {
             return;
         }
         let header = self.load(Field::GcHeader, t, 0);

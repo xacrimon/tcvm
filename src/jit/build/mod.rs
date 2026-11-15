@@ -97,6 +97,9 @@ struct RLoop {
 pub(crate) enum DepOn<'gc> {
     /// A class keeps the metamethod bits as they are.
     Class(crate::env::shape::MtCache<'gc>),
+    /// A watched holder keeps its shape, or a slot its value
+    /// (`deps::SHAPE_GROUP`, `deps::slot_group`).
+    Shape(crate::env::Shape<'gc>),
 }
 
 /// What `build` hands on besides the graph: the shapes the code compares
@@ -845,6 +848,7 @@ impl<'gc> Builder<'_, 'gc> {
                 }
                 _ => match i.op().unquickened() {
                     GETFIELD | GETTABUP | GETTABUP_REF => self.getfield(i),
+                    SELF => self.self_(i),
                     SETFIELD | SETTABUP | SETTABUP_REF => self.setfield(i),
                     _ if matches!(
                         i.op(),

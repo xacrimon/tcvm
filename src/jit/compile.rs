@@ -509,6 +509,7 @@ pub(crate) fn compile<'gc>(
                 let bits = crate::env::MetamethodBits::from_bits_retain(groups as u32);
                 c.depend(ctx.mutation(), region, bits);
             }
+            crate::jit::build::DepOn::Shape(s) => s.depend(ctx.mutation(), region, groups),
         }
     }
     Ok(region)
