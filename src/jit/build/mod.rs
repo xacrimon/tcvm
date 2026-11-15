@@ -449,7 +449,7 @@ impl Builder<'_, '_> {
         // A register the predecessors changed alike holds that value.
         for i in 0..self.e.table.merges() {
             let (key, at) = self.e.table.merge(i);
-            if !key.is_fact() && at.iter().all(|&v| v == at[0]) {
+            if key.is_reg() && at.iter().all(|&v| v == at[0]) {
                 let v = at[0];
                 self.e.table.set(key, v);
             }
@@ -469,7 +469,7 @@ impl Builder<'_, '_> {
         // A register that is not live has no value here.
         for i in 0..self.e.table.merges() {
             let (key, _) = self.e.table.merge(i);
-            if !key.is_fact() && !live.contains(key.index() as usize) {
+            if key.is_reg() && !live.contains(key.index() as usize) {
                 self.e.table.set(key, table::NONE);
             }
         }
