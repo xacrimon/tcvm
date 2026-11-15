@@ -52,6 +52,9 @@ impl<'gc> Builder<'_, 'gc> {
         let (a, nb, c) = i.abc();
         let fused = matches!(i.op(), Bc::CALLS | Bc::CALLS_R0 | Bc::CALLS_R1);
         let callee = self.reg(if fused { i.e() as u8 } else { a });
+        if nb != 0 && self.intrinsic(pc, i, callee) {
+            return;
+        }
         let (callee, known) = self.known_callee(pc, callee);
         self.e
             .emit(Op::SlotStore, Rep::None, a as u16, callee.0, 0, 0);

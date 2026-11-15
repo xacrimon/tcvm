@@ -543,11 +543,16 @@ impl Sel<'_> {
                 self.push(MOp::Cset, Sz::W, cc, 0, &[d]);
                 self.compare(v);
             }
-            Select if i.rep != Rep::F64 => {
+            Select => {
                 let Some(d) = self.def(v) else { return };
                 let cc = self.cond(a);
                 let (x, y) = (self.reg(b), self.reg(Val(i.c)));
-                self.push(MOp::Csel, w, cc, 0, &[d, x, y]);
+                let op = if i.rep == Rep::F64 {
+                    MOp::Fcsel
+                } else {
+                    MOp::Csel
+                };
+                self.push(op, w, cc, 0, &[d, x, y]);
                 self.compare(a);
             }
             Base => {
@@ -712,13 +717,17 @@ impl Sel<'_> {
                 };
                 self.op(op, w, 0, &[d, x, y]);
             }
-            SExt32 | Neg | FNeg | FFloor => {
+            SExt32 | Neg | FNeg | FFloor | FCeil | FAbs | FSqrt | FToI => {
                 let Some(d) = self.def(v) else { return };
                 let x = self.reg(a);
                 let op = match i.op {
                     SExt32 => MOp::Sxtw,
                     Neg => MOp::NegR,
                     FNeg => MOp::FNeg,
+                    FCeil => MOp::Frintp,
+                    FAbs => MOp::FAbs,
+                    FSqrt => MOp::FSqrt,
+                    FToI => MOp::Fcvtzs,
                     _ => MOp::Frintm,
                 };
                 self.op(op, w, 0, &[d, x]);

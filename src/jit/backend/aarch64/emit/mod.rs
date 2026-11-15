@@ -478,6 +478,15 @@ impl<'a> Em<'a> {
             MOp::NegsR => self.a.negs(sz, self.r(i, 0), self.r(i, 1)),
             MOp::FNeg => self.a.fneg(self.fr(i, 0), self.fr(i, 1)),
             MOp::Frintm => self.a.frintm(self.fr(i, 0), self.fr(i, 1)),
+            MOp::Frintp => self.a.frintp(self.fr(i, 0), self.fr(i, 1)),
+            MOp::FAbs => self.a.fabs(self.fr(i, 0), self.fr(i, 1)),
+            MOp::FSqrt => self.a.fsqrt(self.fr(i, 0), self.fr(i, 1)),
+            MOp::Fcvtzs => self.a.fcvtzs(sz, self.r(i, 0), self.fr(i, 1)),
+            MOp::Fcsel => {
+                // SAFETY: selection wrote an `asm::Cond`.
+                let cc: Cond = unsafe { std::mem::transmute(m.cc) };
+                (self.a).fcsel(self.fr(i, 0), self.fr(i, 1), self.fr(i, 2), cc)
+            }
             MOp::AndImm => self.a.and_imm(sz, self.r(i, 0), self.r(i, 1), imm),
             MOp::TstImm => self.a.tst_imm(sz, self.r(i, 0), imm),
             MOp::AddRR => self.a.add(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),

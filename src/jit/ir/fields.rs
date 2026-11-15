@@ -64,6 +64,8 @@ fields! {
     // such a closure's prototype.
     FnKind   layout::FN_IS_VARARG, I32 ANY IMMUTABLE false;
     FnProto  layout::FN_PROTO, Ptr ANY IMMUTABLE false;
+    // A string's length in bytes.
+    StrLen   crate::env::string::LuaString::LEN_OFFSET, I64 ANY IMMUTABLE false;
     // The frame's flags (`vm::frame::flag`), from the base.
     FrameFlags -24,            I64 ANY FRAME     false;
     // A Lua closure's upvalues, from the closure (the offset is the

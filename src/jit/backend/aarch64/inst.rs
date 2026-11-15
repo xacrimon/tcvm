@@ -95,8 +95,15 @@ mops! {
     // Flag-setting, as `AddsRR`.
     NegsR     (D U);
     FNeg      (Fd Fu);
-    // Round toward negative infinity.
+    // Round toward negative infinity, and toward positive.
     Frintm    (Fd Fu);
+    Frintp    (Fd Fu);
+    FAbs      (Fd Fu);
+    FSqrt     (Fd Fu);
+    // Toward zero, saturating.
+    Fcvtzs    (D Fu);
+    // As `Csel`.
+    Fcsel     (Fd Fu Fu);
     OrrRR     (D U U);
     AndImm    (D U);
     TstImm    (U);

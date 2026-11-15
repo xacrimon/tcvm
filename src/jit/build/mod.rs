@@ -7,6 +7,7 @@
 
 mod calls;
 pub(crate) mod cfg;
+mod intrinsics;
 mod iter;
 mod tables;
 
