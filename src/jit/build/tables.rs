@@ -230,14 +230,7 @@ impl<'gc> Builder<'_, 'gc> {
         let template = self.e.k64(Rep::I64, template);
         let t = self.e.call(Helper::NewTable, 0, &[template]);
         self.set(i.a(), t);
-        let metrics = self.e.k64(Rep::Ptr, self.metrics);
-        let used = self.load(Field::GcUsed, metrics, 0);
-        let limit = self.load(Field::GcLimit, metrics, 0);
-        let below = self.e.cmp(Op::Cmp, Cc::Lo, used, limit);
-        let after = self.state_at(pc + 1);
-        let tag = ExitTag::Gc as u16;
-        self.e
-            .emit(Op::Guard, Rep::None, tag, below.0, after.0, u32::MAX);
+        self.gc_check(pc);
     }
 
     /// The cache entry of a constant-key site, where it is an own slot the

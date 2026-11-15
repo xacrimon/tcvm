@@ -241,7 +241,7 @@ pub(crate) extern "C" fn jit_upval_barrier(
     }
 }
 
-/// `CLOSURE` into `R[dst]` (`imm`: `proto | dst << 32`), reading the frame's
+/// `CLOSURE` into `R[dst]` (`imm`: `proto | dst << 16`), reading the frame's
 /// slots.
 pub(crate) extern "C" fn jit_closure(
     rt: *const State<'static>,
@@ -257,14 +257,14 @@ pub(crate) extern "C" fn jit_closure(
         ts,
         base,
         closure,
-        imm as u32 as usize,
-        (imm >> 32) as u8,
+        imm as u16 as usize,
+        (imm >> 16) as u8,
         true,
     );
     Value::function(f).to_raw()
 }
 
-/// `CLOSURE` in an inlined frame (`imm`: `proto | dst << 32 | at << 40`, `at`
+/// `CLOSURE` in an inlined frame (`imm`: `proto | dst << 16 | at << 24`, `at`
 /// its base's region slot) of `closure`'s prototype: no header to mark.
 pub(crate) extern "C" fn jit_closure_of(
     rt: *const State<'static>,
@@ -280,14 +280,14 @@ pub(crate) extern "C" fn jit_closure_of(
             closure as *const crate::env::function::FunctionKind<'static>,
         )
     };
-    let at = unsafe { base.add((imm >> 40) as u8 as usize) };
+    let at = unsafe { base.add((imm >> 24) as u8 as usize) };
     let f = new_closure(
         ctx,
         ts,
         at,
         closure,
-        imm as u32 as usize,
-        (imm >> 32) as u8,
+        imm as u16 as usize,
+        (imm >> 16) as u8,
         false,
     );
     Value::function(f).to_raw()

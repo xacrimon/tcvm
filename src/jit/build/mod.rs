@@ -18,6 +18,7 @@ use crate::instruction::{ArithKind, Family, Instruction, Op as Bc};
 use crate::jit::compile::Bail;
 use crate::jit::feedback as fb;
 use crate::jit::ir::emit::Emitter;
+use crate::jit::ir::fields::Field;
 use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, HELPER_FAIL_VAL, Heaps, Helper, Op};
 use crate::jit::ir::table::{self, Key};
 use crate::jit::ir::types::{Fact, FactFlags, Rep, TypeSet};
@@ -167,11 +168,7 @@ pub(crate) fn build<'gc>(
         metrics,
         missing: Vec::new(),
     };
-    // A captured register lives in its slot, which the closures holding it
-    // read and write: registers here are values only.
-    if cfg.captured != RegSet::EMPTY {
-        b.e.bail(Bail::Unsupported("captured registers"));
-    } else if !b.find_loops(root, &rpo, &order) {
+    if !b.find_loops(root, &rpo, &order) {
         b.e.bail(Bail::Unsupported("irreducible control flow"));
     }
     b.blocks = (0..nb).map(|_| b.e.new_block()).collect();
@@ -293,6 +290,14 @@ impl<'gc> Builder<'_, 'gc> {
                             assigned.insert(a + 3);
                         }
                         Bc::JTSET | Bc::JFSET => assigned.insert(a),
+                        // A callee may write the captured registers, which
+                        // are read again after it.
+                        Bc::CALL
+                        | Bc::CALL_R0
+                        | Bc::CALL_R1
+                        | Bc::CALLS
+                        | Bc::CALLS_R0
+                        | Bc::CALLS_R1 => assigned.union(&self.cfg.captured),
                         _ => {}
                     }
                 }
@@ -308,8 +313,35 @@ impl<'gc> Builder<'_, 'gc> {
         Val(self.e.table.get(Key::reg(r as u32)))
     }
 
+    /// A captured register's slot holds its value at every moment: the
+    /// closures holding its cell read it there, and write it there while
+    /// they run, which is during a call (`calls.rs` reads it again after).
     fn set(&mut self, r: u8, v: Val) {
         self.e.table.set(Key::reg(r as u32), v.0);
+        if self.cfg.captured.contains(r as usize) {
+            self.e.emit(Op::SlotStore, Rep::None, r as u16, v.0, 0, 0);
+        }
+    }
+
+    /// Leave for the interpreter past its threshold, after the instruction
+    /// at `pc`, which allocated: it collects.
+    fn gc_check(&mut self, pc: u32) {
+        let metrics = self.e.k64(Rep::Ptr, self.metrics);
+        let used = self.e.load(Field::GcUsed, metrics, 0);
+        let limit = self.e.load(Field::GcLimit, metrics, 0);
+        let below = self.e.cmp(Op::Cmp, Cc::Lo, used, limit);
+        let after = self.state_at(pc + 1);
+        let tag = ExitTag::Gc as u16;
+        self.e
+            .emit(Op::Guard, Rep::None, tag, below.0, after.0, u32::MAX);
+    }
+
+    /// The frame's flags in `mask`.
+    fn frame_flags(&mut self, mask: u64) -> Val {
+        let base = self.e.emit(Op::Base, Rep::Ptr, 0, 0, 0, 0);
+        let flags = self.e.load(Field::FrameFlags, base, 0);
+        let mask = self.e.k64(Rep::I64, mask);
+        self.e.op2(Op::And, Rep::I64, flags, mask)
     }
 
     fn live(&self, pc: u32) -> RegSet {
@@ -464,7 +496,7 @@ impl<'gc> Builder<'_, 'gc> {
             for r in live.iter().filter(|&r| assigned.contains(r)) {
                 let v = self.reg(r as u8);
                 let p = self.e.param(Rep::Val, Some(pending), &[v]);
-                self.set(r as u8, p);
+                self.e.table.set(Key::reg(r as u32), p.0);
                 self.loops[l].params.push((r as u8, p));
             }
             self.state = Val::NONE;
@@ -716,12 +748,15 @@ impl<'gc> Builder<'_, 'gc> {
             RETURN if b != 0 => {
                 // What a return would close is the interpreter's to close: a
                 // frame entered mid-way may have it.
-                let base = self.e.emit(Op::Base, Rep::Ptr, 0, 0, 0, 0);
-                let field = crate::jit::ir::fields::Field::FrameFlags as u16;
-                let flags = self.e.emit(Op::Load, Rep::I64, field, base.0, u32::MAX, 0);
-                let mask = crate::vm::frame::flag::HAS_OPEN | crate::vm::frame::flag::HAS_TBC;
-                let mask = self.e.k64(Rep::I64, mask);
-                let set = self.e.op2(Op::And, Rep::I64, flags, mask);
+                // Open upvalues of its own registers it closes itself.
+                use crate::vm::frame::flag::{HAS_OPEN, HAS_TBC};
+                let captures = self.cfg.captured != RegSet::EMPTY;
+                let mask = if captures {
+                    HAS_TBC
+                } else {
+                    HAS_OPEN | HAS_TBC
+                };
+                let set = self.frame_flags(mask);
                 let zero = self.e.k64(Rep::I64, 0);
                 let none = self.e.cmp(Op::Cmp, Cc::Eq, set, zero);
                 let state = self.state();
@@ -731,6 +766,13 @@ impl<'gc> Builder<'_, 'gc> {
                 for r in a..a + b - 1 {
                     let v = self.reg(r);
                     self.e.emit(Op::SlotStore, Rep::None, r as u16, v.0, 0, 0);
+                }
+                if captures {
+                    let open = self.frame_flags(HAS_OPEN);
+                    let any = self.e.cmp(Op::Cmp, Cc::Ne, open, zero);
+                    self.e.unless(any, |e| {
+                        e.call(Helper::Close, 0, &[]);
+                    });
                 }
                 self.e
                     .emit(Op::Ret, Rep::None, 0, a as u32, b as u32 - 1, 0);
@@ -849,6 +891,8 @@ impl<'gc> Builder<'_, 'gc> {
                 _ => match i.op().unquickened() {
                     GETFIELD | GETTABUP | GETTABUP_REF => self.getfield(i),
                     SELF => self.self_(i),
+                    CLOSURE => self.closure_new(pc, i),
+                    CLOSE => self.close(i),
                     SETFIELD | SETTABUP | SETTABUP_REF => self.setfield(i),
                     _ if matches!(
                         i.op(),
