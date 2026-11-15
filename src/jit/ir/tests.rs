@@ -784,8 +784,8 @@ fn table_columns() {
             ("Load", FactOf::Field),
             ("LoadIdx", FactOf::Field),
             ("Select", FactOf::JoinBC),
-            ("BoxI32", FactOf::Small),
-            ("BoxF64", FactOf::Float),
+            ("BoxI32", FactOf::Set(TypeSet::SMALL)),
+            ("BoxF64", FactOf::Set(TypeSet::FLOAT)),
             ("BoxPtr", FactOf::AuxSet),
             ("UnboxPtr", FactOf::HeapA),
             ("Guard", FactOf::PassC),
@@ -793,8 +793,8 @@ fn table_columns() {
             ("Proved", FactOf::MeetC),
             ("CallHelper", FactOf::Helper),
             ("CheckType", FactOf::AuxSet),
-            ("BoxI64", FactOf::IntSet),
-            ("NewTable", FactOf::Tab),
+            ("BoxI64", FactOf::Set(TypeSet::INT)),
+            ("NewTable", FactOf::Set(TypeSet::TAB)),
         ]
     );
     let mem: Vec<(&str, Mem)> = (OPS.iter())
@@ -829,7 +829,7 @@ fn table_columns() {
         ]
     );
     let tab: Vec<&str> = (super::ops::HELPERS.iter())
-        .filter(|h| h.fact != super::ops::HelperFact::Rep)
+        .filter(|h| h.fact != TypeSet::ANY)
         .map(|h| h.name)
         .collect();
     assert_eq!(tab, ["BoxInt", "NewTable"]);

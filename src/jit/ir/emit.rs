@@ -6,8 +6,7 @@
 
 use super::fields::Field;
 use super::ops::{
-    Arg, Aux, Cc, Ctx, Dialect, ExitKind, ExitTag, FactOf, Flags, Heaps, Helper, HelperFact, Mem,
-    Op, SET_ARM,
+    Arg, Aux, Cc, Ctx, Dialect, ExitKind, ExitTag, FactOf, Flags, Heaps, Helper, Mem, Op, SET_ARM,
 };
 use super::table::{self, Key, Snap, Table};
 use super::types::{Fact, FactFlags, Rep, TypeSet};
@@ -786,10 +785,7 @@ impl Emitter {
         let mut f = match i.op.info().fact {
             FactOf::Rep => by_rep,
             _ if !held => by_rep,
-            FactOf::Small => Fact::of(TypeSet::SMALL),
-            FactOf::Float => Fact::of(TypeSet::FLOAT),
-            FactOf::IntSet => Fact::of(TypeSet::INT),
-            FactOf::Tab => Fact::of(TypeSet::TAB),
+            FactOf::Set(set) => Fact::of(set),
             FactOf::AuxSet => Fact::of(aux_set),
             FactOf::Field if i.rep == Rep::Val => Fact::of(Field::info(i.aux).set),
             FactOf::Field => by_rep,
@@ -802,11 +798,8 @@ impl Emitter {
                 crate::env::value::Value::from_raw(i.k64())
             })),
             FactOf::Konst => by_rep,
-            FactOf::Helper => match Helper::of(i.aux).info().fact {
-                HelperFact::Tab if i.rep == Rep::Val => Fact::of(TypeSet::TAB),
-                HelperFact::Int if i.rep == Rep::Val => Fact::of(TypeSet::INT),
-                HelperFact::Tab | HelperFact::Int | HelperFact::Rep => by_rep,
-            },
+            FactOf::Helper if i.rep == Rep::Val => Fact::of(Helper::of(i.aux).info().fact),
+            FactOf::Helper => by_rep,
         };
         // A generic op's result is as unresolved as its operands.
         if i.op.has(Flags::GENERIC) {
@@ -887,12 +880,18 @@ impl Emitter {
     fn versions(&self, i: &Inst) -> (u32, u32) {
         if mem_key(i).is_none() {
             let info = i.op.info();
-            return if info.flags.contains(Flags::VERSIONED) {
-                let class = info.reads.bits().trailing_zeros();
-                (self.table.get(Key::heap(class)), 0)
-            } else {
-                (0, 0)
-            };
+            // A reader of heaps stands while none of them is written: the
+            // newest of their versions, which come from one counter.
+            let mut bits = (info.reads & Heaps::ALL).bits();
+            let mut newest = 0;
+            while bits != 0 {
+                let v = self.table.get(Key::heap(bits.trailing_zeros()));
+                if v != table::NONE {
+                    newest = newest.max(v);
+                }
+                bits &= bits - 1;
+            }
+            return (newest, 0);
         }
         let (heap, key) = heap_of(i);
         if heap.is_empty() {

@@ -292,12 +292,9 @@ bitflags::bitflags! {
         /// A copy emits it again operand by operand; an op without this has
         /// an arm of its own in the copy.
         const PLAIN = 128;
-        /// Numbered though it reads a heap: while that heap's version
-        /// stands, a dominating equal one stands for it.
-        const VERSIONED = 256;
         /// Runs for what it does, though it has no result, writes no heap
         /// and may not leave: kept when nothing uses it.
-        const KEPT = 512;
+        const KEPT = 256;
         /// One bytecode meaning on boxed values, which may run a metamethod:
         /// kept until its operands' facts are final, never numbered.
         const GENERIC = 64;
@@ -416,10 +413,8 @@ pub(crate) const SET_ARM: u16 = 1 << TypeSet::BITS;
 pub(crate) enum FactOf {
     /// Nothing beyond its representation.
     Rep,
-    Small,
-    Float,
-    IntSet,
-    Tab,
+    /// A fixed type set.
+    Set(TypeSet),
     /// The type set in `aux`.
     AuxSet,
     /// Its field's set.
@@ -433,7 +428,7 @@ pub(crate) enum FactOf {
     HeapA,
     /// The constant's own type.
     Konst,
-    /// Its helper's (`HelperFact`).
+    /// Its helper's (`HelperInfo::fact`).
     Helper,
 }
 
@@ -447,14 +442,6 @@ pub(crate) enum Mem {
     Store,
     LoadIdx,
     StoreIdx,
-}
-
-/// What a helper's boxed result is known to be.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum HelperFact {
-    Rep,
-    Tab,
-    Int,
 }
 
 pub(crate) struct OpInfo {
@@ -503,6 +490,39 @@ macro_rules! res {
     };
 }
 
+macro_rules! fact {
+    (Rep) => {
+        FactOf::Rep
+    };
+    (AuxSet) => {
+        FactOf::AuxSet
+    };
+    (Field) => {
+        FactOf::Field
+    };
+    (PassC) => {
+        FactOf::PassC
+    };
+    (MeetC) => {
+        FactOf::MeetC
+    };
+    (JoinBC) => {
+        FactOf::JoinBC
+    };
+    (HeapA) => {
+        FactOf::HeapA
+    };
+    (Konst) => {
+        FactOf::Konst
+    };
+    (Helper) => {
+        FactOf::Helper
+    };
+    ($set:ident) => {
+        FactOf::Set(TypeSet::$set)
+    };
+}
+
 macro_rules! ops {
     ($($name:ident $d:ident $aux:ident ($a:ident $b:ident $c:ident) $res:ident
         $fact:ident $mem:ident [$($r:ident)*] [$($w:ident)*] [$($f:ident)*];)*) => {
@@ -516,7 +536,7 @@ macro_rules! ops {
             aux: Aux::$aux,
             args: [Arg::$a, Arg::$b, Arg::$c],
             res: res!($res),
-            fact: FactOf::$fact,
+            fact: fact!($fact),
             mem: Mem::$mem,
             reads: Heaps::from_bits_retain(0 $(| Heaps::$r.bits())*),
             writes: Heaps::from_bits_retain(0 $(| Heaps::$w.bits())*),
@@ -594,8 +614,8 @@ ops! {
 
     // Boxing. Unboxing a small integer is `Trunc32`. An `UnboxPtr`'s operand
     // is typed by its definition (a check's, a guard's or a `Proved`'s result).
-    BoxI32      Both No     (I32 No No)       Val      Small  No        [] [] [PLAIN];
-    BoxF64      Both No     (F64 No No)       Val      Float  No        [] [] [PLAIN];
+    BoxI32      Both No     (I32 No No)       Val      SMALL  No        [] [] [PLAIN];
+    BoxF64      Both No     (F64 No No)       Val      FLOAT  No        [] [] [PLAIN];
     BoxPtr      Both Set    (Ptr No No)       Val      AuxSet No        [] [] [PLAIN];
     UnboxF64    Both No     (Val No No)       F64      Rep    No        [] [] [PLAIN];
     UnboxPtr    Both No     (Val No No)       Ptr      HeapA  No        [] [] [PLAIN];
@@ -626,7 +646,7 @@ ops! {
     // Unit ops: optimized as wholes, lowered by copy 1.
     CheckType   H    SetTag (Val Fs No)       Unboxed  AuxSet No        [] [] [EXITS PLAIN];
     IsType      H    Set    (Val No No)       B1       Rep    No        [] [] [PLAIN];
-    BoxI64      H    No     (I64 No No)       Val      IntSet No        [] [] [ALLOCS PLAIN];
+    BoxI64      H    No     (I64 No No)       Val      INT    No        [] [] [ALLOCS PLAIN];
     UnboxI64    H    No     (Val No No)       I64      Rep    No        [] [] [PLAIN];
     ToF64       H    SetTag (Val Fs No)       F64      Rep    No        [] [] [EXITS PLAIN];
     DivFloor    H    Tag    (Int Int Fs)      Int      Rep    No        [] [] [EXITS PLAIN];
@@ -642,12 +662,12 @@ ops! {
     // A store's barrier on table `a`: nothing where one stood with no
     // collector step since (`Emitter::barrier` drops it for a value that is
     // no heap object).
-    Barrier     H    No     (Ptr No No)       None     Rep    No        [GC] [] [VERSIONED KEPT PLAIN];
+    Barrier     H    No     (Ptr No No)       None     Rep    No        [GC] [] [KEPT PLAIN];
     // A table from the template whose address is `a`.
-    NewTable    H    No     (I64 No No)       Val      Tab    No        [] [] [ALLOCS PLAIN];
+    NewTable    H    No     (I64 No No)       Val      TAB    No        [] [] [ALLOCS PLAIN];
     // Leave, for the interpreter to collect, past the collector's
     // threshold: nothing where one stood with no allocation since.
-    GcCheck     H    Tag    (Fs No No)        None     Rep    No        [GC] [] [EXITS VERSIONED PLAIN];
+    GcCheck     H    Tag    (Fs No No)        None     Rep    No        [GC] [] [EXITS PLAIN];
 
     // Generic ops: the frame state's pc is the feedback site.
     Arith       H    Kind   (Val Val Fs)      Val      Rep    No        [ALL] [ALL] [EXITS CALLS GENERIC PLAIN];
@@ -681,9 +701,7 @@ impl Op {
             .union(Flags::TERMINATOR)
             .union(Flags::PINNED)
             .union(Flags::GENERIC);
-        !i.flags.intersects(NO)
-            && (i.reads.is_empty() || i.flags.contains(Flags::VERSIONED))
-            && i.writes.is_empty()
+        !i.flags.intersects(NO) && i.writes.is_empty()
     }
 }
 
@@ -706,8 +724,8 @@ pub(crate) struct HelperInfo {
     pub(crate) imm: bool,
     pub(crate) args: &'static [Rep],
     pub(crate) ret: Rep,
-    /// What a boxed result is known to be.
-    pub(crate) fact: HelperFact,
+    /// What a boxed result is known to be: every type where nothing.
+    pub(crate) fact: TypeSet,
     pub(crate) reads: Heaps,
     pub(crate) writes: Heaps,
     pub(crate) flags: Flags,
@@ -734,7 +752,7 @@ macro_rules! helpers {
             imm: $imm != 0,
             args: &[$(Rep::$arg),*],
             ret: Rep::$ret,
-            fact: HelperFact::$fact,
+            fact: TypeSet::$fact,
             reads: Heaps::from_bits_retain(0 $(| Heaps::$r.bits())*),
             writes: Heaps::from_bits_retain(0 $(| Heaps::$w.bits())*),
             flags: Flags::from_bits_retain(0 $(| Flags::$f.bits())*),
@@ -749,68 +767,68 @@ macro_rules! helpers {
 // a prototype's index.
 helpers! {
     // Lua's float `%`, and libm called directly.
-    FMod         NONE   0 (F64 F64)     F64  Rep [] [] [];
-    Sin          NONE   0 (F64)         F64  Rep [] [] [];
-    Cos          NONE   0 (F64)         F64  Rep [] [] [];
-    Tan          NONE   0 (F64)         F64  Rep [] [] [];
-    Asin         NONE   0 (F64)         F64  Rep [] [] [];
-    Acos         NONE   0 (F64)         F64  Rep [] [] [];
-    Exp          NONE   0 (F64)         F64  Rep [] [] [];
-    Log          NONE   0 (F64)         F64  Rep [] [] [];
-    Log2         NONE   0 (F64)         F64  Rep [] [] [];
-    Log10        NONE   0 (F64)         F64  Rep [] [] [];
-    Pow          NONE   0 (F64 F64)     F64  Rep [] [] [];
-    Atan2        NONE   0 (F64 F64)     F64  Rep [] [] [];
-    LibmFmod     NONE   0 (F64 F64)     F64  Rep [] [] [];
+    FMod         NONE   0 (F64 F64)     F64  ANY [] [] [];
+    Sin          NONE   0 (F64)         F64  ANY [] [] [];
+    Cos          NONE   0 (F64)         F64  ANY [] [] [];
+    Tan          NONE   0 (F64)         F64  ANY [] [] [];
+    Asin         NONE   0 (F64)         F64  ANY [] [] [];
+    Acos         NONE   0 (F64)         F64  ANY [] [] [];
+    Exp          NONE   0 (F64)         F64  ANY [] [] [];
+    Log          NONE   0 (F64)         F64  ANY [] [] [];
+    Log2         NONE   0 (F64)         F64  ANY [] [] [];
+    Log10        NONE   0 (F64)         F64  ANY [] [] [];
+    Pow          NONE   0 (F64 F64)     F64  ANY [] [] [];
+    Atan2        NONE   0 (F64 F64)     F64  ANY [] [] [];
+    LibmFmod     NONE   0 (F64 F64)     F64  ANY [] [] [];
     // Arithmetic of numbers and numeric strings; integers out of i32 are
     // boxed.
-    ArithCoerce  RT     1 (Val Val)     Val  Rep [] [] [ALLOCS];
-    Unm          RT     0 (Val)         Val  Rep [] [] [ALLOCS];
-    BNot         RT     0 (Val)         Val  Rep [] [] [ALLOCS];
+    ArithCoerce  RT     1 (Val Val)     Val  ANY [] [] [ALLOCS];
+    Unm          RT     0 (Val)         Val  ANY [] [] [ALLOCS];
+    BNot         RT     0 (Val)         Val  ANY [] [] [ALLOCS];
     // A metamethod lookup moves a table off a stale class or adopts a
     // metatable's class.
-    Len          RT     0 (Val)         Val  Rep [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];
-    Concat       RT     0 (Val Val)     Val  Rep [] [] [ALLOCS];
-    UpvalBarrier THREAD 0 (Ptr)         None Rep [] [GC] [];
+    Len          RT     0 (Val)         Val  ANY [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];
+    Concat       RT     0 (Val Val)     Val  ANY [] [] [ALLOCS];
+    UpvalBarrier THREAD 0 (Ptr)         None ANY [] [GC] [];
     // The backward barrier of a table that is not gray.
-    Barrier      RT     0 (Ptr)         None Rep [] [GC] [];
+    Barrier      RT     0 (Ptr)         None ANY [] [GC] [];
     // New open upvalues join the thread's list.
-    Closure      FRAME  1 ()            Val  Rep [SLOT] [FRAME] [ALLOCS];
-    ClosureOf    FRAME  1 (Ptr)         Val  Rep [SLOT] [] [ALLOCS];
-    Close        FRAME  1 ()            None Rep [SLOT FRAME] [UPVAL FRAME] [];
+    Closure      FRAME  1 ()            Val  ANY [SLOT] [FRAME] [ALLOCS];
+    ClosureOf    FRAME  1 (Ptr)         Val  ANY [SLOT] [] [ALLOCS];
+    Close        FRAME  1 ()            None ANY [SLOT FRAME] [UPVAL FRAME] [];
     // An integer outside 32 bits, boxed.
-    BoxInt       RT     0 (I64)         Val  Int [] [] [ALLOCS];
-    NewTable     RT     0 (I64)         Val  Tab [] [] [ALLOCS];
-    SetList      FRAME  1 ()            None Rep [SLOT FRAME] [FIELD ARR GC] [ALLOCS];
-    VarargGet    BASE   0 (Val)         Val  Rep [] [] [ALLOCS];
-    VarargTable  BASE   1 ()            Val  Rep [] [SLOT] [ALLOCS];
-    TforNext     BASE   1 ()            Val  Rep [SLOT FIELD ARR SHAPE] [SLOT] [ALLOCS];
-    TforIpairs   RT     0 (Val Val)     Val  Rep [ARR FIELD META] [] [];
-    TopArgs      STACK  1 ()            I32  Rep [FRAME] [] [];
-    VarargAll    STACK  1 ()            Val  Rep [FRAME] [SLOT FRAME] [];
-    Mm           RT     1 (Val Val)     Val  Rep [LOOKUP] [LOOKUP] [ALLOCS];
-    IndexFn      RT     0 (Val Val)     Val  Rep [LOOKUP] [LOOKUP] [ALLOCS];
-    NewIndexFn   RT     0 (Val Val)     Val  Rep [LOOKUP] [LOOKUP] [ALLOCS];
+    BoxInt       RT     0 (I64)         Val  INT [] [] [ALLOCS];
+    NewTable     RT     0 (I64)         Val  TAB [] [] [ALLOCS];
+    SetList      FRAME  1 ()            None ANY [SLOT FRAME] [FIELD ARR GC] [ALLOCS];
+    VarargGet    BASE   0 (Val)         Val  ANY [] [] [ALLOCS];
+    VarargTable  BASE   1 ()            Val  ANY [] [SLOT] [ALLOCS];
+    TforNext     BASE   1 ()            Val  ANY [SLOT FIELD ARR SHAPE] [SLOT] [ALLOCS];
+    TforIpairs   RT     0 (Val Val)     Val  ANY [ARR FIELD META] [] [];
+    TopArgs      STACK  1 ()            I32  ANY [FRAME] [] [];
+    VarargAll    STACK  1 ()            Val  ANY [FRAME] [SLOT FRAME] [];
+    Mm           RT     1 (Val Val)     Val  ANY [LOOKUP] [LOOKUP] [ALLOCS];
+    IndexFn      RT     0 (Val Val)     Val  ANY [LOOKUP] [LOOKUP] [ALLOCS];
+    NewIndexFn   RT     0 (Val Val)     Val  ANY [LOOKUP] [LOOKUP] [ALLOCS];
     // Fails rather than refresh a stale class.
-    Index        RT     0 (Val Val)     Val  Rep [FIELD ARR LOOKUP] [] [];
-    GetStr       NONE   0 (Val Val)     Val  Rep [FIELD LOOKUP] [] [];
+    Index        RT     0 (Val Val)     Val  ANY [FIELD ARR LOOKUP] [] [];
+    GetStr       NONE   0 (Val Val)     Val  ANY [FIELD LOOKUP] [] [];
     // Stores that touch table memory alone: a metamethod fails them rather
     // than run, and an allocation never collects.
-    SetStr       RT     0 (Val Val Val) Val  Rep [TABLE] [TABLE] [ALLOCS];
-    NewIndex     RT     1 (Val Val Val) Val  Rep [TABLE] [TABLE] [ALLOCS];
-    Type         RT     0 (Val)         Val  Rep [] [] [ALLOCS];
-    GetMetatable RT     0 (Val)         Val  Rep [FIELD LOOKUP] [] [];
-    SetMetatable RT     0 (Val Val)     Val  Rep [TABLE] [TABLE] [ALLOCS];
-    RawGet       NONE   0 (Val Val)     Val  Rep [FIELD ARR SHAPE] [] [];
-    RawSet       RT     0 (Val Val Val) Val  Rep [TABLE] [TABLE] [ALLOCS];
-    RawEqual     NONE   0 (Val Val)     I32  Rep [] [] [];
-    RawLen       RT     0 (Val)         Val  Rep [FIELD ARR] [] [ALLOCS];
-    ToString     RT     0 (Val)         Val  Rep [LOOKUP] [LOOKUP] [ALLOCS];
-    ToNumber     RT     0 (Val)         Val  Rep [] [] [ALLOCS];
-    StrSub       RT     0 (Ptr I32 I32) Val  Rep [] [] [ALLOCS];
-    StrByte      NONE   0 (Ptr I32)     Val  Rep [] [] [];
-    TInsert      RT     0 (Val Val)     Val  Rep [TABLE] [TABLE] [ALLOCS];
-    TRemove      RT     0 (Val)         Val  Rep [TABLE] [TABLE] [ALLOCS];
+    SetStr       RT     0 (Val Val Val) Val  ANY [TABLE] [TABLE] [ALLOCS];
+    NewIndex     RT     1 (Val Val Val) Val  ANY [TABLE] [TABLE] [ALLOCS];
+    Type         RT     0 (Val)         Val  ANY [] [] [ALLOCS];
+    GetMetatable RT     0 (Val)         Val  ANY [FIELD LOOKUP] [] [];
+    SetMetatable RT     0 (Val Val)     Val  ANY [TABLE] [TABLE] [ALLOCS];
+    RawGet       NONE   0 (Val Val)     Val  ANY [FIELD ARR SHAPE] [] [];
+    RawSet       RT     0 (Val Val Val) Val  ANY [TABLE] [TABLE] [ALLOCS];
+    RawEqual     NONE   0 (Val Val)     I32  ANY [] [] [];
+    RawLen       RT     0 (Val)         Val  ANY [FIELD ARR] [] [ALLOCS];
+    ToString     RT     0 (Val)         Val  ANY [LOOKUP] [LOOKUP] [ALLOCS];
+    ToNumber     RT     0 (Val)         Val  ANY [] [] [ALLOCS];
+    StrSub       RT     0 (Ptr I32 I32) Val  ANY [] [] [ALLOCS];
+    StrByte      NONE   0 (Ptr I32)     Val  ANY [] [] [];
+    TInsert      RT     0 (Val Val)     Val  ANY [TABLE] [TABLE] [ALLOCS];
+    TRemove      RT     0 (Val)         Val  ANY [TABLE] [TABLE] [ALLOCS];
 }
 
 impl HelperInfo {
