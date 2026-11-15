@@ -32,7 +32,8 @@ fn aux_key(i: &Inst) -> u16 {
         | Aux::Kind
         | Aux::Exit
         | Aux::Helper
-        | Aux::Array => i.aux,
+        | Aux::Array
+        | Aux::Site => i.aux,
     }
 }
 
@@ -127,6 +128,8 @@ pub(crate) struct Emitter {
     scratch: Vec<Snap>,
     /// A call's operand list while `call` builds it.
     list: Vec<Val>,
+    /// The compile's site records, lent to the emitter that runs.
+    pub(crate) sites: super::sites::Sites,
 }
 
 impl Default for Block {
@@ -514,6 +517,7 @@ impl Emitter {
         }
         match i.op {
             Op::GetIndex | Op::SetIndex => self.index(&i),
+            Op::GetField | Op::SetField => self.field(&i),
             Op::Barrier => self.barrier_rewrite(&i),
             Op::BoxI64 => self.box_rewrite(&i),
             Op::UnboxI64 => self.unbox_rewrite(&i),
@@ -752,7 +756,9 @@ impl Emitter {
             | Op::Compare
             | Op::Truthy
             | Op::GetIndex
-            | Op::SetIndex => {}
+            | Op::SetIndex
+            | Op::GetField
+            | Op::SetField => {}
         }
         if i.op.has(Flags::TERMINATOR) {
             let (succs, n) = self.g.succs(&i);

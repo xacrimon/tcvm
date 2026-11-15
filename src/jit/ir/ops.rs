@@ -401,6 +401,8 @@ pub(crate) enum Aux {
     Helper,
     /// `access::ARRAY`, or 0.
     Array,
+    /// A site record's index (`sites`).
+    Site,
 }
 
 /// The bit of a `Proved`'s `aux` that says it stands in its branch's false
@@ -677,6 +679,10 @@ ops! {
     // Their result is no number to wait for: it is final under a pending key.
     GetIndex    H    Array  (Val Val Fs)      Val      Rep    No        [ALL] [ALL] [EXITS CALLS PLAIN];
     SetIndex    H    Array  (Vals Len Fs)     None     Rep    No        [ALL] [ALL] [EXITS CALLS];
+    // A constant-key access of `a`, by its site record: a metamethod is
+    // the interpreter's, so they write what a table store does at most.
+    GetField    H    Site   (Val Fs No)       Val      Rep    No        [FIELD ARR LOOKUP] [] [EXITS CALLS PLAIN];
+    SetField    H    Site   (Val Val Fs)      None     Rep    No        [FIELD ARR LOOKUP] [TABLE] [EXITS CALLS PLAIN];
 }
 
 impl Op {

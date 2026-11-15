@@ -76,6 +76,7 @@ impl Graph {
             Aux::Exit => o.push_str(if i.aux == 0 { ".before" } else { ".after" }),
             Aux::Array if i.aux & super::access::ARRAY != 0 => o.push_str(".array"),
             Aux::Array => {}
+            Aux::Site => _ = write!(o, ".s{}", i.aux),
             Aux::SetArm => {
                 o.push('.');
                 TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits()).print(o);
@@ -190,7 +191,9 @@ impl Graph {
             | Op::Compare
             | Op::Truthy
             | Op::GetIndex
-            | Op::SetIndex => {
+            | Op::SetIndex
+            | Op::GetField
+            | Op::SetField => {
                 for (k, kind) in info.args.iter().enumerate() {
                     let w = i.args()[k];
                     match kind {

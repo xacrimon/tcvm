@@ -16,6 +16,7 @@ pub(crate) mod ops;
 #[cfg(feature = "tcvm-dev")]
 mod print;
 mod rules;
+pub(crate) mod sites;
 pub(crate) mod table;
 #[cfg(test)]
 mod tests;
@@ -410,6 +411,8 @@ impl Graph {
             ops::Aux::No | ops::Aux::SetTag | ops::Aux::Tag | ops::Aux::Slot | ops::Aux::Kind => {
                 true
             }
+            // Its table checks it, where the rewrite reads the record.
+            ops::Aux::Site => true,
         };
         if !ok {
             return Err("aux");

@@ -281,7 +281,9 @@ pub(crate) fn verify(g: &Graph, lowered: bool) -> Result<(), String> {
             | Op::Compare
             | Op::Truthy
             | Op::GetIndex
-            | Op::SetIndex => {}
+            | Op::SetIndex
+            | Op::GetField
+            | Op::SetField => {}
         }
         let mut bad = None;
         if i.op != Op::Param {

@@ -1082,3 +1082,262 @@ fn a_bail_is_sticky() {
     t.i32(Op::Add, x, x);
     assert_eq!((t.len(), t.e().bail), (n, Some(Bail::TooLarge)));
 }
+
+mod fields {
+    use super::super::sites::{Case, FieldSite, Form};
+    use super::super::types::{Fact, FactFlags};
+    use super::*;
+    use crate::env::shape::Kind;
+    use crate::env::table::SlotLoc;
+    use crate::env::value::Value;
+    use crate::jit::layout::T_INLINE;
+
+    fn inline(k: u32) -> SlotLoc {
+        SlotLoc::from_raw(T_INLINE as u32 + 8 * k)
+    }
+
+    fn case(shape: u64, form: Form) -> Case {
+        Case {
+            shape,
+            form,
+            classed: false,
+            loc: inline(0),
+            kind: Kind::ANY,
+            expect: 0,
+            to: 0,
+        }
+    }
+
+    fn site(t: &T, cases: &[Case]) -> u16 {
+        let mut all = [case(0, Form::Helper); 4];
+        all[..cases.len()].copy_from_slice(cases);
+        let s = FieldSite {
+            key: 0,
+            n: cases.len() as u8,
+            cases: all,
+        };
+        t.e().sites.field(s).unwrap()
+    }
+
+    fn get(t: &T, site: u16, recv: Val) -> Val {
+        (t.e()).lower(Op::GetField, Rep::Val, site, recv.0, t.fs.0, 0)
+    }
+
+    fn set(t: &T, site: u16, recv: Val, v: Val) {
+        (t.e()).lower(Op::SetField, Rep::None, site, recv.0, v.0, t.fs.0);
+    }
+
+    fn inputs(t: &T, v: Val) -> Vec<Op> {
+        let ins = t.e().g.inputs(v).to_vec();
+        ins.iter().map(|&x| t.op(Val(x))).collect()
+    }
+
+    /// The op of the table an access went through.
+    fn base(t: &T, load: Val) -> Op {
+        t.op(Val(t.inst(load).a))
+    }
+
+    #[test]
+    fn loads() {
+        use Op::*;
+        // One shape: straight-line, the slot read through the shape guard.
+        let t = start(true);
+        let recv = t.slot(0);
+        let v = get(&t, site(&t, &[case(0x100, Form::Own)]), recv);
+        assert_eq!((t.op(v), base(&t, v)), (Load, Guard));
+        assert_eq!(t.inst(Val(t.inst(v).a)).aux, ExitTag::Shape as u16);
+        assert_eq!((count(&t, Br), t.e().g.blocks.len()), (0, 1));
+        assert_eq!(t.e().sites.kept, [0x100]);
+        // The same table again: no second guard, the same base, and the
+        // slot's load is the first one.
+        let guards = count(&t, Guard);
+        let again = get(&t, site(&t, &[case(0x100, Form::Own)]), recv);
+        assert_eq!((again, count(&t, Guard)), (v, guards));
+        t.done();
+        // Under a class a nil goes to the helper, in a cold arm.
+        let t = start(true);
+        let own = Case {
+            classed: true,
+            ..case(0x100, Form::Own)
+        };
+        let v = get(&t, site(&t, &[own]), t.slot(0));
+        assert_eq!((t.op(v), inputs(&t, v)), (Param, vec![Load, CallHelper]));
+        assert_eq!(count(&t, Br), 1);
+        t.done();
+        // A key the shape lacks: nil, or under a class what the helper finds.
+        let t = start(true);
+        let v = get(&t, site(&t, &[case(0x100, Form::Absent)]), t.slot(0));
+        assert_eq!(t.inst(v).k64(), crate::env::value::NIL);
+        let classed = Case {
+            classed: true,
+            ..case(0x200, Form::Absent)
+        };
+        let v = get(&t, site(&t, &[classed]), t.slot(1));
+        assert_eq!((t.op(v), count(&t, Br)), (CallHelper, 0));
+        t.done();
+    }
+
+    #[test]
+    fn several_shapes() {
+        use Op::*;
+        // Two shapes: an arm, read as what its branch proved, then the
+        // last under the guard that leaves for a third.
+        let t = start(true);
+        let spilled = Case {
+            loc: SlotLoc::from_raw(1 << 31 | 16),
+            ..case(0x200, Form::Own)
+        };
+        let v = get(&t, site(&t, &[case(0x100, Form::Own), spilled]), t.slot(0));
+        assert_eq!((t.op(v), inputs(&t, v)), (Param, vec![Load, Load]));
+        let ins = t.e().g.inputs(v).to_vec();
+        assert_eq!(base(&t, Val(ins[0])), Proved);
+        // The spilled slot is read from the spill array, read through the guard.
+        let spill = Val(t.inst(Val(ins[1])).a);
+        assert_eq!((t.op(spill), base(&t, spill)), (Load, Guard));
+        assert_eq!((count(&t, Br), count(&t, Proved)), (1, 1));
+        assert_eq!(t.e().sites.kept, [0x100, 0x200]);
+        t.done();
+        // No case: the helper, for any receiver.
+        let t = start(true);
+        let v = get(&t, site(&t, &[]), t.slot(0));
+        assert_eq!(
+            (t.op(v), count(&t, Load), count(&t, Br)),
+            (CallHelper, 0, 0)
+        );
+        assert!(t.e().sites.kept.is_empty());
+        t.done();
+        // A receiver that is no table takes the helper too.
+        let t = start(true);
+        let s = t.small(0);
+        let boxed = t.op1(BoxI32, Rep::Val, s);
+        let v = get(&t, site(&t, &[case(0x100, Form::Own)]), boxed);
+        assert_eq!(t.op(v), CallHelper);
+        t.done();
+    }
+
+    /// The compares of an upper word against a kind's arc.
+    fn arcs(t: &T) -> usize {
+        let e = t.e();
+        let arc = |i: &&Inst| i.op == Op::Cmp && matches!(Cc::of(i.aux), Cc::Ls | Cc::Hi);
+        e.g.insts.iter().filter(arc).count()
+    }
+
+    #[test]
+    fn stores() {
+        use Op::*;
+        // A slot that takes anything: the barrier and the store, which a
+        // load then reads.
+        let t = start(true);
+        let (recv, v) = (t.slot(0), t.slot(1));
+        let own = site(&t, &[case(0x100, Form::Own)]);
+        set(&t, own, recv, v);
+        assert_eq!((count(&t, Store), arcs(&t), count(&t, Br)), (1, 0, 1));
+        assert_eq!(get(&t, own, recv), v);
+        t.done();
+        // A kind: one compare of the upper word, none for a value known
+        // to fit (which is no heap object: no barrier either).
+        let t = start(true);
+        let ints = Case {
+            kind: Kind::NONE.widened(Value::small(3)),
+            ..case(0x100, Form::Own)
+        };
+        let recv = t.slot(0);
+        let before = count(&t, Guard);
+        set(&t, site(&t, &[ints]), recv, t.slot(1));
+        assert_eq!((arcs(&t), count(&t, Br)), (1, 1));
+        assert!(count(&t, Guard) > before);
+        let s = t.small(2);
+        let small = t.op1(BoxI32, Rep::Val, s);
+        let before = count(&t, Guard);
+        set(&t, site(&t, &[ints]), recv, small);
+        assert_eq!((arcs(&t), count(&t, Br), count(&t, Guard)), (1, 1, before));
+        t.done();
+        // A slot tracking a shape: a table is tested for it, in an arm of
+        // the kind's compare unless the value is known to be one.
+        let t = start(true);
+        let tracking = Case {
+            expect: 0x300,
+            ..ints
+        };
+        let recv = t.slot(0);
+        set(&t, site(&t, &[tracking]), recv, t.slot(1));
+        // The kind's arm, and the barrier's.
+        assert_eq!((arcs(&t), count(&t, Br)), (1, 2));
+        let table = t.slot(2);
+        t.check(table, TypeSet::TAB, ExitTag::Type);
+        set(&t, site(&t, &[tracking]), recv, table);
+        assert_eq!((arcs(&t), count(&t, Br)), (1, 3));
+        // The tracked shape is not one the region keeps.
+        assert_eq!(t.e().sites.kept, [0x100]);
+        t.done();
+        // Under a class, `__newindex` is looked for where the slot is nil:
+        // that arm, the one that reads the class, and the barrier's.
+        let t = start(true);
+        let classed = Case {
+            classed: true,
+            ..case(0x100, Form::Own)
+        };
+        set(&t, site(&t, &[classed]), t.slot(0), t.slot(1));
+        assert_eq!((count(&t, Br), count(&t, Store)), (3, 1));
+        t.done();
+    }
+
+    #[test]
+    fn transitions() {
+        use Op::*;
+        let add = Case {
+            to: 0x200,
+            ..case(0x100, Form::Transition)
+        };
+        // The value, then the shape; a nil skips both.
+        let t = start(true);
+        let recv = t.slot(0);
+        set(&t, site(&t, &[add]), recv, t.slot(1));
+        // The nil's arm, and the barrier's.
+        assert_eq!((count(&t, Br), count(&t, Store)), (2, 2));
+        assert_eq!(t.e().sites.kept, [0x100, 0x200]);
+        t.done();
+        let t = start(true);
+        let recv = t.slot(0);
+        let s = t.small(1);
+        let v = t.op1(BoxI32, Rep::Val, s);
+        set(&t, site(&t, &[add]), recv, v);
+        assert_eq!((count(&t, Br), count(&t, Store)), (0, 2));
+        // The table is of the new shape from here: its next access tests
+        // nothing.
+        let guards = count(&t, Guard);
+        let next = Case {
+            loc: inline(1),
+            to: 0x300,
+            ..case(0x200, Form::Transition)
+        };
+        set(&t, site(&t, &[next]), recv, v);
+        assert_eq!((count(&t, Guard), count(&t, Store)), (guards, 4));
+        t.done();
+    }
+
+    /// A receiver whose type is not final leaves the op as it is.
+    #[test]
+    fn pending_receivers_wait() {
+        let t = start(false);
+        let first = t.slot(0);
+        let head = {
+            let mut e = t.e();
+            let head = e.new_block();
+            e.jump(head);
+            let lp = e.new_loop(head, Loop::NONE, Heaps::ALL, t.fs);
+            assert!(e.begin(head, lp, 1, BlockFlags::LOOP_HEADER));
+            head
+        };
+        let pending = Fact {
+            set: TypeSet::ANY,
+            flags: FactFlags::PENDING,
+        };
+        let recv = t.e().param(Rep::Val, Some(pending), &[first]);
+        let v = get(&t, site(&t, &[case(0x100, Form::Own)]), recv);
+        assert_eq!((t.op(v), t.e().g.blocks.len()), (Op::GetField, 2));
+        let k = t.e().next_pred(head);
+        t.e().set_input(recv, k, v);
+        t.jump(head);
+    }
+}

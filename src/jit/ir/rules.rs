@@ -435,7 +435,7 @@ impl Emitter {
             }
             K32 | K64 | KF64 | KObj | Base | Thread | Load | Store | LoadIdx | StoreIdx
             | SlotLoad | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret
-            | CallHelper | GetIndex | SetIndex | Barrier => None,
+            | CallHelper | GetIndex | SetIndex | GetField | SetField | Barrier => None,
             AbsOvf => self.lowered.then(|| self.abs_lower(i)),
             LuaShl | LuaShr => self.lowered.then(|| self.shift_lower(i)),
             FMod => (self.lowered).then(|| self.call(Helper::FMod, 0, &[a, b])),

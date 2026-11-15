@@ -4926,3 +4926,133 @@ fn inlined_bodies_calls_clear_their_own_slots() {
     );
     assert_eq!(got, "80000 3 1");
 }
+
+/// Constant-key sites that see one, two, four, five and seven shapes: an arm
+/// per shape up to four, the helper past that.
+#[test]
+fn field_sites_take_each_shape_they_saw() {
+    let src = "local function mk(k, v) local t = {} for i = 1, k do t['p'..i] = i end t.x = v t.y = 0 return t end
+        local out = {}
+        for _, n in ipairs{1, 2, 4, 5, 7} do
+          local objs = {}
+          for k = 0, n - 1 do objs[k + 1] = mk(k, k + 1) end
+          local s = 0
+          for i = 1, 4000 do
+            local o = objs[i % n + 1]
+            s = s + o.x
+            o.y = o.y + i
+            o.x = o.x + 0.5
+          end
+          local ys = 0
+          for k = 1, n do ys = ys + objs[k].y end
+          out[#out + 1] = s .. ':' .. ys
+        end
+        return table.concat(out, ' ')";
+    assert_eq!(
+        result(src, false),
+        "4003000.0:8002000 2005000.0:8002000 1009000.0:8002000 811000.0:8002000 586426.0:8002000"
+    );
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}
+
+/// A constructor's stores move the table from shape to shape; a nil adds
+/// nothing, a value of a new kind and the table itself take the
+/// interpreter's store.
+#[test]
+fn constructors_add_their_keys_in_compiled_code() {
+    let src = "local s = 0
+        for i = 1, 3000 do
+          local t = {}
+          t.a = i
+          local b
+          if i % 3 ~= 0 then b = i * 2 end
+          t.b = b
+          t.c = 1.5
+          if i % 1000 == 0 then t.c = 'x' end
+          t.d = t
+          s = s + t.a + (t.b or 0) + (t.c == 'x' and 100 or t.c) + t.d.a
+        end
+        return tostring(s)";
+    assert_eq!(result(src, false), "15007795.5");
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}
+
+/// A slot holding tables of one shape takes them tested by shape, then a
+/// table of another, a number and nil through the interpreter's store.
+#[test]
+fn stores_keep_a_slots_tracked_shape() {
+    let src = "local a, b = {v = 1}, {v = 2}
+        local odd = {w = 1, v = 3}
+        local n = {next = a}
+        local s = 0
+        for i = 1, 3000 do
+          local x = a
+          if i % 2 == 0 then x = b end
+          if i > 2000 then x = odd end
+          n.next = x
+          s = s + n.next.v
+        end
+        for i = 1, 100 do n.next = i; s = s + n.next end
+        n.next = nil
+        for i = 1, 100 do if n.next == nil then s = s + 1 end n.next = a end
+        return tostring(s)";
+    assert_eq!(result(src, false), "11051");
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}
+
+/// `__index` and `__newindex`, tables and functions, on absent and nil
+/// slots, and a metatable set on a receiver compiled code has seen bare.
+#[test]
+fn field_sites_leave_metamethods_to_the_interpreter() {
+    let src = "LOG = 0
+        local base = {inh = 7}
+        local o = setmetatable({own = 1, gone = 5}, {__index = base})
+        o.gone = nil
+        local s = 0
+        for i = 1, 3000 do s = s + o.own + o.inh + (o.gone or 1) + (o.none or 2) end
+        local f = setmetatable({}, {__index = function(t, k) return #k end})
+        for i = 1, 300 do s = s + f.abc end
+        local w = setmetatable({a = 1}, {__newindex = function(t, k, v) LOG = LOG + (v or 0); rawset(t, k, v) end})
+        for i = 1, 2000 do
+          w.a = i
+          if i % 500 == 0 then w.a = nil end
+          w.fresh = nil
+        end
+        local store = {}
+        local p = setmetatable({}, {__newindex = store})
+        for i = 1, 500 do p.k = i end
+        local q = {x = 1}
+        for i = 1, 3000 do
+          if i == 1500 then setmetatable(q, {__index = function() return 100 end}) end
+          s = s + q.x + (q.y or 0)
+          if i == 2500 then q.x = nil end
+        end
+        return s .. ' ' .. LOG .. ' ' .. tostring(w.a) .. ' ' .. tostring(rawget(p, 'k')) .. ' ' .. store.k";
+    assert_eq!(result(src, false), "236500 3003 nil nil 500");
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}
+
+/// Fields of the environment upvalue's table, and of a receiver carried
+/// around a loop, whose access copy 1 lowers.
+#[test]
+fn globals_and_list_walks_read_fields() {
+    let src = "-- globals through the environment upvalue, and a list walk
+        g1, g2 = 0, 1.5
+        local head
+        for i = 1, 50 do head = {v = i, next = head} end
+        local s = 0
+        for r = 1, 200 do
+          local n = head
+          while n do s = s + n.v; n.v = n.v + 0; n = n.next end
+          g1 = g1 + 1
+          g2 = g2 + g1
+        end
+        return s .. ' ' .. g1 .. ' ' .. g2";
+    assert_eq!(result(src, false), "255000 200 20101.5");
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}

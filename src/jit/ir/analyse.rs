@@ -133,6 +133,8 @@ impl Analysis {
                 Op::GetIndex if i.aux & ARRAY != 0 => want(i.b, TypeSet::SMALL),
                 Op::SetIndex if i.aux & ARRAY != 0 => want(g.run(i.a, i.b)[1], TypeSet::SMALL),
                 Op::GetIndex | Op::SetIndex => {}
+                // Only number demands are resolved: a receiver's is none.
+                Op::GetField | Op::SetField => {}
                 // No other op asks a type of an operand it would check.
                 Op::K32
                 | Op::K64
@@ -330,7 +332,9 @@ impl Analysis {
                     | Op::Compare
                     | Op::Truthy
                     | Op::GetIndex
-                    | Op::SetIndex => g.facts[v].set,
+                    | Op::SetIndex
+                    | Op::GetField
+                    | Op::SetField => g.facts[v].set,
                 };
             }
             let mut dropped = false;

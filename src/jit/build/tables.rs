@@ -1,38 +1,26 @@
-//! Table, upvalue and global access. A constant-key site whose inline
-//! cache holds the key in the receiver's own slot reads and writes that
-//! slot under a shape guard; a small-integer key goes to the array part
-//! under a bounds guard; everything else takes a helper, whose failure (a
-//! metamethod to call, an error) leaves for the interpreter.
+//! Table, upvalue and global access. A constant-key site is a generic
+//! op naming the record made here of the shapes its feedback saw; an
+//! indexed one a generic op the key's kind decides. Upvalues are loads.
 
 use super::Builder;
 use crate::env::function::InlineCache;
 use crate::env::shape::Kind;
 use crate::env::table::SlotLoc;
-use crate::env::{MetamethodBits, Shape};
+use crate::env::{LuaString, MetamethodBits, Shape};
 use crate::instruction::{Instruction, Op as Bc};
+use crate::jit::compile::Bail;
 use crate::jit::feedback as fb;
+use crate::jit::feedback::MAX_SHAPES;
 use crate::jit::ir::access::ARRAY;
 use crate::jit::ir::fields::Field;
 use crate::jit::ir::ops::{Cc, ExitTag, Helper, Op};
+use crate::jit::ir::sites::{Case, FieldSite, Form};
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{BlockFlags, Val};
-use crate::jit::layout;
 
 impl<'gc> Builder<'_, 'gc> {
     fn load(&mut self, f: Field, base: Val, k: u32) -> Val {
         self.e.load(f, base, k)
-    }
-
-    fn guard(&mut self, c: Val, tag: ExitTag) {
-        let s = self.state();
-        self.e
-            .emit(Op::Guard, Rep::None, tag as u16, c.0, s.0, u32::MAX);
-    }
-
-    /// The lock of the table `v` is, checked to be one.
-    fn table(&mut self, v: Val) -> Val {
-        let s = self.state();
-        self.e.check_type(v, TypeSet::TAB, ExitTag::Type, s)
     }
 
     /// The running closure.
@@ -87,32 +75,6 @@ impl<'gc> Builder<'_, 'gc> {
             .emit(Op::Store, Rep::None, Field::CellValue as u16, at.0, v.0, 0);
         if self.e.fact(v).set.intersects(TypeSet::HEAP) {
             self.e.call(Helper::UpvalBarrier, 0, &[cell]);
-        }
-    }
-
-    /// `t` checked to have `shape`, which the region then keeps alive.
-    fn guard_shape(&mut self, t: Val, shape: Shape<'gc>) {
-        if !self.shapes.iter().any(|s| s.as_word() == shape.as_word()) {
-            self.shapes.push(shape);
-        }
-        let s = self.load(Field::Shape, t, 0);
-        let k = self.e.k64(Rep::Ptr, shape.as_word());
-        let same = self.e.cmp(Op::Cmp, Cc::Eq, s, k);
-        self.guard(same, ExitTag::Shape);
-    }
-
-    /// The named slot at `loc` of table `t`: the access's base, field and
-    /// index.
-    fn slot(&mut self, t: Val, loc: SlotLoc) -> (Val, Field, u32) {
-        if loc.spilled() {
-            let spill = self.load(Field::Spill, t, 0);
-            (spill, Field::Spilled, loc.offset() as u32 / 8)
-        } else {
-            (
-                t,
-                Field::Inline,
-                (loc.offset() - layout::T_INLINE) as u32 / 8,
-            )
         }
     }
 
@@ -215,63 +177,118 @@ impl<'gc> Builder<'_, 'gc> {
         self.e.emit(Op::GcCheck, Rep::None, tag, after.0, 0, 0);
     }
 
-    /// The cache entry of a constant-key site, where it is an own slot the
-    /// region may use: of a shape still current.
-    fn own(&self, ic: u16) -> Option<(Shape<'gc>, SlotLoc)> {
-        match self.proto.feedback.cache(ic as usize).get() {
-            InlineCache::Own { shape, loc, .. } if !shape.is_deprecated() => Some((shape, loc)),
-            _ => None,
+    /// The record of the constant-key site being emitted, of key `K[e]` and
+    /// cache word `ic`: a case per shape its cache entry and its shape list
+    /// name, each found by looking the key up in the shape. None where the
+    /// compile has more sites than an op can name.
+    fn field_site(&mut self, ic: u16, e: u16, get: bool) -> Option<u16> {
+        let kv = self.proto.constants[e as usize];
+        let Some(key) = kv.get_string() else {
+            crate::jit::bug!("a field site's key is no string");
+        };
+        let feedback = &self.proto.feedback;
+        let cached = match feedback.cache(ic as usize).get() {
+            InlineCache::Own { shape, .. } | InlineCache::Absent { shape } => Some(shape),
+            InlineCache::Transition { from, .. } => Some(from),
+            InlineCache::ProtoLoad { recv, .. } => Some(recv),
+            InlineCache::Empty => None,
+        };
+        let mut shapes: Vec<Shape<'gc>> = Vec::new();
+        for s in cached.into_iter().chain(feedback.shapes(self.pc as usize)) {
+            if !s.is_deprecated() && !shapes.iter().any(|&x| Shape::ptr_eq(x, s)) {
+                shapes.push(s);
+            }
         }
+        let none = Case {
+            shape: 0,
+            form: Form::Helper,
+            classed: false,
+            loc: SlotLoc::from_raw(0),
+            kind: Kind::ANY,
+            expect: 0,
+            to: 0,
+        };
+        let mut site = FieldSite {
+            key: self.pool.intern(kv.to_raw()),
+            n: 0,
+            cases: [none; MAX_SHAPES],
+        };
+        // More shapes than a site takes: megamorphic, the helper's.
+        if shapes.len() <= MAX_SHAPES {
+            for (k, &s) in shapes.iter().enumerate() {
+                site.cases[k] = self.case(s, key, get, none);
+                self.shapes.push(s);
+            }
+            site.n = shapes.len() as u8;
+        }
+        let at = self.e.sites.field(site);
+        if at.is_none() {
+            self.e.bail(Bail::TooLarge);
+        }
+        at
+    }
+
+    /// What an access of `key` does for tables of shape `s`.
+    fn case(&mut self, s: Shape<'gc>, key: LuaString<'gc>, get: bool, none: Case) -> Case {
+        let mut c = Case {
+            shape: s.as_word(),
+            classed: s.mt_cache().is_some(),
+            ..none
+        };
+        if s.is_dict() {
+            return c;
+        }
+        let slot = s.find_slot(key);
+        if get {
+            match slot {
+                Some(k) => (c.form, c.loc) = (Form::Own, SlotLoc::new(s, k)),
+                None => c.form = Form::Absent,
+            }
+            return c;
+        }
+        // A metatable's keys tell its class and a watched holder's its
+        // dependents: the helper's store does.
+        if s.as_mt().is_some() || s.is_watched() {
+            return c;
+        }
+        match slot {
+            Some(k) => {
+                let f = s.field(k);
+                if f.kind() != Kind::NONE {
+                    (c.form, c.loc) = (Form::Own, SlotLoc::new(s, k));
+                    (c.kind, c.expect) = (f.store_kind(), f.shape().map_or(0, Shape::as_word));
+                }
+            }
+            // A move repeats one a slow path made from the shape, which
+            // marked it as left; looked up, never made.
+            None if !s.is_stable() => {
+                let Some(to) = s.prop_child(self.mc, key) else {
+                    return c;
+                };
+                let k = s.slot_count();
+                let (loc, f) = (SlotLoc::new(to, k), to.field(k));
+                if !to.is_dict() && !loc.spilled() && f.kind() != Kind::NONE {
+                    (c.form, c.loc, c.to) = (Form::Transition, loc, to.as_word());
+                    (c.kind, c.expect) = (f.store_kind(), f.shape().map_or(0, Shape::as_word));
+                    self.shapes.push(to);
+                }
+            }
+            None => {}
+        }
+        c
     }
 
     /// `R[a] = recv[K[e]]`.
     pub(super) fn getfield(&mut self, i: Instruction) {
         let (dst, _, ic, e) = i.abde();
         let recv = self.receiver(i);
-        let v = match self.own(ic) {
-            Some((shape, loc)) => {
-                let t = self.table(recv);
-                self.guard_shape(t, shape);
-                let (base, f, k) = self.slot(t, loc);
-                let v = self.load(f, base, k);
-                // A nil is the answer only where no `__index` may give one:
-                // under a class, the helper walks for it.
-                if shape.mt_cache().is_some() {
-                    self.or_index(recv, v, e)
-                } else {
-                    v
-                }
-            }
-            None => {
-                let key = self.konst(self.proto.constants[e as usize]);
-                self.helped(Helper::Index, 0, &[recv, key])
-            }
+        let Some(site) = self.field_site(ic, e, true) else {
+            return;
         };
+        let s = self.state();
+        // Lowered here where the receiver's fact is final, else by copy 1.
+        let v = (self.e).lower(Op::GetField, Rep::Val, site, recv.0, s.0, 0);
         self.set(dst, v);
-    }
-
-    /// `v`, read from an own slot of `recv`, or where it is nil what the
-    /// index helper finds for constant `e`, in a cold block.
-    fn or_index(&mut self, recv: Val, v: Val, e: u16) -> Val {
-        let nil = self.e.is_nil(v);
-        if let Some(known) = self.e.known(nil) {
-            return if known {
-                let key = self.konst(self.proto.constants[e as usize]);
-                self.helped(Helper::Index, 0, &[recv, key])
-            } else {
-                v
-            };
-        }
-        self.state();
-        let lp = self.e.g.block(self.e.cur).lp;
-        let (walk, on) = (self.e.new_block(), self.e.new_block());
-        self.e.br(nil, walk, on);
-        self.e.begin(walk, lp, 0, BlockFlags::COLD);
-        let key = self.konst(self.proto.constants[e as usize]);
-        let found = self.helped(Helper::Index, 0, &[recv, key]);
-        self.e.jump(on);
-        self.e.begin(on, lp, 0, BlockFlags::empty());
-        self.e.param(Rep::Val, None, &[v, found])
     }
 
     /// `recv[K[e]] = R[a]`.
@@ -279,46 +296,10 @@ impl<'gc> Builder<'_, 'gc> {
         let (src, _, ic, e) = i.abde();
         let recv = self.receiver(i);
         let v = self.reg(src);
-        let kv = self.proto.constants[e as usize];
-        let held = self.e.fact(v).set;
-        let own = self.own(ic).filter(|&(shape, loc)| {
-            // A metatable's keys tell its class and a watched holder's its
-            // dependents: the helper's store does. So does it store to a slot
-            // that tracks its tables' shape, or whose kind takes more than
-            // one compare to test.
-            let f = shape.field(loc.slot(shape));
-            let fits = TypeSet::of_classes(f.kind().classes());
-            let testable =
-                fits == TypeSet::ANY || fits.contains(held) || fits.unboxed() != Rep::None;
-            shape.as_mt().is_none()
-                && !shape.is_watched()
-                && f.kind() != Kind::NONE
-                && f.shape().is_none()
-                && testable
-        });
-        let Some((shape, loc)) = own else {
-            let key = self.konst(kv);
-            self.helped(Helper::NewIndex, 0, &[recv, key, v]);
+        let Some(site) = self.field_site(ic, e, false) else {
             return;
         };
-        let t = self.table(recv);
-        self.guard_shape(t, shape);
-        // The slot's kind covers what it holds: a value outside it leaves,
-        // and the interpreter's store widens the kind.
-        let kind = shape.field(loc.slot(shape)).kind();
-        let fits = TypeSet::of_classes(kind.classes());
-        if kind != Kind::ANY && !fits.contains(held) {
-            let s = self.state();
-            self.e.check_type(v, fits, ExitTag::Type, s);
-        }
-        let (base, f, k) = self.slot(t, loc);
-        // `__newindex` fires only on a nil slot.
-        if shape.mt_cache().is_some() {
-            let old = self.load(f, base, k);
-            let s = self.state();
-            (self.e).nil_guard(t, old, MetamethodBits::NEWINDEX, ExitTag::Slow, s);
-        }
-        self.e.barrier(t, v);
-        self.e.emit(Op::Store, Rep::None, f as u16, base.0, v.0, k);
+        let s = self.state();
+        (self.e).lower(Op::SetField, Rep::None, site, recv.0, v.0, s.0);
     }
 }

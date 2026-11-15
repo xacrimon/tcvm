@@ -94,6 +94,8 @@ struct RLoop {
 struct Builder<'a, 'gc> {
     e: &'a mut Emitter,
     pool: &'a mut Pool,
+    /// For looking a shape's transitions up; nothing is written.
+    mc: &'a crate::dmm::Mutation<'gc>,
     cfg: &'a Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     loops: Vec<RLoop>,
@@ -108,7 +110,8 @@ struct Builder<'a, 'gc> {
     pc: u32,
     /// The frame state before the instruction at `pc`, once an exit needs it.
     state: Val,
-    /// The shapes the code compares with, which the region keeps alive.
+    /// The shapes the site records name: those the code compares with
+    /// (`Sites::kept`) the region keeps alive.
     shapes: Vec<crate::env::Shape<'gc>>,
     /// The instructions compiled as a deopt for want of code.
     missing: Vec<Bc>,
@@ -119,6 +122,7 @@ struct Builder<'a, 'gc> {
 pub(crate) fn build<'gc>(
     e: &mut Emitter,
     pool: &mut Pool,
+    mc: &crate::dmm::Mutation<'gc>,
     cfg: &Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
@@ -129,6 +133,7 @@ pub(crate) fn build<'gc>(
     let mut b = Builder {
         e,
         pool,
+        mc,
         cfg,
         proto,
         loops: Vec::new(),

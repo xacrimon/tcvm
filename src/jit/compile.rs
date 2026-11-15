@@ -269,7 +269,9 @@ pub(crate) fn compile<'gc>(
     let pool = &mut scratch.pool;
     pool.words.clear();
     high.metrics = crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64;
-    let (shapes, missing) = crate::jit::build::build(high, pool, &cfg, closure.proto, pc);
+    high.sites.clear();
+    let (mut shapes, missing) =
+        crate::jit::build::build(high, pool, ctx.mutation(), &cfg, closure.proto, pc);
     #[cfg(feature = "tcvm-dev")]
     for op in missing {
         (ctx.runtime().stats).count(1, || format!("jit unsupported {}", op.name()));
@@ -288,7 +290,14 @@ pub(crate) fn compile<'gc>(
     low.reset(true);
     low.rt = high.rt;
     low.metrics = high.metrics;
+    // The site records go with the emitter that runs.
+    low.sites = std::mem::take(&mut high.sites);
     scratch.copy.run(&high.g, analysis, low);
+    // Of the shapes the records name, those the code compares with.
+    shapes.retain(|s| low.sites.kept.contains(&s.as_word()));
+    shapes.sort_unstable_by_key(|s| s.as_word());
+    shapes.dedup_by_key(|s| s.as_word());
+    high.sites = std::mem::take(&mut low.sites);
     stage(config, closure, pc, "lower", low);
     if let Some(why) = low.bail {
         return Err(why);
