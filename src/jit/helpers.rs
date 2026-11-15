@@ -136,11 +136,11 @@ pub(crate) extern "C" fn jit_arith(rt: *const State<'static>, kind: u32, a: u64,
     ];
     if let Some(s) = [a, b].into_iter().find(|v| v.get_string().is_some()) {
         let kind = KINDS[kind as usize];
-        // No bitwise op converts a string, and a number's own metamethod
-        // would come before the string's.
+        // No bitwise op converts a string. Numbers are taken to have no
+        // metatable, as the inline arms take them.
         let bitwise = matches!(kind, BAnd | BOr | BXor | Shl | Shr);
         let mm = crate::vm::ops::arith::kind_mm(kind);
-        if bitwise || ctx.number_metatable().is_some() || ctx.mm_of(s, mm).is_nil() {
+        if bitwise || ctx.mm_of(s, mm).is_nil() {
             return HELPER_FAIL_VAL;
         }
         match (coerced(ctx, a), coerced(ctx, b)) {
