@@ -152,7 +152,7 @@ impl Sel<'_> {
             let i = self.g.inst(v);
             v = match i.op {
                 Op::Trunc32 => Val(i.a),
-                Op::Guard | Op::GuardNot => Val(i.c),
+                Op::Guard | Op::GuardNot | Op::Proved => Val(i.c),
                 Op::Param if i.b == 1 => Val(self.g.inputs(v)[0]),
                 _ => return v,
             }
@@ -369,7 +369,7 @@ impl Sel<'_> {
         let w = sz(i.rep);
         let here = self.out.layout.order[pos];
         match i.op {
-            Param | FrameState | Trunc32 => {}
+            Param | FrameState | Trunc32 | Proved => {}
             Cmp | FCmp => {
                 // Asked for as a value, beside what branches on it.
                 let Some(d) = self.def(v) else { return };
@@ -433,7 +433,7 @@ impl Sel<'_> {
                 let x = self.reg(a);
                 self.op(MOp::Uxtw, Sz::X, &[d, x]);
             }
-            UnboxPtr | UnboxPtrPin => {
+            UnboxPtr => {
                 let Some(d) = self.def(v) else { return };
                 let x = self.reg(a);
                 self.const_op(MOp::AndImm, MOp::AndWide, Sz::X, PAYLOAD_MASK, &[d, x]);

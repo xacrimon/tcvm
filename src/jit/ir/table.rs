@@ -9,7 +9,7 @@ pub(crate) const NONE: u32 = u32::MAX;
 /// merge is collected.
 const UNSET: u32 = u32::MAX - 1;
 
-const KINDS: usize = 3;
+const KINDS: usize = 4;
 
 /// A key: its kind and an index dense within the kind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,6 +31,16 @@ impl Key {
         Key(2 << 30 | k)
     }
 
+    /// A value a branch typed: the branch's condition, and `PROOF_FALSE`
+    /// where its false edge did.
+    pub(crate) fn proof(v: u32) -> Key {
+        Key(3 << 30 | v)
+    }
+
+    pub(crate) fn is_proof(self) -> bool {
+        self.kind() == 3
+    }
+
     pub(crate) fn kind(self) -> usize {
         (self.0 >> 30) as usize
     }
@@ -47,6 +57,9 @@ impl Key {
         self.0 & !(3 << 30)
     }
 }
+
+/// In a `Key::proof` value: the false edge.
+pub(crate) const PROOF_FALSE: u32 = 1 << 31;
 
 /// A sealed state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

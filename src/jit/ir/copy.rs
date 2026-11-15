@@ -1,11 +1,12 @@
 //! A copy: the input graph emitted again into another emitter, which
 //! rewrites as it goes. Copy 1 gives each parameter the representation its
 //! resolved type has, converts what flows into it on the edge, and emits
-//! into a low-level graph, so every high-level op meets its lowering rule.
+//! into a low-level graph, so every high-level op meets its lowering rule
+//! or its rewrite (`Emitter::lower`).
 
 use super::analyse::Analysis;
 use super::emit::Emitter;
-use super::ops::{Arg, ExitKind, ExitTag, Op};
+use super::ops::{Arg, Dialect, ExitKind, ExitTag, Flags, Op};
 use super::types::{Fact, Rep, TypeSet};
 use super::{Block, BlockFlags, Graph, Inst, Val};
 use crate::jit::bug;
@@ -216,10 +217,19 @@ impl Copy {
                             let x = self.map[g.run(i.a, i.b)[k] as usize];
                             Copy::convert(e, x, Rep::Val, TypeSet::ANY, Val::NONE)
                         });
-                        e.set_index(recv, key, v, i.aux, self.map[i.c as usize]);
-                        Val::NONE
+                        let at = e.g.extra.len() as u32;
+                        e.g.extra.extend([recv.0, key.0, v.0]);
+                        e.lower(
+                            Op::SetIndex,
+                            Rep::None,
+                            i.aux,
+                            at,
+                            3,
+                            self.map[i.c as usize].0,
+                        )
                     }
-                    _ => self.inst(g, e, i),
+                    _ if i.op.has(Flags::PLAIN) => self.inst(g, e, i),
+                    _ => bug!("{:?} has no copy", i.op),
                 };
                 if e.cur.is_none() {
                     break;
@@ -295,6 +305,10 @@ impl Copy {
                 }
             }
         }
-        e.emit(i.op, i.rep, i.aux, w[0], w[1], w[2])
+        // A high-level op meets its rule, or its rewrite.
+        match i.op.info().dialect {
+            Dialect::H => e.lower(i.op, i.rep, i.aux, w[0], w[1], w[2]),
+            Dialect::Both | Dialect::L => e.emit(i.op, i.rep, i.aux, w[0], w[1], w[2]),
+        }
     }
 }

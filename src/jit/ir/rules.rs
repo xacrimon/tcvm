@@ -10,6 +10,7 @@ use super::types::{Rep, TypeSet};
 use super::{Inst, Val};
 use crate::env::value::{SMALL_INT, Value};
 use crate::instruction::ArithKind;
+use crate::jit::bug;
 use crate::jit::build::{SPEC_SHIFT, Spec};
 
 const NONE: u32 = u32::MAX;
@@ -210,7 +211,12 @@ impl Emitter {
                 let d = *self.g.inst(a);
                 match d.op {
                     KObj => Some(self.emit(KObj, Rep::Val, d.aux, d.a, 0, 0)),
-                    UnboxPtr | UnboxPtrPin | CheckType => Some(Val(d.a)),
+                    CheckType => Some(Val(d.a)),
+                    // The word a branch proved a pointer is the word.
+                    UnboxPtr => {
+                        let x = self.g.inst(Val(d.a));
+                        Some(if x.op == Proved { Val(x.c) } else { Val(d.a) })
+                    }
                     _ => None,
                 }
             }
@@ -222,7 +228,7 @@ impl Emitter {
                     _ => None,
                 }
             }
-            UnboxPtr | UnboxPtrPin => {
+            UnboxPtr => {
                 let d = *self.g.inst(a);
                 match d.op {
                     BoxPtr => Some(Val(d.a)),
@@ -261,8 +267,13 @@ impl Emitter {
                 // Lowered, a fact a check gave is that check again: its
                 // pieces number to the first one's, guard and all.
                 let by_def = set.contains(self.g.facts[a.idx()].set);
-                if set.contains(f.set) && (by_def || !self.lowered) {
-                    return Some(self.unboxed(a, set));
+                // Known already, and something types it by definition: no
+                // check. A fact that holds some other way is checked again.
+                if set.contains(f.set)
+                    && (by_def || !self.lowered)
+                    && let Some(r) = self.try_unboxed(a, set)
+                {
+                    return Some(r);
                 }
                 if !self.lowered {
                     return None;
@@ -385,21 +396,46 @@ impl Emitter {
                 })
             }
             Arith | Compare | Unm => self.specialise(i),
-            GetIndex | SetIndex => self.index(i),
+            // Only a constant condition folds: a folded branch's. In its arm
+            // the condition is always known, and that is what it stands for.
+            Proved => {
+                let k = *self.g.inst(a);
+                if k.op != K32 {
+                    return None;
+                }
+                let set = TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits());
+                // In the arm not taken nothing runs.
+                if (k.a != 0) == (i.aux & super::ops::SET_ARM != 0) {
+                    return Some(c);
+                }
+                // A pointer needs what types it; a number is read out of
+                // the word as it is.
+                match self.typed(c, set) {
+                    Some(v) => Some(v),
+                    None if self.lowered && set.unboxed() == Rep::Ptr => {
+                        bug!("nothing types {c:?} once its branch is gone")
+                    }
+                    None => Some(c),
+                }
+            }
             K32 | K64 | KF64 | KObj | Base | Thread | Load | Store | LoadIdx | StoreIdx
             | SlotLoad | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret
-            | LuaShl | LuaShr | AbsOvf | FMod | CallHelper => None,
+            | LuaShl | LuaShr | AbsOvf | FMod | CallHelper | GetIndex | SetIndex => None,
             Truthy => self.truthy(a),
         }
     }
 
     /// The unboxed value of a `Val` known here to be in `set`, `Val::NONE`
-    /// where the set has no one representation. Typed by its definition, the
-    /// unboxed value is good wherever the value is; typed by a check, it is
-    /// that check's result; typed by a branch, it is good from here on only.
-    pub(crate) fn unboxed(&mut self, v: Val, set: TypeSet) -> Val {
+    /// where the set has no one representation: of the value typed by its
+    /// definition, by the check or guard that typed it, or by a `Proved`
+    /// under the branch that did. None where the fact holds some other way
+    /// (two arms that each proved it joined).
+    pub(crate) fn try_unboxed(&mut self, v: Val, set: TypeSet) -> Option<Val> {
         use Op::*;
         let rep = set.unboxed();
+        if rep == Rep::None {
+            return Some(Val::NONE);
+        }
         let by_def = set.contains(self.g.facts[v.idx()].set);
         let check = Inst {
             op: CheckType,
@@ -410,14 +446,29 @@ impl Emitter {
             c: 0,
         };
         if !by_def && let Ok(r) = self.number(&check) {
-            return r;
+            return Some(r);
         }
+        let t = self.typed(v, set)?;
+        Some(self.unbox(t, rep))
+    }
+
+    fn unbox(&mut self, v: Val, rep: Rep) -> Val {
         match rep {
-            Rep::I32 => self.op1(Trunc32, rep, v),
-            Rep::F64 => self.op1(UnboxF64, rep, v),
-            Rep::Ptr if by_def => self.op1(UnboxPtr, rep, v),
-            Rep::Ptr => self.op1(UnboxPtrPin, rep, v),
-            _ => Val::NONE,
+            Rep::I32 => self.op1(Op::Trunc32, rep, v),
+            Rep::F64 => self.op1(Op::UnboxF64, rep, v),
+            Rep::Ptr => self.op1(Op::UnboxPtr, rep, v),
+            Rep::None | Rep::Val | Rep::I64 | Rep::B1 => bug!("no unboxing to {rep:?}"),
+        }
+    }
+
+    /// `try_unboxed` where there is no state to check again with: a number
+    /// is read out of the word as it is, which cannot fault; a pointer no
+    /// definition types is a bug.
+    pub(crate) fn unboxed(&mut self, v: Val, set: TypeSet) -> Val {
+        match (self.try_unboxed(v, set), set.unboxed()) {
+            (Some(r), _) => r,
+            (None, rep @ (Rep::I32 | Rep::F64)) => self.unbox(v, rep),
+            (None, _) => bug!("nothing types {v:?} as {set:?}"),
         }
     }
 
@@ -425,7 +476,7 @@ impl Emitter {
     /// in values: a small integer's upper word is all ones, a float is below
     /// every box, a heap value's top 16 bits, sign-extended, are its tag
     /// less 8. None for a set that takes more than one compare.
-    fn type_test(&mut self, v: Val, set: TypeSet) -> Option<Val> {
+    pub(super) fn type_test(&mut self, v: Val, set: TypeSet) -> Option<Val> {
         use Op::*;
 
         use crate::env::value::{

@@ -331,8 +331,18 @@ fn type_facts() {
     t.block(yes);
     // Typed by the branch: the pointer is good from here on only.
     assert_eq!((t.set(v), t.known(is_tab)), (TypeSet::TAB, Some(true)));
+    // The pointer is of what the branch proved, which is made once.
     let p = t.check(v, TypeSet::TAB, ExitTag::Type);
-    assert_eq!(t.op(p), Op::UnboxPtrPin);
+    let proved = Val(t.inst(p).a);
+    assert_eq!((t.op(p), t.op(proved)), (Op::UnboxPtr, Op::Proved));
+    assert_eq!(
+        (t.inst(proved).a, t.inst(proved).c, t.inst(proved).aux),
+        (is_tab.0, v.0, TypeSet::TAB.bits())
+    );
+    assert_eq!(t.set(proved), TypeSet::TAB);
+    let n = t.len();
+    assert_eq!(t.check(v, TypeSet::TAB, ExitTag::Type), p);
+    assert_eq!(t.len(), n);
     assert_eq!(
         t.emit(Op::BoxPtr, Rep::Val, TypeSet::TAB.bits(), p, Val(0), Val(0)),
         v
@@ -573,11 +583,294 @@ fn verifier_rejects() {
     drop(e);
     // An unbox that nothing justifies.
     let t = start(false);
-    let p = t.op1(Op::UnboxPtrPin, Rep::Ptr, t.slot(0));
-    t.done();
-    let mut e = t.e();
-    e.g.insts[p.idx()].op = Op::UnboxPtr;
+    t.op1(Op::UnboxPtr, Rep::Ptr, t.slot(0));
+    t.emit(Op::Ret, Rep::None, 0, Val(0), Val(0), Val(0));
+    let e = t.e();
     assert!(verify(&e.g, false).unwrap_err().contains("unchecked unbox"));
+    drop(e);
+    // What a branch proved, outside the branch, and in its other arm.
+    for wrong in [0, 1] {
+        let t = start(false);
+        let v = t.slot(0);
+        let is_tab = t.is_type(v, TypeSet::TAB);
+        if wrong == 0 {
+            t.e().proved(is_tab, true, v, TypeSet::TAB);
+        }
+        let [yes, no, join] = t.diamond(is_tab);
+        t.block(yes);
+        t.jump(join);
+        t.block(no);
+        if wrong == 1 {
+            t.e().proved(is_tab, true, v, TypeSet::TAB);
+        }
+        t.jump(join);
+        t.block(join);
+        t.emit(Op::Ret, Rep::None, 0, Val(0), Val(0), Val(0));
+        let e = t.e();
+        assert!(
+            verify(&e.g, false)
+                .unwrap_err()
+                .contains("not under the branch")
+        );
+    }
+}
+
+#[test]
+fn proved_values() {
+    let not_tab = TypeSet::ANY - TypeSet::TAB;
+    let t = start(false);
+    let v = t.slot(0);
+    // The false arm of a test for everything but a table: a table.
+    let other = t.is_type(v, not_tab);
+    let [yes, no, join] = t.diamond(other);
+    t.block(yes);
+    t.jump(join);
+    t.block(no);
+    let p = t.check(v, TypeSet::TAB, ExitTag::Type);
+    let proved = t.inst(Val(t.inst(p).a));
+    assert_eq!((t.op(p), proved.op), (Op::UnboxPtr, Op::Proved));
+    assert_eq!(proved.aux, TypeSet::TAB.bits() | super::ops::SET_ARM);
+    t.jump(join);
+    t.block(join);
+    // Each arm of a second test proves it; past their join nothing names
+    // one branch, and the check is made again.
+    let is_tab = t.is_type(v, TypeSet::TAB);
+    let [yes, no, join] = t.diamond(is_tab);
+    t.block(yes);
+    t.jump(join);
+    t.block(no);
+    t.check(v, TypeSet::TAB, ExitTag::Type);
+    t.jump(join);
+    t.block(join);
+    assert_eq!(t.set(v), TypeSet::TAB);
+    let again = t.check(v, TypeSet::TAB, ExitTag::Type);
+    assert_eq!(t.op(again), Op::CheckType);
+    t.done();
+    // A constant condition is a folded branch's: the value as something
+    // else types it, here its own definition.
+    let t = start(false);
+    let x = t.op1(Op::BoxI32, Rep::Val, t.i32(Op::Add, t.small(0), t.k(1)));
+    let yes = t.e().k32(Rep::B1, 1);
+    assert_eq!(t.e().proved(yes, true, x, TypeSet::SMALL), x);
+    t.done();
+}
+
+#[test]
+fn arms_and_joins() {
+    use super::fields::Field;
+    let t = start(false);
+    let (x, y) = (t.small(0), t.small(1));
+    let table = t.check(t.slot(2), TypeSet::TAB, ExitTag::Type);
+    let load = |k: u32| {
+        t.emit(
+            Op::Load,
+            Rep::Val,
+            Field::Inline as u16,
+            table,
+            Val::NONE,
+            Val(k),
+        )
+    };
+    let (kept, lost) = (load(0), load(1));
+    let c = t.cmp(Op::Cmp, Cc::Lt, x, y);
+    // Two arms: one value they agree on, one they do not; a store in one.
+    let mut e = t.e();
+    let mut join = e.new_join::<2>();
+    let (yes, no) = e.fork(c, false, true);
+    assert!(e.arm(yes));
+    let a = e.op2(Op::Add, Rep::I32, x, y);
+    e.leave(&mut join, [x, a]);
+    assert!(e.arm(no));
+    let seven = e.k32(Rep::I32, 7);
+    let boxed = e.op1(Op::BoxI32, Rep::Val, seven);
+    e.emit(
+        Op::Store,
+        Rep::None,
+        Field::Inline as u16,
+        table.0,
+        boxed.0,
+        1,
+    );
+    e.leave(&mut join, [x, y]);
+    let [same, differ] = e.join(join).expect("both arms came");
+    drop(e);
+    assert_eq!(same, x);
+    assert_eq!(t.op(differ), Op::Param);
+    assert_eq!(t.e().g.inputs(differ), [a.0, y.0]);
+    // What both arms left of memory stays; what one wrote does not.
+    assert_eq!(load(0), kept);
+    assert_ne!(load(1), lost);
+    // An arm that leaves the region brings nothing, and a known condition
+    // leaves an arm nothing reaches.
+    let mut e = t.e();
+    let mut join = e.new_join::<1>();
+    let (yes, no) = e.fork(c, true, false);
+    assert!(e.arm(yes));
+    e.emit(Op::Deopt, Rep::None, ExitTag::Type as u16, t.fs.0, 0, 0);
+    assert!(e.arm(no));
+    e.leave(&mut join, [y]);
+    assert_eq!(e.join(join), Some([y]));
+    let never = e.k32(Rep::B1, 0);
+    let mut join = e.new_join::<1>();
+    let cold = e.fork_or_leave(never, true, &mut join, [x]);
+    assert!(!e.arm(cold));
+    assert_eq!(e.join(join), Some([x]));
+    drop(e);
+    // `unless` over them: the cold arm, then on.
+    let n = t.e().g.blocks.len();
+    let c = t.cmp(Op::Cmp, Cc::Gt, x, y);
+    t.e().unless(c, |e| {
+        e.emit(Op::Deopt, Rep::None, ExitTag::Type as u16, t.fs.0, 0, 0);
+    });
+    assert_eq!(t.e().g.blocks.len(), n + 2);
+    t.done();
+}
+
+#[test]
+fn loops_of_their_own() {
+    use super::fields::Field;
+    let t = start(false);
+    let n = t.small(0);
+    let table = t.check(t.slot(1), TypeSet::TAB, ExitTag::Type);
+    let load = |f: Field| {
+        let rep = Field::info(f as u16).rep;
+        t.emit(Op::Load, rep, f as u16, table, Val::NONE, Val(0))
+    };
+    let (size, named) = (load(Field::ASize), load(Field::Inline));
+    let zero = t.k(0);
+    let one = t.k(1);
+    // Count to `n`, leaving two ways for one join: at the end, and early.
+    let mut e = t.e();
+    let mut out = e.new_join::<1>();
+    let (lp, [i]) = e.loop_open(Heaps::FIELD, t.fs, [zero]);
+    assert_eq!(e.g.op(i), Op::Param);
+    let more = e.cmp(Op::Cmp, Cc::Lt, i, n);
+    let body = e.fork_or_leave(more, false, &mut out, [i]);
+    assert!(e.arm(body));
+    let early = e.cmp(Op::Cmp, Cc::Eq, i, one);
+    let (stop, on) = e.fork(early, true, false);
+    assert!(e.arm(stop));
+    e.leave(&mut out, [i]);
+    assert!(e.arm(on));
+    let next = e.op2(Op::Add, Rep::I32, i, one);
+    e.loop_back(lp, [next]);
+    // The loop's value leaves through a parameter, kept though its inputs
+    // are one value: the loop-closed form.
+    let [last] = e.join(out).expect("the exits came");
+    drop(e);
+    assert!(last != i && t.op(last) == Op::Param);
+    assert_eq!(t.e().g.inputs(last), [i.0, i.0]);
+    assert_eq!(t.e().g.inputs(i), [zero.0, next.0]);
+    // What the loop was said to write is unknown past its header; the
+    // rest stands.
+    assert_eq!(load(Field::ASize), size);
+    assert_ne!(load(Field::Inline), named);
+    t.op1(Op::BoxI32, Rep::Val, last);
+    t.done();
+}
+
+#[test]
+fn table_columns() {
+    use super::ops::{FactOf, Mem, OPS};
+    let facts: Vec<(&str, FactOf)> = (OPS.iter())
+        .filter(|o| o.fact != FactOf::Rep)
+        .map(|o| (o.name, o.fact))
+        .collect();
+    assert_eq!(
+        facts,
+        [
+            ("K64", FactOf::Konst),
+            ("KObj", FactOf::AuxSet),
+            ("Load", FactOf::Field),
+            ("LoadIdx", FactOf::Field),
+            ("Select", FactOf::JoinBC),
+            ("BoxI32", FactOf::Small),
+            ("BoxF64", FactOf::Float),
+            ("BoxPtr", FactOf::AuxSet),
+            ("UnboxPtr", FactOf::HeapA),
+            ("Guard", FactOf::PassC),
+            ("GuardNot", FactOf::PassC),
+            ("Proved", FactOf::MeetC),
+            ("CallHelper", FactOf::Helper),
+            ("CheckType", FactOf::AuxSet),
+            ("BoxI64", FactOf::IntSet),
+        ]
+    );
+    let mem: Vec<(&str, Mem)> = (OPS.iter())
+        .filter(|o| o.mem != Mem::No)
+        .map(|o| (o.name, o.mem))
+        .collect();
+    assert_eq!(
+        mem,
+        [
+            ("Load", Mem::Load),
+            ("Store", Mem::Store),
+            ("LoadIdx", Mem::LoadIdx),
+            ("StoreIdx", Mem::StoreIdx),
+            ("SlotLoad", Mem::SlotLoad),
+            ("SlotStore", Mem::SlotStore),
+        ]
+    );
+    // The ops a copy has an arm of its own for.
+    let own: Vec<&str> = (OPS.iter())
+        .filter(|o| !o.flags.contains(super::ops::Flags::PLAIN))
+        .map(|o| o.name)
+        .collect();
+    assert_eq!(
+        own,
+        [
+            "FrameState",
+            "Param",
+            "Jump",
+            "Br",
+            "CallHelper",
+            "SetIndex"
+        ]
+    );
+    let tab: Vec<&str> = (super::ops::HELPERS.iter())
+        .filter(|h| h.fact != super::ops::HelperFact::Rep)
+        .map(|h| h.name)
+        .collect();
+    assert_eq!(tab, ["NewTable"]);
+}
+
+/// An array access through its rewrite: the table and key checks, the
+/// bounds guard, the load, and the cold arm a nil takes, whose class is
+/// read as what its branch proved.
+#[test]
+fn index_rewrite() {
+    let t = start(true);
+    let (recv, key) = (t.slot(0), t.slot(1));
+    let v = (t.e()).lower(
+        Op::GetIndex,
+        Rep::Val,
+        super::access::ARRAY,
+        recv.0,
+        key.0,
+        t.fs.0,
+    );
+    assert_eq!(t.op(v), Op::LoadIdx);
+    let e = t.e();
+    let has = |op: Op| e.g.insts.iter().filter(|i| i.op == op).count();
+    assert_eq!((has(Op::Br), has(Op::Proved), has(Op::GetIndex)), (2, 1, 0));
+    assert!(e.g.blocks.len() > 1 && e.cur != Block(0));
+    drop(e);
+    t.done();
+}
+
+#[test]
+#[should_panic(expected = "high-level")]
+fn emit_runs_no_rewrite() {
+    let t = start(true);
+    let (recv, key) = (t.slot(0), t.slot(1));
+    t.emit(
+        Op::GetIndex,
+        Rep::Val,
+        super::access::ARRAY,
+        recv,
+        key,
+        t.fs,
+    );
 }
 
 #[test]

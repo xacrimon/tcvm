@@ -61,7 +61,7 @@ impl Graph {
         };
         match info.aux {
             Aux::No => {}
-            Aux::Cc => _ = write!(o, ".{}", Cc::of(i.aux & 15).name()),
+            Aux::Cc | Aux::FCc => _ = write!(o, ".{}", Cc::of(i.aux & 15).name()),
             Aux::Set | Aux::SetTag => {
                 o.push('.');
                 TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits()).print(o);
@@ -74,6 +74,15 @@ impl Graph {
             Aux::Field => _ = write!(o, ".f{}", i.aux),
             Aux::Kind => _ = write!(o, ".{}", KINDS[i.aux as usize & 15]),
             Aux::Exit => o.push_str(if i.aux == 0 { ".before" } else { ".after" }),
+            Aux::Array if i.aux & super::access::ARRAY != 0 => o.push_str(".array"),
+            Aux::Array => {}
+            Aux::SetArm => {
+                o.push('.');
+                TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits()).print(o);
+                if i.aux & super::ops::SET_ARM != 0 {
+                    o.push_str(".else");
+                }
+            }
             Aux::Helper => {
                 let _ = write!(
                     o,
@@ -81,9 +90,6 @@ impl Graph {
                     super::ops::HELPERS[i.aux as usize].name.to_lowercase()
                 );
             }
-        }
-        if matches!(i.op, Op::GetIndex | Op::SetIndex) && i.aux & super::access::ARRAY != 0 {
-            o.push_str(".array");
         }
         // A generic op's speculated operand kinds.
         if matches!(i.op, Op::Arith | Op::Compare) {
@@ -99,7 +105,89 @@ impl Graph {
             Op::K64 => _ = write!(o, " {:#x}", i.k64()),
             Op::KF64 => _ = write!(o, " {:?}", f64::from_bits(i.k64())),
             Op::KObj => _ = write!(o, " #{}", i.a),
-            _ => {
+            // Operands by the row's forms.
+            Op::K32
+            | Op::Load
+            | Op::Store
+            | Op::LoadIdx
+            | Op::StoreIdx
+            | Op::Base
+            | Op::Thread
+            | Op::SlotLoad
+            | Op::SlotStore
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Neg
+            | Op::Shl
+            | Op::Shr
+            | Op::Sar
+            | Op::SDiv
+            | Op::UDiv
+            | Op::ZExt32
+            | Op::SExt32
+            | Op::Trunc32
+            | Op::Cmp
+            | Op::Select
+            | Op::AddOvf
+            | Op::SubOvf
+            | Op::MulOvf
+            | Op::NegOvf
+            | Op::FAdd
+            | Op::FSub
+            | Op::FMul
+            | Op::FDiv
+            | Op::FNeg
+            | Op::FAbs
+            | Op::FSqrt
+            | Op::FFloor
+            | Op::FCeil
+            | Op::FCmp
+            | Op::IToF
+            | Op::LToF
+            | Op::FToI
+            | Op::FToL
+            | Op::BoxI32
+            | Op::BoxF64
+            | Op::BoxPtr
+            | Op::UnboxF64
+            | Op::UnboxPtr
+            | Op::Guard
+            | Op::GuardNot
+            | Op::Proved
+            | Op::Deopt
+            | Op::LazyExit
+            | Op::FrameState
+            | Op::Param
+            | Op::Jump
+            | Op::Br
+            | Op::Ret
+            | Op::CallHelper
+            | Op::CheckType
+            | Op::IsType
+            | Op::BoxI64
+            | Op::UnboxI64
+            | Op::ToF64
+            | Op::DivFloor
+            | Op::ModFloor
+            | Op::LuaShl
+            | Op::LuaShr
+            | Op::FToIExact
+            | Op::FToLExact
+            | Op::LToI
+            | Op::AbsOvf
+            | Op::FIDiv
+            | Op::FMod
+            | Op::Arith
+            | Op::Unm
+            | Op::Compare
+            | Op::Truthy
+            | Op::GetIndex
+            | Op::SetIndex => {
                 for (k, kind) in info.args.iter().enumerate() {
                     let w = i.args()[k];
                     match kind {

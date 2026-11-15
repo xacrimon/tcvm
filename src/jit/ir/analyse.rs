@@ -132,7 +132,87 @@ impl Analysis {
                 Op::Unm => want(i.a, Spec::of(i.aux >> SPEC_SHIFT[0]).set()),
                 Op::GetIndex if i.aux & ARRAY != 0 => want(i.b, TypeSet::SMALL),
                 Op::SetIndex if i.aux & ARRAY != 0 => want(g.run(i.a, i.b)[1], TypeSet::SMALL),
-                _ => {}
+                Op::GetIndex | Op::SetIndex => {}
+                // No other op asks a type of an operand it would check.
+                Op::K32
+                | Op::K64
+                | Op::KF64
+                | Op::KObj
+                | Op::Load
+                | Op::Store
+                | Op::LoadIdx
+                | Op::StoreIdx
+                | Op::Base
+                | Op::Thread
+                | Op::SlotLoad
+                | Op::SlotStore
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::And
+                | Op::Or
+                | Op::Xor
+                | Op::Not
+                | Op::Neg
+                | Op::Shl
+                | Op::Shr
+                | Op::Sar
+                | Op::SDiv
+                | Op::UDiv
+                | Op::ZExt32
+                | Op::SExt32
+                | Op::Trunc32
+                | Op::Cmp
+                | Op::Select
+                | Op::AddOvf
+                | Op::SubOvf
+                | Op::MulOvf
+                | Op::NegOvf
+                | Op::FAdd
+                | Op::FSub
+                | Op::FMul
+                | Op::FDiv
+                | Op::FNeg
+                | Op::FAbs
+                | Op::FSqrt
+                | Op::FFloor
+                | Op::FCeil
+                | Op::FCmp
+                | Op::IToF
+                | Op::LToF
+                | Op::FToI
+                | Op::FToL
+                | Op::BoxI32
+                | Op::BoxF64
+                | Op::BoxPtr
+                | Op::UnboxF64
+                | Op::UnboxPtr
+                | Op::Guard
+                | Op::GuardNot
+                | Op::Proved
+                | Op::Deopt
+                | Op::LazyExit
+                | Op::FrameState
+                | Op::Param
+                | Op::Jump
+                | Op::Br
+                | Op::Ret
+                | Op::CallHelper
+                | Op::IsType
+                | Op::BoxI64
+                | Op::UnboxI64
+                | Op::ToF64
+                | Op::DivFloor
+                | Op::ModFloor
+                | Op::LuaShl
+                | Op::LuaShr
+                | Op::FToIExact
+                | Op::FToLExact
+                | Op::LToI
+                | Op::AbsOvf
+                | Op::FIDiv
+                | Op::FMod
+                | Op::Truthy => {}
             }
         }
         for v in 0..n {
@@ -161,7 +241,90 @@ impl Analysis {
                         }
                     }
                     Op::Unm if g.facts[v].pending() => self.kind(i, 0).set(),
-                    _ => g.facts[v].set,
+                    Op::Param | Op::Arith | Op::Unm => g.facts[v].set,
+                    // Every other op's type is its fact's.
+                    Op::K32
+                    | Op::K64
+                    | Op::KF64
+                    | Op::KObj
+                    | Op::Load
+                    | Op::Store
+                    | Op::LoadIdx
+                    | Op::StoreIdx
+                    | Op::Base
+                    | Op::Thread
+                    | Op::SlotLoad
+                    | Op::SlotStore
+                    | Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::And
+                    | Op::Or
+                    | Op::Xor
+                    | Op::Not
+                    | Op::Neg
+                    | Op::Shl
+                    | Op::Shr
+                    | Op::Sar
+                    | Op::SDiv
+                    | Op::UDiv
+                    | Op::ZExt32
+                    | Op::SExt32
+                    | Op::Trunc32
+                    | Op::Cmp
+                    | Op::Select
+                    | Op::AddOvf
+                    | Op::SubOvf
+                    | Op::MulOvf
+                    | Op::NegOvf
+                    | Op::FAdd
+                    | Op::FSub
+                    | Op::FMul
+                    | Op::FDiv
+                    | Op::FNeg
+                    | Op::FAbs
+                    | Op::FSqrt
+                    | Op::FFloor
+                    | Op::FCeil
+                    | Op::FCmp
+                    | Op::IToF
+                    | Op::LToF
+                    | Op::FToI
+                    | Op::FToL
+                    | Op::BoxI32
+                    | Op::BoxF64
+                    | Op::BoxPtr
+                    | Op::UnboxF64
+                    | Op::UnboxPtr
+                    | Op::Guard
+                    | Op::GuardNot
+                    | Op::Proved
+                    | Op::Deopt
+                    | Op::LazyExit
+                    | Op::FrameState
+                    | Op::Jump
+                    | Op::Br
+                    | Op::Ret
+                    | Op::CallHelper
+                    | Op::CheckType
+                    | Op::IsType
+                    | Op::BoxI64
+                    | Op::UnboxI64
+                    | Op::ToF64
+                    | Op::DivFloor
+                    | Op::ModFloor
+                    | Op::LuaShl
+                    | Op::LuaShr
+                    | Op::FToIExact
+                    | Op::FToLExact
+                    | Op::LToI
+                    | Op::AbsOvf
+                    | Op::FIDiv
+                    | Op::FMod
+                    | Op::Compare
+                    | Op::Truthy
+                    | Op::GetIndex
+                    | Op::SetIndex => g.facts[v].set,
                 };
             }
             let mut dropped = false;

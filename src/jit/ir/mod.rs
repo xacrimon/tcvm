@@ -208,7 +208,24 @@ impl Graph {
         match i.op.info().args[0] {
             Arg::Vals => self.run(i.a, i.b),
             Arg::Entries => self.run(i.a, 1 + 2 * i.b),
-            _ => &[],
+            Arg::No
+            | Arg::Imm
+            | Arg::Val
+            | Arg::I32
+            | Arg::I64
+            | Arg::F64
+            | Arg::B1
+            | Arg::Ptr
+            | Arg::Int
+            | Arg::IntB
+            | Arg::W64
+            | Arg::Same
+            | Arg::Any
+            | Arg::Fs
+            | Arg::OptFs
+            | Arg::Opt
+            | Arg::Blk
+            | Arg::Len => &[],
         }
     }
 
@@ -359,32 +376,49 @@ impl Graph {
                         rep_of(i.c)
                     }
             }
-            ops::Res::Dyn => match i.op {
-                Op::K32 => matches!(i.rep, Rep::I32 | Rep::B1),
-                Op::K64 => i.rep.word64(),
-                Op::KObj => matches!(i.rep, Rep::Val | Rep::Ptr),
-                Op::Load | Op::LoadIdx => i.rep == fields::Field::info(i.aux).rep,
-                Op::Select | Op::Param => i.rep != Rep::None,
-                Op::CallHelper => {
+            ops::Res::K32 => matches!(i.rep, Rep::I32 | Rep::B1),
+            ops::Res::Word => i.rep.word64(),
+            ops::Res::Obj => matches!(i.rep, Rep::Val | Rep::Ptr),
+            ops::Res::Field => {
+                (i.aux as usize) < fields::FIELDS.len() && i.rep == fields::Field::info(i.aux).rep
+            }
+            ops::Res::Some => i.rep != Rep::None,
+            ops::Res::Helper => {
+                (i.aux as usize) < ops::HELPERS.len() && {
                     let h = &ops::HELPERS[i.aux as usize];
                     let reps = self.run(i.a, i.b).iter().map(|&v| rep_of(v));
                     i.rep == h.ret && reps.eq(h.operands())
                 }
-                Op::CheckType => i.rep == set.unboxed(),
-                _ => false,
-            },
+            }
+            ops::Res::Unboxed => i.rep == set.unboxed(),
         };
         if !ok {
             return Err("result");
         }
-        let ok = match i.op {
-            Op::Cmp => (i.aux as usize) < 10,
-            Op::FCmp => (i.aux as usize) < 6,
-            // The `I32` forms can leave `I32`.
-            Op::LuaShl | Op::LuaShr => i.rep == Rep::I64 || i.c != u32::MAX,
-            _ => true,
+        let any = types::TypeSet::ANY.bits();
+        let ok = match info.aux {
+            // A generic op keeps its operands' speculated kinds above.
+            ops::Aux::Cc => (i.aux as usize & 15) < 10,
+            ops::Aux::FCc => (i.aux as usize) < 6,
+            ops::Aux::Set => i.aux & !any == 0,
+            ops::Aux::SetArm => i.aux & !(any | ops::SET_ARM) == 0,
+            ops::Aux::Field => (i.aux as usize) < fields::FIELDS.len(),
+            ops::Aux::Helper => (i.aux as usize) < ops::HELPERS.len(),
+            ops::Aux::Exit | ops::Aux::Array => i.aux < 2,
+            // A tag's, a slot's and a kind's own types check theirs.
+            ops::Aux::No | ops::Aux::SetTag | ops::Aux::Tag | ops::Aux::Slot | ops::Aux::Kind => {
+                true
+            }
         };
-        if ok { Ok(()) } else { Err("aux") }
+        if !ok {
+            return Err("aux");
+        }
+        // The `I32` forms of the Lua shifts can leave `I32`: they take a
+        // frame state.
+        if matches!(i.op, Op::LuaShl | Op::LuaShr) && i.rep != Rep::I64 && i.c == u32::MAX {
+            return Err("operand c");
+        }
+        Ok(())
     }
 
     /// The dominator of `b` at depth `depth`, at most `b`'s.

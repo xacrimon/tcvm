@@ -13,7 +13,7 @@ const OPS_BOTH: &str = "\
     Add Sub Mul And Or Xor Not Neg Shl Shr Sar SDiv UDiv ZExt32 SExt32 \
     Trunc32 Cmp Select AddOvf SubOvf MulOvf NegOvf FAdd FSub FMul FDiv FNeg \
     FAbs FSqrt FFloor FCeil FCmp IToF LToF FToI FToL BoxI32 BoxF64 BoxPtr \
-    UnboxF64 UnboxPtr UnboxPtrPin Guard GuardNot Deopt LazyExit FrameState \
+    UnboxF64 UnboxPtr Guard GuardNot Proved Deopt LazyExit FrameState \
     Param Jump Br Ret CallHelper";
 const OPS_HIGH: &str = "\
     CheckType IsType BoxI64 UnboxI64 ToF64 DivFloor ModFloor LuaShl LuaShr \

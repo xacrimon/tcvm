@@ -1,5 +1,5 @@
 //! Table access as the emitter writes it: the cold arms, the class and
-//! barrier tests, and the rule of the generic `GetIndex`/`SetIndex`. A
+//! barrier tests, and the rewrite of the generic `GetIndex`/`SetIndex`. A
 //! small-integer key goes to the array part under a bounds guard; anything
 //! else takes a helper, whose failure (a metamethod to call, an error)
 //! leaves for the interpreter.
@@ -8,7 +8,7 @@ use super::emit::Emitter;
 use super::fields::Field;
 use super::ops::{Cc, ExitTag, HELPER_FAIL_VAL, Helper, Op};
 use super::types::{Rep, TypeSet};
-use super::{BlockFlags, Inst, Val};
+use super::{Inst, Val};
 use crate::env::MetamethodBits;
 use crate::env::value::NIL;
 
@@ -30,15 +30,15 @@ impl Emitter {
             Some(true) => return slow(self),
             None => {}
         }
-        let lp = self.g.block(self.cur).lp;
-        let (cold, on) = (self.new_block(), self.new_block());
-        self.br(c, cold, on);
-        self.begin(cold, lp, 0, BlockFlags::COLD);
-        slow(self);
-        if !self.cur.is_none() {
-            self.jump(on);
+        let mut on = self.new_join::<0>();
+        let cold = self.fork_or_leave(c, true, &mut on, []);
+        if self.arm(cold) {
+            slow(self);
+            if !self.cur.is_none() {
+                self.leave(&mut on, []);
+            }
         }
-        self.begin(on, lp, 0, BlockFlags::empty());
+        self.join(on);
     }
 
     pub(crate) fn is_nil(&mut self, v: Val) -> Val {
@@ -65,6 +65,8 @@ impl Emitter {
         let zero = self.k64(Rep::I64, 0);
         let classed = self.cmp(Op::Cmp, Cc::Ne, class, zero);
         self.unless(classed, |e| {
+            // The class is one only in this arm.
+            let class = e.proved(classed, true, class, TypeSet::ANY);
             let have = e.load(Field::ClassBits, class, 0);
             let mask = e.k32(Rep::I32, bits.bits());
             let hit = e.op2(Op::And, Rep::I32, have, mask);
@@ -112,8 +114,10 @@ impl Emitter {
         self.emit(Op::SetIndex, Rep::None, aux, at, 3, state.0);
     }
 
-    /// `GetIndex`/`SetIndex` once the key's fact is final.
-    pub(super) fn index(&mut self, i: &Inst) -> Option<Val> {
+    /// The rewrite of `GetIndex`/`SetIndex`, the key's fact final: a helper
+    /// call, or the array part under its checks, with the cold arms a nil
+    /// there and a store's barrier take.
+    pub(super) fn index(&mut self, i: &Inst) -> Val {
         let get = i.op == Op::GetIndex;
         let (recv, key, v, state) = if get {
             (Val(i.a), Val(i.b), Val::NONE, Val(i.c))
@@ -123,15 +127,15 @@ impl Emitter {
         };
         let kf = self.fact(key);
         if kf.pending() {
-            return None;
+            return self.append(*i);
         }
         if i.aux & ARRAY == 0 || !kf.set.intersects(TypeSet::SMALL) {
-            return Some(if get {
+            return if get {
                 self.helped(Helper::Index, 0, &[recv, key], state)
             } else {
                 self.helped(Helper::NewIndex, 1, &[recv, key, v], state);
                 Val::NONE
-            });
+            };
         }
         let t = self.check_type(recv, TypeSet::TAB, ExitTag::Type, state);
         let k = self.check_type(key, TypeSet::SMALL, ExitTag::Type, state);
@@ -147,11 +151,11 @@ impl Emitter {
         let old = self.emit(Op::LoadIdx, Rep::Val, item, arr.0, at.0, u32::MAX);
         if get {
             self.nil_guard(t, old, MetamethodBits::INDEX, ExitTag::Bounds, state);
-            return Some(old);
+            return old;
         }
         self.nil_guard(t, old, MetamethodBits::NEWINDEX, ExitTag::Bounds, state);
         self.barrier(t, v);
         self.emit(Op::StoreIdx, Rep::None, item, arr.0, at.0, v.0);
-        Some(Val::NONE)
+        Val::NONE
     }
 }

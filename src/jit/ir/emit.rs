@@ -5,7 +5,10 @@
 //! the instruction makes known.
 
 use super::fields::Field;
-use super::ops::{Arg, Aux, Cc, Ctx, Dialect, ExitKind, ExitTag, Flags, Heaps, Helper, Op};
+use super::ops::{
+    Arg, Aux, Cc, Ctx, Dialect, ExitKind, ExitTag, FactOf, Flags, Heaps, Helper, HelperFact, Mem,
+    Op, SET_ARM,
+};
 use super::table::{self, Key, Snap, Table};
 use super::types::{Fact, FactFlags, Rep, TypeSet};
 use super::{Block, BlockData, BlockFlags, Graph, Inst, Loop, LoopData, Val};
@@ -20,15 +23,19 @@ fn aux_key(i: &Inst) -> u16 {
     match i.op.info().aux {
         Aux::Tag => 0,
         Aux::SetTag => i.aux & TypeSet::ANY.bits(),
-        _ => i.aux,
+        Aux::No
+        | Aux::Cc
+        | Aux::FCc
+        | Aux::Set
+        | Aux::SetArm
+        | Aux::Slot
+        | Aux::Field
+        | Aux::Kind
+        | Aux::Exit
+        | Aux::Helper
+        | Aux::Array => i.aux,
     }
 }
-
-/// The ops whose rule makes blocks inside `emit`, each until the step that
-/// turns it into a rewrite (step 3). Nothing is added here: `emit` returns
-/// in the block it was called in, or with that block closed.
-#[cfg(feature = "tcvm-dev")]
-const RULES_MAKING_BLOCKS: [Op; 2] = [Op::GetIndex, Op::SetIndex];
 
 /// A heap key's index among the versions: the heaps by their bit, then
 /// the frame slots, then the indexed fields' slots.
@@ -39,29 +46,52 @@ const FIELD_KEYS: u32 = SLOT_KEYS + 256;
 /// base and index, and for a store the value it leaves there. A load and
 /// the store that feeds it have one key.
 fn mem_key(i: &Inst) -> Option<([u32; 4], Option<u32>)> {
-    Some(match i.op {
-        Op::SlotLoad => ([0, i.aux as u32, 0, 0], None),
-        Op::SlotStore => ([0, i.aux as u32, 0, 0], Some(i.a)),
-        Op::Load => ([1, i.aux as u32, i.a, i.c], None),
-        Op::Store => ([1, i.aux as u32, i.a, i.c], Some(i.b)),
-        Op::LoadIdx => ([2, i.aux as u32, i.a, i.b], None),
-        Op::StoreIdx => ([2, i.aux as u32, i.a, i.b], Some(i.c)),
-        _ => return None,
+    Some(match i.op.info().mem {
+        Mem::No => return None,
+        Mem::SlotLoad => ([0, i.aux as u32, 0, 0], None),
+        Mem::SlotStore => ([0, i.aux as u32, 0, 0], Some(i.a)),
+        Mem::Load => ([1, i.aux as u32, i.a, i.c], None),
+        Mem::Store => ([1, i.aux as u32, i.a, i.c], Some(i.b)),
+        Mem::LoadIdx => ([2, i.aux as u32, i.a, i.b], None),
+        Mem::StoreIdx => ([2, i.aux as u32, i.a, i.b], Some(i.c)),
     })
 }
 
 /// The heap a memory access is in, and its key's index where the heap is
 /// keyed.
 fn heap_of(i: &Inst) -> (Heaps, Option<u32>) {
-    match i.op {
-        Op::SlotLoad | Op::SlotStore => (Heaps::SLOT, Some(SLOT_KEYS + i.aux as u32)),
-        _ => {
+    match i.op.info().mem {
+        Mem::No => bug!("{:?} is no memory access", i.op),
+        Mem::SlotLoad | Mem::SlotStore => (Heaps::SLOT, Some(SLOT_KEYS + i.aux as u32)),
+        Mem::Load | Mem::Store | Mem::LoadIdx | Mem::StoreIdx => {
             let f = Field::info(i.aux);
             let spilled = (i.aux == Field::Spilled as u16) as u32;
             let keyed = f.indexed && !f.heap.is_empty();
             (f.heap, keyed.then(|| FIELD_KEYS + 2 * i.c + spilled))
         }
     }
+}
+
+/// How many arms one join takes.
+const MAX_ARMS: usize = 4;
+
+/// A block a branch leads to, before it is opened (`Emitter::arm`).
+#[derive(Clone, Copy)]
+pub(crate) struct Arm {
+    block: Block,
+    lp: Loop,
+    cold: bool,
+}
+
+/// A continuation before it is opened, with the values each arm that left
+/// for it brings.
+pub(crate) struct Join<const N: usize> {
+    block: Block,
+    lp: Loop,
+    arms: [[Val; N]; MAX_ARMS],
+    n: usize,
+    /// An arm left from a loop inside the continuation's.
+    from_loop: bool,
 }
 
 /// `reset` before the first graph, and between graphs.
@@ -215,6 +245,14 @@ impl Emitter {
             if key.is_reg() {
                 continue;
             }
+            // A value the predecessors' branches typed differently has no
+            // one branch to name.
+            if key.is_proof() {
+                let v = at_preds[0];
+                let same = at_preds.iter().all(|&w| w == v);
+                self.table.set(key, if same { v } else { table::NONE });
+                continue;
+            }
             if !key.is_fact() {
                 // A heap the predecessors left at different versions is at
                 // a new one: nothing known of it survives the join.
@@ -251,7 +289,7 @@ impl Emitter {
         if nfwd == 1 {
             let t = *self.g.term(self.g.preds[at]);
             if t.op == Op::Br && t.b != t.c {
-                self.assume(Val(t.a), t.b == b.0);
+                self.assume(Val(t.a), t.b == b.0, true);
             }
         }
         true
@@ -366,8 +404,10 @@ impl Emitter {
         }
     }
 
-    /// The `B1` `c` is `truth` from here on, and with it what it tested.
-    fn assume(&mut self, c: Val, truth: bool) {
+    /// The `B1` `c` is `truth` from here on, and with it what it tested;
+    /// `branch` where an edge of a branch on it says so, which is then what
+    /// types the tested value (`typed`).
+    fn assume(&mut self, c: Val, truth: bool, branch: bool) {
         let flag = if truth {
             FactFlags::TRUE
         } else {
@@ -385,6 +425,10 @@ impl Emitter {
             let set = TypeSet::from_bits_retain(i.aux);
             let set = if truth { set } else { !set };
             self.refine(Val(i.a), Fact::of(set));
+            if branch {
+                let arm = if truth { 0 } else { table::PROOF_FALSE };
+                self.table.set(Key::proof(i.a), c.0 | arm);
+            }
         }
     }
 
@@ -441,13 +485,119 @@ impl Emitter {
             Some(v) => v,
             None => self.append(i),
         };
+        // A rule makes no block and leaves the open one open, or closed.
         #[cfg(feature = "tcvm-dev")]
-        if !RULES_MAKING_BLOCKS.contains(&op)
-            && (at.1 != self.g.blocks.len() || !(self.cur == at.0 || self.cur.is_none()))
-        {
+        if at.1 != self.g.blocks.len() || !(self.cur == at.0 || self.cur.is_none()) {
             bug!("the rule of {op:?} left {:?} for {:?}", at.0, self.cur);
         }
         v
+    }
+
+    /// `emit`, and for an op its rule leaves high-level, its rewrite: the
+    /// lowering that needs blocks. Returns in the continuation block.
+    pub(crate) fn lower(&mut self, op: Op, rep: Rep, aux: u16, a: u32, b: u32, c: u32) -> Val {
+        if self.bail.is_some() {
+            return Val(0);
+        }
+        let mut i = Inst {
+            op,
+            rep,
+            aux,
+            a,
+            b,
+            c,
+        };
+        self.check(&mut i);
+        if let Some(v) = self.rule(&mut i) {
+            return v;
+        }
+        match i.op {
+            Op::GetIndex | Op::SetIndex => self.index(&i),
+            // No rewrite: a rule lowers each, or it is not lowered yet.
+            Op::CheckType
+            | Op::IsType
+            | Op::BoxI64
+            | Op::UnboxI64
+            | Op::ToF64
+            | Op::DivFloor
+            | Op::ModFloor
+            | Op::LuaShl
+            | Op::LuaShr
+            | Op::FToIExact
+            | Op::FToLExact
+            | Op::LToI
+            | Op::AbsOvf
+            | Op::FIDiv
+            | Op::FMod
+            | Op::Arith
+            | Op::Unm
+            | Op::Compare
+            | Op::Truthy => self.append(i),
+            Op::K32
+            | Op::K64
+            | Op::KF64
+            | Op::KObj
+            | Op::Load
+            | Op::Store
+            | Op::LoadIdx
+            | Op::StoreIdx
+            | Op::Base
+            | Op::Thread
+            | Op::SlotLoad
+            | Op::SlotStore
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Neg
+            | Op::Shl
+            | Op::Shr
+            | Op::Sar
+            | Op::SDiv
+            | Op::UDiv
+            | Op::ZExt32
+            | Op::SExt32
+            | Op::Trunc32
+            | Op::Cmp
+            | Op::Select
+            | Op::AddOvf
+            | Op::SubOvf
+            | Op::MulOvf
+            | Op::NegOvf
+            | Op::FAdd
+            | Op::FSub
+            | Op::FMul
+            | Op::FDiv
+            | Op::FNeg
+            | Op::FAbs
+            | Op::FSqrt
+            | Op::FFloor
+            | Op::FCeil
+            | Op::FCmp
+            | Op::IToF
+            | Op::LToF
+            | Op::FToI
+            | Op::FToL
+            | Op::BoxI32
+            | Op::BoxF64
+            | Op::BoxPtr
+            | Op::UnboxF64
+            | Op::UnboxPtr
+            | Op::Guard
+            | Op::GuardNot
+            | Op::Proved
+            | Op::Deopt
+            | Op::LazyExit
+            | Op::FrameState
+            | Op::Param
+            | Op::Jump
+            | Op::Br
+            | Op::Ret
+            | Op::CallHelper => self.append(i),
+        }
     }
 
     /// Number and append, past the rules.
@@ -504,14 +654,96 @@ impl Emitter {
                 self.grow();
             }
         }
+        // What standing past it tells.
         match i.op {
-            Op::Guard => self.assume(Val(i.a), true),
-            Op::GuardNot => self.assume(Val(i.a), false),
+            Op::Guard => self.assume(Val(i.a), true, false),
+            Op::GuardNot => self.assume(Val(i.a), false, false),
             Op::CheckType => {
                 let set = TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits());
                 self.refine(Val(i.a), Fact::of(set))
             }
-            _ => {}
+            Op::K32
+            | Op::K64
+            | Op::KF64
+            | Op::KObj
+            | Op::Load
+            | Op::Store
+            | Op::LoadIdx
+            | Op::StoreIdx
+            | Op::Base
+            | Op::Thread
+            | Op::SlotLoad
+            | Op::SlotStore
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Neg
+            | Op::Shl
+            | Op::Shr
+            | Op::Sar
+            | Op::SDiv
+            | Op::UDiv
+            | Op::ZExt32
+            | Op::SExt32
+            | Op::Trunc32
+            | Op::Cmp
+            | Op::Select
+            | Op::AddOvf
+            | Op::SubOvf
+            | Op::MulOvf
+            | Op::NegOvf
+            | Op::FAdd
+            | Op::FSub
+            | Op::FMul
+            | Op::FDiv
+            | Op::FNeg
+            | Op::FAbs
+            | Op::FSqrt
+            | Op::FFloor
+            | Op::FCeil
+            | Op::FCmp
+            | Op::IToF
+            | Op::LToF
+            | Op::FToI
+            | Op::FToL
+            | Op::BoxI32
+            | Op::BoxF64
+            | Op::BoxPtr
+            | Op::UnboxF64
+            | Op::UnboxPtr
+            | Op::Proved
+            | Op::Deopt
+            | Op::LazyExit
+            | Op::FrameState
+            | Op::Param
+            | Op::Jump
+            | Op::Br
+            | Op::Ret
+            | Op::CallHelper
+            | Op::IsType
+            | Op::BoxI64
+            | Op::UnboxI64
+            | Op::ToF64
+            | Op::DivFloor
+            | Op::ModFloor
+            | Op::LuaShl
+            | Op::LuaShr
+            | Op::FToIExact
+            | Op::FToLExact
+            | Op::LToI
+            | Op::AbsOvf
+            | Op::FIDiv
+            | Op::FMod
+            | Op::Arith
+            | Op::Unm
+            | Op::Compare
+            | Op::Truthy
+            | Op::GetIndex
+            | Op::SetIndex => {}
         }
         if i.op.has(Flags::TERMINATOR) {
             let (succs, n) = self.g.succs(&i);
@@ -536,26 +768,33 @@ impl Emitter {
     /// The fact a new instruction's result has by its definition.
     fn def_fact(&self, i: &Inst) -> Fact {
         let of = |w: u32| self.fact(Val(w));
-        let mut f = match (i.op, i.rep) {
+        let by_rep = Fact::of_rep(i.rep);
+        let aux_set = TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits());
+        // Only a boxed value and a pointer have more to say than their
+        // representation.
+        let held = matches!(i.rep, Rep::Val | Rep::Ptr);
+        let mut f = match i.op.info().fact {
+            FactOf::Rep => by_rep,
+            _ if !held => by_rep,
+            FactOf::Small => Fact::of(TypeSet::SMALL),
+            FactOf::Float => Fact::of(TypeSet::FLOAT),
+            FactOf::IntSet => Fact::of(TypeSet::INT),
+            FactOf::AuxSet => Fact::of(aux_set),
+            FactOf::Field if i.rep == Rep::Val => Fact::of(Field::info(i.aux).set),
+            FactOf::Field => by_rep,
+            FactOf::PassC => of(i.c),
+            FactOf::MeetC => of(i.c).meet(Fact::of(aux_set)),
+            FactOf::JoinBC => of(i.b).join(of(i.c)),
+            FactOf::HeapA => Fact::of(of(i.a).set & TypeSet::HEAP),
             // SAFETY: a `K64` `Val` names no heap object.
-            (Op::K64, Rep::Val) => Fact::of(TypeSet::of(unsafe {
+            FactOf::Konst if i.rep == Rep::Val => Fact::of(TypeSet::of(unsafe {
                 crate::env::value::Value::from_raw(i.k64())
             })),
-            (Op::KObj | Op::BoxPtr, _) => Fact::of(TypeSet::from_bits_retain(i.aux)),
-            (Op::Load | Op::LoadIdx, Rep::Val) => Fact::of(Field::info(i.aux).set),
-            (Op::CallHelper, Rep::Val) if i.aux == Helper::NewTable as u16 => {
-                Fact::of(TypeSet::TAB)
-            }
-            (Op::BoxI32, _) => Fact::of(TypeSet::SMALL),
-            (Op::BoxF64, _) => Fact::of(TypeSet::FLOAT),
-            (Op::BoxI64, _) => Fact::of(TypeSet::INT),
-            (Op::Select, Rep::Val | Rep::Ptr) => of(i.b).join(of(i.c)),
-            (Op::Guard | Op::GuardNot, Rep::Val | Rep::Ptr) => of(i.c),
-            (Op::UnboxPtr | Op::UnboxPtrPin, _) => Fact::of(of(i.a).set & TypeSet::HEAP),
-            (Op::CheckType, Rep::Ptr) => {
-                Fact::of(TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits()))
-            }
-            _ => Fact::of_rep(i.rep),
+            FactOf::Konst => by_rep,
+            FactOf::Helper => match Helper::of(i.aux).info().fact {
+                HelperFact::Tab if i.rep == Rep::Val => Fact::of(TypeSet::TAB),
+                HelperFact::Tab | HelperFact::Rep => by_rep,
+            },
         };
         // A generic op's result is as unresolved as its operands.
         if i.op.has(Flags::GENERIC) {
@@ -711,6 +950,207 @@ impl Emitter {
                 self.num[s] = e;
             }
         }
+    }
+
+    // --- what a branch proved -----------------------------------------------
+
+    /// `v` in the arm of a branch on `cond` (`arm`: its true one), where it
+    /// is known to be in `set` because of the branch: what relies on that
+    /// uses the result.
+    pub(crate) fn proved(&mut self, cond: Val, arm: bool, v: Val, set: TypeSet) -> Val {
+        let aux = (set & TypeSet::ANY).bits() | if arm { 0 } else { SET_ARM };
+        self.emit(Op::Proved, self.g.rep(v), aux, cond.0, 0, v.0)
+    }
+
+    /// `v` as a value whose definition says it is in `set`: itself, the
+    /// result of the guard that checked it, or of a `Proved` under the
+    /// branch that typed it. None where its fact holds some other way.
+    pub(crate) fn typed(&mut self, v: Val, set: TypeSet) -> Option<Val> {
+        if set.contains(self.g.facts[v.idx()].set) {
+            return Some(v);
+        }
+        if self.lowered
+            && let Some(cond) = self.type_test(v, set)
+        {
+            let guard = Inst {
+                op: Op::Guard,
+                rep: self.g.rep(v),
+                aux: 0,
+                a: cond.0,
+                b: 0,
+                c: v.0,
+            };
+            if let Ok(r) = self.number(&guard) {
+                return Some(r);
+            }
+        }
+        let proof = self.table.get(Key::proof(v.0));
+        if proof == table::NONE {
+            return None;
+        }
+        let cond = Val(proof & !table::PROOF_FALSE);
+        let c = *self.g.inst(cond);
+        let arm = proof & table::PROOF_FALSE == 0;
+        let by = TypeSet::from_bits_retain(c.aux);
+        let by = if arm { by } else { !by & TypeSet::ANY };
+        // The branch tested this set, not what else narrowed the value since.
+        (c.op == Op::IsType && set.contains(by)).then(|| self.proved(cond, arm, v, by))
+    }
+
+    // --- arms, joins and loops ----------------------------------------------
+
+    /// Branch on `cond` into two arms, each cold or not. A condition known
+    /// here leaves one of them unreached.
+    pub(crate) fn fork(&mut self, cond: Val, cold_t: bool, cold_f: bool) -> (Arm, Arm) {
+        let lp = self.loop_here();
+        let arm = |e: &mut Self, cold| Arm {
+            block: e.new_block(),
+            lp,
+            cold,
+        };
+        let (t, f) = (arm(self, cold_t), arm(self, cold_f));
+        self.br(cond, t.block, f.block);
+        (t, f)
+    }
+
+    /// Where `cond` holds, a new arm; else on to `join` with `values`.
+    pub(crate) fn fork_or_leave<const N: usize>(
+        &mut self,
+        cond: Val,
+        cold: bool,
+        join: &mut Join<N>,
+        values: [Val; N],
+    ) -> Arm {
+        let arm = Arm {
+            block: self.new_block(),
+            lp: self.loop_here(),
+            cold,
+        };
+        // A condition known to hold sends nothing on.
+        if self.known(cond) != Some(true) {
+            self.left(join, values);
+        }
+        self.br(cond, arm.block, join.block);
+        arm
+    }
+
+    /// Open `arm`; false where nothing reaches it.
+    pub(crate) fn arm(&mut self, arm: Arm) -> bool {
+        if self.bail.is_some() {
+            return false;
+        }
+        let flags = if arm.cold {
+            BlockFlags::COLD
+        } else {
+            BlockFlags::empty()
+        };
+        self.begin(arm.block, arm.lp, 0, flags)
+    }
+
+    /// A continuation of the open block's loop, opened by `join` once its
+    /// arms have left for it.
+    pub(crate) fn new_join<const N: usize>(&mut self) -> Join<N> {
+        Join {
+            block: self.new_block(),
+            lp: self.loop_here(),
+            arms: [[Val::NONE; N]; MAX_ARMS],
+            n: 0,
+            from_loop: false,
+        }
+    }
+
+    fn left<const N: usize>(&mut self, join: &mut Join<N>, values: [Val; N]) {
+        if self.bail.is_some() {
+            return;
+        }
+        if join.n == MAX_ARMS {
+            bug!("more arms than a join takes");
+        }
+        join.arms[join.n] = values;
+        join.n += 1;
+        join.from_loop |= self.loop_here() != join.lp;
+    }
+
+    /// End the open arm: on to `join` with `values`.
+    pub(crate) fn leave<const N: usize>(&mut self, join: &mut Join<N>, values: [Val; N]) {
+        self.left(join, values);
+        self.jump(join.block);
+    }
+
+    /// Open `join` as the merge of the arms that left for it: a parameter
+    /// where their values differ, and for every value where an arm left from
+    /// a loop inside the join's (the loop-closed form keeps those). None
+    /// where no arm left: nothing reaches what follows.
+    pub(crate) fn join<const N: usize>(&mut self, join: Join<N>) -> Option<[Val; N]> {
+        if self.bail.is_some() {
+            return Some([Val(0); N]);
+        }
+        if join.n == 0 || !self.begin(join.block, join.lp, 0, BlockFlags::empty()) {
+            return None;
+        }
+        let came = self.g.block(self.cur).nfwd as usize;
+        if came != join.n {
+            bug!("{} arms left for a join {came} reach", join.n);
+        }
+        let arms = &join.arms[..came];
+        let mut out = [Val::NONE; N];
+        for (k, o) in out.iter_mut().enumerate() {
+            let first = arms[0][k];
+            *o = if !join.from_loop && arms.iter().all(|a| a[k] == first) {
+                first
+            } else {
+                let mut inputs = [Val::NONE; MAX_ARMS];
+                for (i, a) in inputs.iter_mut().zip(arms) {
+                    *i = a[k];
+                }
+                self.param(self.g.rep(first), None, &inputs[..came])
+            };
+        }
+        Some(out)
+    }
+
+    /// Enter a loop of its own header, nested in the open block's, carrying
+    /// `values` as the header's parameters. `writes` is what its body may
+    /// write, unknown from the header on; `state` what an exit hoisted to its
+    /// entry restores.
+    pub(crate) fn loop_open<const N: usize>(
+        &mut self,
+        writes: Heaps,
+        state: Val,
+        values: [Val; N],
+    ) -> (Loop, [Val; N]) {
+        if self.bail.is_some() {
+            return (Loop::NONE, values);
+        }
+        let header = self.new_block();
+        let lp = self.new_loop(header, self.loop_here(), writes, state);
+        self.jump(header);
+        self.begin(header, lp, 1, BlockFlags::LOOP_HEADER);
+        // A parameter says nothing its back edge's value might not.
+        let params = values.map(|v| {
+            let rep = self.g.rep(v);
+            self.param(rep, Some(Fact::of_rep(rep)), &[v])
+        });
+        (lp, params)
+    }
+
+    /// The back edge of `lp` from the open block, with the header's
+    /// parameters' next values.
+    pub(crate) fn loop_back<const N: usize>(&mut self, lp: Loop, values: [Val; N]) {
+        if self.bail.is_some() {
+            return;
+        }
+        let header = self.g.loops[lp.idx()].header;
+        let k = self.next_pred(header);
+        let first = self.g.block(header).start;
+        for (j, v) in values.into_iter().enumerate() {
+            self.set_input(Val(first + j as u32), k, v);
+        }
+        self.jump(header);
+    }
+
+    fn loop_here(&self) -> Loop {
+        self.g.block(self.cur).lp
     }
 
     // --- shorthands ---------------------------------------------------------

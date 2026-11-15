@@ -3,7 +3,7 @@
 //! come from the rows, so an op without a row does not compile. Helpers have
 //! a table of their own.
 
-use crate::jit::ir::types::Rep;
+use crate::jit::ir::types::{Rep, TypeSet};
 
 /// An integer or float comparison. On a NaN operand every float compare is
 /// false except `Ne`, which is true.
@@ -289,6 +289,9 @@ bitflags::bitflags! {
         const COMMUTES = 16;
         /// Valid only where it stands: never moved, never numbered.
         const PINNED = 32;
+        /// A copy emits it again operand by operand; an op without this has
+        /// an arm of its own in the copy.
+        const PLAIN = 128;
         /// One bytecode meaning on boxed values, which may run a metamethod:
         /// kept until its operands' facts are final, never numbered.
         const GENERIC = 64;
@@ -350,8 +353,20 @@ pub(crate) enum Res {
     Is(Rep),
     /// `I32` or `I64`, the width of its `Int` operands; `B1` of `IntB` ones.
     Int,
-    /// Given at emission and checked there per op.
-    Dyn,
+    /// `I32` or `B1`: a 32-bit constant's.
+    K32,
+    /// Any 64-bit word's: a 64-bit constant's.
+    Word,
+    /// `Val` or `Ptr`: a heap object's word, or its pointer.
+    Obj,
+    /// Its field's.
+    Field,
+    /// Any, but some: a parameter's, a select's.
+    Some,
+    /// Its helper's, whose row the operands are checked against too.
+    Helper,
+    /// What its type set unboxes to.
+    Unboxed,
     /// That of operand `c`, the value an exit passes through when it does
     /// not leave; none without one.
     Pass,
@@ -361,11 +376,15 @@ pub(crate) enum Res {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Aux {
     No,
+    /// A `Cc`; `FCc` one of those a float compare has.
     Cc,
+    FCc,
     /// A type set.
     Set,
     /// A type set and, above it, an exit tag.
     SetTag,
+    /// A type set and `SET_ARM`.
+    SetArm,
     Tag,
     /// A frame slot.
     Slot,
@@ -377,6 +396,57 @@ pub(crate) enum Aux {
     Exit,
     /// A `Helper`.
     Helper,
+    /// `access::ARRAY`, or 0.
+    Array,
+}
+
+/// The bit of a `Proved`'s `aux` that says it stands in its branch's false
+/// arm.
+pub(crate) const SET_ARM: u16 = 1 << TypeSet::BITS;
+
+/// How the fact of an op's `Val` or `Ptr` result is found; any other
+/// result's is its representation's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FactOf {
+    /// Nothing beyond its representation.
+    Rep,
+    Small,
+    Float,
+    IntSet,
+    /// The type set in `aux`.
+    AuxSet,
+    /// Its field's set.
+    Field,
+    /// Operand `c`'s fact; `MeetC` that met with the set in `aux`.
+    PassC,
+    MeetC,
+    /// What holds of both operand `b` and operand `c`.
+    JoinBC,
+    /// Operand `a`'s set, of the heap types.
+    HeapA,
+    /// The constant's own type.
+    Konst,
+    /// Its helper's (`HelperFact`).
+    Helper,
+}
+
+/// An op as a memory access.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Mem {
+    No,
+    SlotLoad,
+    SlotStore,
+    Load,
+    Store,
+    LoadIdx,
+    StoreIdx,
+}
+
+/// What a helper's boxed result is known to be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HelperFact {
+    Rep,
+    Tab,
 }
 
 pub(crate) struct OpInfo {
@@ -385,6 +455,8 @@ pub(crate) struct OpInfo {
     pub(crate) aux: Aux,
     pub(crate) args: [Arg; 3],
     pub(crate) res: Res,
+    pub(crate) fact: FactOf,
+    pub(crate) mem: Mem,
     pub(crate) reads: Heaps,
     pub(crate) writes: Heaps,
     pub(crate) flags: Flags,
@@ -394,8 +466,26 @@ macro_rules! res {
     (Int) => {
         Res::Int
     };
-    (Dyn) => {
-        Res::Dyn
+    (K32) => {
+        Res::K32
+    };
+    (Word) => {
+        Res::Word
+    };
+    (Obj) => {
+        Res::Obj
+    };
+    (Field) => {
+        Res::Field
+    };
+    (Some) => {
+        Res::Some
+    };
+    (Helper) => {
+        Res::Helper
+    };
+    (Unboxed) => {
+        Res::Unboxed
     };
     (Pass) => {
         Res::Pass
@@ -407,7 +497,7 @@ macro_rules! res {
 
 macro_rules! ops {
     ($($name:ident $d:ident $aux:ident ($a:ident $b:ident $c:ident) $res:ident
-        [$($r:ident)*] [$($w:ident)*] [$($f:ident)*];)*) => {
+        $fact:ident $mem:ident [$($r:ident)*] [$($w:ident)*] [$($f:ident)*];)*) => {
         #[repr(u8)]
         #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
         pub(crate) enum Op { $($name),* }
@@ -418,6 +508,8 @@ macro_rules! ops {
             aux: Aux::$aux,
             args: [Arg::$a, Arg::$b, Arg::$c],
             res: res!($res),
+            fact: FactOf::$fact,
+            mem: Mem::$mem,
             reads: Heaps::from_bits_retain(0 $(| Heaps::$r.bits())*),
             writes: Heaps::from_bits_retain(0 $(| Heaps::$w.bits())*),
             flags: Flags::from_bits_retain(0 $(| Flags::$f.bits())*),
@@ -425,126 +517,129 @@ macro_rules! ops {
     };
 }
 
-// name, dialect, aux, (a b c), result, [reads] [writes] [flags]
+// name, dialect, aux, (a b c), result, fact, memory, [reads] [writes] [flags]
 ops! {
     // Constants. A `K32` is an `I32` or a `B1`; a `K64` (halves in `a`, `b`)
     // an `I64`, a `Val` with no heap object or a raw word; a `KObj` (a pool
     // index, its type in `aux`) a heap `Val` or its `Ptr`.
-    K32         Both No     (Imm No No)       Dyn  [] [] [];
-    K64         Both No     (Imm Imm No)      Dyn  [] [] [];
-    KF64        Both No     (Imm Imm No)      F64  [] [] [];
-    KObj        Both Set    (Imm No No)       Dyn  [] [] [];
+    K32         Both No     (Imm No No)       K32      Rep    No        [] [] [PLAIN];
+    K64         Both No     (Imm Imm No)      Word     Konst  No        [] [] [PLAIN];
+    KF64        Both No     (Imm Imm No)      F64      Rep    No        [] [] [PLAIN];
+    KObj        Both Set    (Imm No No)       Obj      AuxSet No        [] [] [PLAIN];
 
     // Memory. A load's `Opt` operand is what makes it safe (a shape guard);
     // an indexed access takes the index its bounds guard returns. `c` of a
     // fixed access is the index of a parametrised field class.
-    Load        Both Field  (Ptr Opt Imm)     Dyn  [BY_FIELD] [] [];
-    Store       Both Field  (Ptr Any Imm)     None [] [BY_FIELD] [];
-    LoadIdx     Both Field  (Ptr I64 Opt)     Dyn  [BY_FIELD] [] [];
-    StoreIdx    Both Field  (Ptr I64 Any)     None [] [BY_FIELD] [];
+    Load        Both Field  (Ptr Opt Imm)     Field    Field  Load      [BY_FIELD] [] [PLAIN];
+    Store       Both Field  (Ptr Any Imm)     None     Rep    Store     [] [BY_FIELD] [PLAIN];
+    LoadIdx     Both Field  (Ptr I64 Opt)     Field    Field  LoadIdx   [BY_FIELD] [] [PLAIN];
+    StoreIdx    Both Field  (Ptr I64 Any)     None     Rep    StoreIdx  [] [BY_FIELD] [PLAIN];
     // The frame's base, which frame fields are loaded from.
-    Base        Both No     (No No No)        Ptr  [] [] [];
-    Thread      Both No     (No No No)        Ptr  [] [] [];
-    SlotLoad    Both Slot   (No No No)        Val  [SLOT] [] [];
-    SlotStore   Both Slot   (Val No No)       None [] [SLOT] [];
+    Base        Both No     (No No No)        Ptr      Rep    No        [] [] [PLAIN];
+    Thread      Both No     (No No No)        Ptr      Rep    No        [] [] [PLAIN];
+    SlotLoad    Both Slot   (No No No)        Val      Rep    SlotLoad  [SLOT] [] [PLAIN];
+    SlotStore   Both Slot   (Val No No)       None     Rep    SlotStore [] [SLOT] [PLAIN];
 
     // Integers, 32 and 64 bit by the result. Shifts and divisions have the
     // machine's semantics; a division's operands are what its guards return.
-    Add         Both No     (Int Int No)      Int  [] [] [COMMUTES];
-    Sub         Both No     (Int Int No)      Int  [] [] [];
-    Mul         Both No     (Int Int No)      Int  [] [] [COMMUTES];
-    And         Both No     (IntB IntB No)    Int  [] [] [COMMUTES];
-    Or          Both No     (IntB IntB No)    Int  [] [] [COMMUTES];
-    Xor         Both No     (IntB IntB No)    Int  [] [] [COMMUTES];
-    Not         Both No     (Int No No)       Int  [] [] [];
-    Neg         Both No     (Int No No)       Int  [] [] [];
-    Shl         Both No     (Int Int No)      Int  [] [] [];
-    Shr         Both No     (Int Int No)      Int  [] [] [];
-    Sar         Both No     (Int Int No)      Int  [] [] [];
-    SDiv        Both No     (Int Int No)      Int  [] [] [];
-    UDiv        Both No     (Int Int No)      Int  [] [] [];
-    ZExt32      Both No     (I32 No No)       I64  [] [] [];
-    SExt32      Both No     (I32 No No)       I64  [] [] [];
-    Trunc32     Both No     (W64 No No)       I32  [] [] [];
-    Cmp         Both Cc     (Int Int No)      B1   [] [] [];
-    Select      Both No     (B1 Same Same)    Dyn  [] [] [];
+    Add         Both No     (Int Int No)      Int      Rep    No        [] [] [COMMUTES PLAIN];
+    Sub         Both No     (Int Int No)      Int      Rep    No        [] [] [PLAIN];
+    Mul         Both No     (Int Int No)      Int      Rep    No        [] [] [COMMUTES PLAIN];
+    And         Both No     (IntB IntB No)    Int      Rep    No        [] [] [COMMUTES PLAIN];
+    Or          Both No     (IntB IntB No)    Int      Rep    No        [] [] [COMMUTES PLAIN];
+    Xor         Both No     (IntB IntB No)    Int      Rep    No        [] [] [COMMUTES PLAIN];
+    Not         Both No     (Int No No)       Int      Rep    No        [] [] [PLAIN];
+    Neg         Both No     (Int No No)       Int      Rep    No        [] [] [PLAIN];
+    Shl         Both No     (Int Int No)      Int      Rep    No        [] [] [PLAIN];
+    Shr         Both No     (Int Int No)      Int      Rep    No        [] [] [PLAIN];
+    Sar         Both No     (Int Int No)      Int      Rep    No        [] [] [PLAIN];
+    SDiv        Both No     (Int Int No)      Int      Rep    No        [] [] [PLAIN];
+    UDiv        Both No     (Int Int No)      Int      Rep    No        [] [] [PLAIN];
+    ZExt32      Both No     (I32 No No)       I64      Rep    No        [] [] [PLAIN];
+    SExt32      Both No     (I32 No No)       I64      Rep    No        [] [] [PLAIN];
+    Trunc32     Both No     (W64 No No)       I32      Rep    No        [] [] [PLAIN];
+    Cmp         Both Cc     (Int Int No)      B1       Rep    No        [] [] [PLAIN];
+    Select      Both No     (B1 Same Same)    Some     JoinBC No        [] [] [PLAIN];
 
     // Checked: the value, or an exit.
-    AddOvf      Both Tag    (Int Int Fs)      Int  [] [] [EXITS COMMUTES];
-    SubOvf      Both Tag    (Int Int Fs)      Int  [] [] [EXITS];
-    MulOvf      Both Tag    (Int Int Fs)      Int  [] [] [EXITS COMMUTES];
-    NegOvf      Both Tag    (Int Fs No)       Int  [] [] [EXITS];
+    AddOvf      Both Tag    (Int Int Fs)      Int      Rep    No        [] [] [EXITS COMMUTES PLAIN];
+    SubOvf      Both Tag    (Int Int Fs)      Int      Rep    No        [] [] [EXITS PLAIN];
+    MulOvf      Both Tag    (Int Int Fs)      Int      Rep    No        [] [] [EXITS COMMUTES PLAIN];
+    NegOvf      Both Tag    (Int Fs No)       Int      Rep    No        [] [] [EXITS PLAIN];
 
     // Floats. `FToI` and `FToL` out of range are unspecified: a guard
     // follows.
-    FAdd        Both No     (F64 F64 No)      F64  [] [] [COMMUTES];
-    FSub        Both No     (F64 F64 No)      F64  [] [] [];
-    FMul        Both No     (F64 F64 No)      F64  [] [] [COMMUTES];
-    FDiv        Both No     (F64 F64 No)      F64  [] [] [];
-    FNeg        Both No     (F64 No No)       F64  [] [] [];
-    FAbs        Both No     (F64 No No)       F64  [] [] [];
-    FSqrt       Both No     (F64 No No)       F64  [] [] [];
-    FFloor      Both No     (F64 No No)       F64  [] [] [];
-    FCeil       Both No     (F64 No No)       F64  [] [] [];
-    FCmp        Both Cc     (F64 F64 No)      B1   [] [] [];
-    IToF        Both No     (I32 No No)       F64  [] [] [];
-    LToF        Both No     (I64 No No)       F64  [] [] [];
-    FToI        Both No     (F64 No No)       I32  [] [] [];
-    FToL        Both No     (F64 No No)       I64  [] [] [];
+    FAdd        Both No     (F64 F64 No)      F64      Rep    No        [] [] [COMMUTES PLAIN];
+    FSub        Both No     (F64 F64 No)      F64      Rep    No        [] [] [PLAIN];
+    FMul        Both No     (F64 F64 No)      F64      Rep    No        [] [] [COMMUTES PLAIN];
+    FDiv        Both No     (F64 F64 No)      F64      Rep    No        [] [] [PLAIN];
+    FNeg        Both No     (F64 No No)       F64      Rep    No        [] [] [PLAIN];
+    FAbs        Both No     (F64 No No)       F64      Rep    No        [] [] [PLAIN];
+    FSqrt       Both No     (F64 No No)       F64      Rep    No        [] [] [PLAIN];
+    FFloor      Both No     (F64 No No)       F64      Rep    No        [] [] [PLAIN];
+    FCeil       Both No     (F64 No No)       F64      Rep    No        [] [] [PLAIN];
+    FCmp        Both FCc    (F64 F64 No)      B1       Rep    No        [] [] [PLAIN];
+    IToF        Both No     (I32 No No)       F64      Rep    No        [] [] [PLAIN];
+    LToF        Both No     (I64 No No)       F64      Rep    No        [] [] [PLAIN];
+    FToI        Both No     (F64 No No)       I32      Rep    No        [] [] [PLAIN];
+    FToL        Both No     (F64 No No)       I64      Rep    No        [] [] [PLAIN];
 
     // Boxing. Unboxing a small integer is `Trunc32`. An `UnboxPtr`'s operand
-    // is typed by its definition; `UnboxPtrPin`'s by a branch, which pins it.
-    BoxI32      Both No     (I32 No No)       Val  [] [] [];
-    BoxF64      Both No     (F64 No No)       Val  [] [] [];
-    BoxPtr      Both Set    (Ptr No No)       Val  [] [] [];
-    UnboxF64    Both No     (Val No No)       F64  [] [] [];
-    UnboxPtr    Both No     (Val No No)       Ptr  [] [] [];
-    UnboxPtrPin Both No     (Val No No)       Ptr  [] [] [PINNED];
+    // is typed by its definition (a check's, a guard's or a `Proved`'s result).
+    BoxI32      Both No     (I32 No No)       Val      Small  No        [] [] [PLAIN];
+    BoxF64      Both No     (F64 No No)       Val      Float  No        [] [] [PLAIN];
+    BoxPtr      Both Set    (Ptr No No)       Val      AuxSet No        [] [] [PLAIN];
+    UnboxF64    Both No     (Val No No)       F64      Rep    No        [] [] [PLAIN];
+    UnboxPtr    Both No     (Val No No)       Ptr      HeapA  No        [] [] [PLAIN];
 
     // Exits. A guard returns operand `c` where it does not leave: a use of
     // the result depends on the guard.
-    Guard       Both Tag    (B1 Fs Opt)       Pass [] [] [EXITS];
-    GuardNot    Both Tag    (B1 Fs Opt)       Pass [] [] [EXITS];
-    Deopt       Both Tag    (Fs No No)        None [] [] [EXITS TERMINATOR];
-    LazyExit    Both No     (Fs No No)        None [] [] [EXITS PINNED];
-    FrameState  Both Exit   (Entries Len OptFs) None [] [] [];
+    Guard       Both Tag    (B1 Fs Opt)       Pass     PassC  No        [] [] [EXITS PLAIN];
+    GuardNot    Both Tag    (B1 Fs Opt)       Pass     PassC  No        [] [] [EXITS PLAIN];
+    // What a branch proved, in the arm it leads to: operand `c`, known to
+    // be in the set in `aux` there (`SET_ARM`: its high bit for the false
+    // arm). No code: a use of the result depends on the branch.
+    Proved      Both SetArm (B1 No Any)       Pass     MeetC  No        [] [] [PLAIN];
+    Deopt       Both Tag    (Fs No No)        None     Rep    No        [] [] [EXITS TERMINATOR PLAIN];
+    LazyExit    Both No     (Fs No No)        None     Rep    No        [] [] [EXITS PINNED PLAIN];
+    FrameState  Both Exit   (Entries Len OptFs) None     Rep    No        [] [] [];
 
     // Control. A parameter's inputs are in its block's predecessor order.
     // `Ret` returns `b` results from `R[a..]`, stored already.
-    Param       Both No     (Vals Len No)     Dyn  [] [] [PINNED];
-    Jump        Both No     (Blk No No)       None [] [] [TERMINATOR];
-    Br          Both No     (B1 Blk Blk)      None [] [] [TERMINATOR];
-    Ret         Both No     (Imm Imm No)      None [SLOT] [] [TERMINATOR];
+    Param       Both No     (Vals Len No)     Some     Rep    No        [] [] [PINNED];
+    Jump        Both No     (Blk No No)       None     Rep    No        [] [] [TERMINATOR];
+    Br          Both No     (B1 Blk Blk)      None     Rep    No        [] [] [TERMINATOR];
+    Ret         Both No     (Imm Imm No)      None     Rep    No        [SLOT] [] [TERMINATOR PLAIN];
 
     // A C call of the helper in `aux` (`HELPERS`): its context values, its
     // immediate where it has one, then its operands (`Emitter::call`).
-    CallHelper  Both Helper (Vals Len No)     Dyn  [] [] [CALLS];
+    CallHelper  Both Helper (Vals Len No)     Helper   Helper No        [] [] [CALLS];
 
     // Unit ops: optimized as wholes, lowered by copy 1.
-    CheckType   H    SetTag (Val Fs No)       Dyn  [] [] [EXITS];
-    IsType      H    Set    (Val No No)       B1   [] [] [];
-    BoxI64      H    No     (I64 No No)       Val  [] [] [ALLOCS];
-    UnboxI64    H    No     (Val No No)       I64  [] [] [];
-    ToF64       H    SetTag (Val Fs No)       F64  [] [] [EXITS];
-    DivFloor    H    Tag    (Int Int Fs)      Int  [] [] [EXITS];
-    ModFloor    H    Tag    (Int Int Fs)      Int  [] [] [EXITS];
-    LuaShl      H    Tag    (Int Int OptFs)   Int  [] [] [];
-    LuaShr      H    Tag    (Int Int OptFs)   Int  [] [] [];
-    FToIExact   H    Tag    (F64 Fs No)       I32  [] [] [EXITS];
-    FToLExact   H    Tag    (F64 Fs No)       I64  [] [] [EXITS];
-    LToI        H    Tag    (I64 Fs No)       I32  [] [] [EXITS];
-    AbsOvf      H    Tag    (Int Fs No)       Int  [] [] [EXITS];
-    FIDiv       H    No     (F64 F64 No)      F64  [] [] [];
-    FMod        H    No     (F64 F64 No)      F64  [] [] [];
+    CheckType   H    SetTag (Val Fs No)       Unboxed  AuxSet No        [] [] [EXITS PLAIN];
+    IsType      H    Set    (Val No No)       B1       Rep    No        [] [] [PLAIN];
+    BoxI64      H    No     (I64 No No)       Val      IntSet No        [] [] [ALLOCS PLAIN];
+    UnboxI64    H    No     (Val No No)       I64      Rep    No        [] [] [PLAIN];
+    ToF64       H    SetTag (Val Fs No)       F64      Rep    No        [] [] [EXITS PLAIN];
+    DivFloor    H    Tag    (Int Int Fs)      Int      Rep    No        [] [] [EXITS PLAIN];
+    ModFloor    H    Tag    (Int Int Fs)      Int      Rep    No        [] [] [EXITS PLAIN];
+    LuaShl      H    Tag    (Int Int OptFs)   Int      Rep    No        [] [] [PLAIN];
+    LuaShr      H    Tag    (Int Int OptFs)   Int      Rep    No        [] [] [PLAIN];
+    FToIExact   H    Tag    (F64 Fs No)       I32      Rep    No        [] [] [EXITS PLAIN];
+    FToLExact   H    Tag    (F64 Fs No)       I64      Rep    No        [] [] [EXITS PLAIN];
+    LToI        H    Tag    (I64 Fs No)       I32      Rep    No        [] [] [EXITS PLAIN];
+    AbsOvf      H    Tag    (Int Fs No)       Int      Rep    No        [] [] [EXITS PLAIN];
+    FIDiv       H    No     (F64 F64 No)      F64      Rep    No        [] [] [PLAIN];
+    FMod        H    No     (F64 F64 No)      F64      Rep    No        [] [] [PLAIN];
 
     // Generic ops: the frame state's pc is the feedback site.
-    Arith       H    Kind   (Val Val Fs)      Val  [ALL] [ALL] [EXITS CALLS GENERIC];
-    Unm         H    No     (Val Fs No)       Val  [ALL] [ALL] [EXITS CALLS GENERIC];
-    Compare     H    Cc     (Val Val Fs)      B1   [ALL] [ALL] [EXITS CALLS GENERIC];
-    Truthy      H    No     (Val No No)       B1   [] [] [GENERIC];
+    Arith       H    Kind   (Val Val Fs)      Val      Rep    No        [ALL] [ALL] [EXITS CALLS GENERIC PLAIN];
+    Unm         H    No     (Val Fs No)       Val      Rep    No        [ALL] [ALL] [EXITS CALLS GENERIC PLAIN];
+    Compare     H    Cc     (Val Val Fs)      B1       Rep    No        [ALL] [ALL] [EXITS CALLS GENERIC PLAIN];
+    Truthy      H    No     (Val No No)       B1       Rep    No        [] [] [GENERIC PLAIN];
     // Their result is no number to wait for: it is final under a pending key.
-    GetIndex    H    No     (Val Val Fs)      Val  [ALL] [ALL] [EXITS CALLS];
-    SetIndex    H    No     (Vals Len Fs)     None [ALL] [ALL] [EXITS CALLS];
+    GetIndex    H    Array  (Val Val Fs)      Val      Rep    No        [ALL] [ALL] [EXITS CALLS PLAIN];
+    SetIndex    H    Array  (Vals Len Fs)     None     Rep    No        [ALL] [ALL] [EXITS CALLS];
 }
 
 impl Op {
@@ -592,6 +687,8 @@ pub(crate) struct HelperInfo {
     pub(crate) imm: bool,
     pub(crate) args: &'static [Rep],
     pub(crate) ret: Rep,
+    /// What a boxed result is known to be.
+    pub(crate) fact: HelperFact,
     pub(crate) reads: Heaps,
     pub(crate) writes: Heaps,
     pub(crate) flags: Flags,
@@ -605,7 +702,7 @@ const STACK: &[Ctx] = &[Ctx::Thread, Ctx::Base];
 const THREAD: &[Ctx] = &[Ctx::Rt, Ctx::Thread];
 
 macro_rules! helpers {
-    ($($name:ident $ctx:ident $imm:literal ($($arg:ident)*) $ret:ident
+    ($($name:ident $ctx:ident $imm:literal ($($arg:ident)*) $ret:ident $fact:ident
         [$($r:ident)*] [$($w:ident)*] [$($f:ident)*];)*) => {
         /// Rust routines a region calls with the C ABI (`jit::helpers`).
         #[repr(u8)]
@@ -618,6 +715,7 @@ macro_rules! helpers {
             imm: $imm != 0,
             args: &[$(Rep::$arg),*],
             ret: Rep::$ret,
+            fact: HelperFact::$fact,
             reads: Heaps::from_bits_retain(0 $(| Heaps::$r.bits())*),
             writes: Heaps::from_bits_retain(0 $(| Heaps::$w.bits())*),
             flags: Flags::from_bits_retain(0 $(| Flags::$f.bits())*),
@@ -625,73 +723,73 @@ macro_rules! helpers {
     };
 }
 
-// name, pinned registers, whether an immediate follows them, (operands),
-// result, [reads] [writes] [flags].
+// name, context, whether an immediate follows it, (operands), result, its
+// fact, [reads] [writes] [flags].
 // A `Val` result is `HELPER_FAIL_VAL` where the interpreter must run the
 // instruction. The immediates are their callers': an `ArithKind`, registers,
 // a prototype's index.
 helpers! {
     // Lua's float `%`, and libm called directly.
-    FMod         NONE   0 (F64 F64)     F64  [] [] [];
-    Sin          NONE   0 (F64)         F64  [] [] [];
-    Cos          NONE   0 (F64)         F64  [] [] [];
-    Tan          NONE   0 (F64)         F64  [] [] [];
-    Asin         NONE   0 (F64)         F64  [] [] [];
-    Acos         NONE   0 (F64)         F64  [] [] [];
-    Exp          NONE   0 (F64)         F64  [] [] [];
-    Log          NONE   0 (F64)         F64  [] [] [];
-    Log2         NONE   0 (F64)         F64  [] [] [];
-    Log10        NONE   0 (F64)         F64  [] [] [];
-    Pow          NONE   0 (F64 F64)     F64  [] [] [];
-    Atan2        NONE   0 (F64 F64)     F64  [] [] [];
-    LibmFmod     NONE   0 (F64 F64)     F64  [] [] [];
+    FMod         NONE   0 (F64 F64)     F64  Rep [] [] [];
+    Sin          NONE   0 (F64)         F64  Rep [] [] [];
+    Cos          NONE   0 (F64)         F64  Rep [] [] [];
+    Tan          NONE   0 (F64)         F64  Rep [] [] [];
+    Asin         NONE   0 (F64)         F64  Rep [] [] [];
+    Acos         NONE   0 (F64)         F64  Rep [] [] [];
+    Exp          NONE   0 (F64)         F64  Rep [] [] [];
+    Log          NONE   0 (F64)         F64  Rep [] [] [];
+    Log2         NONE   0 (F64)         F64  Rep [] [] [];
+    Log10        NONE   0 (F64)         F64  Rep [] [] [];
+    Pow          NONE   0 (F64 F64)     F64  Rep [] [] [];
+    Atan2        NONE   0 (F64 F64)     F64  Rep [] [] [];
+    LibmFmod     NONE   0 (F64 F64)     F64  Rep [] [] [];
     // Arithmetic of numbers and numeric strings; integers out of i32 are
     // boxed.
-    ArithCoerce  RT     1 (Val Val)     Val  [] [] [ALLOCS];
-    Unm          RT     0 (Val)         Val  [] [] [ALLOCS];
-    BNot         RT     0 (Val)         Val  [] [] [ALLOCS];
+    ArithCoerce  RT     1 (Val Val)     Val  Rep [] [] [ALLOCS];
+    Unm          RT     0 (Val)         Val  Rep [] [] [ALLOCS];
+    BNot         RT     0 (Val)         Val  Rep [] [] [ALLOCS];
     // A metamethod lookup moves a table off a stale class or adopts a
     // metatable's class.
-    Len          RT     0 (Val)         Val  [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];
-    Concat       RT     0 (Val Val)     Val  [] [] [ALLOCS];
-    UpvalBarrier THREAD 0 (Ptr)         None [] [GC] [];
+    Len          RT     0 (Val)         Val  Rep [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];
+    Concat       RT     0 (Val Val)     Val  Rep [] [] [ALLOCS];
+    UpvalBarrier THREAD 0 (Ptr)         None Rep [] [GC] [];
     // The backward barrier of a table that is not gray.
-    Barrier      RT     0 (Ptr)         None [] [GC] [];
+    Barrier      RT     0 (Ptr)         None Rep [] [GC] [];
     // New open upvalues join the thread's list.
-    Closure      FRAME  1 ()            Val  [SLOT] [FRAME] [ALLOCS];
-    ClosureOf    FRAME  1 (Ptr)         Val  [SLOT] [] [ALLOCS];
-    Close        FRAME  1 ()            None [SLOT FRAME] [UPVAL FRAME] [];
-    NewTable     RT     0 (I64)         Val  [] [] [ALLOCS];
-    SetList      FRAME  1 ()            None [SLOT FRAME] [FIELD ARR GC] [ALLOCS];
-    VarargGet    BASE   0 (Val)         Val  [] [] [ALLOCS];
-    VarargTable  BASE   1 ()            Val  [] [SLOT] [ALLOCS];
-    TforNext     BASE   1 ()            Val  [SLOT FIELD ARR SHAPE] [SLOT] [ALLOCS];
-    TforIpairs   RT     0 (Val Val)     Val  [ARR FIELD META] [] [];
-    TopArgs      STACK  1 ()            I32  [FRAME] [] [];
-    VarargAll    STACK  1 ()            Val  [FRAME] [SLOT FRAME] [];
-    Mm           RT     1 (Val Val)     Val  [LOOKUP] [LOOKUP] [ALLOCS];
-    IndexFn      RT     0 (Val Val)     Val  [LOOKUP] [LOOKUP] [ALLOCS];
-    NewIndexFn   RT     0 (Val Val)     Val  [LOOKUP] [LOOKUP] [ALLOCS];
+    Closure      FRAME  1 ()            Val  Rep [SLOT] [FRAME] [ALLOCS];
+    ClosureOf    FRAME  1 (Ptr)         Val  Rep [SLOT] [] [ALLOCS];
+    Close        FRAME  1 ()            None Rep [SLOT FRAME] [UPVAL FRAME] [];
+    NewTable     RT     0 (I64)         Val  Tab [] [] [ALLOCS];
+    SetList      FRAME  1 ()            None Rep [SLOT FRAME] [FIELD ARR GC] [ALLOCS];
+    VarargGet    BASE   0 (Val)         Val  Rep [] [] [ALLOCS];
+    VarargTable  BASE   1 ()            Val  Rep [] [SLOT] [ALLOCS];
+    TforNext     BASE   1 ()            Val  Rep [SLOT FIELD ARR SHAPE] [SLOT] [ALLOCS];
+    TforIpairs   RT     0 (Val Val)     Val  Rep [ARR FIELD META] [] [];
+    TopArgs      STACK  1 ()            I32  Rep [FRAME] [] [];
+    VarargAll    STACK  1 ()            Val  Rep [FRAME] [SLOT FRAME] [];
+    Mm           RT     1 (Val Val)     Val  Rep [LOOKUP] [LOOKUP] [ALLOCS];
+    IndexFn      RT     0 (Val Val)     Val  Rep [LOOKUP] [LOOKUP] [ALLOCS];
+    NewIndexFn   RT     0 (Val Val)     Val  Rep [LOOKUP] [LOOKUP] [ALLOCS];
     // Fails rather than refresh a stale class.
-    Index        RT     0 (Val Val)     Val  [FIELD ARR LOOKUP] [] [];
-    GetStr       NONE   0 (Val Val)     Val  [FIELD LOOKUP] [] [];
+    Index        RT     0 (Val Val)     Val  Rep [FIELD ARR LOOKUP] [] [];
+    GetStr       NONE   0 (Val Val)     Val  Rep [FIELD LOOKUP] [] [];
     // Stores that touch table memory alone: a metamethod fails them rather
     // than run, and an allocation never collects.
-    SetStr       RT     0 (Val Val Val) Val  [TABLE] [TABLE] [ALLOCS];
-    NewIndex     RT     1 (Val Val Val) Val  [TABLE] [TABLE] [ALLOCS];
-    Type         RT     0 (Val)         Val  [] [] [ALLOCS];
-    GetMetatable RT     0 (Val)         Val  [FIELD LOOKUP] [] [];
-    SetMetatable RT     0 (Val Val)     Val  [TABLE] [TABLE] [ALLOCS];
-    RawGet       NONE   0 (Val Val)     Val  [FIELD ARR SHAPE] [] [];
-    RawSet       RT     0 (Val Val Val) Val  [TABLE] [TABLE] [ALLOCS];
-    RawEqual     NONE   0 (Val Val)     I32  [] [] [];
-    RawLen       RT     0 (Val)         Val  [FIELD ARR] [] [ALLOCS];
-    ToString     RT     0 (Val)         Val  [LOOKUP] [LOOKUP] [ALLOCS];
-    ToNumber     RT     0 (Val)         Val  [] [] [ALLOCS];
-    StrSub       RT     0 (Ptr I32 I32) Val  [] [] [ALLOCS];
-    StrByte      NONE   0 (Ptr I32)     Val  [] [] [];
-    TInsert      RT     0 (Val Val)     Val  [TABLE] [TABLE] [ALLOCS];
-    TRemove      RT     0 (Val)         Val  [TABLE] [TABLE] [ALLOCS];
+    SetStr       RT     0 (Val Val Val) Val  Rep [TABLE] [TABLE] [ALLOCS];
+    NewIndex     RT     1 (Val Val Val) Val  Rep [TABLE] [TABLE] [ALLOCS];
+    Type         RT     0 (Val)         Val  Rep [] [] [ALLOCS];
+    GetMetatable RT     0 (Val)         Val  Rep [FIELD LOOKUP] [] [];
+    SetMetatable RT     0 (Val Val)     Val  Rep [TABLE] [TABLE] [ALLOCS];
+    RawGet       NONE   0 (Val Val)     Val  Rep [FIELD ARR SHAPE] [] [];
+    RawSet       RT     0 (Val Val Val) Val  Rep [TABLE] [TABLE] [ALLOCS];
+    RawEqual     NONE   0 (Val Val)     I32  Rep [] [] [];
+    RawLen       RT     0 (Val)         Val  Rep [FIELD ARR] [] [ALLOCS];
+    ToString     RT     0 (Val)         Val  Rep [LOOKUP] [LOOKUP] [ALLOCS];
+    ToNumber     RT     0 (Val)         Val  Rep [] [] [ALLOCS];
+    StrSub       RT     0 (Ptr I32 I32) Val  Rep [] [] [ALLOCS];
+    StrByte      NONE   0 (Ptr I32)     Val  Rep [] [] [];
+    TInsert      RT     0 (Val Val)     Val  Rep [TABLE] [TABLE] [ALLOCS];
+    TRemove      RT     0 (Val)         Val  Rep [TABLE] [TABLE] [ALLOCS];
 }
 
 impl HelperInfo {

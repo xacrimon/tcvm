@@ -173,7 +173,112 @@ pub(crate) fn verify(g: &Graph, lowered: bool) -> Result<(), String> {
             Op::UnboxPtr if g.facts[i.a as usize].set.unboxed() != Rep::Ptr => {
                 return Err(format!("v{v}: unchecked unbox of an untyped value"));
             }
-            _ => {}
+            Op::UnboxPtr => {}
+            // It stands under its branch: up the dominators there is a block
+            // entered only by the edge of a branch on its condition that
+            // its arm names.
+            Op::Proved => {
+                let arm = i.aux & super::ops::SET_ARM == 0;
+                let mut at = b;
+                let under = loop {
+                    let d = g.block(at);
+                    if d.npreds == 1 {
+                        let t = g.term(g.preds(at)[0]);
+                        if t.op == Op::Br && t.a == i.a && t.b != t.c {
+                            break (t.b == at.0) == arm;
+                        }
+                    }
+                    if d.idom == at {
+                        break false;
+                    }
+                    at = d.idom;
+                };
+                if !under {
+                    return Err(format!("v{v}: not under the branch it names"));
+                }
+            }
+            // Nothing more than its form.
+            Op::K32
+            | Op::K64
+            | Op::KF64
+            | Op::KObj
+            | Op::Load
+            | Op::Store
+            | Op::LoadIdx
+            | Op::StoreIdx
+            | Op::Base
+            | Op::Thread
+            | Op::SlotLoad
+            | Op::SlotStore
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Neg
+            | Op::Shl
+            | Op::Shr
+            | Op::Sar
+            | Op::SDiv
+            | Op::UDiv
+            | Op::ZExt32
+            | Op::SExt32
+            | Op::Trunc32
+            | Op::Cmp
+            | Op::Select
+            | Op::AddOvf
+            | Op::SubOvf
+            | Op::MulOvf
+            | Op::NegOvf
+            | Op::FAdd
+            | Op::FSub
+            | Op::FMul
+            | Op::FDiv
+            | Op::FNeg
+            | Op::FAbs
+            | Op::FSqrt
+            | Op::FFloor
+            | Op::FCeil
+            | Op::FCmp
+            | Op::IToF
+            | Op::LToF
+            | Op::FToI
+            | Op::FToL
+            | Op::BoxI32
+            | Op::BoxF64
+            | Op::BoxPtr
+            | Op::UnboxF64
+            | Op::Guard
+            | Op::GuardNot
+            | Op::Deopt
+            | Op::LazyExit
+            | Op::Jump
+            | Op::Br
+            | Op::Ret
+            | Op::CallHelper
+            | Op::CheckType
+            | Op::IsType
+            | Op::BoxI64
+            | Op::UnboxI64
+            | Op::ToF64
+            | Op::DivFloor
+            | Op::ModFloor
+            | Op::LuaShl
+            | Op::LuaShr
+            | Op::FToIExact
+            | Op::FToLExact
+            | Op::LToI
+            | Op::AbsOvf
+            | Op::FIDiv
+            | Op::FMod
+            | Op::Arith
+            | Op::Unm
+            | Op::Compare
+            | Op::Truthy
+            | Op::GetIndex
+            | Op::SetIndex => {}
         }
         let mut bad = None;
         if i.op != Op::Param {
