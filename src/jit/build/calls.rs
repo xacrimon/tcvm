@@ -3,6 +3,8 @@
 
 use super::Builder;
 use super::cfg::RegSet;
+use crate::dmm::Gc;
+use crate::env::function::{Function, Prototype};
 use crate::env::value::Value;
 use crate::instruction::UpvalSource;
 use crate::instruction::{Instruction, Op as Bc};
@@ -12,7 +14,7 @@ use crate::jit::ir::table::Key;
 use crate::jit::ir::types::{Rep, TypeSet};
 use crate::jit::ir::{BlockFlags, HOME, Val};
 
-impl Builder<'_, '_> {
+impl<'gc> Builder<'_, 'gc> {
     /// `R[a] = closure(P[d])`: the helper reads what it captures from the
     /// frame's slots, and marks the frame as having open upvalues.
     pub(super) fn closure_new(&mut self, pc: u32, i: Instruction) {
@@ -50,6 +52,7 @@ impl Builder<'_, '_> {
         let (a, nb, c) = i.abc();
         let fused = matches!(i.op(), Bc::CALLS | Bc::CALLS_R0 | Bc::CALLS_R1);
         let callee = self.reg(if fused { i.e() as u8 } else { a });
+        let (callee, known) = self.known_callee(pc, callee);
         self.e
             .emit(Op::SlotStore, Rep::None, a as u16, callee.0, 0, 0);
         // Arguments up to `top` (`nb == 0`): those before the ones a call
@@ -58,7 +61,20 @@ impl Builder<'_, '_> {
             0 => self.cfg.nregs as u16,
             _ => a as u16 + 3 + nb as u16,
         };
-        for r in a as u16 + 4..end {
+        // A known callee takes its first parameters in registers.
+        let known = known.filter(|_| nb != 0);
+        let in_regs = known.map_or(0, |p| (nb - 1).min(p.num_params).min(8));
+        if let Some(p) = known {
+            let at = self.e.g.extra.len() as u32;
+            for k in 0..in_regs {
+                let v = self.reg(a + 4 + k);
+                self.e.g.extra.push(v.0);
+            }
+            let k = self.pool.intern(p.ptr.as_ptr() as u64);
+            (self.e).emit(Op::CallArgs, Rep::None, 0, at, in_regs as u32, k);
+            self.protos.push(p);
+        }
+        for r in a as u16 + 4 + in_regs as u16..end {
             let v = self.reg(r as u8);
             if !v.is_none() {
                 self.e.emit(Op::SlotStore, Rep::None, r, v.0, 0, 0);
@@ -81,6 +97,60 @@ impl Builder<'_, '_> {
         }
         // The callee may have broken what the region assumes.
         self.lazy_exit(pc + 1);
+    }
+
+    /// `callee` as the call at `pc` may take it, and its prototype where it
+    /// is a Lua closure without varargs: a constant; else the one function
+    /// the site called, guarded by identity, or by its prototype where that
+    /// made several closures or the site's word names it. Nothing once such
+    /// a guard failed here.
+    fn known_callee(&mut self, pc: u32, callee: Val) -> (Val, Option<Gc<'gc, Prototype<'gc>>>) {
+        use crate::env::feedback::slot_proto;
+        let fixed = |f: Function<'gc>| f.as_lua().filter(|c| !c.proto.is_vararg).map(|c| c.proto);
+        let d = *self.e.g.inst(callee);
+        if d.op == Op::KObj {
+            // SAFETY: a pool word is a value's.
+            let v: Value<'gc> = unsafe { Value::from_raw(self.pool.words[d.a as usize]) };
+            return (callee, v.get_function().and_then(fixed));
+        }
+        let feedback = &self.proto.feedback;
+        let seen = feedback.callee(pc as usize).map_or(0, |w| w.get());
+        if seen == 0 || feedback.bits(pc as usize) & crate::jit::feedback::CONST_MISS != 0 {
+            return (callee, None);
+        }
+        let s = self.state();
+        // Bit 0: megamorphic, or a prototype's.
+        // SAFETY: else the word is the value of the function the site called.
+        let f = (seen & 1 == 0).then(|| unsafe { Value::from_raw(seen) }.get_function());
+        let proto = match f {
+            None => slot_proto(seen).filter(|p| !p.is_vararg),
+            Some(Some(f)) => match f.as_lua() {
+                // The call tests such a callee anyway.
+                Some(c) if c.proto.is_vararg => return (callee, None),
+                Some(c) if c.proto.closures.get() > 1 => Some(c.proto),
+                _ => {
+                    let k = self.konst(Value::function(f));
+                    let same = self.e.cmp(Op::Cmp, Cc::Eq, callee, k);
+                    let tag = ExitTag::Const as u16;
+                    (self.e).emit(Op::Guard, Rep::None, tag, same.0, s.0, u32::MAX);
+                    return (k, fixed(f));
+                }
+            },
+            Some(None) => None,
+        };
+        let Some(p) = proto else {
+            return (callee, None);
+        };
+        let f = self.e.check_type(callee, TypeSet::FUN, ExitTag::Const, s);
+        let kind = self.e.load(Field::FnKind, f, 0);
+        let zero = self.e.k32(Rep::I32, 0);
+        let fixed = self.e.cmp(Op::Cmp, Cc::Eq, kind, zero);
+        self.guard(fixed, ExitTag::Const);
+        let has = self.e.load(Field::FnProto, f, 0);
+        let want = self.e.k64(Rep::Ptr, p.ptr.as_ptr() as u64);
+        let same = self.e.cmp(Op::Cmp, Cc::Eq, has, want);
+        self.guard(same, ExitTag::Const);
+        (callee, Some(p))
     }
 
     /// The call whose callee and arguments are in their slots: the block

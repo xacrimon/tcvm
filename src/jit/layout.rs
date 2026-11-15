@@ -124,6 +124,9 @@ pub(crate) const FUNCTION_TAG: u16 = (crate::env::value::FUNCTION_BITS >> 48) as
 /// box the prototype's fast entry.
 pub(crate) const FN_PROTO: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, proto);
+/// A prototype from its box, and its fast entry from there.
+pub(crate) const PROTO_VALUE: usize =
+    Gc::<'static, crate::env::function::Prototype<'static>>::VALUE_OFFSET;
 pub(crate) const PROTO_FAST: usize =
     Gc::<'static, crate::env::function::Prototype<'static>>::VALUE_OFFSET
         + offset_of!(crate::env::function::Prototype<'static>, jit_fast);

@@ -58,6 +58,11 @@ struct Em<'a> {
     rt: u64,
     /// The address of the function's bytecode.
     code: u64,
+    /// The parameters a function region takes in registers.
+    nreg: u8,
+    /// Its prototype's address and the entry a call of it from here takes,
+    /// its parameters in registers.
+    own: Option<(u64, Label)>,
 }
 
 fn gpr(p: PReg) -> Gpr {
@@ -79,11 +84,10 @@ fn spill_off(slot: usize) -> i32 {
 /// proved them.
 const KNOWN_ENTRY: usize = 24;
 
-/// A fast entry's known entry, from it. Parameters are not passed in
-/// registers yet, so the entry for a call that would is the same.
+/// A fast entry's known entry, from it: the one that loads the parameters
+/// from their slots, or with `regs` the one past those loads.
 pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
-    let _ = (regs, nparams);
-    KNOWN_ENTRY
+    KNOWN_ENTRY + if regs { 4 * nparams.min(8) as usize } else { 0 }
 }
 
 /// `rt` is the runtime's address, which helpers take, and `code` that of
@@ -119,6 +123,8 @@ pub(crate) fn emit(
         level_tail: (a.new_label(), false),
         rt,
         code,
+        nreg: fast.map_or(0, |fe| fe.num_params.min(8)),
+        own: None,
         s,
         v: &s.vcode,
         out,
@@ -376,6 +382,7 @@ impl<'a> Em<'a> {
             MOp::StrSlot => self.a.str(self.r(i, 0), BASE, imm as i32 * 8),
             MOp::Ldr if sz == Sz::W => self.a.ldr_w(self.r(i, 0), self.r(i, 1), imm as i32),
             MOp::Ldr => self.a.ldr(self.r(i, 0), self.r(i, 1), imm as i32),
+            MOp::Ldrb => self.a.ldrb(self.r(i, 0), self.r(i, 1), imm as i32),
             MOp::Str => self.a.str(self.r(i, 0), self.r(i, 1), imm as i32),
             MOp::LdrIdx | MOp::StrIdx => {
                 let ext = if m.cc == 1 { Extend::Uxtw } else { Extend::Lsl };

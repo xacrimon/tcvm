@@ -60,6 +60,10 @@ fields! {
     TypeMt   layout::NUMBER_MT, Ptr ANY META  false;
     // The frame's function, from the base: its closure under header flags.
     FrameFn  -32,              Val FUN FRAME     false;
+    // A function's kind, a byte (0: a Lua closure without varargs), and
+    // such a closure's prototype.
+    FnKind   layout::FN_IS_VARARG, I32 ANY IMMUTABLE false;
+    FnProto  layout::FN_PROTO, Ptr ANY IMMUTABLE false;
     // The frame's flags (`vm::frame::flag`), from the base.
     FrameFlags -24,            I64 ANY FRAME     false;
     // A Lua closure's upvalues, from the closure (the offset is the

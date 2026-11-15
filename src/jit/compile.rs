@@ -272,6 +272,7 @@ pub(crate) fn compile<'gc>(
         deps,
         missing,
         window,
+        protos,
     } = {
         use crate::jit::layout::{METRICS, NUMBER_MT_SLOT, rt_read, type_mt_cell};
         let links = crate::jit::build::Links {
@@ -360,6 +361,7 @@ pub(crate) fn compile<'gc>(
     let fast = enterable.then_some(crate::jit::backend::emit::FastEntry {
         num_params: closure.proto.num_params,
         max_stack: window.max(closure.proto.max_stack_size as u16),
+        proto: closure.proto.ptr.as_ptr() as u64,
     });
     let code = closure.code as u64;
     let mut em = target::emit::emit(sel, out, rt, code, fast, !deps.is_empty(), window)?;
@@ -494,7 +496,7 @@ pub(crate) fn compile<'gc>(
             entry_regs: Box::new([]),
             entry_fails: std::cell::Cell::new(0),
             proto: closure.proto,
-            protos: Box::new([]),
+            protos: protos.into_boxed_slice(),
             site_protos: Box::new([]),
             entry_pc: pc,
             window,

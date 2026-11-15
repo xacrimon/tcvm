@@ -339,6 +339,26 @@ impl Sel<'_> {
     fn call(&mut self, pos: usize, fs: Val, imm: u32) {
         let g = self.g;
         let here = self.out.layout.order[pos];
+        let start = self.s.ops.len() as u32;
+        let d = g.block(here);
+        let (mut known, mut nparams) = (0, 0);
+        if let Some(x) = (d.start..d.end)
+            .rev()
+            .map(|k| &g.insts[k as usize])
+            .find(|x| x.op == Op::CallArgs)
+        {
+            known = self.pool.words[x.c as usize];
+            let value = crate::jit::layout::PROTO_VALUE as u64;
+            nparams = match crate::env::feedback::slot_proto((known + value) | 1) {
+                Some(p) => p.num_params,
+                None => bug!("a known callee without its prototype"),
+            };
+            for (k, &v) in g.run(x.a, x.b).iter().enumerate() {
+                let r = self.reg(Val(v));
+                (self.s.ops).push(Operand::reg_fixed_use(r, abi::preg_int(k as u8)));
+            }
+        }
+        let args = (self.s.ops.len() as u32 - start) as u8;
         let (pc, at, first) = self.state(fs, true);
         for k in 0..self.s.traced.len() {
             let (v, tag) = self.s.traced[k];
@@ -366,6 +386,9 @@ impl Sel<'_> {
             len: self.out.entries.len() as u32 - at,
             block: pos as u32,
             inst: 0,
+            args,
+            nparams,
+            known,
         });
         let i = MInst {
             op: MOp::CallLua,
@@ -373,8 +396,8 @@ impl Sel<'_> {
             sz: Sz::X,
             imm: imm as u64 | (pc as u64) << 32,
         };
-        let n = self.s.ops.len() as u32 - first;
-        self.s.insts.push((i, first, n, abi::allocatable()));
+        let n = self.s.ops.len() as u32 - start;
+        self.s.insts.push((i, start, n, abi::allocatable()));
     }
 
     /// The values of frame state `fs` as late operands, appended, with
@@ -533,7 +556,12 @@ impl Sel<'_> {
                 let Some(d) = self.def(v) else { return };
                 let base = self.reg(a);
                 let off = Field::offset(i.aux, i.c) as i64 as u64;
-                self.op(MOp::Ldr, w, off, &[d, base]);
+                let op = if i.aux == Field::FnKind as u16 {
+                    MOp::Ldrb
+                } else {
+                    MOp::Ldr
+                };
+                self.op(op, w, off, &[d, base]);
             }
             Store => {
                 let (x, base) = (self.reg(b), self.reg(a));
@@ -564,6 +592,8 @@ impl Sel<'_> {
                 };
                 self.push(op, Sz::X, uxtw, 0, &[t, base, index]);
             }
+            // The call's and the entry's operands.
+            CallArgs | Arg => {}
             ArrNext | NamedNext => {
                 let Some(d) = self.def(v) else { return };
                 let (t, from) = (self.reg(a), self.reg(b));
@@ -880,7 +910,14 @@ impl Sel<'_> {
                     sz: Sz::X,
                     imm: 0,
                 };
-                self.out.vcode.push(entry, &[], PRegSet::empty());
+                let params: Vec<Operand> = (d.start..d.end)
+                    .filter(|&p| g.insts[p as usize].op == Op::Arg)
+                    .filter_map(|p| {
+                        let k = abi::preg_int(g.insts[p as usize].a as u8);
+                        Some(Operand::reg_fixed_def(self.def(Val(p))?, k))
+                    })
+                    .collect();
+                self.out.vcode.push(entry, &params, PRegSet::empty());
             }
             let (at, end, args, nargs) = self.s.blocks[pos];
             for k in (at..end).rev() {

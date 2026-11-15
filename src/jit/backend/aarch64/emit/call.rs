@@ -41,6 +41,20 @@ pub(super) enum Ool {
         deep: Label,
         pc_after: u64,
     },
+    /// Those of a known callee's call, `regs` arguments in registers: the
+    /// call found no fast entry at `stores`; `own` is the region's entry
+    /// where the callee is its own function.
+    Known {
+        i: usize,
+        block: usize,
+        hdr: i32,
+        stores: Label,
+        ret: Label,
+        deep: Label,
+        pc_after: u64,
+        regs: u8,
+        own: Option<Label>,
+    },
     /// `n` results from slot offset `at`, those the callee left out nil.
     Fill {
         fill: Label,
@@ -51,12 +65,13 @@ pub(super) enum Ool {
 }
 
 /// A fast entry's labels: the entry, its arity check passed, the arity
-/// fixup, and the miss.
+/// fixup, and the misses with the parameters in registers and in slots.
 #[derive(Clone, Copy)]
 pub(super) struct Entries {
     pub(super) fast: Label,
     budget: Label,
     fixup: Label,
+    param_miss: Label,
     miss: Label,
 }
 
@@ -72,6 +87,7 @@ impl<'a> Em<'a> {
             fast: self.a.new_label(),
             budget: self.a.new_label(),
             fixup: self.a.new_label(),
+            param_miss: self.a.new_label(),
             miss: self.a.new_label(),
         };
         self.a.bind(e.fast);
@@ -88,10 +104,16 @@ impl<'a> Em<'a> {
         if off != super::known_offset(false, fe.num_params) {
             bug!("the known entry is {off} bytes past the fast one");
         }
+        // The parameters a caller left in slots to their registers, where
+        // a call passing them there enters.
+        self.param_regs(true, 0);
+        let regs = self.a.new_label();
+        self.a.bind(regs);
+        self.own = Some((fe.proto, regs));
         self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
         self.window_end(fe.max_stack);
         self.a.cmp(Sz::X, X17, X16);
-        self.a.b_cond(Cond::Hi, e.miss);
+        self.a.b_cond(Cond::Hi, e.param_miss);
         if !falls {
             self.a.b(self.labels[0]);
         }
@@ -118,8 +140,23 @@ impl<'a> Em<'a> {
         self.a.cmp(Sz::X, X17, Gpr(9));
         self.a.b_cond(Cond::Lo, fill);
         self.a.b(e.budget);
+        // A miss past the loads leaves the parameters in their slots for
+        // the caller's slow path.
+        self.a.bind(e.param_miss);
+        self.param_regs(false, 0);
         self.a.bind(e.miss);
         self.a.b_far(addr!(abi::direct_miss));
+    }
+
+    /// Load the parameters' registers from their slots at `off`, or store
+    /// them there.
+    fn param_regs(&mut self, load: bool, off: i32) {
+        for k in 0..self.nreg {
+            match load {
+                true => self.a.ldr(Gpr(k), BASE, off + 8 * k as i32),
+                false => self.a.str(Gpr(k), BASE, off + 8 * k as i32),
+            }
+        }
     }
 
     /// An invalidated region's entry, its frame not open yet: on to
@@ -127,6 +164,8 @@ impl<'a> Em<'a> {
     pub(super) fn dead_entry(&mut self) {
         let dead = self.a.new_label();
         self.a.bind(dead);
+        // The interpreter runs the function from its slots.
+        self.param_regs(false, 0);
         self.a.ldr_label(INSN, self.region_word);
         self.a
             .ldr_lit(X16, addr!(crate::jit::jit_dead_entry) as u64);
@@ -181,6 +220,7 @@ impl<'a> Em<'a> {
     pub(super) fn dispatch_entry(&mut self, window: u16) -> Label {
         let dispatch = self.a.new_label();
         self.a.bind(dispatch);
+        self.param_regs(true, 0);
         if window == 0 {
             self.a.adr(X16, self.labels[0]);
             self.a.b_far(addr!(abi::level_enter));
@@ -226,6 +266,12 @@ impl<'a> Em<'a> {
         let (hdr, nargs, pc) = (imm >> 24 & 0xff, imm >> 8 & 0xff, imm >> 32);
         let hdr = hdr as i32 * 8;
         let (slow, native, deep) = (self.a.new_label(), self.a.new_label(), self.a.new_label());
+        let Some(site) = self.s.sites.iter().find(|s| s.inst as usize == i) else {
+            bug!("a call without its site")
+        };
+        if site.known != 0 {
+            return self.known_call(i, block, next, (site.known, site.nparams), deep);
+        }
         if nargs == 255 {
             // Up to `top`.
             self.a.ldr(X16, THREAD, layout::THREAD_STACK as i32);
@@ -283,8 +329,134 @@ impl<'a> Em<'a> {
         });
     }
 
+    /// `call` of a Lua closure without varargs of a known prototype, a
+    /// static count of arguments: its first parameters in registers, those
+    /// left out nil, entered past the arity and native stack checks.
+    fn known_call(
+        &mut self,
+        i: usize,
+        block: usize,
+        next: Option<Label>,
+        (proto, nparams): (u64, u8),
+        deep: Label,
+    ) {
+        let imm = self.v.insts[i].imm;
+        let (hdr, nargs, pc) = (imm >> 24 & 0xff, (imm >> 8 & 0xff) as u8, imm >> 32);
+        let hdr = hdr as i32 * 8;
+        if nargs < nparams {
+            self.a.mov_imm(Gpr(9), NIL);
+            for k in nargs..nparams {
+                if k < 8 {
+                    self.a.mov(Gpr(k), Gpr(9));
+                } else {
+                    self.a.str(Gpr(9), BASE, hdr + 32 + 8 * k as i32);
+                }
+            }
+        }
+        // The slow paths take the parameters as the arguments.
+        self.a.movz(Sz::X, INSN, nparams as u16, 0);
+        let stores = self.a.new_label();
+        let own = self.own.filter(|o| o.0 == proto).map(|o| o.1);
+        if own.is_none() {
+            self.a.mov_imm(X17, proto);
+            self.a.ldr(X17, X17, layout::PROTO_FAST as i32);
+            self.a.cbz(Sz::X, X17, stores);
+            let off = super::known_offset(true, nparams);
+            self.a.add_imm(Sz::X, X17, X17, off as u64);
+        }
+        self.a.ldr(X16, BASE, hdr);
+        self.a.and_imm(Sz::X, X16, X16, PTR_MASK);
+        if hdr <= 504 {
+            self.a.stp(X16, ZR, BASE, hdr);
+        } else {
+            self.a.str(X16, BASE, hdr);
+            self.a.str(ZR, BASE, hdr + 8);
+        }
+        self.a.add_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
+        self.a.mov_sp(Gpr(9), SP);
+        self.a.ldr(Gpr(10), THREAD, layout::NATIVE_DEEP as i32);
+        self.a.cmp(Sz::X, Gpr(9), Gpr(10));
+        self.a.b_cond(Cond::Lo, deep);
+        match own {
+            Some(l) => self.a.bl(l),
+            None => self.a.blr(X17),
+        }
+        let ret = self.a.new_label();
+        self.a.bind(ret);
+        let r = self.v.succs(block)[0].index();
+        if Some(self.labels[r]) != next {
+            self.a.b(self.resume_of(block).fast);
+        }
+        self.ool.push(Ool::Known {
+            i,
+            block,
+            hdr,
+            stores,
+            ret,
+            deep,
+            pc_after: self.code + pc * 8,
+            regs: nparams.min(8),
+            own,
+        });
+    }
+
+    /// Where a fast callee whose entry checks failed goes: the caller's
+    /// `BASE` and word 0's callee value back, then the slow path.
+    fn miss_path(&mut self, miss: Label, hdr: i32, slow: Label) {
+        self.a.bind(miss);
+        self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
+        self.a.ldr(X16, BASE, hdr);
+        self.a.movz(Sz::X, X17, FUNCTION_TAG, 3);
+        self.a.orr(Sz::X, X16, X16, X17);
+        self.a.str(X16, BASE, hdr);
+        self.a.b(slow);
+    }
+
     pub(super) fn out_of_line(&mut self, o: Ool) {
         match o {
+            Ool::Known {
+                i,
+                block,
+                hdr,
+                stores,
+                ret,
+                deep,
+                pc_after,
+                regs,
+                own,
+            } => {
+                let r = self.resume_of(block);
+                let slow = self.a.new_label();
+                self.miss_path(r.miss, hdr, slow);
+                // The known entry trusts the native stack, which is deep
+                // enough here to check; below the limit the call misses,
+                // with its arguments in the callee's slots.
+                let deep_miss = self.a.new_label();
+                self.a.bind(deep);
+                if let Some(l) = own {
+                    self.a.adr(X17, l);
+                }
+                self.a.ldr(Gpr(10), THREAD, layout::NATIVE_LIMIT as i32);
+                self.a.cmp(Sz::X, Gpr(9), Gpr(10));
+                self.a.b_cond(Cond::Lo, deep_miss);
+                self.a.adr(LR, r.fast);
+                self.a.orr_imm(Sz::X, LR, LR, 1);
+                self.a.br(X17);
+                self.a.bind(deep_miss);
+                for k in 0..regs {
+                    self.a.str(Gpr(k), BASE, 8 * k as i32);
+                }
+                self.a.b(r.miss);
+                // Without a fast entry.
+                self.a.bind(stores);
+                for k in 0..regs {
+                    self.a.str(Gpr(k), BASE, hdr + 32 + 8 * k as i32);
+                }
+                self.a.bind(slow);
+                let back = self.level_call(hdr, block, pc_after);
+                let keys = vec![(ret, false), (r.fast, false), (back, true)];
+                self.call_site(keys, i, block, hdr as u16 / 8, pc_after);
+            }
             Ool::Call {
                 i,
                 block,
@@ -296,16 +468,7 @@ impl<'a> Em<'a> {
                 pc_after,
             } => {
                 let r = self.resume_of(block);
-                // Where a fast callee whose entry checks failed goes: the
-                // caller's `BASE` and word 0's callee value back, then the
-                // slow path.
-                self.a.bind(r.miss);
-                self.a.sub_imm(Sz::X, BASE, BASE, hdr as u64 + 32);
-                self.a.ldr(X16, BASE, hdr);
-                self.a.movz(Sz::X, X17, FUNCTION_TAG, 3);
-                self.a.orr(Sz::X, X16, X16, X17);
-                self.a.str(X16, BASE, hdr);
-                self.a.b(slow);
+                self.miss_path(r.miss, hdr, slow);
                 // Deep in a chain the return address goes in tagged (bit 0),
                 // so the callee returns with `br` and the return address
                 // stack stays right for the shallower frames' `ret`s.
@@ -451,7 +614,7 @@ impl<'a> Em<'a> {
                         consts.push(w);
                         Loc::Const(consts.len() as u32 - 1)
                     }
-                    Src::Operand(k) => match allocs[k as usize].as_stack() {
+                    Src::Operand(k) => match allocs[site.args as usize + k as usize].as_stack() {
                         Some(slot) => Loc::Spill(slot.index() as u16),
                         None => bug!("a value kept across a call outside the frame"),
                     },

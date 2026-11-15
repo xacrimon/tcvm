@@ -113,6 +113,8 @@ pub(crate) struct Built<'gc> {
     /// The slots the frame needs where that is more than its prototype's
     /// (a call staged past its registers), else 0.
     pub(crate) window: u16,
+    /// The prototypes of known callees, whose addresses the code holds.
+    pub(crate) protos: Vec<Gc<'gc, Prototype<'gc>>>,
 }
 
 /// Addresses in the runtime the code reads from.
@@ -149,6 +151,9 @@ struct Builder<'a, 'gc> {
     deps: Vec<(DepOn<'gc>, u64)>,
     links: Links,
     window: u16,
+    protos: Vec<Gc<'gc, Prototype<'gc>>>,
+    /// The parameters a function region takes in registers (`Op::Arg`).
+    nreg: u8,
     /// The instructions compiled as a deopt for want of code.
     missing: Vec<Bc>,
 }
@@ -182,6 +187,12 @@ pub(crate) fn build<'gc>(
         deps: Vec::new(),
         links,
         window: 0,
+        protos: Vec::new(),
+        // As `compile` gives the region a fast entry.
+        nreg: match cfg.code[entry_pc as usize].op() == Bc::FUNC && !proto.is_vararg {
+            true => proto.num_params.min(8),
+            false => 0,
+        },
         missing: Vec::new(),
     };
     if !b.find_loops(root, &rpo, &order) {
@@ -200,6 +211,7 @@ pub(crate) fn build<'gc>(
         deps: b.deps,
         missing: b.missing,
         window: b.window,
+        protos: b.protos,
     }
 }
 
@@ -514,7 +526,10 @@ impl<'gc> Builder<'_, 'gc> {
         (self.bb, self.pc, self.state) = (bb, start, Val::NONE);
         if root {
             for r in self.live(start).iter() {
-                let v = self.e.emit(Op::SlotLoad, Rep::Val, r as u16, 0, 0, 0);
+                let v = match r < self.nreg as usize {
+                    true => self.e.emit(Op::Arg, Rep::Val, 0, r as u32, 0, 0),
+                    false => self.e.emit(Op::SlotLoad, Rep::Val, r as u16, 0, 0, 0),
+                };
                 self.set(r as u8, v);
             }
         } else {

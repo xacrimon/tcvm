@@ -536,6 +536,12 @@ ops! {
     // whose word is `a` (low) and `b`: what is live is in its slots.
     Dispatch    Both No     (Imm Imm Imm)     None [SLOT] [] [TERMINATOR];
     CallEntry   Both No     (Fs Blk Imm)      None [ALL] [ALL] [CALLS TERMINATOR];
+    // The call that ends the block is of a Lua closure without varargs
+    // whose prototype's address is pool word `c`: these are its first
+    // arguments, passed in registers. `Arg`: parameter `a` of a function
+    // region, which such a caller passes so and every other entry loads.
+    CallArgs    Both No     (Vals Len Imm)    None [] [] [CALLS PINNED];
+    Arg         Both No     (Imm No No)       Val  [] [] [PINNED];
     Resume      Both No     (Imm No No)       Dyn  [] [SLOT] [PINNED];
 
     // A C call of the helper in `aux` (`HELPERS`), its immediate in `c`.

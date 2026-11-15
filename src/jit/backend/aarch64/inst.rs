@@ -43,11 +43,13 @@ macro_rules! mops {
 // name (register operands). `imm` is the immediate where there is one: a
 // constant, a shift, a frame slot, an exit's index.
 mops! {
-    // Opens the native frame.
+    // Opens the native frame. Its operands are the parameters a function
+    // region takes in registers, those it reads.
     Entry     ();
     // A Lua call, last in its block: `imm` is the `CallEntry`'s, and from
     // bit 32 the pc after it. Its
-    // operands are what the frame keeps across it, in stack slots.
+    // operands are a known callee's arguments, in its parameter registers,
+    // then what the frame keeps across it, in stack slots.
     CallLua   ();
     // Leave for the interpreter's handler of an instruction: `imm` indexes
     // `Selected::dispatches`.
@@ -67,6 +69,7 @@ mops! {
     // `imm` is the byte offset from the base, the last register; a `W`
     // load is of 32 bits.
     Ldr       (D U);
+    Ldrb      (D U);
     Str       (U U);
     // The base, then an index of 8-byte elements: `cc` 1 for a 32-bit index
     // zero-extended (`uxtw`).

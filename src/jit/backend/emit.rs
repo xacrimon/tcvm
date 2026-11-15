@@ -31,6 +31,12 @@ pub(crate) struct CallSite {
     /// The call's block and instruction.
     pub(crate) block: u32,
     pub(crate) inst: u32,
+    /// The arguments in registers, the instruction's first operands; the
+    /// address of a known callee's prototype (else 0) and its parameter
+    /// count.
+    pub(crate) args: u8,
+    pub(crate) nparams: u8,
+    pub(crate) known: u64,
 }
 
 pub(crate) const TRACED: u8 = 255;
@@ -97,6 +103,8 @@ pub(crate) struct ExitOut {
 pub(crate) struct FastEntry {
     pub(crate) num_params: u8,
     pub(crate) max_stack: u16,
+    /// The prototype's address: a call of it from its own code is direct.
+    pub(crate) proto: u64,
 }
 
 /// The machine code of a region, before its address is known. Places are

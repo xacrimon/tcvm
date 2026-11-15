@@ -218,6 +218,17 @@ impl Copy {
                         }
                         e.call(super::ops::Helper::of(i.aux), i.c, &self.scratch)
                     }
+                    Op::CallArgs => {
+                        self.scratch.clear();
+                        for &x in g.run(i.a, i.b) {
+                            let v = self.map[x as usize];
+                            let v = Copy::convert(e, v, Rep::Val, TypeSet::ANY, Val::NONE);
+                            self.scratch.push(v);
+                        }
+                        let at = e.g.extra.len() as u32;
+                        e.g.extra.extend(self.scratch.iter().map(|v| v.0));
+                        e.emit(Op::CallArgs, Rep::None, 0, at, i.b, i.c)
+                    }
                     Op::SetIndex => {
                         let [recv, key, v] = [0, 1, 2].map(|k| {
                             let x = self.map[g.run(i.a, i.b)[k] as usize];
