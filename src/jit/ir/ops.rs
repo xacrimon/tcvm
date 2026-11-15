@@ -813,8 +813,9 @@ helpers! {
     Pow          NONE   0 (F64 F64)     F64  ANY [] [] [];
     Atan2        NONE   0 (F64 F64)     F64  ANY [] [] [];
     LibmFmod     NONE   0 (F64 F64)     F64  ANY [] [] [];
-    // Arithmetic of numbers of any kinds (not of strings, whose arithmetic
-    // is their metatable's); integers out of i32 are boxed.
+    // Arithmetic of numbers of any kinds, and of numeric strings as the
+    // string library's metamethods convert them; integers out of i32 are
+    // boxed.
     ArithCoerce  RT     1 (Val Val)     Val  NUM [] [] [ALLOCS];
     Unm          RT     0 (Val)         Val  NUM [] [] [ALLOCS];
     BNot         RT     0 (Val)         Val  INT [] [] [ALLOCS];

@@ -159,10 +159,8 @@ fn integer_rules() {
     assert_eq!(t.op(sum), Add);
     assert_eq!(t.i32(Add, y, x), sum);
     assert_eq!(t.i32(Mul, x, t.k(2)), t.i32(Add, x, x));
-    // `Not` has no machine instruction yet: `x ^ -1` stays as it is.
     let not = t.i32(Xor, x, t.k(-1));
-    assert_eq!(t.op(not), Xor);
-    let not = t.op1(Not, Rep::I32, x);
+    assert_eq!(t.op(not), Not);
     assert_eq!(t.op1(Not, Rep::I32, not), x);
     let neg = t.i32(Mul, x, t.k(-1));
     assert_eq!(t.op(neg), Neg);
@@ -1574,7 +1572,7 @@ mod lengths_and_loops {
 
 mod arithmetic {
     use super::super::analyse::Analysis;
-    use super::super::arith::{self, BIG, FLOAT, MM, OVERFLOWED, SEEN_SHIFT, SMALL};
+    use super::super::arith::{self, BIG, FLOAT, MM, OVERFLOWED, SEEN_SHIFT, SMALL, STR};
     use super::super::copy::Copy;
     use super::super::types::{Fact, FactFlags};
     use super::*;
@@ -1713,6 +1711,30 @@ mod arithmetic {
         let last = e.g.insts.last().unwrap();
         assert_eq!((last.op, last.aux), (Deopt, ExitTag::Mm as u16));
         assert!(e.cur.is_none());
+    }
+
+    /// A string's arithmetic is the helper's, which converts it; no bitwise
+    /// op converts one.
+    #[test]
+    fn strings_take_the_helper() {
+        use Op::*;
+        let t = start(true);
+        let r = arith(&t, aux(K::Add, STR, SMALL), t.slot(0), t.slot(1));
+        assert_eq!(
+            (t.op(r), t.set(r), count(&t, Br)),
+            (CallHelper, TypeSet::NUM, 0)
+        );
+        t.done();
+        // Numbers on some runs: the string's arm beside theirs.
+        let t = start(true);
+        let r = arith(&t, aux(K::Mul, STR | SMALL, SMALL), t.slot(0), small(&t, 1));
+        assert_eq!((count(&t, MulOvf), count(&t, CallHelper)), (1, 1));
+        assert_eq!((t.op(r), t.set(r)), (Param, TypeSet::NUM));
+        t.done();
+        let t = start(true);
+        let s = t.emit(KObj, Rep::Val, TypeSet::STR.bits(), Val(0), Val(0), Val(0));
+        arith(&t, aux(K::BOr, STR | SMALL, SMALL), s, t.slot(1));
+        assert!(t.e().cur.is_none() && t.e().g.insts.last().unwrap().op == Deopt);
     }
 
     #[test]

@@ -75,6 +75,7 @@ impl Em<'_> {
             MOp::SdivRR => self.a.sdiv(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::Sxtw => self.a.sxtw(self.r(i, 0), self.r(i, 1)),
             MOp::NegR => self.a.neg(sz, self.r(i, 0), self.r(i, 1)),
+            MOp::MvnR => self.a.mvn(sz, self.r(i, 0), self.r(i, 1)),
             MOp::NegsR => self.a.negs(sz, self.r(i, 0), self.r(i, 1)),
             MOp::FNeg => self.a.fneg(self.fr(i, 0), self.fr(i, 1)),
             MOp::Frintm => self.a.frintm(self.fr(i, 0), self.fr(i, 1)),

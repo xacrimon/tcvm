@@ -62,7 +62,7 @@ mod aarch64 {
     const PSEUDO: &str = "Entry Ret";
     const MOP_LIST: &str = "\
         Entry MovImm MovWide FImm LdrSlot StrSlot Ldr Str LdrIdx StrIdx MovBase \
-        MovThread Uxtw Cset Csel AndRR EorRR SdivRR Sxtw NegR NegsR FNeg Frintm \
+        MovThread Uxtw Cset Csel AndRR EorRR SdivRR Sxtw NegR MvnR NegsR FNeg Frintm \
         OrrRR AndImm AndWide OrrImm OrrWide TstImm TstWide AddRR SubRR MulRR \
         AddImm SubImm AddsRR SubsRR AddsImm SubsImm CmpRR CmpImm CmnImm CmpSxtw \
         Fcmp LslRR LsrRR AsrRR LslImm LsrImm AsrImm Smull Scvtf Fcvtzs FmovToGpr FmovFromGpr FAdd FSub \

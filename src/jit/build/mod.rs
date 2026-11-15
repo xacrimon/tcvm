@@ -526,6 +526,7 @@ impl Builder<'_, '_> {
             (fb::SMALL, arith::SMALL),
             (fb::BIGINT, arith::BIG),
             (fb::FLOAT, arith::FLOAT),
+            (fb::STR, arith::STR),
         ]
         .iter()
         .fold(0, |k, &(bit, kind)| {
@@ -538,7 +539,7 @@ impl Builder<'_, '_> {
             .flatten();
         let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
         let (i, f) = (arith::SMALL, arith::FLOAT);
-        let wider = site & arith::BIG;
+        let wider = site & (arith::BIG | arith::STR);
         // A site whose kinds kept changing is locked to its any-numbers
         // form, or to its generic opcode, and records no more of them.
         let (misses, locked) = match generic.info().adaptive_shift {
@@ -563,7 +564,7 @@ impl Builder<'_, '_> {
         if kinds == [0; 2] && !mm && bits & fb::MM == 0 {
             let own = vals.map(|v| {
                 let f = self.e.fact(v);
-                let known = !f.pending() && TypeSet::NUM.contains(f.set);
+                let known = !f.pending() && (TypeSet::NUM | TypeSet::STR).contains(f.set);
                 if known { arith::kinds_of(f.set) } else { 0 }
             });
             kinds = [own[0] | own[1]; 2];

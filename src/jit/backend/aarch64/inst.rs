@@ -114,6 +114,8 @@ mops! {
     SdivRR    [D U U]          None None Fall false false;
     Sxtw      [D U NO]         None None Fall false false;
     NegR      [D U NO]         None None Fall false false;
+    // `mvn`: every bit inverted.
+    MvnR      [D U NO]         None None Fall false false;
     // Flag-setting, as `AddsRR`.
     NegsR     [D U NO]         None None Fall false false;
     FNeg      [FD FU NO]       None None Fall false false;

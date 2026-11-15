@@ -769,8 +769,7 @@ impl Emitter {
             (Shl | Shr | Sar, _) if k & (bits - 1) == 0 => return Some(a),
             (Mul | And, 0) => return Some(b),
             (And | Or, _) if k == ones => return Some(if i.op == And { a } else { b }),
-            // `x ^ -1` stays an exclusive-or: `Not` has no machine
-            // instruction yet (aarch64's `mvn` is no opcode of the table).
+            (Xor, -1) if bits != 1 => return Some(self.op1(Not, rep, a)),
             (Mul, -1) => return Some(self.op1(Neg, rep, a)),
             (Mul, 2) => return Some(self.op2(Add, rep, a, a)),
             (Sub, _) => {

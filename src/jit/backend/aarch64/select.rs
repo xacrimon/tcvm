@@ -512,12 +512,13 @@ impl Sel<'_> {
                 };
                 self.op(op, w, &[d, x, y]);
             }
-            SExt32 | Neg | FNeg | FFloor => {
+            SExt32 | Neg | Not | FNeg | FFloor => {
                 let Some(d) = self.def(v) else { return };
                 let x = self.reg(a);
                 let op = match i.op {
                     SExt32 => MOp::Sxtw,
                     Neg => MOp::NegR,
+                    Not => MOp::MvnR,
                     FNeg => MOp::FNeg,
                     _ => MOp::Frintm,
                 };

@@ -111,16 +111,43 @@ unsafe extern "C" {
     safe fn fmod(x: f64, y: f64) -> f64;
 }
 
-/// `arith_slow`'s numeric cases; everything it would raise or hand to a
-/// metamethod fails.
+/// What the string metatable's arithmetic makes of an operand: a number as
+/// it is, a string that converts entirely as its number.
+fn coerced<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Option<Value<'gc>> {
+    if v.is_number() {
+        return Some(v);
+    }
+    let s = v.get_string()?;
+    crate::builtin::util::str_to_number(s.as_bytes()).map(|n| n.into_value(ctx.mutation()))
+}
+
+/// `arith_slow`'s numeric cases, and a numeric string as the number it
+/// converts to: a string's arithmetic is its metatable's metamethod, which
+/// is taken to be the string library's while there is one (a region is to
+/// depend on that once regions can). Everything else that would raise or
+/// call a metamethod fails.
 pub(crate) extern "C" fn jit_arith(rt: *const State<'static>, kind: u32, a: u64, b: u64) -> u64 {
     use ArithKind::*;
     let ctx = unsafe { Context::from_state(rt) };
     let mc = ctx.mutation();
-    let (a, b) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
+    let (mut a, mut b) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
     const KINDS: [ArithKind; 13] = [
         None, Add, Sub, Mul, Mod, Pow, Div, IDiv, BAnd, BOr, BXor, Shl, Shr,
     ];
+    if let Some(s) = [a, b].into_iter().find(|v| v.get_string().is_some()) {
+        let kind = KINDS[kind as usize];
+        // No bitwise op converts a string, and a number's own metamethod
+        // would come before the string's.
+        let bitwise = matches!(kind, BAnd | BOr | BXor | Shl | Shr);
+        let mm = crate::vm::ops::arith::kind_mm(kind);
+        if bitwise || ctx.number_metatable().is_some() || ctx.mm_of(s, mm).is_nil() {
+            return HELPER_FAIL_VAL;
+        }
+        match (coerced(ctx, a), coerced(ctx, b)) {
+            (Some(x), Some(y)) => (a, b) = (x, y),
+            _ => return HELPER_FAIL_VAL,
+        }
+    }
     let r = match KINDS[kind as usize] {
         Add => num::op_arith_slow::<num::Add>(mc, a, b),
         Sub => num::op_arith_slow::<num::Sub>(mc, a, b),
@@ -142,10 +169,20 @@ pub(crate) extern "C" fn jit_arith(rt: *const State<'static>, kind: u32, a: u64,
     }
 }
 
-/// `-v` as `op_unm` and `unm_slow` compute it without a metamethod.
+/// `-v` as `op_unm` and `unm_slow` compute it without a metamethod, and of
+/// a numeric string as the string metatable's does (`jit_arith`).
 pub(crate) extern "C" fn jit_unm(rt: *const State<'static>, v: u64) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
-    let v = unsafe { Value::from_raw(v) };
+    let mut v = unsafe { Value::from_raw(v) };
+    if v.get_string().is_some() {
+        if ctx.mm_of(v, MetamethodBits::UNM).is_nil() {
+            return HELPER_FAIL_VAL;
+        }
+        match coerced(ctx, v) {
+            Some(n) => v = n,
+            None => return HELPER_FAIL_VAL,
+        }
+    }
     if v.is_float() {
         Value::float(-v.read_float()).to_raw()
     } else if let Some(i) = v.get_integer() {
