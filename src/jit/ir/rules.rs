@@ -390,7 +390,7 @@ impl Emitter {
             | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr
             | AbsOvf | FMod | CallHelper | CallHelperCold | CallEntry | Resume | Dispatch
             | ArrNext | NamedNext | NamedKey | NamedVal | HashKeys | CallArgs | Arg | TailEnter
-            | FnFits => None,
+            | FnFits | VarargAt => None,
             Truthy => self.truthy(a),
         }
     }

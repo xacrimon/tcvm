@@ -189,12 +189,17 @@ impl<'gc> Builder<'_, 'gc> {
     /// `SETLIST`: the items, in their slots, into the table in `R[a]`.
     pub(super) fn setlist(&mut self, i: Instruction) {
         let (a, n) = (i.a(), i.b());
-        if n == 0 {
-            return self.deopt(ExitTag::Unsupported);
-        }
-        for r in a..=a + n {
-            let v = self.reg(r);
-            self.e.emit(Op::SlotStore, Rep::None, r as u16, v.0, 0, 0);
+        // Up to `top` (`n == 0`): those before the ones a call or `VARARG`
+        // landed there, which have no value here.
+        let end = match n {
+            0 => self.cfg.nregs as u16 - 1,
+            _ => a as u16 + n as u16,
+        };
+        for r in a as u16..=end {
+            let v = self.reg(r as u8);
+            if !v.is_none() {
+                self.e.emit(Op::SlotStore, Rep::None, r, v.0, 0, 0);
+            }
         }
         let imm = a as u32 | (n as u32) << 8 | (i.d() as u32) << 16;
         self.e.call(Helper::SetList, imm, &[]);

@@ -406,6 +406,20 @@ impl<'a> Em<'a> {
                 self.a.ldr(X16, X16, (word & 0xff) as i32 * 8);
                 self.tail_level();
             }
+            MOp::VarargAt => {
+                // The extras end at the header, their count in its first
+                // word's upper bits: extra k is at base - 32 - 8 * nv + 8 * k,
+                // read only when k < nv.
+                let d = self.r(i, 0);
+                self.a.ldr(X16, BASE, -32);
+                self.a.lsr_imm(Sz::X, X16, X16, 48);
+                self.a.cmp_imm(Sz::W, X16, imm);
+                self.a.lsl_imm(Sz::W, X16, X16, 3);
+                self.a.sub(Sz::X, X16, BASE, X16);
+                self.a.ldr(d, X16, 8 * imm as i32 - 32);
+                self.a.mov_imm(X17, NIL);
+                self.a.csel(Sz::X, d, d, X17, Cond::Hi);
+            }
             MOp::TailEnter => self.tail_enter(self.r(i, 0), imm),
             MOp::FnFits => {
                 let (d, f) = (self.r(i, 0), self.r(i, 1));

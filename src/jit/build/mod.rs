@@ -705,6 +705,13 @@ impl<'gc> Builder<'_, 'gc> {
                 self.set(a, v);
             }
             ARITH_MM | ARITH_MM_R | ARITH_MMI => self.arith_mm(pc, i),
+            VARARGPREP => self.varargprep(pc),
+            VARARG => self.vararg(i),
+            VARARGGET => {
+                let key = self.reg(i.c());
+                let v = self.e.call(Helper::VarargGet, 0, &[key]);
+                self.set(a, v);
+            }
             TFORPREP => self.tforprep(pc, i, jump.or(fall).unwrap()),
             // With the `TFORLOOP` after it, as the interpreter takes them.
             TFORCALL_NEXT => self.tforcall_next(i, fall.unwrap(), jump.unwrap()),

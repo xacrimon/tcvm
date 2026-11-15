@@ -99,6 +99,45 @@ impl<'gc> Builder<'_, 'gc> {
         self.lazy_exit(pc + 1);
     }
 
+    /// `VARARGPREP`: only a function that needs its extras as a table has
+    /// work, `R[num_params]` the table.
+    pub(super) fn varargprep(&mut self, pc: u32) {
+        if self.proto.needs_vararg_table {
+            let np = self.proto.num_params;
+            let t = self.e.call(Helper::VarargTable, np as u32, &[]);
+            self.set(np, t);
+            self.gc_check(pc);
+        }
+    }
+
+    /// `VARARG a b`: `b - 1` extras into `R[a..]`, or all of them and `top`
+    /// after them, through the slots.
+    pub(super) fn vararg(&mut self, i: Instruction) {
+        let (a, b) = (i.a(), i.b());
+        // A vararg table makes it read the table.
+        if self.proto.needs_vararg_table {
+            return self.deopt(ExitTag::Unsupported);
+        }
+        if b != 0 {
+            for k in 0..b - 1 {
+                let v = self.e.emit(Op::VarargAt, Rep::Val, 0, k as u32, 0, 0);
+                self.set(a + k, v);
+            }
+            return;
+        }
+        // A window that must grow first is the interpreter's.
+        let s = self.state();
+        let r = self.e.call(Helper::VarargAll, a as u32, &[]);
+        let zero = self.e.k64(Rep::Val, 0);
+        let ok = self.e.cmp(Op::Cmp, Cc::Eq, r, zero);
+        let tag = ExitTag::Slow as u16;
+        (self.e).emit(Op::Guard, Rep::None, tag, ok.0, s.0, u32::MAX);
+        // They stay in their slots, for the instruction that takes them.
+        for r in a as usize..self.cfg.nregs {
+            self.e.table.set(Key::reg(r as u32), Val::NONE.0);
+        }
+    }
+
     /// `TAILCALL a` with a static count: the interpreter's fast arm for a
     /// Lua closure without varargs whose window fits, from a frame with
     /// nothing to close; any other callee is the interpreter's, from the

@@ -143,6 +143,8 @@ mops! {
     // The same through the helper's trampoline, which keeps every register
     // but the result's.
     CallCold  ();
+    // The frame's extra argument `imm`, nil past their count.
+    VarargAt  (D);
     // The frame replaced by the closure's, `imm` arguments in its slots;
     // and whether the closure's window fits the stack, 1 or 0.
     TailEnter (U);

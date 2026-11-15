@@ -788,6 +788,10 @@ impl Sel<'_> {
                 self.pass(pos, 1, here, Block(i.c));
             }
             Ret => self.op(MOp::Ret, Sz::X, i.a as u64 | (i.b as u64) << 8, &[]),
+            VarargAt => {
+                let Some(d) = self.def(v) else { return };
+                self.op(MOp::VarargAt, Sz::X, i.a as u64, &[d]);
+            }
             TailEnter => {
                 let f = self.reg(a);
                 self.op(MOp::TailEnter, Sz::X, i.b as u64, &[f]);

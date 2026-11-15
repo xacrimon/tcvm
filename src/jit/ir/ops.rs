@@ -536,6 +536,8 @@ ops! {
     // whose word is `a` (low) and `b`: what is live is in its slots.
     Dispatch    Both No     (Imm Imm Imm)     None [SLOT] [] [TERMINATOR];
     CallEntry   Both No     (Fs Blk Imm)      None [ALL] [ALL] [CALLS TERMINATOR];
+    // The frame's extra argument `a`, nil past their count.
+    VarargAt    Both No     (Imm No No)       Val  [FRAME] [] [];
     // Replace the frame by one of the Lua closure without varargs `a` (its
     // lock), whose `b` arguments are in `R[0..]`: nothing of this frame is
     // left to close. `FnFits`: whether such a closure's window fits the
