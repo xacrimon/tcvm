@@ -10,6 +10,7 @@
 pub(crate) mod analyse;
 pub(crate) mod copy;
 pub(crate) mod emit;
+pub(crate) mod fields;
 pub(crate) mod ops;
 #[cfg(feature = "tcvm-dev")]
 mod print;
@@ -344,7 +345,8 @@ impl Graph {
                 Op::K32 => matches!(i.rep, Rep::I32 | Rep::B1),
                 Op::K64 => i.rep.word64(),
                 Op::KObj => matches!(i.rep, Rep::Val | Rep::Ptr),
-                Op::Load | Op::LoadIdx | Op::Select | Op::Param => i.rep != Rep::None,
+                Op::Load | Op::LoadIdx => i.rep == fields::Field::info(i.aux).rep,
+                Op::Select | Op::Param => i.rep != Rep::None,
                 Op::CheckType => i.rep == set.unboxed(),
                 _ => false,
             },

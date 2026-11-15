@@ -444,23 +444,72 @@ b0:
   v3: i32 = k32 0
   v4 = jump b1
 b1: <- b0 b2 l0 header
-  v5: i32 = param v3 v13
+  v5: i32 = param v3 v12
   v6: b1 = cmp.lt v5 v2
   v7 = br v6 b2 b3
 b2: <- b1 l0
   v8: val = boxi32 v5
-  v9: val = slotload r0
-  v10 = framestate.before pc4 r0=*v9 r2=v5
-  v11 = framestate.after pc4 r0=*v9 r2=v5
-  v12: i32 = k32 1
-  v13: i32 = addovf!overflow v5 v12 v10
-  v14 = jump b1
+  v9 = framestate.before pc4 r0=*v1 r2=v5
+  v10 = framestate.after pc4 r0=*v1 r2=v5
+  v11: i32 = k32 1
+  v12: i32 = addovf!overflow v5 v11 v9
+  v13 = jump b1
 b3: <- b1
-  v15: i32 = param v5
-  v16: val = boxi32 v15
-  v17 = ret 0 0
+  v14: i32 = param v5
+  v15: val = boxi32 v14
+  v16 = ret 0 0
 "
     );
+}
+
+#[test]
+fn memory() {
+    use super::fields::Field;
+    let t = start(false);
+    let table = |r| t.check(t.slot(r), TypeSet::TAB, ExitTag::Type);
+    let (a, b) = (table(0), table(1));
+    let load = |f: Field, base: Val, k: u32| {
+        let rep = Field::info(f as u16).rep;
+        t.emit(Op::Load, rep, f as u16, base, Val::NONE, Val(k))
+    };
+    let store = |f: Field, base: Val, v: Val, k: u32| {
+        t.emit(Op::Store, Rep::None, f as u16, base, v, Val(k))
+    };
+    // A load again is the load; a slot is read once.
+    let x = load(Field::Inline, a, 0);
+    assert_eq!(load(Field::Inline, a, 0), x);
+    assert_eq!(t.slot(0), t.slot(0));
+    // A store to another slot leaves it, one to the same slot of any table
+    // does not, and the stored value is what a load there gives.
+    let seven = t.op1(Op::BoxI32, Rep::Val, t.k(7));
+    store(Field::Inline, b, seven, 1);
+    assert_eq!(load(Field::Inline, a, 0), x);
+    assert_eq!(load(Field::Inline, b, 1), seven);
+    store(Field::Inline, b, seven, 0);
+    assert_ne!(load(Field::Inline, a, 0), x);
+    // A store of what is there is nothing.
+    let n = t.len();
+    store(Field::Inline, b, seven, 0);
+    assert_eq!(t.len(), n);
+    // Heaps are apart: a named store leaves the array's size.
+    let size = load(Field::ASize, a, 0);
+    store(Field::Inline, a, seven, 2);
+    assert_eq!(load(Field::ASize, a, 0), size);
+    // What a slot holds is what was stored there, until a branch's arms
+    // disagree.
+    t.emit(Op::SlotStore, Rep::None, 3, seven, Val(0), Val(0));
+    assert_eq!(t.slot(3), seven);
+    assert!(t.e().slot_holds(3, seven));
+    let [left, right, join] = t.diamond(t.cmp(Op::Cmp, Cc::Lt, t.small(4), t.k(0)));
+    t.block(left);
+    t.emit(Op::SlotStore, Rep::None, 3, x, Val(0), Val(0));
+    t.jump(join);
+    t.block(right);
+    t.jump(join);
+    t.block(join);
+    assert!(!t.e().slot_holds(3, seven));
+    assert_eq!(load(Field::Inline, b, 1), seven);
+    t.done();
 }
 
 #[test]

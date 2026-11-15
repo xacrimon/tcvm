@@ -9,7 +9,7 @@ pub(crate) const NONE: u32 = u32::MAX;
 /// merge is collected.
 const UNSET: u32 = u32::MAX - 1;
 
-const KINDS: usize = 2;
+const KINDS: usize = 3;
 
 /// A key: its kind and an index dense within the kind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,15 +23,28 @@ impl Key {
 
     /// A value: its fact's bits where refined.
     pub(crate) fn fact(v: u32) -> Key {
-        Key(1 << 31 | v)
+        Key(1 << 30 | v)
+    }
+
+    /// An abstract heap, or one key of a keyed heap: its version.
+    pub(crate) fn heap(k: u32) -> Key {
+        Key(2 << 30 | k)
+    }
+
+    pub(crate) fn kind(self) -> usize {
+        (self.0 >> 30) as usize
     }
 
     pub(crate) fn is_fact(self) -> bool {
-        self.0 >> 31 != 0
+        self.kind() == 1
+    }
+
+    pub(crate) fn is_reg(self) -> bool {
+        self.kind() == 0
     }
 
     pub(crate) fn index(self) -> u32 {
-        self.0 & !(1 << 31)
+        self.0 & !(3 << 30)
     }
 }
 
@@ -98,12 +111,12 @@ impl Table {
 
     #[inline]
     pub(crate) fn get(&self, key: Key) -> u32 {
-        let c = &self.cur[key.is_fact() as usize];
+        let c = &self.cur[key.kind()];
         c.get(key.index() as usize).copied().unwrap_or(NONE)
     }
 
     fn put(&mut self, key: Key, v: u32) {
-        let c = &mut self.cur[key.is_fact() as usize];
+        let c = &mut self.cur[key.kind()];
         let i = key.index() as usize;
         if i >= c.len() {
             c.resize(i + 1, NONE);
@@ -191,7 +204,7 @@ impl Table {
     pub(crate) fn start(&mut self, preds: &[Snap]) {
         debug_assert!(self.open as usize == self.log.len());
         for &key in &self.merge_keys {
-            self.mark[key.is_fact() as usize][key.index() as usize] = 0;
+            self.mark[key.kind()][key.index() as usize] = 0;
         }
         self.merge_keys.clear();
         self.merge_vals.clear();
@@ -212,7 +225,7 @@ impl Table {
                 // Backward: a key's first change met is its value at `p`.
                 for at in range.rev() {
                     let Change { key, new, .. } = self.log[at];
-                    let m = &mut self.mark[key.is_fact() as usize];
+                    let m = &mut self.mark[key.kind()];
                     let i = key.index() as usize;
                     if i >= m.len() {
                         m.resize(i + 1, 0);
@@ -255,7 +268,7 @@ impl Table {
 
     /// A key's value at the end of predecessor `k` of the last `start`.
     pub(crate) fn pred_value(&self, key: Key, k: usize) -> u32 {
-        let m = &self.mark[key.is_fact() as usize];
+        let m = &self.mark[key.kind()];
         match m.get(key.index() as usize) {
             Some(&i) if i != 0 => self.merge_vals[(i as usize - 1) * self.np + k],
             // Unchanged since the common ancestor by every predecessor.

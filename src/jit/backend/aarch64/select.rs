@@ -66,6 +66,8 @@ pub(crate) struct Select {
     /// terminator passes each successor, a run of `args`.
     blocks: Vec<(u32, u32, u32, [u32; 2])>,
     args: Vec<VReg>,
+    /// The frame slots the region stores to.
+    stored: Vec<bool>,
     bail: Option<Bail>,
 }
 
@@ -88,6 +90,11 @@ impl Select {
         self.args.clear();
         self.blocks.clear();
         self.bail = None;
+        self.stored.clear();
+        self.stored.resize(256, false);
+        for i in g.insts.iter().filter(|i| i.op == Op::SlotStore) {
+            self.stored[i.aux as usize] = true;
+        }
         let n = out.layout.order.len();
         self.blocks.resize(n, (0, 0, 0, [0; 2]));
         let mut sel = Sel { g, s: self, out };
@@ -338,9 +345,11 @@ impl Sel<'_> {
             }
             SlotLoad => {
                 let Some(d) = self.def(v) else { return };
-                // Its slot keeps the value: nothing stores to a frame slot
-                // but a return's results, which nothing follows.
-                self.out.vcode.remat[d.vreg()] = Remat::Slot(i.aux as u8);
+                // A slot nothing stores to keeps the value: it is read
+                // again from there instead of being kept.
+                if !self.s.stored[i.aux as usize] {
+                    self.out.vcode.remat[d.vreg()] = Remat::Slot(i.aux as u8);
+                }
                 self.op(MOp::LdrSlot, Sz::X, i.aux as u64, &[d]);
             }
             SlotStore => {

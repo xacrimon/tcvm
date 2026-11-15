@@ -4,6 +4,7 @@
 //! instruction where there is one, and otherwise appends and records what
 //! the instruction makes known.
 
+use super::fields::Field;
 use super::ops::{Arg, Aux, Cc, Dialect, ExitKind, ExitTag, Flags, Heaps, Op};
 use super::table::{self, Key, Snap, Table};
 use super::types::{Fact, FactFlags, Rep, TypeSet};
@@ -23,6 +24,39 @@ fn aux_key(i: &Inst) -> u16 {
     }
 }
 
+/// A heap key's index among the versions: the heaps by their bit, then
+/// the frame slots, then the indexed fields' slots.
+const SLOT_KEYS: u32 = 16;
+const FIELD_KEYS: u32 = SLOT_KEYS + 256;
+
+/// A memory access as the number table keys it: its kind, field or slot,
+/// base and index, and for a store the value it leaves there. A load and
+/// the store that feeds it have one key.
+fn mem_key(i: &Inst) -> Option<([u32; 4], Option<u32>)> {
+    Some(match i.op {
+        Op::SlotLoad => ([0, i.aux as u32, 0, 0], None),
+        Op::SlotStore => ([0, i.aux as u32, 0, 0], Some(i.a)),
+        Op::Load => ([1, i.aux as u32, i.a, i.c], None),
+        Op::Store => ([1, i.aux as u32, i.a, i.c], Some(i.b)),
+        Op::LoadIdx => ([2, i.aux as u32, i.a, i.b], None),
+        Op::StoreIdx => ([2, i.aux as u32, i.a, i.b], Some(i.c)),
+        _ => return None,
+    })
+}
+
+/// The heap a memory access is in, and its key's index where the heap is
+/// keyed.
+fn heap_of(i: &Inst) -> (Heaps, Option<u32>) {
+    match i.op {
+        Op::SlotLoad | Op::SlotStore => (Heaps::SLOT, Some(SLOT_KEYS + i.aux as u32)),
+        _ => {
+            let f = Field::info(i.aux);
+            let spilled = (i.aux == Field::Spilled as u16) as u32;
+            (f.heap, f.indexed.then(|| FIELD_KEYS + 2 * i.c + spilled))
+        }
+    }
+}
+
 /// `reset` before the first graph, and between graphs.
 #[derive(Default)]
 pub(crate) struct Emitter {
@@ -30,11 +64,15 @@ pub(crate) struct Emitter {
     pub(crate) table: Table,
     /// Each sealed block's end state.
     ends: Vec<Snap>,
-    /// Value numbers, open-addressed: a value and its block, empty where the
-    /// value is `NONE`. An entry whose block does not dominate is stale and
-    /// gets overwritten.
-    num: Vec<[u32; 2]>,
+    /// Value numbers, open-addressed: an instruction, its block, and for a
+    /// memory access the versions of its heap and key it holds at; empty
+    /// where the instruction is `NONE`. An entry whose block does not
+    /// dominate, or whose versions have passed, is stale and gets
+    /// overwritten.
+    num: Vec<[u32; 4]>,
     num_len: usize,
+    /// The last heap version handed out.
+    version: u32,
     /// Edges into blocks not opened yet: each with the next of its target's,
     /// newest first from `pending[target]`.
     edges: Vec<(Block, u32)>,
@@ -62,7 +100,8 @@ impl Emitter {
         self.table.reset();
         self.ends.clear();
         self.num.clear();
-        self.num.resize(256, [NONE; 2]);
+        self.num.resize(256, [NONE; 4]);
+        self.version = 0;
         self.num_len = 0;
         self.edges.clear();
         self.pending.clear();
@@ -162,7 +201,20 @@ impl Emitter {
         // What every predecessor knows of a value stays known.
         for i in 0..self.table.merges() {
             let (key, at_preds) = self.table.merge(i);
+            if key.is_reg() {
+                continue;
+            }
             if !key.is_fact() {
+                // A heap the predecessors left at different versions is at
+                // a new one: nothing known of it survives the join.
+                let v = at_preds[0];
+                let v = if at_preds.iter().all(|&w| w == v) {
+                    v
+                } else {
+                    self.version += 1;
+                    self.version
+                };
+                self.table.set(key, v);
                 continue;
             }
             let def = self.g.facts[key.index() as usize];
@@ -176,6 +228,11 @@ impl Emitter {
             let f = (at_preds[1..].iter()).fold(of(at_preds[0]), |f, &w| f.join(of(w)));
             self.table
                 .set(key, if f == def { table::NONE } else { f.bits() });
+        }
+        // What the loop's body may write is unknown from its header on.
+        if flags.contains(BlockFlags::LOOP_HEADER) {
+            let writes = self.g.loops[lp.idx()].writes;
+            self.kill(writes);
         }
         // A branch's condition is known on its edges. The fact is of an SSA
         // value, so one forward predecessor is enough: back edges come from
@@ -378,13 +435,33 @@ impl Emitter {
         if self.lowered && i.op.info().dialect == Dialect::H {
             bug!("high-level {:?} in a low-level graph", i.op);
         }
-        let numbered = i.op.numbered();
+        let info = i.op.info();
+        let mem = mem_key(&i);
+        let numbered = i.op.numbered() || mem.is_some();
         let mut slot = 0;
         if numbered {
-            match self.number(&i) {
-                Ok(v) => return v,
-                Err(s) => slot = s,
+            match (self.number(&i), mem) {
+                // A store of what is there already is nothing.
+                (Ok(v), Some((_, Some(stored)))) if v.0 == stored => return Val::NONE,
+                (Ok(v), Some((_, None)) | None) => return v,
+                _ => {}
             }
+        }
+        // A write makes its heap's other contents unknown; a store then
+        // records what it left.
+        if let Some((_, Some(_))) = mem {
+            match heap_of(&i) {
+                (_, Some(key)) => {
+                    self.version += 1;
+                    self.table.set(Key::heap(key), self.version);
+                }
+                (heap, None) => self.kill(heap),
+            }
+        } else if !info.writes.is_empty() {
+            self.kill(info.writes);
+        }
+        if numbered && let Err(s) = self.number(&i) {
+            slot = s;
         }
         let fact = self.def_fact(&i);
         let v = self.push(i, fact);
@@ -392,7 +469,8 @@ impl Emitter {
             if self.num[slot][0] == NONE {
                 self.num_len += 1;
             }
-            self.num[slot] = [v.0, self.cur.0];
+            let (heap, key) = self.versions(&i);
+            self.num[slot] = [v.0, self.cur.0, heap, key];
             if self.num_len * 2 > self.num.len() {
                 self.grow();
             }
@@ -477,13 +555,17 @@ impl Emitter {
     // --- numbering ----------------------------------------------------------
 
     fn hash(&self, i: &Inst) -> usize {
-        let info = i.op.info();
-        let exits = info.flags.contains(Flags::EXITS);
         let mix = |h: u64, x: u32| {
             (h ^ x as u64)
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 .rotate_left(29)
         };
+        if let Some((key, _)) = mem_key(i) {
+            let h = key.iter().fold(0xff, |h, &x| mix(h, x));
+            return (h ^ h >> 32) as usize;
+        }
+        let info = i.op.info();
+        let exits = info.flags.contains(Flags::EXITS);
         let mut h = mix(i.op as u64 | (i.rep as u64) << 8, aux_key(i) as u32);
         for (k, kind) in info.args.iter().enumerate() {
             match kind {
@@ -501,6 +583,9 @@ impl Emitter {
     }
 
     fn same(&self, i: &Inst, j: &Inst) -> bool {
+        if let (Some((x, _)), y) = (mem_key(i), mem_key(j)) {
+            return y.is_some_and(|(y, _)| x == y);
+        }
         if (i.op, i.rep, aux_key(i)) != (j.op, j.rep, aux_key(j)) {
             return false;
         }
@@ -513,30 +598,76 @@ impl Emitter {
         })
     }
 
-    /// The dominating instruction equal to `i`, or the slot `i` takes.
+    /// The versions a memory access's heap and key are at; zeros for
+    /// anything else, and for memory nothing writes.
+    fn versions(&self, i: &Inst) -> (u32, u32) {
+        if mem_key(i).is_none() {
+            return (0, 0);
+        }
+        let (heap, key) = heap_of(i);
+        if heap.is_empty() {
+            return (0, 0);
+        }
+        let class = heap.bits().trailing_zeros();
+        (
+            self.table.get(Key::heap(class)),
+            key.map_or(0, |k| self.table.get(Key::heap(k))),
+        )
+    }
+
+    /// Everything in `heaps` may have been written.
+    pub(crate) fn kill(&mut self, heaps: Heaps) {
+        let mut bits = (heaps & Heaps::ALL).bits();
+        while bits != 0 {
+            self.version += 1;
+            self.table
+                .set(Key::heap(bits.trailing_zeros()), self.version);
+            bits &= bits - 1;
+        }
+    }
+
+    /// The dominating value equal to `i`, or the slot `i` takes: for a
+    /// memory access, what its place holds, a load's result or a store's
+    /// value.
     pub(super) fn number(&self, i: &Inst) -> Result<Val, usize> {
         let mask = self.num.len() - 1;
         let mut s = self.hash(i) & mask;
+        let now = self.versions(i);
         loop {
-            let [v, b] = self.num[s];
+            let [v, b, heap, key] = self.num[s];
             if v == NONE {
                 return Err(s);
             }
-            if self.same(i, &self.g.insts[v as usize]) {
+            let j = &self.g.insts[v as usize];
+            if self.same(i, j) {
                 let b = Block(b);
-                return if b == self.cur || self.g.dominates(b, self.cur) {
-                    Ok(Val(v))
-                } else {
-                    Err(s)
+                let holds = (heap, key) == now && (b == self.cur || self.g.dominates(b, self.cur));
+                return match (holds, mem_key(j)) {
+                    (false, _) => Err(s),
+                    (true, Some((_, Some(stored)))) => Ok(Val(stored)),
+                    (true, _) => Ok(Val(v)),
                 };
             }
             s = (s + 1) & mask;
         }
     }
 
+    /// Whether frame slot `r` holds `v` here.
+    pub(crate) fn slot_holds(&self, r: u16, v: Val) -> bool {
+        let load = Inst {
+            op: Op::SlotLoad,
+            rep: Rep::Val,
+            aux: r,
+            a: 0,
+            b: 0,
+            c: 0,
+        };
+        self.number(&load) == Ok(v)
+    }
+
     fn grow(&mut self) {
         let old = std::mem::take(&mut self.num);
-        self.num.resize(old.len() * 2, [NONE; 2]);
+        self.num.resize(old.len() * 2, [NONE; 4]);
         let mask = self.num.len() - 1;
         for e in old {
             if e[0] != NONE {

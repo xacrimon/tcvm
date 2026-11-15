@@ -275,8 +275,7 @@ impl Builder<'_, '_> {
         let entries: Vec<(u32, Val)> = (self.live(pc).iter())
             .map(|r| {
                 let v = self.reg(r as u8);
-                let i = self.e.g.inst(v);
-                let home = i.op == Op::SlotLoad && i.aux as usize == r;
+                let home = self.e.slot_holds(r as u16, v);
                 (r as u32 | if home { HOME } else { 0 }, v)
             })
             .collect();
@@ -534,11 +533,9 @@ impl Builder<'_, '_> {
             }
             // Nothing to close: the compiler emits `RETURN` where there is.
             RETURN1 => {
+                // Nothing where the slot holds it already.
                 let v = self.reg(a);
-                let d = self.e.g.inst(v);
-                if !(d.op == Op::SlotLoad && d.aux == a as u16) {
-                    self.e.emit(Op::SlotStore, Rep::None, a as u16, v.0, 0, 0);
-                }
+                self.e.emit(Op::SlotStore, Rep::None, a as u16, v.0, 0, 0);
                 self.e.emit(Op::Ret, Rep::None, 0, a as u32, 1, 0);
             }
             FORPREP => self.forprep(pc, i, fall.unwrap(), jump.unwrap()),
