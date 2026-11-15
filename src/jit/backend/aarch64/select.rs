@@ -102,7 +102,7 @@ impl Select {
         self.blocks.clear();
         self.bail = None;
         self.stored.clear();
-        self.stored.resize(256, false);
+        self.stored.resize(256 + 16, false);
         let mut calls = false;
         for i in &g.insts {
             match i.op {
@@ -747,7 +747,7 @@ impl Sel<'_> {
                     Some(d) => {
                         clobbers.remove(abi::preg_int(0));
                         self.s.ops.push(Operand::reg_fixed_def(d, abi::preg_int(0)));
-                        imm |= 1 << 31;
+                        imm |= 1 << 32;
                     }
                     // One result nothing reads is none.
                     None if i.rep == Rep::Val => imm = imm & !0xff_0000 | 1 << 16,

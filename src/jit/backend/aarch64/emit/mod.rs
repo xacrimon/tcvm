@@ -86,7 +86,8 @@ pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
 }
 
 /// `rt` is the runtime's address, which helpers take, and `code` that of
-/// the function's bytecode.
+/// the function's bytecode; `window` is how many slots the frame needs where
+/// that is more than its prototype's, else 0.
 pub(crate) fn emit(
     s: &Selected,
     out: &Output,
@@ -94,6 +95,7 @@ pub(crate) fn emit(
     code: u64,
     fast: Option<FastEntry>,
     invalidable: bool,
+    window: u16,
 ) -> Result<Emitted, Bail> {
     if out.num_spillslots > MAX_SPILLS {
         return Err(Bail::TooLarge);
@@ -174,13 +176,8 @@ pub(crate) fn emit(
     if invalidable {
         em.dead_entry();
     }
+    let dispatch = em.dispatch_entry(window);
     em.level_tail_stub();
-    // Where dispatch enters: through `level_enter`, which returns to
-    // `level_land`, on to the entry block.
-    let dispatch = em.a.new_label();
-    em.a.bind(dispatch);
-    em.a.adr(X16, em.labels[0]);
-    em.a.b_far(addr!(abi::level_enter));
     // One stub per exit and the region's exit trampoline, which they share.
     let exit_region = em.a.new_label();
     for k in 0..em.exit_labels.len() {

@@ -27,7 +27,8 @@ fn aux_key(i: &Inst) -> u16 {
 /// A heap key's index among the versions: the heaps by their bit, then
 /// the frame slots, then the indexed fields' slots.
 const SLOT_KEYS: u32 = 16;
-const FIELD_KEYS: u32 = SLOT_KEYS + 256;
+// A frame's slots, and those of a call staged past them.
+const FIELD_KEYS: u32 = SLOT_KEYS + 256 + 16;
 
 /// A memory access as the number table keys it: its kind, field or slot,
 /// base and index, and for a store the value it leaves there. A load and

@@ -174,6 +174,32 @@ impl<'a> Em<'a> {
         }
     }
 
+    /// Where dispatch enters: through `level_enter`, which returns to
+    /// `level_land`, on to the entry block. The interpreter made sure of the
+    /// frame's window, not of a `window` past it (a metamethod's staged
+    /// call): `jit_window` grows the stack.
+    pub(super) fn dispatch_entry(&mut self, window: u16) -> Label {
+        let dispatch = self.a.new_label();
+        self.a.bind(dispatch);
+        if window == 0 {
+            self.a.adr(X16, self.labels[0]);
+            self.a.b_far(addr!(abi::level_enter));
+            return dispatch;
+        }
+        let check = self.a.new_label();
+        self.a.adr(X16, check);
+        self.a.b_far(addr!(abi::level_enter));
+        self.a.bind(check);
+        self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
+        self.window_end(window);
+        self.a.cmp(Sz::X, X17, X16);
+        self.a.b_cond(Cond::Ls, self.labels[0]);
+        self.a.ldr_label(INSN, self.region_word);
+        self.a.ldr_lit(X16, addr!(crate::jit::jit_window) as u64);
+        self.tail_level();
+        dispatch
+    }
+
     pub(super) fn resume_labels(&mut self) -> ResumeLabels {
         ResumeLabels {
             fast: self.a.new_label(),
@@ -197,8 +223,8 @@ impl<'a> Em<'a> {
     /// call is in the frame.
     pub(super) fn call(&mut self, i: usize, block: usize, next: Option<Label>) {
         let imm = self.v.insts[i].imm;
-        let (a, nargs, pc) = (imm & 0xff, imm >> 8 & 0xff, imm >> 32);
-        let hdr = a as i32 * 8;
+        let (hdr, nargs, pc) = (imm >> 24 & 0xff, imm >> 8 & 0xff, imm >> 32);
+        let hdr = hdr as i32 * 8;
         let (slow, native, deep) = (self.a.new_label(), self.a.new_label(), self.a.new_label());
         if nargs == 255 {
             // Up to `top`.
@@ -448,13 +474,13 @@ impl<'a> Em<'a> {
     /// `MOp::Resume`: where the call's returns land, and its results.
     pub(super) fn on_resume(&mut self, i: usize, block: usize) {
         let m = self.v.insts[i];
-        let (a, c) = (m.imm & 0xff, m.imm >> 16 & 0xff);
+        let (a, c, hdr) = (m.imm & 0xff, m.imm >> 16 & 0xff, m.imm >> 24 & 0xff);
         let Some(r) = self.resume[block] else {
             bug!("a resume outside a resume block")
         };
         // A fast callee returns here; its base is past the header.
         self.a.bind(r.fast);
-        self.a.sub_imm(Sz::X, BASE, BASE, a * 8 + 32);
+        self.a.sub_imm(Sz::X, BASE, BASE, hdr * 8 + 32);
         self.a.bind(r.based);
         if m.plain_resume() {
             return;

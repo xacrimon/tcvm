@@ -152,7 +152,7 @@ impl MInst {
     /// A `Resume` that reads at most the first result, in its register:
     /// not the result count or the values behind it.
     pub(crate) fn plain_resume(&self) -> bool {
-        self.imm >> 31 & 1 != 0 || self.imm >> 16 & 0xff == 1
+        self.imm >> 32 & 1 != 0 || self.imm >> 16 & 0xff == 1
     }
 }
 

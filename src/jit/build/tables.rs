@@ -43,14 +43,14 @@ impl<'gc> Builder<'_, 'gc> {
         self.e.load(f, base, k)
     }
 
-    fn guard(&mut self, c: Val, tag: ExitTag) {
+    pub(super) fn guard(&mut self, c: Val, tag: ExitTag) {
         let s = self.state();
         self.e
             .emit(Op::Guard, Rep::None, tag as u16, c.0, s.0, u32::MAX);
     }
 
     /// The lock of the table `v` is, checked to be one.
-    fn table(&mut self, v: Val) -> Val {
+    pub(super) fn table(&mut self, v: Val) -> Val {
         let s = self.state();
         self.e.check_type(v, TypeSet::TAB, ExitTag::Type, s)
     }

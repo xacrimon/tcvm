@@ -52,6 +52,12 @@ fields! {
     // A shape's class (null for none), and the class's metamethod bits.
     ShapeClass crate::env::Shape::MT_CACHE_OFFSET, Ptr ANY IMMUTABLE false;
     ClassBits crate::env::MtCache::BITS_OFFSET, I32 ANY META false;
+    // A class's metamethods besides `__index` and `__newindex` (null while
+    // it has none), and one of them by its bit's index.
+    ClassRest crate::env::MtCache::REST_OFFSET, Ptr ANY META false;
+    RestMm   crate::env::MtCache::REST_VALUES_OFFSET, Val ANY META true;
+    // A basic type's metatable (null for none), from its cell.
+    TypeMt   layout::NUMBER_MT, Ptr ANY META  false;
     // The frame's function, from the base: its closure under header flags.
     FrameFn  -32,              Val FUN FRAME     false;
     // The frame's flags (`vm::frame::flag`), from the base.

@@ -109,6 +109,17 @@ pub(crate) struct Built<'gc> {
     pub(crate) shapes: Vec<crate::env::Shape<'gc>>,
     pub(crate) deps: Vec<(DepOn<'gc>, u64)>,
     pub(crate) missing: Vec<Bc>,
+    /// The slots the frame needs where that is more than its prototype's
+    /// (a call staged past its registers), else 0.
+    pub(crate) window: u16,
+}
+
+/// Addresses in the runtime the code reads from.
+pub(crate) struct Links {
+    /// The arena's metrics, where the collector's counters are.
+    pub(crate) metrics: u64,
+    /// The cell of the numbers' metatable.
+    pub(crate) number_mt: u64,
 }
 
 struct Builder<'a, 'gc> {
@@ -131,9 +142,8 @@ struct Builder<'a, 'gc> {
     /// The shapes the code compares with, which the region keeps alive.
     shapes: Vec<crate::env::Shape<'gc>>,
     deps: Vec<(DepOn<'gc>, u64)>,
-    /// The address of the arena's metrics, where the collector's counters
-    /// are.
-    metrics: u64,
+    links: Links,
+    window: u16,
     /// The instructions compiled as a deopt for want of code.
     missing: Vec<Bc>,
 }
@@ -146,7 +156,7 @@ pub(crate) fn build<'gc>(
     cfg: &Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
-    metrics: u64,
+    links: Links,
 ) -> Built<'gc> {
     let nb = cfg.blocks.len();
     let root = cfg.block_of[entry_pc as usize];
@@ -165,7 +175,8 @@ pub(crate) fn build<'gc>(
         state: Val::NONE,
         shapes: Vec::new(),
         deps: Vec::new(),
-        metrics,
+        links,
+        window: 0,
         missing: Vec::new(),
     };
     if !b.find_loops(root, &rpo, &order) {
@@ -183,6 +194,7 @@ pub(crate) fn build<'gc>(
         shapes: b.shapes,
         deps: b.deps,
         missing: b.missing,
+        window: b.window,
     }
 }
 
@@ -297,7 +309,10 @@ impl<'gc> Builder<'_, 'gc> {
                         | Bc::CALL_R1
                         | Bc::CALLS
                         | Bc::CALLS_R0
-                        | Bc::CALLS_R1 => assigned.union(&self.cfg.captured),
+                        | Bc::CALLS_R1
+                        | Bc::ARITH_MM
+                        | Bc::ARITH_MM_R
+                        | Bc::ARITH_MMI => assigned.union(&self.cfg.captured),
                         _ => {}
                     }
                 }
@@ -326,7 +341,7 @@ impl<'gc> Builder<'_, 'gc> {
     /// Leave for the interpreter past its threshold, after the instruction
     /// at `pc`, which allocated: it collects.
     fn gc_check(&mut self, pc: u32) {
-        let metrics = self.e.k64(Rep::Ptr, self.metrics);
+        let metrics = self.e.k64(Rep::Ptr, self.links.metrics);
         let used = self.e.load(Field::GcUsed, metrics, 0);
         let limit = self.e.load(Field::GcLimit, metrics, 0);
         let below = self.e.cmp(Op::Cmp, Cc::Lo, used, limit);
@@ -664,6 +679,7 @@ impl<'gc> Builder<'_, 'gc> {
                 let v = self.helped(Helper::Concat, 0, &[x, y]);
                 self.set(a, v);
             }
+            ARITH_MM | ARITH_MM_R | ARITH_MMI => self.arith_mm(pc, i),
             NEWTABLE => self.newtable(pc, i),
             SETLIST => self.setlist(i),
             GETTABLE => self.gettable(pc, i),

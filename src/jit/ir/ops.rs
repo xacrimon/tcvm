@@ -516,9 +516,11 @@ ops! {
     Ret         Both No     (Imm Imm No)      None [SLOT] [] [TERMINATOR];
     // The Lua call protocol. The callee and its arguments are in its slots;
     // the state's values live on in the frame, and the collector clears the
-    // slots it does not name. `c`: the `CALL`'s `a`, argument count and `c`,
-    // a byte each. `Resume` is first in the call's successor: the first
-    // result when it has a value, else the results in their slots.
+    // slots it does not name. `c`, a byte each: where results land (the
+    // `CALL`'s `a`), the argument count, the `CALL`'s `c`, and the header's
+    // slot, which is the first but for a metamethod's call, staged past the
+    // frame's registers. `Resume` is first in the call's successor: the
+    // first result when it has a value, else the results in their slots.
     // Leave for the interpreter's handler of the instruction at pc `c`,
     // whose word is `a` (low) and `b`: what is live is in its slots.
     Dispatch    Both No     (Imm Imm Imm)     None [SLOT] [] [TERMINATOR];

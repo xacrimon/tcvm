@@ -271,9 +271,14 @@ pub(crate) fn compile<'gc>(
         shapes,
         deps,
         missing,
+        window,
     } = {
-        let metrics = crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64;
-        crate::jit::build::build(high, pool, &cfg, closure.proto, pc, metrics)
+        use crate::jit::layout::{METRICS, NUMBER_MT_SLOT, rt_read, type_mt_cell};
+        let links = crate::jit::build::Links {
+            metrics: rt_read(ctx, METRICS) as u64,
+            number_mt: rt_read(ctx, type_mt_cell(NUMBER_MT_SLOT)) as u64,
+        };
+        crate::jit::build::build(high, pool, &cfg, closure.proto, pc, links)
     };
     #[cfg(feature = "tcvm-dev")]
     for op in missing {
@@ -352,9 +357,10 @@ pub(crate) fn compile<'gc>(
         cfg.code[pc as usize].op() == crate::instruction::Op::FUNC && !closure.proto.is_vararg;
     let fast = enterable.then_some(crate::jit::backend::emit::FastEntry {
         num_params: closure.proto.num_params,
-        max_stack: closure.proto.max_stack_size as u16,
+        max_stack: window.max(closure.proto.max_stack_size as u16),
     });
-    let mut em = target::emit::emit(sel, out, rt, closure.code as u64, fast, !deps.is_empty())?;
+    let code = closure.code as u64;
+    let mut em = target::emit::emit(sel, out, rt, code, fast, !deps.is_empty(), window)?;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc.reserve(em.asm.max_len())?;
     let start = block.rx();
@@ -489,7 +495,7 @@ pub(crate) fn compile<'gc>(
             protos: Box::new([]),
             site_protos: Box::new([]),
             entry_pc: pc,
-            window: 0,
+            window,
             nest: nest.into_boxed_slice(),
             num_spills: em.num_spills,
             #[cfg(target_arch = "aarch64")]
