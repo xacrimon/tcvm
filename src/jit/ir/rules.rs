@@ -5,10 +5,12 @@
 //! recursion.
 
 use super::emit::Emitter;
-use super::ops::{Cc, Flags, Op};
+use super::ops::{Cc, ExitTag, Flags, Op};
 use super::types::{Rep, TypeSet};
 use super::{Inst, Val};
 use crate::env::value::{SMALL_INT, Value};
+use crate::instruction::ArithKind;
+use crate::jit::build::{SPEC_SHIFT, Spec};
 
 const NONE: u32 = u32::MAX;
 
@@ -253,10 +255,46 @@ impl Emitter {
             CheckType => {
                 let set = TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits());
                 let f = self.fact(a);
-                if f.pending() || !set.contains(f.set) {
+                if f.pending() {
                     return None;
                 }
-                Some(self.unboxed(a, set))
+                // Lowered, a fact a check gave is that check again: its
+                // pieces number to the first one's, guard and all.
+                let by_def = set.contains(self.g.facts[a.idx()].set);
+                if set.contains(f.set) && (by_def || !self.lowered) {
+                    return Some(self.unboxed(a, set));
+                }
+                if !self.lowered {
+                    return None;
+                }
+                // Today's aarch64 sequences, as values: a small integer's
+                // upper word is all ones, a float is below every box.
+                let cond = match i.rep {
+                    Rep::I32 => {
+                        let k = self.k64(Rep::I64, 32);
+                        let hi = self.op2(Shr, Rep::I64, a, k);
+                        let hi = self.op1(Trunc32, Rep::I32, hi);
+                        let ones = self.k32(Rep::I32, u32::MAX);
+                        self.cmp(Cmp, Cc::Eq, hi, ones)
+                    }
+                    Rep::F64 => {
+                        let k = self.k64(Rep::I64, crate::env::value::BOX);
+                        self.cmp(Cmp, Cc::Lo, a, k)
+                    }
+                    _ => {
+                        self.bail(crate::jit::compile::Bail::Unsupported("type test"));
+                        return Some(Val(0));
+                    }
+                };
+                let tag = i.aux >> TypeSet::BITS;
+                let checked = self.emit(Guard, Rep::Val, tag, cond.0, i.b, a.0);
+                // The guard's result is the value, typed by its definition.
+                self.g.facts[checked.idx()] = super::types::Fact::of(set);
+                self.refine(a, super::types::Fact::of(set));
+                Some(match i.rep {
+                    Rep::I32 => self.op1(Trunc32, Rep::I32, checked),
+                    _ => self.op1(UnboxF64, Rep::F64, checked),
+                })
             }
             IsType => {
                 let set = TypeSet::from_bits_retain(i.aux);
@@ -388,9 +426,64 @@ impl Emitter {
                     self.op1(FFloor, Rep::F64, q)
                 })
             }
+            Arith | Compare => {
+                // Once both operands' facts are final, each has a kind: its
+                // fact's, or the one the site speculates, which is checked.
+                if self.fact(a).pending() || self.fact(b).pending() {
+                    return None;
+                }
+                // Copy 1 goes by definitions alone, as the analysis that
+                // typed the parameters did.
+                let kind = |e: &Self, v: Val, k: usize| {
+                    let f = if e.lowered {
+                        e.g.facts[v.idx()]
+                    } else {
+                        e.fact(v)
+                    };
+                    Spec::by_fact(f).unwrap_or(Spec::of(i.aux >> SPEC_SHIFT[k]))
+                };
+                let (ka, kb) = (kind(self, a, 0), kind(self, b, 1));
+                let fs = c;
+                let low = i.aux & 15;
+                let float = i.op == Arith && low == ArithKind::Div as u16;
+                if ka == Spec::I32 && kb == Spec::I32 && !float {
+                    let x = self.check_type(a, TypeSet::SMALL, ExitTag::Type, fs);
+                    let y = self.check_type(b, TypeSet::SMALL, ExitTag::Type, fs);
+                    if i.op == Compare {
+                        return Some(self.emit(Cmp, Rep::B1, low, x.0, y.0, 0));
+                    }
+                    let op = match low {
+                        _ if low == ArithKind::Add as u16 => AddOvf,
+                        _ if low == ArithKind::Sub as u16 => SubOvf,
+                        _ => MulOvf,
+                    };
+                    let tag = ExitTag::Overflow as u16;
+                    let r = self.emit(op, Rep::I32, tag, x.0, y.0, fs.0);
+                    return Some(self.op1(BoxI32, Rep::Val, r));
+                }
+                let f64_of = |e: &mut Self, v: Val, k: Spec| {
+                    let x = e.check_type(v, k.set(), ExitTag::Type, fs);
+                    match k {
+                        Spec::I32 => e.op1(IToF, Rep::F64, x),
+                        Spec::F64 => x,
+                    }
+                };
+                let (x, y) = (f64_of(self, a, ka), f64_of(self, b, kb));
+                if i.op == Compare {
+                    return Some(self.emit(FCmp, Rep::B1, low, x.0, y.0, 0));
+                }
+                let op = match low {
+                    _ if low == ArithKind::Add as u16 => FAdd,
+                    _ if low == ArithKind::Sub as u16 => FSub,
+                    _ if low == ArithKind::Mul as u16 => FMul,
+                    _ => FDiv,
+                };
+                let r = self.op2(op, Rep::F64, x, y);
+                Some(self.op1(BoxF64, Rep::Val, r))
+            }
             K32 | K64 | KF64 | KObj | Load | Store | LoadIdx | StoreIdx | SlotLoad | SlotStore
             | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr | AbsOvf
-            | FMod | Arith | Unm | Compare | Truthy => None,
+            | FMod | Unm | Truthy => None,
         }
     }
 
@@ -398,7 +491,7 @@ impl Emitter {
     /// where the set has no one representation. Typed by its definition, the
     /// unboxed value is good wherever the value is; typed by a check, it is
     /// that check's result; typed by a branch, it is good from here on only.
-    fn unboxed(&mut self, v: Val, set: TypeSet) -> Val {
+    pub(crate) fn unboxed(&mut self, v: Val, set: TypeSet) -> Val {
         use Op::*;
         let rep = set.unboxed();
         let by_def = set.contains(self.g.facts[v.idx()].set);

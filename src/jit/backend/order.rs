@@ -1,238 +1,133 @@
 //! Block layout. `order` puts every dominator of a block before it and keeps
-//! each loop's blocks contiguous, which plain reverse postorder does not give
-//! (nothing stops it from placing a block outside a loop between two of the
-//! loop's blocks): each loop collapses to its header, the collapsed graph is
-//! laid out in reverse postorder, and each loop's own layout is spliced in
-//! where its header landed. VCode blocks are numbered by `order`.
+//! each loop's blocks contiguous, which the graph's own order does not
+//! promise (nothing stops a block outside a loop from standing between two
+//! of the loop's): the blocks are taken in the graph's order, each into its
+//! innermost loop's list, a loop into its parent's where its header stands,
+//! and the lists are flattened. Machine blocks are numbered by `order`.
 //!
 //! `emit` keeps `order` for the hot blocks and moves the blocks that end in a
-//! deopt (run at most once per entry), then the cold arms, after them, so loop
-//! bodies fall through. The allocator and the encoder both take `emit`: live
-//! ranges are intervals of it, and each loop's hot blocks are contiguous in
-//! it. The encoder also rotates hot loops so the back edge is a branch out of
-//! the loop inverted (`emit::rotate_loops`). Irreducible graphs never get here
-//! (`cfg.rs` refuses them).
+//! deopt (run at most once per entry), then the cold ones, after them, so
+//! loop bodies fall through. The allocator and the encoder both take `emit`:
+//! live ranges are intervals of it, and each loop's hot blocks are contiguous
+//! in it. The encoder also rotates hot loops (`emit::rotate_loops`).
 
 use crate::jit::ir::ops::Op;
-use crate::jit::ir::{Block, CfgInfo, Func};
+use crate::jit::ir::{Block, BlockFlags, Graph, Loop};
 
+#[derive(Default)]
 pub(crate) struct Layout {
     pub(crate) order: Vec<Block>,
+    /// A block's index in `order`, `u32::MAX` for one the graph never opened.
+    pub(crate) pos: Vec<u32>,
     /// The allocator's and the encoder's order, as indices into `order`.
     pub(crate) emit: Vec<u32>,
     /// How many of `emit` come before the first block ending in a deopt or
     /// cold.
     pub(crate) hot: usize,
-    /// Each loop as the first and last index of its blocks in `order` (its
-    /// header first), innermost loops first.
+    /// Each loop as the first and last index of its blocks in `order`, its
+    /// header first.
     pub(crate) loops: Vec<(u32, u32)>,
     /// Per block of `order`: the header of the innermost loop holding it
     /// (itself for a header), and for a header the enclosing loop's; as
     /// indices into `order`, `u32::MAX` for none.
     pub(crate) loop_of: Vec<u32>,
     pub(crate) loop_parent: Vec<u32>,
+    /// Each list's items, linked: a block, or a loop (`LOOP` set).
+    next: Vec<u32>,
+    items: Vec<u32>,
+    /// Per loop, then the top level: a list's first and last link.
+    lists: Vec<(u32, u32)>,
+    stack: Vec<u32>,
 }
 
-pub(crate) fn layout(f: &Func<'_>) -> Layout {
-    let cfg = f.cfg();
-    let n = f.blocks.len();
-    let mut rpo_num = vec![u32::MAX; n];
-    for (k, &b) in cfg.rpo.iter().enumerate() {
-        rpo_num[b.idx()] = k as u32;
-    }
-    // Natural loops, one per header, from the back edges into it.
-    let mut bodies: Vec<(Block, Vec<bool>)> = Vec::new();
-    for &b in &cfg.rpo {
-        for s in f.succs(b) {
-            if rpo_num[s.idx()] > rpo_num[b.idx()] || !cfg.dominates(s, b) {
-                continue;
-            }
-            let k = match bodies.iter().position(|(h, _)| *h == s) {
-                Some(k) => k,
-                None => {
-                    let mut body = vec![false; n];
-                    body[s.idx()] = true;
-                    bodies.push((s, body));
-                    bodies.len() - 1
-                }
-            };
-            let body = &mut bodies[k].1;
-            let mut work = vec![b];
-            while let Some(x) = work.pop() {
-                if !body[x.idx()] {
-                    body[x.idx()] = true;
-                    work.extend_from_slice(cfg.preds(x));
+const NONE: u32 = u32::MAX;
+const LOOP: u32 = 1 << 31;
+
+impl Layout {
+    pub(crate) fn of(&mut self, g: &Graph) {
+        let (nl, n) = (g.loops.len(), g.order.len());
+        self.items.clear();
+        self.next.clear();
+        self.lists.clear();
+        self.lists.resize(nl + 1, (NONE, NONE));
+        let push = |s: &mut Self, list: usize, item: u32| {
+            s.items.push(item);
+            s.next.push(NONE);
+            let at = s.items.len() as u32 - 1;
+            match s.lists[list] {
+                (NONE, _) => s.lists[list] = (at, at),
+                (first, last) => {
+                    s.next[last as usize] = at;
+                    s.lists[list] = (first, at);
                 }
             }
-        }
-    }
-    // The nesting forest: smallest bodies first give each block its
-    // innermost loop on the first write.
-    bodies.sort_by_key(|(_, body)| body.iter().filter(|&&x| x).count());
-    let mut loop_header: Vec<Option<Block>> = vec![None; n];
-    for (h, body) in &bodies {
-        for (x, &inside) in body.iter().enumerate() {
-            if inside && loop_header[x].is_none() {
-                loop_header[x] = Some(*h);
-            }
-        }
-    }
-    let mut loop_parent: Vec<Option<Block>> = vec![None; n];
-    for (i, (h, _)) in bodies.iter().enumerate() {
-        loop_parent[h.idx()] = bodies[i + 1..]
-            .iter()
-            .find(|(_, body)| body[h.idx()])
-            .map(|(p, _)| *p);
-    }
-    let lp = Loops {
-        cfg: &cfg,
-        rpo_num: &rpo_num,
-        loop_header: &loop_header,
-        loop_parent: &loop_parent,
-    };
-    let mut order = Vec::with_capacity(cfg.rpo.len());
-    lp.scope(f, None, f.entry, &mut order);
-    debug_assert_eq!(order.len(), cfg.rpo.len());
-    let rank = |b: Block| match f.terminator(b).map(|t| f.op(t)) {
-        Some(Op::Deopt) => 1,
-        _ if f.blocks[b.idx()].cold => 2,
-        _ => 0,
-    };
-    let mut emit: Vec<u32> = (0..order.len() as u32).collect();
-    emit.sort_by_key(|&k| rank(order[k as usize]));
-    let hot = emit
-        .iter()
-        .take_while(|&&k| rank(order[k as usize]) == 0)
-        .count();
-    let mut at = vec![0u32; n];
-    for (k, b) in order.iter().enumerate() {
-        at[b.idx()] = k as u32;
-    }
-    let loops = bodies
-        .iter()
-        .map(|(h, body)| {
-            let last = (body.iter().enumerate())
-                .filter(|&(_, &inside)| inside)
-                .map(|(x, _)| at[x])
-                .max()
-                .unwrap_or(at[h.idx()]);
-            (at[h.idx()], last)
-        })
-        .collect();
-    let index = |h: Option<Block>| h.map_or(u32::MAX, |h| at[h.idx()]);
-    let loop_of = order.iter().map(|b| index(loop_header[b.idx()])).collect();
-    let loop_parent = order.iter().map(|b| index(loop_parent[b.idx()])).collect();
-    Layout {
-        order,
-        emit,
-        hot,
-        loops,
-        loop_of,
-        loop_parent,
-    }
-}
-
-struct Loops<'a> {
-    cfg: &'a CfgInfo,
-    rpo_num: &'a [u32],
-    loop_header: &'a [Option<Block>],
-    loop_parent: &'a [Option<Block>],
-}
-
-impl Loops<'_> {
-    /// Whether `b` lies in loop `s` (or anywhere, for `None`).
-    fn inside(&self, b: Block, s: Option<Block>) -> bool {
-        let Some(s) = s else {
-            return self.rpo_num[b.idx()] != u32::MAX;
         };
-        let mut cur = self.loop_header[b.idx()];
-        while let Some(h) = cur {
-            if h == s {
-                return true;
+        let list_of = |l: Loop| if l.is_none() { nl } else { l.idx() };
+        for &b in &g.order {
+            let d = g.block(b);
+            if d.flags.contains(BlockFlags::LOOP_HEADER) {
+                push(self, list_of(g.loops[d.lp.idx()].parent), LOOP | d.lp.0);
             }
-            cur = self.loop_parent[h.idx()];
+            push(self, list_of(d.lp), b.0);
         }
-        false
-    }
-
-    /// What `b` collapses to in `scope`: the header of the outermost loop
-    /// strictly inside `scope` holding it, or `b`.
-    fn unit(&self, b: Block, scope: Option<Block>) -> Block {
-        let mut cur = self.loop_header[b.idx()];
-        let mut unit = b;
-        while let Some(h) = cur {
-            if Some(h) == scope {
-                break;
-            }
-            unit = h;
-            cur = self.loop_parent[h.idx()];
-        }
-        unit
-    }
-
-    /// Lay out a loop's body (or the whole region for `None`) entered at
-    /// `entry`, appending to `out`; recursion depth is loop depth.
-    fn scope(&self, f: &Func<'_>, scope: Option<Block>, entry: Block, out: &mut Vec<Block>) {
-        let mut units: Vec<Block> = Vec::new();
-        let mut succs: Vec<Vec<Block>> = Vec::new();
-        let mut index = vec![usize::MAX; self.loop_header.len()];
-        for &b in &self.cfg.rpo {
-            if !self.inside(b, scope) {
+        self.order.clear();
+        self.pos.clear();
+        self.pos.resize(g.blocks.len(), NONE);
+        self.loops.clear();
+        self.loops.resize(nl, (NONE, NONE));
+        // Depth first through the lists: a loop's own before what follows it.
+        self.stack.clear();
+        self.stack.push(self.lists[nl].0);
+        while let Some(at) = self.stack.pop() {
+            if at == NONE {
                 continue;
             }
-            let u = self.unit(b, scope);
-            if index[u.idx()] == usize::MAX {
-                index[u.idx()] = units.len();
-                units.push(u);
-                succs.push(Vec::new());
-            }
-        }
-        // Edges between units, leaving out those leaving the scope and the
-        // back edges into its header.
-        for &b in &self.cfg.rpo {
-            if !self.inside(b, scope) {
-                continue;
-            }
-            let u = self.unit(b, scope);
-            for s in f.succs(b) {
-                if !self.inside(s, scope) {
-                    continue;
-                }
-                let v = self.unit(s, scope);
-                let ss = &mut succs[index[u.idx()]];
-                if v != u && v != entry && !ss.contains(&v) {
-                    ss.push(v);
-                }
-            }
-        }
-        // Successors in RPO order, so the layout keeps RPO where the loops
-        // allow.
-        for ss in &mut succs {
-            ss.sort_by_key(|b| self.rpo_num[b.idx()]);
-        }
-        let root = self.unit(entry, scope);
-        let mut seen = vec![false; units.len()];
-        let mut post = Vec::with_capacity(units.len());
-        let mut stack = vec![(root, 0usize)];
-        seen[index[root.idx()]] = true;
-        while let Some((u, next)) = stack.pop() {
-            let ss = &succs[index[u.idx()]];
-            if next < ss.len() {
-                stack.push((u, next + 1));
-                let s = ss[next];
-                if !std::mem::replace(&mut seen[index[s.idx()]], true) {
-                    stack.push((s, 0));
-                }
+            self.stack.push(self.next[at as usize]);
+            let item = self.items[at as usize];
+            if item & LOOP != 0 {
+                self.stack.push(self.lists[(item & !LOOP) as usize].0);
             } else {
-                post.push(u);
+                self.pos[item as usize] = self.order.len() as u32;
+                self.order.push(Block(item));
             }
         }
-        for &u in post.iter().rev() {
-            if self.loop_header[u.idx()] == Some(u) && Some(u) != scope {
-                self.scope(f, Some(u), u, out);
+        self.loop_of.clear();
+        self.loop_of.resize(n, NONE);
+        self.loop_parent.clear();
+        self.loop_parent.resize(n, NONE);
+        let header = |s: &Self, l: Loop| {
+            if l.is_none() {
+                NONE
             } else {
-                out.push(u);
+                s.pos[g.loops[l.idx()].header.idx()]
             }
+        };
+        for k in 0..n {
+            let d = g.block(self.order[k]);
+            self.loop_of[k] = header(self, d.lp);
+            let mut l = d.lp;
+            while !l.is_none() {
+                let r = &mut self.loops[l.idx()];
+                *r = (r.0.min(k as u32), k as u32);
+                l = g.loops[l.idx()].parent;
+            }
+            if d.flags.contains(BlockFlags::LOOP_HEADER) {
+                self.loop_parent[k] = header(self, g.loops[d.lp.idx()].parent);
+            }
+        }
+        self.emit.clear();
+        let kind = |b: Block| {
+            if g.block(b).flags.contains(BlockFlags::COLD) {
+                2
+            } else {
+                (g.term(b).op == Op::Deopt) as u32
+            }
+        };
+        for pass in 0..3 {
+            if pass == 1 {
+                self.hot = self.emit.len();
+            }
+            (self.emit).extend((0..n as u32).filter(|&k| kind(self.order[k as usize]) == pass));
         }
     }
 }

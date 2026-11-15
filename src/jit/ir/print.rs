@@ -61,7 +61,7 @@ impl Graph {
         };
         match info.aux {
             Aux::No => {}
-            Aux::Cc => _ = write!(o, ".{}", Cc::of(i.aux).name()),
+            Aux::Cc => _ = write!(o, ".{}", Cc::of(i.aux & 15).name()),
             Aux::Set | Aux::SetTag => {
                 o.push('.');
                 TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits()).print(o);
@@ -72,8 +72,17 @@ impl Graph {
             Aux::Tag => tag(o, i.aux),
             Aux::Slot => _ = write!(o, " r{}", i.aux),
             Aux::Field => _ = write!(o, ".f{}", i.aux),
-            Aux::Kind => _ = write!(o, ".{}", KINDS[i.aux as usize]),
+            Aux::Kind => _ = write!(o, ".{}", KINDS[i.aux as usize & 15]),
             Aux::Exit => o.push_str(if i.aux == 0 { ".before" } else { ".after" }),
+        }
+        // A generic op's speculated operand kinds.
+        if matches!(i.op, Op::Arith | Op::Compare) {
+            for shift in crate::jit::build::SPEC_SHIFT {
+                o.push_str(match crate::jit::build::Spec::of(i.aux >> shift) {
+                    crate::jit::build::Spec::I32 => ".i",
+                    crate::jit::build::Spec::F64 => ".f",
+                });
+            }
         }
         match i.op {
             Op::K32 if i.rep == Rep::I32 => _ = write!(o, " {}", i.a as i32),

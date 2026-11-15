@@ -176,6 +176,7 @@ pub(crate) struct JitRuntime {
     code: RefCell<Option<std::rc::Rc<crate::jit::backend::alloc::CodeAllocator>>>,
     /// The register allocator, its buffers kept from compile to compile.
     pub(crate) ra: RefCell<crate::jit::backend::ra::Ctx>,
+    pub(crate) scratch: RefCell<crate::jit::compile::Scratch>,
     /// Compile failures from running out of code memory turn the JIT off.
     pub(crate) exhausted: Cell<bool>,
     /// Where handlers return in a level (`abi::level_return`).
@@ -221,6 +222,7 @@ impl JitRuntime {
             ra: RefCell::new(crate::jit::backend::ra::Ctx::new(
                 crate::jit::backend::target::abi::ra_env(),
             )),
+            scratch: RefCell::default(),
             exhausted: Cell::new(false),
             level_ret: crate::jit::backend::target::abi::level_return_addr(),
             level_land: crate::vm::stack::level_land(),

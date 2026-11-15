@@ -660,7 +660,7 @@ impl Cfg {
 
 /// RPO of the blocks reachable from `entry`, and each block's position in it
 /// (`usize::MAX` when unreachable).
-fn rpo_of(blocks: &[BcBlock], entry: u32) -> (Vec<u32>, Vec<usize>) {
+pub(crate) fn rpo_of(blocks: &[BcBlock], entry: u32) -> (Vec<u32>, Vec<usize>) {
     let n = blocks.len();
     let mut seen = vec![false; n];
     let mut post = Vec::new();

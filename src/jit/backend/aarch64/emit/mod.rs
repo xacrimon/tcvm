@@ -1,19 +1,20 @@
-//! Allocated `MInst`s to machine code: the native frame, the allocator's moves,
-//! every instruction's sequence, the exit stubs and the region's exit
-//! trampoline in the cold section.
+//! Allocated `MInst`s to machine code: the native frame, the allocator's
+//! moves, one instruction per `MInst`, the edges' move stubs, the dispatch
+//! entry, the exit stubs and the region's exit trampoline.
 
-use crate::jit::backend::aarch64::abi::{BASE, FRAME_SPILLS, MAX_SPILLS};
-use crate::jit::backend::aarch64::asm::{Asm, FP, Fpr, Gpr, LR, Label, SP, Sz, ZR};
-use crate::jit::backend::aarch64::inst::{ENTRY_FAIL, MInst};
-use crate::jit::backend::aarch64::types::test_words;
-use crate::jit::backend::emit::{
-    Emitted, FastEntry, Links, Origin, SiteOut, exit_out, rotate_loops, thread_jumps,
+use crate::env::value::NIL;
+use crate::jit::backend::aarch64::abi::{self, BASE, FRAME_SPILLS, INSN, MAX_SPILLS, PC, X16, X17};
+use crate::jit::backend::aarch64::asm::{
+    Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
 };
-use crate::jit::backend::lower::{Lowered, Tramp};
+use crate::jit::backend::aarch64::inst::{MInst, MOp};
+use crate::jit::backend::emit::{Emitted, ExitOut, Selected, Src};
 use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
 use crate::jit::backend::reg::{Allocation, Block, Inst, PReg, RegClass};
 use crate::jit::backend::vcode::{Remat, VCode};
-use crate::jit::ir::types::TypeSet;
+use crate::jit::bug;
+use crate::jit::compile::Bail;
+use crate::jit::region::{Loc, SnapEntry};
 
 /// The address of a routine the code branches to.
 macro_rules! addr {
@@ -22,163 +23,18 @@ macro_rules! addr {
     };
 }
 
-mod call;
-mod entry;
-mod inst;
-
-type OolPath<'a> = Box<dyn FnOnce(&mut Em<'a>) + 'a>;
-
-/// A resume block's labels.
-#[derive(Clone, Copy)]
-struct ResumeLabels {
-    /// Where a fast callee's `ret` lands.
-    fast: Label,
-    /// Its call's miss path (`miss_path`), which its site names
-    /// (`abi::call_miss`).
-    miss: Label,
-    /// Past the fast resume's `BASE`, which a native call keeps and a
-    /// level's return restores.
-    based: Label,
-    /// The landing of a level returning to its call, where its
-    /// `GuardLanding` runs out of line.
-    boxed: Option<Label>,
-}
-
-/// The labels the entries share with their stubs.
-struct Entries {
-    /// The fast entry, where the region has one.
-    fast: Option<Label>,
-    /// Its native stack check, past the arity check, where `fixup` comes
-    /// back with the missing arguments filled in.
-    budget: Label,
-    fixup: Label,
-    /// Its failed checks: on to the caller's slow path, from `param_miss`
-    /// with the parameters back in their slots.
-    fast_miss: Label,
-    param_miss: Label,
-    /// The entry guards, where dispatch enters.
-    guards: Label,
-}
-
 struct Em<'a> {
     a: Asm,
-    l: &'a Lowered,
     v: &'a VCode<MInst>,
     out: &'a Output,
     frame: u32,
     labels: Vec<Label>,
-    /// Where a branch to each block goes: a block that is only a deopt is
-    /// its exit (`thread_jumps`).
-    dest: Vec<Label>,
     exit_labels: Vec<Label>,
-    exit_region: Label,
-    entry_fail: Label,
-    links: Links,
-    /// The exits `TCVM_JIT_DEOPT_ALL` may take where first reached
-    /// (`LExit::forced`).
-    #[cfg(feature = "tcvm-dev")]
-    forced: Vec<bool>,
-    /// By block, for the resume blocks.
-    resume: Vec<ResumeLabels>,
     /// The code's first word, the region pointer (`Region::of_return`).
     region_word: Label,
-    /// For the asm dump: where each hot block starts (its IR block), and
-    /// where the hot ones end (`Emitted::hot`, `cold`).
-    #[cfg(feature = "tcvm-dev")]
-    hot_starts: Vec<(u32, Label)>,
-    #[cfg(feature = "tcvm-dev")]
-    cold: Label,
-    sites: Vec<SiteOut<Label>>,
-    /// This region's prototype and its known entries, when it has them:
-    /// arguments in slots, and in registers.
-    own_entry: Option<(u64, Label, Label)>,
-    /// The direct branches to known entries, by the callee's prototype.
-    direct: Vec<(Label, u64, Option<Label>)>,
-    lazy: Vec<(Label, Label)>,
-    /// Where self-calls whose arguments pass the entry guards enter (the
-    /// entry block, past the fast entry's tests), checking the window
-    /// themselves.
-    typed_entry: Option<Label>,
-    /// The window a fast entry checks: the frame's, or the region's past it
-    /// (`Lowered::window`).
-    own_window: u16,
-    /// A resume block whose `GuardLanding` follows its `Resume` (with the
-    /// call's header slot): its slow resume is bound out of line, unless a
-    /// move comes between.
-    pending_based: Option<(usize, u16)>,
-    landings: Vec<(Label, Label)>,
-    /// `tail_level`'s level path, shared (it rewrites typed return
-    /// addresses, all known only at the end).
-    level_tail: Label,
-    /// Code out of the way of the fast paths, emitted after the blocks: a
-    /// call's paths besides its fast one, so its callee returns into the
-    /// resume block.
-    ool: Vec<OolPath<'a>>,
-    /// Bit tests branch with `tbz`/`tbnz` (±32 KB), else `tst` and `b.cond`.
-    bit_branches: bool,
-    /// With `trace`: each code word's origin (`Emitted::origins`).
-    origins: Option<Vec<(u32, u32)>>,
-}
-
-/// The fast entry past its arity and native stack checks, for a caller that
-/// proved them.
-const KNOWN_ENTRY: usize = 24;
-
-/// A fast entry's known entry, from it: `KNOWN_ENTRY`, and for a call passing
-/// the parameters in registers past their loads from the slots, an instruction
-/// each.
-pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
-    KNOWN_ENTRY + if regs { 4 * nparams.min(8) as usize } else { 0 }
-}
-
-/// A trampoline: a C call of `target` that keeps x0-x15, d0-d7 and d16-d30 but
-/// the result's register and the caller's argument registers, behind a frame
-/// record that keeps the frame chain walkable; and its frame's size.
-pub(crate) fn trampoline(target: usize, kind: Tramp) -> (Asm, u32) {
-    let first = match kind {
-        Tramp::Int => 1,
-        Tramp::Float => 0,
-        Tramp::Args(n) => n,
-    };
-    let ints: Vec<Gpr> = (first..16u8).map(Gpr).collect();
-    let floats: Vec<Fpr> = (0..8u8)
-        .chain(16..31)
-        .filter(|&r| kind != Tramp::Float || r != 0)
-        .map(Fpr)
-        .collect();
-    let frame = (16 + 8 * (ints.len() + floats.len()) as u64).next_multiple_of(16);
-    let mut a = Asm::new();
-    a.sub_imm(Sz::X, SP, SP, frame);
-    a.stp(FP, LR, SP, 0);
-    a.mov_sp(FP, SP);
-    let save = |a: &mut Asm, load: bool| {
-        let mut off = 16;
-        for p in ints.chunks(2) {
-            match (p, load) {
-                ([x, y], false) => a.stp(*x, *y, SP, off),
-                ([x, y], true) => a.ldp(*x, *y, SP, off),
-                (_, false) => a.str(p[0], SP, off),
-                (_, true) => a.ldr(p[0], SP, off),
-            }
-            off += 8 * p.len() as i32;
-        }
-        for p in floats.chunks(2) {
-            match (p, load) {
-                ([x, y], false) => a.stp_d(*x, *y, SP, off),
-                ([x, y], true) => a.ldp_d(*x, *y, SP, off),
-                (_, false) => a.str_d(p[0], SP, off),
-                (_, true) => a.ldr_d(p[0], SP, off),
-            }
-            off += 8 * p.len() as i32;
-        }
-    };
-    save(&mut a, false);
-    a.bl_far(target);
-    save(&mut a, true);
-    a.ldp(FP, LR, SP, 0);
-    a.add_imm(Sz::X, SP, SP, frame);
-    a.ret();
-    (a, frame as u32)
+    /// The moves of the edges that do not fall through: where the stub is,
+    /// the branch and its edge, and where the stub goes on to.
+    stubs: Vec<(Label, usize, usize, Label)>,
 }
 
 fn gpr(p: PReg) -> Gpr {
@@ -196,285 +52,145 @@ fn spill_off(slot: usize) -> i32 {
     (FRAME_SPILLS + 8 * slot) as i32
 }
 
-pub(crate) fn emit(
-    l: &Lowered,
-    out: &Output,
-    links: Links,
-    fast: Option<FastEntry>,
-    trace: bool,
-) -> Result<Emitted, String> {
-    let e = emit_with(l, out, links.clone(), fast, trace, true)?;
-    if e.asm.short_branches_reach() {
-        return Ok(e);
-    }
-    // A region past `tbz`'s reach: bit tests as `tst` and `b.cond`.
-    emit_with(l, out, links, fast, trace, false)
-}
-
-fn emit_with(
-    l: &Lowered,
-    out: &Output,
-    links: Links,
-    fast: Option<FastEntry>,
-    trace: bool,
-    bit_branches: bool,
-) -> Result<Emitted, String> {
+pub(crate) fn emit(s: &Selected, out: &Output) -> Result<Emitted, Bail> {
     if out.num_spillslots > MAX_SPILLS {
-        return Err(format!("{} spill slots", out.num_spillslots));
+        return Err(Bail::TooLarge);
     }
-    let (mut em, skip) = Em::new(l, out, links, trace, bit_branches);
-    em.origin(Origin::Entry as u32);
+    let mut a = Asm::new();
+    let mut em = Em {
+        labels: (0..s.vcode.blocks.len()).map(|_| a.new_label()).collect(),
+        exit_labels: (0..s.exits.len()).map(|_| a.new_label()).collect(),
+        region_word: a.new_label(),
+        frame: ((FRAME_SPILLS + 8 * out.num_spillslots) as u32).next_multiple_of(16),
+        stubs: Vec::new(),
+        v: &s.vcode,
+        out,
+        a,
+    };
     em.a.bind(em.region_word);
     em.a.emit(0);
     em.a.emit(0);
-    let entries = em.entries(fast);
-    em.blocks(&skip)?;
-    // Each stub anew: an edge's moves inside one set the origin to theirs.
-    for f in std::mem::take(&mut em.ool) {
-        em.origin(Origin::OutOfLine as u32);
-        f(&mut em);
+    let order = &s.layout.emit;
+    for (at, &b) in order.iter().enumerate() {
+        let next = order.get(at + 1).map(|&x| em.labels[x as usize]);
+        em.a.bind(em.labels[b as usize]);
+        for ie in out.block_insts_and_edits(&s.vcode, Block::new(b as usize)) {
+            match ie {
+                InstOrEdit::Edit(e) => em.edit(e),
+                InstOrEdit::Inst(i) => em.inst(i.index(), b as usize, next),
+            }
+        }
     }
-    em.origin(Origin::Stubs as u32);
-    let dispatch = em.dispatch_entry(entries.guards);
-    em.exit_stubs();
-    em.entry_stubs(&entries, fast);
-    em.level_tail_stub();
+    for k in 0..em.stubs.len() {
+        let (stub, i, edge, to) = em.stubs[k];
+        em.a.bind(stub);
+        for (_, _, e) in out.edge_edits(Inst::new(i), edge) {
+            em.edit(e);
+        }
+        em.a.b(to);
+    }
+    // Where dispatch enters: through `level_enter`, which returns to
+    // `level_land`, on to the entry block.
+    let dispatch = em.a.new_label();
+    em.a.bind(dispatch);
+    em.a.adr(X16, em.labels[0]);
+    em.a.b_far(addr!(abi::level_enter));
+    // One stub per exit and the region's exit trampoline, which they share.
+    let exit_region = em.a.new_label();
+    for k in 0..em.exit_labels.len() {
+        em.a.bind(em.exit_labels[k]);
+        em.a.movz(Sz::W, X16, k as u16, 0);
+        em.a.b(exit_region);
+    }
+    em.a.align(8);
+    em.a.bind(exit_region);
+    em.a.ldr_label(X17, em.region_word);
+    em.a.orr_shift(Sz::X, X16, X17, X16, Shift::Lsl, 48);
+    em.a.b_far(addr!(abi::exit_common));
     let at = |l: Label| em.a.label_offset(l) as u32;
-    let pairs = |v: &[(Label, Label)]| v.iter().map(|&(x, y)| (at(x), at(y))).collect();
     Ok(Emitted {
         entry: at(dispatch),
-        fast: entries.fast.map(at),
         num_spills: out.num_spillslots as u32,
         frame_size: em.frame,
         region_word: at(em.region_word),
-        exits: l.exits.iter().map(|e| exit_out(l, out, e)).collect(),
-        sites: em.sites.into_iter().map(|s| s.placed(at)).collect(),
-        direct: (em.direct.iter().map(|&(l, p, s)| (at(l), p, s.map(at)))).collect(),
-        lazy: pairs(&em.lazy),
-        landings: pairs(&em.landings),
-        #[cfg(feature = "tcvm-dev")]
-        hot: em.hot_starts.iter().map(|&(b, l)| (b, at(l))).collect(),
-        #[cfg(feature = "tcvm-dev")]
-        cold: at(em.cold),
-        #[cfg(feature = "tcvm-dev")]
-        origins: em.origins.take().unwrap_or_default(),
+        exits: (0..s.exits.len()).map(|k| exit_out(s, out, k)).collect(),
         asm: em.a,
     })
 }
 
-impl<'a> Em<'a> {
-    /// The emitter with its labels made, and the blocks jump threading
-    /// leaves out.
-    fn new(
-        l: &'a Lowered,
-        out: &'a Output,
-        links: Links,
-        trace: bool,
-        bit_branches: bool,
-    ) -> (Em<'a>, Vec<bool>) {
-        let mut a = Asm::new();
-        let nb = l.vcode.blocks.len();
-        let labels: Vec<Label> = (0..nb).map(|_| a.new_label()).collect();
-        let exit_labels: Vec<Label> = (0..l.exits.len()).map(|_| a.new_label()).collect();
-        let entry_fail = a.new_label();
-        let exit_of = |exit: u32| {
-            if exit == ENTRY_FAIL {
-                entry_fail
-            } else {
-                exit_labels[exit as usize]
-            }
-        };
-        let (dest, skip, resume_to) = thread_jumps(l, out, &labels, exit_of);
-        let resume = (resume_to.iter())
-            .map(|to| ResumeLabels {
-                fast: a.new_label(),
-                miss: a.new_label(),
-                // Bound in its block, but where its returns go elsewhere
-                // (`thread_jumps`).
-                based: to.unwrap_or_else(|| a.new_label()),
-                boxed: None,
-            })
-            .collect();
-        let em = Em {
-            l,
-            v: &l.vcode,
-            out,
-            frame: ((FRAME_SPILLS + 8 * out.num_spillslots) as u32).next_multiple_of(16),
-            labels,
-            dest,
-            exit_labels,
-            exit_region: a.new_label(),
-            entry_fail,
-            links,
-            #[cfg(feature = "tcvm-dev")]
-            forced: l.exits.iter().map(|e| e.forced).collect(),
-            resume,
-            region_word: a.new_label(),
-            #[cfg(feature = "tcvm-dev")]
-            hot_starts: Vec::new(),
-            #[cfg(feature = "tcvm-dev")]
-            cold: a.new_label(),
-            sites: Vec::new(),
-            own_entry: None,
-            direct: Vec::new(),
-            lazy: Vec::new(),
-            typed_entry: None,
-            own_window: 0,
-            pending_based: None,
-            landings: Vec::new(),
-            level_tail: a.new_label(),
-            ool: Vec::new(),
-            bit_branches,
-            origins: trace.then(Vec::new),
-            a,
-        };
-        (em, skip)
-    }
-
-    /// The blocks but `skip`'s in layout order, hot loops rotated, each with
-    /// the allocator's moves; for the asm dump, where each hot block starts
-    /// and where the hot ones end (`hot_starts`, `cold`).
-    fn blocks(&mut self, skip: &[bool]) -> Result<(), String> {
-        let l = self.l;
-        let mut laid: Vec<usize> = (l.emit_order.iter())
-            .map(|&b| b as usize)
-            .filter(|&b| !skip[b])
-            .collect();
-        let mut hot = vec![false; l.vcode.blocks.len()];
-        for &b in &l.emit_order[..l.hot_blocks] {
-            hot[b as usize] = true;
-        }
-        let hot_laid = laid.iter().take_while(|&&b| hot[b]).count();
-        let tops = rotate_loops(l, &self.labels, &self.dest, &mut laid, hot_laid);
-        #[cfg(feature = "tcvm-dev")]
-        let mut cold_bound = false;
-        for (at, &b) in laid.iter().enumerate() {
-            #[cfg(feature = "tcvm-dev")]
-            if !cold_bound {
-                if hot[b] {
-                    self.hot_starts.push((l.ir_blocks[b], self.labels[b]));
-                } else {
-                    self.a.bind(self.cold);
-                    cold_bound = true;
+/// The runtime record of an exit: each entry's location after allocation.
+fn exit_out(s: &Selected, out: &Output, k: usize) -> ExitOut {
+    let e = &s.exits[k];
+    let allocs = out.inst_allocs(&s.vcode, Inst::new(e.inst as usize));
+    let mut consts = Vec::new();
+    let entries = s.entries[e.at as usize..(e.at + e.len) as usize]
+        .iter()
+        .map(|&(reg, rep, src)| {
+            let loc = match src {
+                Src::Const(w) => {
+                    consts.push(w);
+                    Loc::Const(consts.len() as u32 - 1)
                 }
-            }
-            let blk = &l.vcode.blocks[b];
-            // A rotated loop's top, past the jump into its header: padding
-            // there never runs (V8 aligns these too; 16 measured as well as 64).
-            if tops.contains(&b) && self.a.after_jump() {
-                self.a.align(16);
-            }
-            self.a.bind(self.labels[b]);
-            let insts = self.out.block_insts_and_edits(&l.vcode, Block::new(b));
-            for (k, ie) in insts.enumerate() {
-                match ie {
-                    // A fast callee's `ret` lands at the `Resume`, past anything
-                    // before it.
-                    InstOrEdit::Edit(_) if blk.resume && k == 0 => {
-                        return Err("a move before a call's resume".into());
-                    }
-                    InstOrEdit::Edit(e) => {
-                        if let Some((r, _)) = self.pending_based.take() {
-                            self.a.bind(self.resume[r].based);
-                        }
-                        self.edit(e);
-                    }
-                    InstOrEdit::Inst(i) => {
-                        let next = laid.get(at + 1).map(|&x| self.labels[x]);
-                        self.origin(i.index() as u32);
-                        self.inst(i.index(), b, next)?;
+                Src::Operand(k) => {
+                    let al = allocs[(e.own + k as u32) as usize];
+                    match (al.as_reg(), al.as_stack()) {
+                        (Some(p), _) => Loc::Reg(abi::image_index(p)),
+                        (_, Some(slot)) => Loc::Spill(slot.index() as u16),
+                        _ => bug!("a frame state's value without a location"),
                     }
                 }
-            }
-        }
-        #[cfg(feature = "tcvm-dev")]
-        if !cold_bound {
-            self.a.bind(self.cold);
-        }
-        Ok(())
+            };
+            SnapEntry { reg, rep, loc }
+        })
+        .collect();
+    ExitOut {
+        pc: e.pc,
+        kind: e.kind,
+        tag: e.tag,
+        entries,
+        consts,
     }
 }
 
 impl<'a> Em<'a> {
     fn allocs(&self, i: usize) -> &[Allocation] {
-        self.out
-            .inst_allocs(self.v, crate::jit::backend::reg::Inst::new(i))
-    }
-
-    /// The registers of instruction `i`'s words for a test of `set` whose
-    /// value is operand `k`, where it has them (`Test::Type`).
-    fn words(&self, i: usize, k: usize, set: TypeSet, has: bool) -> Vec<Gpr> {
-        if !has {
-            return Vec::new();
-        }
-        (0..test_words(set).len())
-            .map(|j| self.r(i, k + 1 + j))
-            .collect()
+        self.out.inst_allocs(self.v, Inst::new(i))
     }
 
     fn r(&self, i: usize, k: usize) -> Gpr {
-        gpr(self.allocs(i)[k].as_reg().expect("a register operand"))
+        match self.allocs(i)[k].as_reg() {
+            Some(p) => gpr(p),
+            None => bug!("operand {k} of instruction {i} is in no register"),
+        }
     }
 
     fn fr(&self, i: usize, k: usize) -> Fpr {
-        fpr(self.allocs(i)[k].as_reg().expect("a register operand"))
-    }
-
-    fn reg(&self, i: usize, k: usize) -> PReg {
-        self.allocs(i)[k].as_reg().expect("a register operand")
-    }
-
-    fn origin(&mut self, o: u32) {
-        if let Some(v) = &mut self.origins {
-            v.push((self.a.offset() as u32, o));
+        match self.allocs(i)[k].as_reg() {
+            Some(p) => fpr(p),
+            None => bug!("operand {k} of instruction {i} is in no register"),
         }
     }
 
     fn edit(&mut self, e: &Edit) {
         match *e {
-            Edit::Move { from, to } => {
-                self.origin(Origin::Move as u32);
-                self.mov(from, to)
-            }
-            Edit::Remat { to, vreg, src } => {
-                self.origin(Origin::Remat as u32);
-                self.remat(to, vreg.vreg(), src)
-            }
-        }
-    }
-
-    /// A branch's targets, with the allocator's moves on its edges: the
-    /// edge falling through has them in line after the branch (returned),
-    /// any other in a stub out of line that jumps on.
-    fn edge_labels(
-        &mut self,
-        i: usize,
-        block: usize,
-        next: Option<Label>,
-    ) -> ([Label; 2], &'a [(Inst, u8, Edit)]) {
-        let succs = self.v.succs(block);
-        let mut labels = [self.dest[succs[0].index()], self.dest[succs[1].index()]];
-        let mut inline: &'a [(Inst, u8, Edit)] = &[];
-        for (k, l) in labels.iter_mut().enumerate() {
-            let edits = self.out.edge_edits(Inst::new(i), k);
-            if edits.is_empty() {
-                continue;
-            }
-            if Some(*l) == next && inline.is_empty() {
-                inline = edits;
-                continue;
-            }
-            let (stub, to) = (self.a.new_label(), *l);
-            *l = stub;
-            self.ool.push(Box::new(move |em: &mut Em<'a>| {
-                em.a.bind(stub);
-                for (_, _, e) in edits {
-                    em.edit(e);
+            Edit::Move { from, to } => self.mov(from, to),
+            Edit::Remat { to, vreg, .. } => {
+                let Some(r) = to.as_reg() else {
+                    bug!("a value made again into no register")
+                };
+                match self.v.remat[vreg.vreg()] {
+                    Remat::Int(x) => self.a.mov_imm(gpr(r), x),
+                    // The transport register on the way to a stack slot
+                    // (`ra::resolve`): the word.
+                    Remat::Float(bits) if r.class() == RegClass::Int => {
+                        self.a.mov_imm(gpr(r), bits)
+                    }
+                    Remat::Float(bits) => self.fimm(fpr(r), bits),
+                    Remat::Slot(slot) => self.a.ldr(gpr(r), BASE, slot as i32 * 8),
+                    Remat::AndImm { .. } | Remat::None => bug!("{vreg:?} cannot be made again"),
                 }
-                em.a.b(to);
-            }));
+            }
         }
-        (labels, inline)
     }
 
     fn mov(&mut self, from: Allocation, to: Allocation) {
@@ -491,7 +207,7 @@ impl<'a> Em<'a> {
                 RegClass::Int => self.a.ldr(gpr(t), FP, spill_off(s.index())),
                 _ => self.a.ldr_d(fpr(t), FP, spill_off(s.index())),
             },
-            _ => panic!("stack-to-stack move"),
+            _ => bug!("a stack-to-stack move"),
         }
     }
 
@@ -505,50 +221,126 @@ impl<'a> Em<'a> {
         }
     }
 
-    /// A value computed again into `to` (`VCode::remat`).
-    fn remat(&mut self, to: Allocation, vreg: usize, src: Allocation) {
-        let r = to.as_reg().expect("a register to compute into");
-        match self.v.remat[vreg] {
-            Remat::Int(v) => self.a.mov_imm(gpr(r), v),
-            // The transport register on the way to a stack slot
-            // (`ra::resolve`): the word.
-            Remat::Float(bits) if r.class() == RegClass::Int => self.a.mov_imm(gpr(r), bits),
-            Remat::Float(bits) => self.fimm(fpr(r), bits),
-            Remat::Slot(slot) => self.word_at(false, r, BASE, slot as i32 * 8),
-            Remat::AndImm { src: sv, imm } => {
-                let s = match (src.as_reg(), src.as_stack(), self.v.remat[sv as usize]) {
-                    (Some(s), _, _) => gpr(s),
-                    (None, Some(slot), _) => {
-                        self.a.ldr(gpr(r), FP, spill_off(slot.index()));
-                        gpr(r)
-                    }
-                    (None, None, Remat::Slot(slot)) => {
-                        self.a.ldr(gpr(r), BASE, slot as i32 * 8);
-                        gpr(r)
-                    }
-                    _ => panic!("v{vreg} computed again from nowhere"),
-                };
-                self.a.and_imm(Sz::X, gpr(r), s, imm);
+    /// A branch's targets, with the allocator's moves on its edges: the
+    /// edge falling through has them in line after the branch (returned),
+    /// any other in a stub that jumps on.
+    fn edge_labels(
+        &mut self,
+        i: usize,
+        block: usize,
+        next: Option<Label>,
+    ) -> ([Label; 2], &'a [(Inst, u8, Edit)]) {
+        let succs = self.v.succs(block);
+        let mut labels = [self.labels[succs[0].index()], self.labels[succs[1].index()]];
+        let mut inline: &'a [(Inst, u8, Edit)] = &[];
+        for (k, l) in labels.iter_mut().enumerate() {
+            let edits = self.out.edge_edits(Inst::new(i), k);
+            if edits.is_empty() {
+                continue;
             }
-            Remat::None => panic!("v{vreg} is not rematerializable"),
+            if Some(*l) == next && inline.is_empty() {
+                inline = edits;
+                continue;
+            }
+            let stub = self.a.new_label();
+            self.stubs.push((stub, i, k, *l));
+            *l = stub;
         }
+        (labels, inline)
     }
 
-    fn open_frame(&mut self) {
-        self.a.sub_imm(Sz::X, SP, SP, self.frame as u64);
-        self.a.stp(FP, LR, SP, 0);
-        self.a.mov_sp(FP, SP);
-    }
-
-    fn close_frame(&mut self) {
-        self.a.ldp(FP, LR, SP, 0);
-        self.a.add_imm(Sz::X, SP, SP, self.frame as u64);
-    }
-
-    fn exit(&mut self, exit: u32) -> Label {
-        if exit == ENTRY_FAIL {
-            return self.entry_fail;
+    fn inst(&mut self, i: usize, block: usize, next: Option<Label>) {
+        let m = self.v.insts[i];
+        let (sz, imm) = (m.sz, m.imm);
+        // A value left for the allocator to make where used has no code.
+        let unmade = self.allocs(i).first().is_some_and(|a| a.is_none());
+        match m.op {
+            MOp::Entry => {
+                self.a.sub_imm(Sz::X, SP, SP, self.frame as u64);
+                self.a.stp(FP, LR, SP, 0);
+                self.a.mov_sp(FP, SP);
+            }
+            MOp::MovImm | MOp::FImm | MOp::LdrSlot if unmade => {}
+            MOp::MovImm => self.a.mov_imm(self.r(i, 0), imm),
+            MOp::FImm => self.fimm(self.fr(i, 0), imm),
+            MOp::LdrSlot => self.a.ldr(self.r(i, 0), BASE, imm as i32 * 8),
+            MOp::StrSlot => self.a.str(self.r(i, 0), BASE, imm as i32 * 8),
+            MOp::AddRR => self.a.add(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::SubRR => self.a.sub(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::MulRR => self.a.mul(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::AddImm => self.a.add_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::SubImm => self.a.sub_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::AddsRR => self.a.adds(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::SubsRR => self.a.subs(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::AddsImm => self.a.adds_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::SubsImm => self.a.subs_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::CmpRR => self.a.cmp(sz, self.r(i, 0), self.r(i, 1)),
+            MOp::CmpImm => self.a.cmp_imm(sz, self.r(i, 0), imm),
+            MOp::CmnImm => self.a.cmn_imm(sz, self.r(i, 0), imm),
+            MOp::CmpSxtw => self.a.cmp_ext(self.r(i, 0), self.r(i, 1), Extend::Sxtw),
+            MOp::Fcmp => self.a.fcmp(self.fr(i, 0), self.fr(i, 1)),
+            MOp::LslImm => self.a.lsl_imm(sz, self.r(i, 0), self.r(i, 1), imm as u32),
+            MOp::LsrImm => self.a.lsr_imm(sz, self.r(i, 0), self.r(i, 1), imm as u32),
+            MOp::AsrImm => self.a.asr_imm(sz, self.r(i, 0), self.r(i, 1), imm as u32),
+            MOp::Smull => self.a.smull(self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::OrrImm => self.a.orr_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::Scvtf => self.a.scvtf(sz, self.fr(i, 0), self.r(i, 1)),
+            MOp::FmovToGpr => self.a.fmov_to_gpr(self.r(i, 0), self.fr(i, 1)),
+            MOp::FmovFromGpr => self.a.fmov_from_gpr(self.fr(i, 0), self.r(i, 1)),
+            MOp::FAdd => self.a.fadd(self.fr(i, 0), self.fr(i, 1), self.fr(i, 2)),
+            MOp::FSub => self.a.fsub(self.fr(i, 0), self.fr(i, 1), self.fr(i, 2)),
+            MOp::FMul => self.a.fmul(self.fr(i, 0), self.fr(i, 1), self.fr(i, 2)),
+            MOp::FDiv => self.a.fdiv(self.fr(i, 0), self.fr(i, 1), self.fr(i, 2)),
+            MOp::B => {
+                let to = self.labels[self.v.succs(block)[0].index()];
+                if Some(to) != next {
+                    self.a.b(to);
+                }
+            }
+            MOp::BCond => {
+                // SAFETY: selection wrote an `asm::Cond`.
+                let cc: Cond = unsafe { std::mem::transmute(m.cc) };
+                let ([t, f], inline) = self.edge_labels(i, block, next);
+                // Unordered fails a float condition and holds its inverse,
+                // so the inverted branch takes it to `f` too.
+                if Some(f) == next {
+                    self.a.b_cond(cc, t);
+                } else {
+                    self.a.b_cond(cc.invert(), f);
+                    if Some(t) != next {
+                        self.a.b(t);
+                    }
+                }
+                for (_, _, e) in inline {
+                    self.edit(e);
+                }
+            }
+            MOp::BCondExit => {
+                // SAFETY: as above.
+                let cc: Cond = unsafe { std::mem::transmute(m.cc) };
+                self.a.b_cond(cc, self.exit_labels[imm as usize]);
+            }
+            MOp::BExit => self.a.b(self.exit_labels[imm as usize]),
+            MOp::Ret => {
+                // To a compiled caller, or to `level_land` for a frame
+                // dispatch entered; a tagged return address is a deep one's.
+                let (a, n) = (imm & 0xff, imm >> 8);
+                if n == 0 {
+                    self.a.mov_imm(Gpr(0), NIL);
+                } else {
+                    self.a.ldr(Gpr(0), BASE, a as i32 * 8);
+                }
+                self.a.ldp(FP, LR, SP, 0);
+                self.a.add_imm(Sz::X, SP, SP, self.frame as u64);
+                self.a.movz(Sz::X, INSN, n as u16, 0);
+                self.a.add_imm(Sz::X, PC, BASE, a * 8);
+                let deep = self.a.new_label();
+                self.a.tbnz(LR, 0, deep);
+                self.a.ret();
+                self.a.bind(deep);
+                self.a.and_imm(Sz::X, LR, LR, !1u64);
+                self.a.br(LR);
+            }
         }
-        self.exit_labels[exit as usize]
     }
 }

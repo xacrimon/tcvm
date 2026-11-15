@@ -123,6 +123,22 @@ impl<I: TargetInst> VCode<I> {
         }
     }
 
+    /// Empty it, keeping its storage.
+    pub(crate) fn clear(&mut self) {
+        self.insts.clear();
+        self.operands.clear();
+        self.ops.clear();
+        self.clobbers.clear();
+        self.blocks.clear();
+        self.bpool.clear();
+        self.rpool.clear();
+        self.args.clear();
+        self.vreg_classes.clear();
+        self.remat.clear();
+        self.loop_of.clear();
+        self.loop_parent.clear();
+    }
+
     pub(crate) fn new_vreg(&mut self, class: RegClass) -> VReg {
         let v = VReg::new(self.vreg_classes.len(), class);
         self.vreg_classes.push(class);

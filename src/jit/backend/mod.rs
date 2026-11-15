@@ -32,6 +32,8 @@
 // `emit/` and `types.rs`.
 pub(crate) mod alloc;
 pub(crate) mod code;
+pub(crate) mod emit;
+pub(crate) mod order;
 pub(crate) mod ra;
 pub(crate) mod reg;
 pub(crate) mod unwind;

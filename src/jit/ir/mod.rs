@@ -7,12 +7,14 @@
 //! high-level ops, copy 1 lowers them, and everything after sees low-level
 //! ops only.
 
+pub(crate) mod analyse;
+pub(crate) mod copy;
 pub(crate) mod emit;
 pub(crate) mod ops;
 #[cfg(feature = "tcvm-dev")]
 mod print;
 mod rules;
-mod table;
+pub(crate) mod table;
 #[cfg(test)]
 mod tests;
 pub(crate) mod types;
@@ -120,6 +122,9 @@ pub(crate) struct LoopData {
     pub(crate) parent: Loop,
     /// The heaps its body may write.
     pub(crate) writes: Heaps,
+    /// The frame state at its entry, before its header's first instruction:
+    /// where an exit moved in front of the loop leaves to.
+    pub(crate) entry_state: Val,
 }
 
 /// Everything is appended; a graph is recycled by `reset`.

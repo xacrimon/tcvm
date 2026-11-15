@@ -403,7 +403,7 @@ fn loop_parameters_and_frame_states() {
         let mut e = t.e();
         let (head, body, exit) = (e.new_block(), e.new_block(), e.new_block());
         e.jump(head);
-        let lp = e.new_loop(head, Loop::NONE, Heaps::empty());
+        let lp = e.new_loop(head, Loop::NONE, Heaps::empty(), t.fs);
         assert!(e.begin(head, lp, 1, BlockFlags::LOOP_HEADER));
         (head, body, exit, lp)
     };
@@ -450,8 +450,8 @@ b1: <- b0 b2 l0 header
 b2: <- b1 l0
   v8: val = boxi32 v5
   v9: val = slotload r0
-  v10 = framestate.before pc4 r0=*v9 r2=v8
-  v11 = framestate.after pc4 r0=*v9 r2=v8
+  v10 = framestate.before pc4 r0=*v9 r2=v5
+  v11 = framestate.after pc4 r0=*v9 r2=v5
   v12: i32 = k32 1
   v13: i32 = addovf!overflow v5 v12 v10
   v14 = jump b1

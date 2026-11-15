@@ -3,6 +3,8 @@ fn main() {
     cfg_aliases::cfg_aliases! {
         nightly: { feature = "nightly" },
         // The JIT enters and leaves interpreter handlers in their nightly-only ABI.
-        jit: { all(feature = "jit", nightly, any(target_arch = "aarch64", target_arch = "x86_64")) },
+        // aarch64 alone while the compiler is rebuilt: x86-64 selection and
+        // its encoder come back once the lowered IR is stable.
+        jit: { all(feature = "jit", nightly, target_arch = "aarch64") },
     }
 }

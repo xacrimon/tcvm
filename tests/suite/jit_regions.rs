@@ -4428,7 +4428,6 @@ fn loop_count_division_stays_behind_its_step_guard() {
 /// An unboxed constant a late fold left live across a call: the third
 /// program of #340, whose region failed to compile at these counts.
 #[test]
-#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn folded_constants_cross_calls_in_recompiles() {
     let src = r##"
     local function emit(s) io.write(s, "\n") end
@@ -4484,7 +4483,6 @@ fn folded_constants_cross_calls_in_recompiles() {
 /// The programs of #340, whose regions failed to compile at these counts: a
 /// pointer live across a call through chained parameters.
 #[test]
-#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn chained_pointer_parameters_cross_calls() {
     let src = r##"
     local function f(a, b, c)
@@ -4507,7 +4505,6 @@ fn chained_pointer_parameters_cross_calls() {
 
 /// Through a parameter that is a constant's pointer.
 #[test]
-#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn constant_pointer_parameters_cross_calls() {
     let src = r##"
     local function emit(s) io.write(s, "\n") end

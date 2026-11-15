@@ -95,11 +95,18 @@ impl Emitter {
         Block(self.g.blocks.len() as u32 - 1)
     }
 
-    pub(crate) fn new_loop(&mut self, header: Block, parent: Loop, writes: Heaps) -> Loop {
+    pub(crate) fn new_loop(
+        &mut self,
+        header: Block,
+        parent: Loop,
+        writes: Heaps,
+        entry_state: Val,
+    ) -> Loop {
         self.g.loops.push(LoopData {
             header,
             parent,
             writes,
+            entry_state,
         });
         Loop(self.g.loops.len() as u32 - 1)
     }
@@ -182,6 +189,27 @@ impl Emitter {
         true
     }
 
+    /// End the graph: a late predecessor that never came (its block left
+    /// some other way) goes from its block and the block's parameters.
+    pub(crate) fn finish(&mut self) {
+        let g = &mut self.g;
+        for k in 0..g.order.len() {
+            let d = &mut g.blocks[g.order[k].idx()];
+            let preds = &g.preds[d.preds as usize..(d.preds + d.npreds) as usize];
+            let came = preds.iter().take_while(|p| !p.is_none()).count() as u32;
+            if came == d.npreds {
+                continue;
+            }
+            d.npreds = came;
+            for i in &mut g.insts[d.start as usize..d.end as usize] {
+                if i.op != Op::Param {
+                    break;
+                }
+                i.b = came;
+            }
+        }
+    }
+
     /// A parameter of the open block, before its other instructions:
     /// `inputs` by forward predecessor, the late ones set as their edges are
     /// emitted (`next_pred`, `set_input`). Without `fact`, its fact is what
@@ -262,7 +290,7 @@ impl Emitter {
         }
     }
 
-    fn refine(&mut self, v: Val, with: Fact) {
+    pub(super) fn refine(&mut self, v: Val, with: Fact) {
         let was = self.fact(v);
         let f = was.meet(with);
         if f != was {
@@ -347,6 +375,9 @@ impl Emitter {
 
     /// Number and append, past the rules.
     pub(super) fn append(&mut self, i: Inst) -> Val {
+        if self.lowered && i.op.info().dialect == Dialect::H {
+            bug!("high-level {:?} in a low-level graph", i.op);
+        }
         let numbered = i.op.numbered();
         let mut slot = 0;
         if numbered {
@@ -432,9 +463,6 @@ impl Emitter {
         let info = i.op.info();
         if self.cur.is_none() {
             bug!("{:?} outside a block", i.op);
-        }
-        if self.lowered && info.dialect == Dialect::H {
-            bug!("high-level {:?} in a low-level graph", i.op);
         }
         for (k, w) in [&mut i.a, &mut i.b, &mut i.c].into_iter().enumerate() {
             if info.args[k] == Arg::No {
@@ -594,6 +622,13 @@ impl Emitter {
                 bug!("frame state entry r{reg} out of order or without a value");
             }
             last = Some(reg);
+            // An exit boxes by representation: the entry needs no box.
+            let d = self.g.inst(v);
+            let v = if matches!(d.op, Op::BoxI32 | Op::BoxF64) {
+                Val(d.a)
+            } else {
+                v
+            };
             self.g.extra.extend([r, v.0]);
         }
         let n = entries.len() as u32;
