@@ -7,6 +7,7 @@
 
 mod calls;
 pub(crate) mod cfg;
+mod iter;
 mod tables;
 
 use cfg::{Cfg, RegSet};
@@ -120,6 +121,10 @@ pub(crate) struct Links {
     pub(crate) metrics: u64,
     /// The cell of the numbers' metatable.
     pub(crate) number_mt: u64,
+    /// The values of the `next` that `pairs` returns and of `ipairs`'s
+    /// iterator.
+    pub(crate) next_fn: u64,
+    pub(crate) ipairs_iter: u64,
 }
 
 struct Builder<'a, 'gc> {
@@ -313,6 +318,11 @@ impl<'gc> Builder<'_, 'gc> {
                         | Bc::ARITH_MM
                         | Bc::ARITH_MM_R
                         | Bc::ARITH_MMI => assigned.union(&self.cfg.captured),
+                        // The iterator's call, and `next`'s position.
+                        Bc::TFORCALL | Bc::TFORCALL_NEXT | Bc::TFORCALL_IPAIRS => {
+                            assigned.union(&self.cfg.captured);
+                            assigned.insert(a + 3);
+                        }
                         _ => {}
                     }
                 }
@@ -680,6 +690,16 @@ impl<'gc> Builder<'_, 'gc> {
                 self.set(a, v);
             }
             ARITH_MM | ARITH_MM_R | ARITH_MMI => self.arith_mm(pc, i),
+            TFORPREP => self.tforprep(pc, i, jump.or(fall).unwrap()),
+            // With the `TFORLOOP` after it, as the interpreter takes them.
+            TFORCALL_NEXT => self.tforcall_next(i, fall.unwrap(), jump.unwrap()),
+            TFORCALL_IPAIRS => self.tforcall_ipairs(i, fall.unwrap(), jump.unwrap()),
+            TFORCALL => self.tforcall(pc, i),
+            TFORLOOP => {
+                let v = self.reg(a + crate::instruction::TFOR_VARS);
+                let end = self.e.is_nil(v);
+                self.br(end, fall.unwrap(), jump.unwrap());
+            }
             NEWTABLE => self.newtable(pc, i),
             SETLIST => self.setlist(i),
             GETTABLE => self.gettable(pc, i),

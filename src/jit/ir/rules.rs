@@ -388,7 +388,8 @@ impl Emitter {
             GetIndex | SetIndex => self.index(i),
             K32 | K64 | KF64 | KObj | Base | Load | Store | LoadIdx | StoreIdx | SlotLoad
             | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr
-            | AbsOvf | FMod | CallHelper | CallEntry | Resume | Dispatch => None,
+            | AbsOvf | FMod | CallHelper | CallEntry | Resume | Dispatch | ArrNext | NamedNext
+            | NamedKey | NamedVal | HashKeys => None,
             Truthy => self.truthy(a),
         }
     }

@@ -442,6 +442,17 @@ ops! {
     Store       Both Field  (Ptr Any Imm)     None [] [BY_FIELD] [];
     LoadIdx     Both Field  (Ptr I64 Opt)     Dyn  [BY_FIELD] [] [];
     StoreIdx    Both Field  (Ptr I64 Any)     None [] [BY_FIELD] [];
+    // A generic `for`'s steps over a table (its lock), each a declared
+    // sequence. `ArrNext`: the index of the first array slot at or after
+    // `b` that is not nil, or the array part's size. `NamedNext`: that of
+    // the first such named slot, the metatable's skipped, or -1. `NamedKey`
+    // and `NamedVal`: the key and the value of named slot `b`. `HashKeys`:
+    // the key counts of the hash parts in `b` (`HASH_*`) or'd.
+    ArrNext     Both No     (Ptr I32 No)      I32  [ARR_SIZE ARR_ITEMS] [] [];
+    NamedNext   Both No     (Ptr I32 No)      I32  [SHAPE FIELD] [] [];
+    NamedKey    Both No     (Ptr I32 No)      Val  [SHAPE] [] [];
+    NamedVal    Both No     (Ptr I32 No)      Val  [SHAPE FIELD] [] [];
+    HashKeys    Both No     (Ptr Imm No)      I64  [FIELD ARR_ITEMS] [] [];
     // The frame's base, which frame fields are loaded from.
     Base        Both No     (No No No)        Ptr  [] [] [];
     SlotLoad    Both Slot   (No No No)        Val  [SLOT] [] [];

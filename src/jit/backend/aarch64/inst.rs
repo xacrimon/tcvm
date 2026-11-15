@@ -13,6 +13,10 @@ pub(crate) enum Role {
     /// An integer register written, read.
     D,
     U,
+    /// One written while the operands are still read, and one the
+    /// instruction uses for itself.
+    De,
+    T,
     /// A float register written, read.
     Fd,
     Fu,
@@ -41,8 +45,8 @@ macro_rules! mops {
 mops! {
     // Opens the native frame.
     Entry     ();
-    // A Lua call, last in its block: `imm` is the `CALL`'s `a`, argument
-    // count and `c`, a byte each, and from bit 32 the pc after it. Its
+    // A Lua call, last in its block: `imm` is the `CallEntry`'s, and from
+    // bit 32 the pc after it. Its
     // operands are what the frame keeps across it, in stack slots.
     CallLua   ();
     // Leave for the interpreter's handler of an instruction: `imm` indexes
@@ -52,7 +56,7 @@ mops! {
     // `imm` its index.
     LazyExit  ();
     // Where the call's returns land, first in its block: `imm` as the
-    // call's, bit 31 where the first result is its operand, in x0.
+    // call's, bit 32 where the first result is its operand, in x0.
     Resume    ();
     // Values the allocator may make again where used: left without an
     // allocation they have no code.
@@ -68,6 +72,13 @@ mops! {
     // zero-extended (`uxtw`).
     LdrIdx    (D U U);
     StrIdx    (U U U);
+    // A generic `for`'s steps, as the IR's ops of these names: a table's
+    // lock, then an index. `HashKeys` takes its parts in `imm`.
+    ArrNext   (De U U T);
+    NamedNext (De U U T T T);
+    NamedKey  (D U U);
+    NamedVal  (D U U);
+    HashKeys  (D U);
     MovBase   (D);
     Uxtw      (D U);
     Cset      (D);

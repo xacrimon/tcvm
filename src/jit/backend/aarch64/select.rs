@@ -210,6 +210,8 @@ impl Sel<'_> {
         for (r, &v) in roles.iter().zip(regs) {
             self.s.ops.push(match r {
                 Role::D | Role::Fd => Operand::reg_def(v),
+                Role::De => Operand::reg_def_at_start(v),
+                Role::T => Operand::reg_temp(v),
                 Role::U | Role::Fu => Operand::reg_use(v),
             });
         }
@@ -561,6 +563,33 @@ impl Sel<'_> {
                     MOp::StrIdx
                 };
                 self.push(op, Sz::X, uxtw, 0, &[t, base, index]);
+            }
+            ArrNext | NamedNext => {
+                let Some(d) = self.def(v) else { return };
+                let (t, from) = (self.reg(a), self.reg(b));
+                let mut temp = || self.out.vcode.new_vreg(RegClass::Int);
+                if i.op == ArrNext {
+                    let regs = [d, t, from, temp()];
+                    self.op(MOp::ArrNext, Sz::X, 0, &regs);
+                } else {
+                    let regs = [d, t, from, temp(), temp(), temp()];
+                    self.op(MOp::NamedNext, Sz::X, 0, &regs);
+                }
+            }
+            NamedKey | NamedVal => {
+                let Some(d) = self.def(v) else { return };
+                let (t, k) = (self.reg(a), self.reg(b));
+                let op = if i.op == NamedKey {
+                    MOp::NamedKey
+                } else {
+                    MOp::NamedVal
+                };
+                self.op(op, Sz::X, 0, &[d, t, k]);
+            }
+            HashKeys => {
+                let Some(d) = self.def(v) else { return };
+                let t = self.reg(a);
+                self.op(MOp::HashKeys, Sz::X, i.b as u64, &[d, t]);
             }
             ZExt32 => {
                 let Some(d) = self.def(v) else { return };

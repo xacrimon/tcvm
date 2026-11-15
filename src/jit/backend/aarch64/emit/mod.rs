@@ -29,6 +29,7 @@ macro_rules! addr {
 }
 
 mod call;
+mod iter;
 
 struct Em<'a> {
     a: Asm,
@@ -383,6 +384,9 @@ impl<'a> Em<'a> {
                     MOp::LdrIdx => self.a.ldr_idx(t, n, x, ext, true),
                     _ => self.a.str_idx(t, n, x, ext, true),
                 }
+            }
+            MOp::ArrNext | MOp::NamedNext | MOp::NamedKey | MOp::NamedVal | MOp::HashKeys => {
+                self.step(i, m)
             }
             MOp::MovBase => self.a.mov(self.r(i, 0), BASE),
             MOp::Uxtw => self.a.mov_w(self.r(i, 0), self.r(i, 1)),

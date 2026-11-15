@@ -529,6 +529,7 @@ impl Emitter {
                 Fact::of(TypeSet::TAB)
             }
             (Op::BoxI32, _) => Fact::of(TypeSet::SMALL),
+            (Op::NamedKey, _) => Fact::of(TypeSet::STR),
             (Op::BoxF64, _) => Fact::of(TypeSet::FLOAT),
             (Op::BoxI64, _) => Fact::of(TypeSet::INT),
             (Op::Select, Rep::Val | Rep::Ptr) => of(i.b).join(of(i.c)),

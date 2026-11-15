@@ -277,6 +277,8 @@ pub(crate) fn compile<'gc>(
         let links = crate::jit::build::Links {
             metrics: rt_read(ctx, METRICS) as u64,
             number_mt: rt_read(ctx, type_mt_cell(NUMBER_MT_SLOT)) as u64,
+            next_fn: Value::function(ctx.next_fn()).to_raw(),
+            ipairs_iter: Value::function(ctx.ipairs_iter()).to_raw(),
         };
         crate::jit::build::build(high, pool, &cfg, closure.proto, pc, links)
     };
