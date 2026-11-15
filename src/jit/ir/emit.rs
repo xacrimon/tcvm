@@ -24,6 +24,12 @@ fn aux_key(i: &Inst) -> u16 {
     }
 }
 
+/// The ops whose rule makes blocks inside `emit`, each until the step that
+/// turns it into a rewrite (step 3). Nothing is added here: `emit` returns
+/// in the block it was called in, or with that block closed.
+#[cfg(feature = "tcvm-dev")]
+const RULES_MAKING_BLOCKS: [Op; 2] = [Op::GetIndex, Op::SetIndex];
+
 /// A heap key's index among the versions: the heaps by their bit, then
 /// the frame slots, then the indexed fields' slots.
 const SLOT_KEYS: u32 = 16;
@@ -425,10 +431,19 @@ impl Emitter {
             c,
         };
         self.check(&mut i);
-        if let Some(v) = self.rule(&mut i) {
-            return v;
+        #[cfg(feature = "tcvm-dev")]
+        let at = (self.cur, self.g.blocks.len());
+        let v = match self.rule(&mut i) {
+            Some(v) => v,
+            None => self.append(i),
+        };
+        #[cfg(feature = "tcvm-dev")]
+        if !RULES_MAKING_BLOCKS.contains(&op)
+            && (at.1 != self.g.blocks.len() || !(self.cur == at.0 || self.cur.is_none()))
+        {
+            bug!("the rule of {op:?} left {:?} for {:?}", at.0, self.cur);
         }
-        self.append(i)
+        v
     }
 
     /// Number and append, past the rules.

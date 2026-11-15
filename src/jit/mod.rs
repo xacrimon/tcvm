@@ -17,6 +17,8 @@ pub(crate) mod helpers;
 pub(crate) mod ir;
 #[cfg(jit)]
 pub(crate) mod layout;
+#[cfg(all(test, jit))]
+mod rails;
 #[cfg(jit)]
 pub(crate) mod region;
 #[cfg(jit)]
