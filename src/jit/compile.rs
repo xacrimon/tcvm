@@ -267,7 +267,13 @@ pub(crate) fn compile<'gc>(
     high.reset(false);
     let pool = &mut scratch.pool;
     pool.words.clear();
-    let shapes = crate::jit::build::build(high, pool, &cfg, closure.proto, pc);
+    let (shapes, missing) = crate::jit::build::build(high, pool, &cfg, closure.proto, pc);
+    #[cfg(feature = "tcvm-dev")]
+    for op in missing {
+        (ctx.runtime().stats).count(1, || format!("jit unsupported {}", op.name()));
+    }
+    #[cfg(not(feature = "tcvm-dev"))]
+    let _ = missing;
     high.finish();
     stage(config, closure, pc, "build", high);
     if let Some(why) = high.bail {
@@ -283,14 +289,11 @@ pub(crate) fn compile<'gc>(
     if let Some(why) = low.bail {
         return Err(why);
     }
-    // A region that only leaves does no work.
-    if low.g.loops.is_empty()
-        && !low
-            .g
-            .insts
-            .iter()
-            .any(|i| i.op == crate::jit::ir::ops::Op::Ret)
-    {
+    // A region that only leaves does no work: none of its loops comes
+    // around and nothing returns.
+    let around = |b: &crate::jit::ir::Block| low.g.block(*b).npreds > low.g.block(*b).nfwd;
+    let returns = (low.g.insts.iter()).any(|i| i.op == crate::jit::ir::ops::Op::Ret);
+    if !low.g.order.iter().any(around) && !returns {
         return Err(Bail::Useless);
     }
     mark!(1);

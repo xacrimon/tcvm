@@ -97,6 +97,8 @@ struct Builder<'a, 'gc> {
     state: Val,
     /// The shapes the code compares with, which the region keeps alive.
     shapes: Vec<crate::env::Shape<'gc>>,
+    /// The instructions compiled as a deopt for want of code.
+    missing: Vec<Bc>,
 }
 
 /// Build the region of `proto` entered at `entry_pc` into `e`, which was
@@ -107,7 +109,7 @@ pub(crate) fn build<'gc>(
     cfg: &Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
-) -> Vec<crate::env::Shape<'gc>> {
+) -> (Vec<crate::env::Shape<'gc>>, Vec<Bc>) {
     let nb = cfg.blocks.len();
     let root = cfg.block_of[entry_pc as usize];
     let (rpo, order) = cfg::rpo_of(&cfg.blocks, root);
@@ -124,6 +126,7 @@ pub(crate) fn build<'gc>(
         pc: entry_pc,
         state: Val::NONE,
         shapes: Vec::new(),
+        missing: Vec::new(),
     };
     // A captured register lives in its slot, which the closures holding it
     // read and write: registers here are values only.
@@ -139,7 +142,7 @@ pub(crate) fn build<'gc>(
         }
         b.block(bb, bb == root, entry_pc);
     }
-    b.shapes
+    (b.shapes, b.missing)
 }
 
 impl Builder<'_, '_> {
@@ -291,6 +294,9 @@ impl Builder<'_, '_> {
     }
 
     fn deopt(&mut self, tag: ExitTag) {
+        if tag == ExitTag::Unsupported {
+            self.missing.push(self.cfg.code[self.pc as usize].op());
+        }
         let s = self.state();
         self.e.emit(Op::Deopt, Rep::None, tag as u16, s.0, 0, 0);
     }
