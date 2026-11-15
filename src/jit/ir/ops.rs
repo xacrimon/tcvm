@@ -536,6 +536,12 @@ ops! {
     // whose word is `a` (low) and `b`: what is live is in its slots.
     Dispatch    Both No     (Imm Imm Imm)     None [SLOT] [] [TERMINATOR];
     CallEntry   Both No     (Fs Blk Imm)      None [ALL] [ALL] [CALLS TERMINATOR];
+    // Replace the frame by one of the Lua closure without varargs `a` (its
+    // lock), whose `b` arguments are in `R[0..]`: nothing of this frame is
+    // left to close. `FnFits`: whether such a closure's window fits the
+    // stack from this frame's base.
+    TailEnter   Both No     (Ptr Imm No)      None [SLOT] [] [TERMINATOR];
+    FnFits      Both No     (Ptr No No)       B1   [FRAME] [] [];
     // The call that ends the block is of a Lua closure without varargs
     // whose prototype's address is pool word `c`: these are its first
     // arguments, passed in registers. `Arg`: parameter `a` of a function

@@ -788,6 +788,15 @@ impl Sel<'_> {
                 self.pass(pos, 1, here, Block(i.c));
             }
             Ret => self.op(MOp::Ret, Sz::X, i.a as u64 | (i.b as u64) << 8, &[]),
+            TailEnter => {
+                let f = self.reg(a);
+                self.op(MOp::TailEnter, Sz::X, i.b as u64, &[f]);
+            }
+            FnFits => {
+                let Some(d) = self.def(v) else { return };
+                let f = self.reg(a);
+                self.op(MOp::FnFits, Sz::X, 0, &[d, f]);
+            }
             Dispatch => {
                 let word = i.a as u64 | (i.b as u64) << 32;
                 self.out.dispatches.push((word, i.c));

@@ -406,6 +406,16 @@ impl<'a> Em<'a> {
                 self.a.ldr(X16, X16, (word & 0xff) as i32 * 8);
                 self.tail_level();
             }
+            MOp::TailEnter => self.tail_enter(self.r(i, 0), imm),
+            MOp::FnFits => {
+                let (d, f) = (self.r(i, 0), self.r(i, 1));
+                self.a.ldrb(X16, f, crate::jit::layout::FN_MAX_STACK as i32);
+                self.a.add_shift(Sz::X, X16, BASE, X16, Shift::Lsl, 3);
+                self.a
+                    .ldr(X17, THREAD, crate::jit::layout::THREAD_STACK_END as i32);
+                self.a.cmp(Sz::X, X16, X17);
+                self.a.cset(Sz::W, d, Cond::Ls);
+            }
             MOp::Resume => self.on_resume(i, block),
             MOp::Entry => {
                 self.a.sub_imm(Sz::X, SP, SP, self.frame as u64);

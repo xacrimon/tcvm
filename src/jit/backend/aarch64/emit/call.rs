@@ -4,7 +4,7 @@
 
 use crate::env::value::{NIL, PAYLOAD_MASK as PTR_MASK};
 use crate::jit::backend::aarch64::abi::{self, BASE, CLOSURE, INSN, PC, RT, THREAD, X16, X17};
-use crate::jit::backend::aarch64::asm::{Asm, Cond, Gpr, LR, Label, SP, Shift, Sz, ZR};
+use crate::jit::backend::aarch64::asm::{Asm, Cond, Extend, FP, Gpr, LR, Label, SP, Shift, Sz, ZR};
 use crate::jit::backend::aarch64::emit::Em;
 use crate::jit::backend::emit::{FastEntry, SiteOut, Src};
 use crate::jit::bug;
@@ -200,6 +200,47 @@ impl<'a> Em<'a> {
         self.a.str(Gpr(9), BASE, -24);
         self.a.mov(X17, BASE);
         self.a.b_far(addr!(abi::jit_level));
+    }
+
+    /// `MOp::TailEnter`: the parameters left out nil, the closure `f` the
+    /// frame's, and the native frame popped; then the callee's fast entry,
+    /// which returns where this frame would have and misses to this frame's
+    /// caller, or its code in the interpreter.
+    pub(super) fn tail_enter(&mut self, f: Gpr, nargs: u64) {
+        self.a.mov(CLOSURE, f);
+        let (top, done) = (self.a.new_label(), self.a.new_label());
+        self.a.ldrb(X16, CLOSURE, layout::FN_NUM_PARAMS as i32);
+        self.a.movz(Sz::X, X17, nargs as u16, 0);
+        self.a.mov_imm(INSN, NIL);
+        self.a.bind(top);
+        self.a.cmp(Sz::X, X17, X16);
+        self.a.b_cond(Cond::Hs, done);
+        self.a.str_idx(INSN, BASE, X17, Extend::Lsl, true);
+        self.a.add_imm(Sz::X, X17, X17, 1);
+        self.a.b(top);
+        self.a.bind(done);
+        // The header keeps its flags: the frame's vararg count, so its
+        // results still land where its caller expects.
+        self.a.ldr(X16, BASE, -32);
+        self.a.and_imm(Sz::X, X16, X16, !PTR_MASK);
+        self.a.orr(Sz::X, X16, X16, CLOSURE);
+        self.a.str(X16, BASE, -32);
+        self.a.ldp(FP, LR, SP, 0);
+        self.a.add_imm(Sz::X, SP, SP, self.frame as u64);
+        let dispatch = self.a.new_label();
+        self.a.ldr(X16, CLOSURE, layout::FN_PROTO as i32);
+        self.a.ldr(X16, X16, layout::PROTO_FAST as i32);
+        self.a.cbz(Sz::X, X16, dispatch);
+        self.a.mov(INSN, X17);
+        self.a.br(X16);
+        self.a.bind(dispatch);
+        self.a.ldr(X16, CLOSURE, layout::FN_CODE as i32);
+        self.a.ldr(INSN, X16, 0);
+        self.a.add_imm(Sz::X, PC, X16, 8);
+        self.a.and_imm(Sz::X, X17, INSN, 0xff);
+        self.a.ldr_lit(X16, self.rt);
+        self.a.ldr_idx(X16, X16, X17, Extend::Lsl, true);
+        self.tail_level();
     }
 
     /// `x17 = BASE + 8 * slots`, the end of a window to check.

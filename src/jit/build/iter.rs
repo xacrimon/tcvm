@@ -17,14 +17,14 @@ use crate::vm::ops::control::TFOR_IPAIRS;
 impl Builder<'_, '_> {
     /// Branch on `c` and go on where it holds; the block for where it does
     /// not is returned, to `open` once this arm has ended.
-    fn arm(&mut self, c: Val) -> Block {
+    pub(super) fn arm(&mut self, c: Val) -> Block {
         let (yes, no) = (self.e.new_block(), self.e.new_block());
         self.e.br(c, yes, no);
         self.open(yes, false);
         no
     }
 
-    fn open(&mut self, b: Block, cold: bool) {
+    pub(super) fn open(&mut self, b: Block, cold: bool) {
         let flags = if cold {
             BlockFlags::COLD
         } else {

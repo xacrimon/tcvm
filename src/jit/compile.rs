@@ -309,7 +309,7 @@ pub(crate) fn compile<'gc>(
     let around = |b: &crate::jit::ir::Block| low.g.block(*b).npreds > low.g.block(*b).nfwd;
     let returns = (low.g.insts.iter()).any(|i| {
         use crate::jit::ir::ops::Op;
-        matches!(i.op, Op::Ret | Op::Dispatch | Op::CallEntry)
+        matches!(i.op, Op::Ret | Op::Dispatch | Op::CallEntry | Op::TailEnter)
     });
     if !low.g.order.iter().any(around) && !returns {
         return Err(Bail::Useless);

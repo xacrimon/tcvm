@@ -143,6 +143,10 @@ mops! {
     // The same through the helper's trampoline, which keeps every register
     // but the result's.
     CallCold  ();
+    // The frame replaced by the closure's, `imm` arguments in its slots;
+    // and whether the closure's window fits the stack, 1 or 0.
+    TailEnter (U);
+    FnFits    (D U);
     // Return `imm >> 8` results from `R[imm & 0xff..]`.
     Ret       ();
 }

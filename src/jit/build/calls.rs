@@ -99,6 +99,51 @@ impl<'gc> Builder<'_, 'gc> {
         self.lazy_exit(pc + 1);
     }
 
+    /// `TAILCALL a` with a static count: the interpreter's fast arm for a
+    /// Lua closure without varargs whose window fits, from a frame with
+    /// nothing to close; any other callee is the interpreter's, from the
+    /// slots.
+    pub(super) fn tailcall(&mut self, i: Instruction) {
+        use crate::vm::frame::flag::{HAS_OPEN, HAS_TBC};
+        let (a, nb) = (i.a(), i.b());
+        if nb == 0 {
+            return self.dispatch();
+        }
+        let f = self.reg(a);
+        // Read before the stores below overwrite their slots.
+        let args: Vec<Val> = (0..nb - 1).map(|k| self.reg(a + 4 + k)).collect();
+        let mut others = Vec::new();
+        let fun = (self.e).emit(Op::IsType, Rep::B1, TypeSet::FUN.bits(), f.0, 0, 0);
+        others.push(self.arm(fun));
+        let p = self.e.unboxed(f, TypeSet::FUN);
+        let kind = self.e.load(Field::FnKind, p, 0);
+        let zero = self.e.k32(Rep::I32, 0);
+        let fixed = self.e.cmp(Op::Cmp, Cc::Eq, kind, zero);
+        others.push(self.arm(fixed));
+        let flags = self.frame_flags(HAS_OPEN | HAS_TBC);
+        let none = self.e.k64(Rep::I64, 0);
+        let plain = self.e.cmp(Op::Cmp, Cc::Eq, flags, none);
+        others.push(self.arm(plain));
+        let fits = self.e.emit(Op::FnFits, Rep::B1, 0, p.0, 0, 0);
+        others.push(self.arm(fits));
+        for (k, v) in args.iter().enumerate() {
+            self.e.emit(Op::SlotStore, Rep::None, k as u16, v.0, 0, 0);
+        }
+        (self.e).emit(Op::TailEnter, Rep::None, 0, p.0, nb as u32 - 1, 0);
+        let slow = self.e.new_block();
+        for o in others {
+            if self.e.begin(o, self.ir_loop(self.bb), 0, BlockFlags::COLD) {
+                self.e.jump(slow);
+            }
+        }
+        if self
+            .e
+            .begin(slow, self.ir_loop(self.bb), 0, BlockFlags::COLD)
+        {
+            self.dispatch();
+        }
+    }
+
     /// `callee` as the call at `pc` may take it, and its prototype where it
     /// is a Lua closure without varargs: a constant; else the one function
     /// the site called, guarded by identity, or by its prototype where that

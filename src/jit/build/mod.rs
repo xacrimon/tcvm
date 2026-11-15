@@ -963,9 +963,7 @@ impl<'gc> Builder<'_, 'gc> {
                     SELF => self.self_(i),
                     CLOSURE => self.closure_new(pc, i),
                     CLOSE => self.close(i),
-                    // The interpreter's, until the frame can be replaced
-                    // in compiled code.
-                    TAILCALL => self.dispatch(),
+                    TAILCALL => self.tailcall(i),
                     SETFIELD | SETTABUP | SETTABUP_REF => self.setfield(i),
                     _ if matches!(
                         i.op(),
