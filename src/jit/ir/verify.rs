@@ -1,48 +1,44 @@
-//! Structural checks of a `Func`: SSA dominance of every use (operands, edge
-//! arguments, snapshot entries), terminators, edge arity, snapshots on every
-//! exiting instruction, and that nothing but constants lives across a call.
+//! The development verifier: what a finished graph must satisfy, checked
+//! from the graph alone. The dominators here are computed afresh, not read
+//! from what the emitter kept as it went.
 
-use crate::jit::ir::{Block, CfgInfo, Func};
-#[cfg(feature = "tcvm-dev")]
-use crate::jit::ir::{Inst, NO_SNAP, Val, ValDef};
+use super::ops::{Arg, Dialect, Flags, Op};
+use super::types::Rep;
+use super::{Block, BlockFlags, Graph, Val};
 
-/// Dominators by the Cooper-Harvey-Kennedy iteration over an RPO.
-pub(crate) fn dominators(f: &Func<'_>, cfg: &CfgInfo) -> Vec<Option<Block>> {
-    let rpo = &cfg.rpo;
-    let n = f.blocks.len();
-    let mut order = vec![usize::MAX; n];
-    for (i, b) in rpo.iter().enumerate() {
-        order[b.idx()] = i;
-    }
-    let mut idom: Vec<Option<Block>> = vec![None; n];
-    idom[f.entry.idx()] = Some(f.entry);
+/// Immediate dominators over every edge (Cooper, Harvey, Kennedy), by a
+/// block's position in `g.order`.
+fn dominators(g: &Graph, pos: &[u32]) -> Vec<u32> {
+    let n = g.order.len();
+    let mut idom = vec![u32::MAX; n];
+    idom[0] = 0;
     let mut changed = true;
     while changed {
         changed = false;
-        for &b in rpo.iter().skip(1) {
-            let mut new: Option<Block> = None;
-            for &p in cfg.preds(b) {
-                if idom[p.idx()].is_none() {
+        for k in 1..n {
+            let mut new = u32::MAX;
+            for p in g.preds(g.order[k]) {
+                let mut p = pos[p.idx()];
+                if idom[p as usize] == u32::MAX {
                     continue;
                 }
-                new = Some(match new {
-                    None => p,
-                    Some(mut a) => {
-                        let mut c = p;
-                        while a != c {
-                            while order[a.idx()] > order[c.idx()] {
-                                a = idom[a.idx()].unwrap();
-                            }
-                            while order[c.idx()] > order[a.idx()] {
-                                c = idom[c.idx()].unwrap();
-                            }
+                if new != u32::MAX {
+                    // A late predecessor comes later in the order, so depth
+                    // is not position: walk by known dominators' positions.
+                    let mut q = new;
+                    while p != q {
+                        while p > q {
+                            p = idom[p as usize];
                         }
-                        a
+                        while q > p {
+                            q = idom[q as usize];
+                        }
                     }
-                });
+                }
+                new = p;
             }
-            if new.is_some() && idom[b.idx()] != new {
-                idom[b.idx()] = new;
+            if new != idom[k] {
+                idom[k] = new;
                 changed = true;
             }
         }
@@ -50,389 +46,149 @@ pub(crate) fn dominators(f: &Func<'_>, cfg: &CfgInfo) -> Vec<Option<Block>> {
     idom
 }
 
-/// The walk up the dominator tree `CfgInfo::dominates` answers by numbers,
-/// kept for the verifier to check with.
-#[cfg(feature = "tcvm-dev")]
-fn dominates(idom: &[Option<Block>], a: Block, mut b: Block) -> bool {
-    loop {
-        if a == b {
-            return true;
-        }
-        match idom[b.idx()] {
-            Some(p) if p != b => b = p,
-            _ => return false,
-        }
-    }
-}
-
-#[cfg(feature = "tcvm-dev")]
-pub(crate) fn verify(f: &Func<'_>) -> Result<(), String> {
-    let cfg = f.cfg();
-    let rpo = &cfg.rpo;
-    let idom = &cfg.idom;
-    let mut pos = vec![(Block(u32::MAX), usize::MAX); f.insts.len()];
-    for &b in rpo {
-        for (k, &i) in f.insts_of(b).iter().enumerate() {
-            pos[i.idx()] = (b, k);
-        }
-    }
-    let def_pos = |v: Val| -> Option<(Block, usize)> {
-        match f.vals[v.idx()].def {
-            ValDef::Inst(i, _) => {
-                let p = pos[i.idx()];
-                (p.1 != usize::MAX).then_some(p)
-            }
-            ValDef::Param(b, _) => Some((b, 0)),
-        }
+pub(crate) fn verify(g: &Graph, lowered: bool) -> Result<(), String> {
+    let Some(&entry) = g.order.first() else {
+        return Err("no blocks".into());
     };
-    let is_param = |v: Val| matches!(f.vals[v.idx()].def, ValDef::Param(..));
-    let check_use = |v: Val, b: Block, k: usize, what: &str, i: Inst| -> Result<(), String> {
-        let Some((db, dk)) = def_pos(v) else {
+    if g.facts.len() != g.insts.len() {
+        return Err("facts and instructions differ in number".into());
+    }
+    // Blocks: contiguous in order, parameters first, one terminator, last.
+    let mut pos = vec![u32::MAX; g.blocks.len()];
+    let mut block_of = vec![Block::NONE; g.insts.len()];
+    let mut at = 0;
+    for (k, &b) in g.order.iter().enumerate() {
+        let d = g.block(b);
+        if !d.flags.contains(BlockFlags::SEALED) || d.start != at || d.end <= d.start {
+            return Err(format!("b{} is open, empty or out of place", b.0));
+        }
+        pos[b.idx()] = k as u32;
+        let mut body = false;
+        for v in d.start..d.end {
+            block_of[v as usize] = b;
+            let op = g.insts[v as usize].op;
+            if op.has(Flags::TERMINATOR) != (v + 1 == d.end) {
+                return Err(format!(
+                    "v{v}: a terminator inside b{}, or none at its end",
+                    b.0
+                ));
+            }
+            if op == Op::Param && body {
+                return Err(format!("v{v}: a parameter after other instructions"));
+            }
+            body |= op != Op::Param;
+        }
+        at = d.end;
+    }
+    if at as usize != g.insts.len() {
+        return Err("instructions past the last block".into());
+    }
+    // Edges: a block's predecessors are exactly the blocks that branch to
+    // it, forward ones first.
+    let mut edges = 0i64;
+    for &b in &g.order {
+        let d = g.block(b);
+        if b != entry && d.npreds == 0 {
+            return Err(format!("b{} has no predecessor", b.0));
+        }
+        for (k, &p) in g.preds(b).iter().enumerate() {
+            if p.is_none() || pos[p.idx()] == u32::MAX {
+                return Err(format!("b{}: predecessor {k} never came", b.0));
+            }
+            let forward = pos[p.idx()] < pos[b.idx()];
+            if forward != (k < d.nfwd as usize) {
+                return Err(format!("b{}: predecessor b{} on the wrong side", b.0, p.0));
+            }
+            let (succs, n) = g.succs(g.term(p));
+            let to = succs[..n].iter().filter(|&&s| s == b).count();
+            let from = g.preds(b).iter().filter(|&&q| q == p).count();
+            if to != from {
+                return Err(format!("b{} and b{} disagree on their edges", p.0, b.0));
+            }
+        }
+        edges += d.npreds as i64 - g.succs(g.term(b)).1 as i64;
+        let header = d.flags.contains(BlockFlags::LOOP_HEADER);
+        if header && (d.lp.is_none() || g.loops[d.lp.idx()].header != b) {
+            return Err(format!("b{} heads no loop", b.0));
+        }
+    }
+    if edges != 0 {
+        return Err("an edge into a block that was never opened".into());
+    }
+    let idom = dominators(g, &pos);
+    for (k, &b) in g.order.iter().enumerate() {
+        let want = g.order[idom[k] as usize];
+        if g.block(b).idom != want {
             return Err(format!(
-                "v{} used by {what} of i{} in b{} has no placed definition",
-                v.0, i.0, b.0
-            ));
-        };
-        let ok = if db == b {
-            is_param(v) || dk < k
-        } else {
-            dominates(idom, db, b)
-        };
-        if !ok {
-            return Err(format!(
-                "v{} used by {what} of i{} in b{} does not dominate it",
-                v.0, i.0, b.0
+                "b{}: dominator b{} kept, b{} found",
+                b.0,
+                g.block(b).idom.0,
+                want.0
             ));
         }
-        Ok(())
+    }
+    let dominates = |a: Block, b: Block| {
+        let (a, mut b) = (pos[a.idx()], pos[b.idx()]);
+        while b > a {
+            b = idom[b as usize];
+        }
+        a == b
     };
-    for &b in rpo {
-        let insts = f.insts_of(b);
-        let Some(&last) = insts.last() else {
-            return Err(format!("b{} is empty", b.0));
-        };
-        if !f.op(last).is_terminator() {
-            return Err(format!("b{} does not end in a terminator", b.0));
+    // Instructions: their form, and each use dominated by its definition.
+    for v in 0..g.insts.len() as u32 {
+        let i = &g.insts[v as usize];
+        let b = block_of[v as usize];
+        let info = i.op.info();
+        if lowered && info.dialect == Dialect::H {
+            return Err(format!("v{v}: high-level {:?} in a low-level graph", i.op));
         }
-        for (k, &i) in insts.iter().enumerate() {
-            let d = &f.insts[i.idx()];
-            if d.op.is_terminator() && k + 1 != insts.len() {
-                return Err(format!("terminator i{} in the middle of b{}", i.0, b.0));
-            }
-            if d.block != b {
-                return Err(format!(
-                    "i{} records b{} but sits in b{}",
-                    i.0, d.block.0, b.0
-                ));
-            }
-            for &a in f.args(i) {
-                check_use(a, b, k, "operand", i)?;
-            }
-            check_reps(f, i)?;
-            if d.op.may_deopt() && d.snap == NO_SNAP {
-                return Err(format!(
-                    "exiting i{} ({}) has no snapshot",
-                    i.0,
-                    d.op.name()
-                ));
-            }
-            for &(_, v) in f.snap_entries(i) {
-                check_use(v, b, k, "snapshot", i)?;
-            }
-            for &(_, v) in f.blame_entries(i) {
-                check_use(v, b, k, "blame", i)?;
-            }
-            if d.blame != NO_SNAP && d.snap == NO_SNAP {
-                return Err(format!("i{} has a blame but no snapshot", i.0));
-            }
-            for e in f.edges(i) {
-                let tb = &f.blocks[e.target.idx()];
-                if tb.dead {
-                    return Err(format!("edge from b{} to dead b{}", b.0, e.target.0));
+        if let Err(what) = g.form(i) {
+            return Err(format!("v{v}: {:?} breaks its form: {what}", i.op));
+        }
+        match i.op {
+            Op::Param => {
+                let preds = g.preds(b);
+                if i.b as usize != preds.len() {
+                    return Err(format!("v{v}: an input per predecessor"));
                 }
-                if e.args.len() != tb.params.len() {
-                    return Err(format!(
-                        "edge b{} -> b{} passes {} args for {} params",
-                        b.0,
-                        e.target.0,
-                        e.args.len(),
-                        tb.params.len()
-                    ));
-                }
-                for &a in f.vl(e.args) {
-                    check_use(a, b, k + 1, "edge argument", i)?;
-                }
-            }
-        }
-    }
-    check_r6(f, rpo, &pos)?;
-    Ok(())
-}
-
-/// The builder's checkpoints (`Builder::snap_before`), on its IR before any
-/// pass: an exit blamed on a later instruction than its snapshot's runs
-/// with no side effect since the checkpoint started, on every path.
-#[cfg(feature = "tcvm-dev")]
-pub(crate) fn checkpoints(f: &Func<'_>) -> Result<(), String> {
-    let cfg = f.cfg();
-    // The checkpoints live at each block's end; `None` before it is reached.
-    let mut out: Vec<Option<Vec<u32>>> = vec![None; f.blocks.len()];
-    let walk = |b: Block, out: &[Option<Vec<u32>>], check: bool| -> Result<Vec<u32>, String> {
-        let start = |live: &mut Vec<u32>, at: Option<Inst>| {
-            live.extend(
-                f.ckpts
-                    .iter()
-                    .filter(|c| c.1 == b && c.2 == at)
-                    .map(|c| c.0),
-            );
-        };
-        let mut live: Option<Vec<u32>> = None;
-        for o in cfg.preds(b).iter().filter_map(|p| out[p.idx()].as_ref()) {
-            match &mut live {
-                Some(l) => l.retain(|s| o.contains(s)),
-                None => live = Some(o.clone()),
-            }
-        }
-        let mut live = live.unwrap_or_default();
-        start(&mut live, None);
-        for &i in f.insts_of(b) {
-            let d = &f.insts[i.idx()];
-            if check && d.blame != NO_SNAP && !live.contains(&d.snap) {
-                return Err(format!(
-                    "i{} ({}) takes checkpoint s{} past a side effect",
-                    i.0,
-                    d.op.name(),
-                    d.snap
-                ));
-            }
-            if d.op.side_effect() {
-                live.clear();
-            }
-            start(&mut live, Some(i));
-        }
-        Ok(live)
-    };
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in &cfg.rpo {
-            let live = Some(walk(b, &out, false)?);
-            if out[b.idx()] != live {
-                out[b.idx()] = live;
-                changed = true;
-            }
-        }
-    }
-    for &b in &cfg.rpo {
-        walk(b, &out, true)?;
-    }
-    Ok(())
-}
-
-/// Once the call-boundary pass ran, what is live across a call is a value its
-/// snapshot names, a constant, or a table's pointer whose table it names.
-#[cfg(feature = "tcvm-dev")]
-fn check_r6(f: &Func<'_>, rpo: &[Block], _pos: &[(Block, usize)]) -> Result<(), String> {
-    if !f.boundaries {
-        return Ok(());
-    }
-    let live = live_in(f, rpo);
-    let cfg = f.cfg();
-    for &b in rpo {
-        if !f.blocks[b.idx()].resume {
-            continue;
-        }
-        let kept = crate::jit::opt::calls::kept_across(f, &cfg, b);
-        for v in live[b.idx()].iter() {
-            let v = Val(v as u32);
-            use crate::jit::opt::calls::{is_const, rooted, same_reg, table_of};
-            if !kept.contains(&same_reg(f, v))
-                && !is_const(f, v)
-                && !table_of(f, v).is_some_and(|t| rooted(f, &kept, t))
-            {
-                return Err(format!(
-                    "v{} is live across the call resuming at b{}",
-                    v.0, b.0
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// A set of values as a bit vector.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ValSet(Vec<u64>);
-
-impl ValSet {
-    pub(crate) fn new(n: usize) -> Self {
-        ValSet(vec![0; n.div_ceil(64)])
-    }
-
-    pub(crate) fn insert(&mut self, v: usize) -> bool {
-        let (w, b) = (v / 64, v % 64);
-        let had = self.0[w] >> b & 1 != 0;
-        self.0[w] |= 1 << b;
-        !had
-    }
-
-    pub(crate) fn contains(&self, v: usize) -> bool {
-        self.0[v / 64] >> (v % 64) & 1 != 0
-    }
-
-    pub(crate) fn remove(&mut self, v: usize) {
-        self.0[v / 64] &= !(1 << (v % 64));
-    }
-
-    /// `self |= other`; whether anything was added.
-    pub(crate) fn union(&mut self, other: &ValSet) -> bool {
-        let mut changed = false;
-        for (a, b) in self.0.iter_mut().zip(&other.0) {
-            let n = *a | *b;
-            changed |= n != *a;
-            *a = n;
-        }
-        changed
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().flat_map(|(w, &bits)| {
-            let mut bits = bits;
-            std::iter::from_fn(move || {
-                if bits == 0 {
-                    return None;
-                }
-                let t = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                Some(w * 64 + t)
-            })
-        })
-    }
-}
-
-/// Values live into each block: used in it or later before being defined,
-/// snapshot entries counting as uses. Block parameters are defined at entry.
-pub(crate) fn live_in(f: &Func<'_>, rpo: &[Block]) -> Vec<ValSet> {
-    let n = f.vals.len();
-    let mut live = vec![ValSet::new(n); f.blocks.len()];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in rpo.iter().rev() {
-            let mut cur = ValSet::new(n);
-            for s in f.succs(b) {
-                cur.union(&live[s.idx()]);
-            }
-            for &i in f.insts_of(b).iter().rev() {
-                for e in f.edges(i) {
-                    for &p in f.params(e.target) {
-                        cur.remove(p.idx());
+                for (k, &x) in g.inputs(Val(v)).iter().enumerate() {
+                    if x == u32::MAX || g.insts[x as usize].rep != i.rep {
+                        return Err(format!(
+                            "v{v}: input {k} missing or of another representation"
+                        ));
                     }
-                    for &a in f.vl(e.args) {
-                        cur.insert(a.idx());
+                    if !dominates(block_of[x as usize], preds[k]) {
+                        return Err(format!("v{v}: input v{x} does not reach b{}", preds[k].0));
                     }
                 }
-                for r in f.results(i) {
-                    cur.remove(r.idx());
-                }
-                for &a in f.args(i) {
-                    cur.insert(a.idx());
-                }
-                for &(_, v) in f.snap_entries(i).iter().chain(f.blame_entries(i)) {
-                    cur.insert(v.idx());
+            }
+            Op::FrameState => {
+                let (_, entries) = g.entries(Val(v));
+                if !entries.is_sorted_by(|x, y| x[0] & !super::HOME < y[0] & !super::HOME) {
+                    return Err(format!("v{v}: entries out of register order"));
                 }
             }
-            for &p in f.params(b) {
-                cur.remove(p.idx());
+            // Its operand is typed by definition: nothing else names what
+            // makes the pointer one.
+            Op::UnboxPtr if g.facts[i.a as usize].set.unboxed() != Rep::Ptr => {
+                return Err(format!("v{v}: unchecked unbox of an untyped value"));
             }
-            if cur != live[b.idx()] {
-                live[b.idx()] = cur;
-                changed = true;
-            }
+            _ => {}
         }
-    }
-    live
-}
-
-/// Each operation's operands are the representations it takes.
-#[cfg(feature = "tcvm-dev")]
-fn check_reps(f: &Func<'_>, i: Inst) -> Result<(), String> {
-    use crate::jit::ir::ops::Op::*;
-    use crate::jit::ir::types::Rep::{self, *};
-    let op = f.op(i);
-    let args = f.args(i);
-    let want: &[Rep] = match op {
-        Store(_) | Unbox(_) | IsType(_) | IsFalsy | Guard(_) | GuardProto(_) => &[Val],
-        ToF64(set) | ToPos(set) => {
-            use crate::jit::ir::types::TypeSet;
-            if set.is_empty() || !(TypeSet::NUM | TypeSet::STR).contains(set) {
-                return Err(format!("i{} converts {set:?}", i.0));
-            }
-            &[Val]
+        let mut bad = None;
+        if i.op != Op::Param {
+            g.uses(i, |x| {
+                let db = block_of[x.idx()];
+                if x.0 >= v || !(db == b || dominates(db, b)) {
+                    bad = Some(x);
+                }
+            });
         }
-        SameBits | GuardSame => &[Val, Val],
-        GuardMiss => &[Val, B1, Val],
-        Helper(h) => h.sig().args,
-        GuardTrue | GuardFalse | Br => &[B1],
-        IAdd | ISub | IMul | IAddNo | ISubNo | IMulNo | IAnd | IOr | IXor | IShl | IShr
-        | IDivFloor | IModFloor | IRem | IAsr | IUMulShr(_) | ICmp(_) => &[I32, I32],
-        INeg | INot | IToF | IToL => &[I32],
-        LAdd | LSub | LMul | LUDiv | LAnd | LOr | LXor | LShl | LShr | LDivFloor | LModFloor
-        | LRem | LAsr | LCmp(_) => &[I64, I64],
-        LNeg | LNot | LToF | LToI | LTrunc => &[I64],
-        StrLt | StrLe => &[Ptr, Ptr],
-        StrByteAt => &[Ptr, I32],
-        IFCmp(_) => &[I64, F64],
-        NumCmp(_) => &[Val, Val],
-        UpvalValueOf(_) => &[Ptr],
-        FAdd | FSub | FMul | FDiv | FIDiv | FCmp(_) => &[F64, F64],
-        FNeg | FAbs | FSqrt | FFloor | FCeil | FToIExact | FToLExact | FToL => &[F64],
-        Box => {
-            if f.ty(args[0]).rep == Val {
-                return Err(format!("i{} boxes a val", i.0));
-            }
-            &[]
+        if let Some(x) = bad {
+            return Err(format!("v{v}: v{} does not dominate its use", x.0));
         }
-        Select => {
-            if f.ty(args[0]).rep != B1 || f.ty(args[1]).rep != f.ty(args[2]).rep {
-                return Err(format!("i{} selects mismatched representations", i.0));
-            }
-            &[]
-        }
-        _ => &[],
-    };
-    for (k, (&a, &r)) in args.iter().zip(want).enumerate() {
-        if f.ty(a).rep != r {
-            return Err(format!(
-                "i{} ({}) operand {k} v{} is {:?}, not {r:?}",
-                i.0,
-                op.name(),
-                a.0,
-                f.ty(a).rep
-            ));
-        }
-    }
-    // A type test's other operands are its words (`opt::words`).
-    let tested = match op {
-        IsType(set) | Guard(set) => Some(set),
-        IsFalsy => Some(crate::jit::ir::types::TypeSet::FALSY),
-        ToF64(_) => Some(crate::jit::ir::types::TypeSet::FLOAT),
-        _ => None,
-    };
-    if let Some(set) = tested
-        && args.len() > 1
-    {
-        let words = crate::jit::backend::test_words(set);
-        let given = args[1..].iter().map(|&a| match f.def_op(a) {
-            Some(KI64(w)) => Some(w as u64),
-            _ => None,
-        });
-        if args.len() != 1 + words.len() || !given.eq(words.into_iter().map(Some)) {
-            return Err(format!(
-                "i{} ({}) has operands past its value that are not its words",
-                i.0,
-                op.name()
-            ));
+        if info.args.contains(&Arg::Blk) && !i.op.has(Flags::TERMINATOR) {
+            return Err(format!("v{v}: a block operand outside a terminator"));
         }
     }
     Ok(())

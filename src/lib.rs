@@ -4,6 +4,9 @@
 #![cfg_attr(not(any(debug_assertions, test)), allow(clippy::drop_non_drop))]
 // Without a library, the VM's and other libraries' code for it is left unused.
 #![cfg_attr(not(feature = "lib-all"), allow(dead_code, unused_imports))]
+// The JIT's pipeline is being rebuilt: what the stages not written yet will
+// use is unused until then. Goes when stage 3 connects the last of it.
+#![cfg_attr(jit, allow(dead_code, unused_imports))]
 #![cfg_attr(
     nightly,
     feature(

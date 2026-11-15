@@ -282,30 +282,6 @@ impl JitRuntime {
             .clone()
     }
 
-    /// The trampoline that calls `helper` keeping the registers, made on first
-    /// use.
-    pub(crate) fn trampoline(
-        &self,
-        helper: usize,
-        kind: crate::jit::backend::lower::Tramp,
-    ) -> Result<usize, crate::jit::compile::CompileError> {
-        if let Some(&(_, t)) = self.trampolines.borrow().iter().find(|(h, _)| *h == helper) {
-            return Ok(t);
-        }
-        let (asm, frame) = crate::jit::backend::target::emit::trampoline(helper, kind);
-        let alloc = self.code_alloc();
-        let mut block = alloc.reserve(asm.max_len())?;
-        let code = asm
-            .finish(block.rx() as usize)
-            .map_err(|e| crate::jit::compile::CompileError::Backend(format!("assembler: {e:?}")))?;
-        block.write(&code);
-        block.describe_frame(frame);
-        let t = block.rx() as usize;
-        self.trampoline_code.borrow_mut().push(block);
-        self.trampolines.borrow_mut().push((helper, t));
-        Ok(t)
-    }
-
     /// The register image of the last exit.
     pub(crate) fn exit_regs(&self) -> &[Cell<u64>; EXIT_REGS] {
         &self.exit_regs_buf

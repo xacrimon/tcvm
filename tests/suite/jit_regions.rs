@@ -84,6 +84,7 @@ fn count(stats: &str, key: &str) -> u64 {
 }
 
 #[test]
+#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn hot_counts_of_one_compile_at_the_first_count() {
     let src = "local function f(a) return a + 1 end
         local s = 0 for i = 1, 3 do s = f(s) end return tostring(s)";
@@ -580,6 +581,7 @@ fn tail_calls_and_multret() {
 /// inlined in a loop and from one inlined in a region frame's place;
 /// `string.byte` out of range by the call.
 #[test]
+#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn tail_called_builtins_without_results() {
     let mixed = r##"
     local t, u = {}, {}
@@ -1926,6 +1928,7 @@ fn integer_loops_at_sites_that_saw_float_loops() {
 
 /// The same where the function compiles after its first call, a float loop.
 #[test]
+#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn integer_loops_after_one_float_loop() {
     compiles_at_first_count(
         "local function f(b) local last; for i = b, 1 do last = i end; return last end
@@ -4425,6 +4428,7 @@ fn loop_count_division_stays_behind_its_step_guard() {
 /// An unboxed constant a late fold left live across a call: the third
 /// program of #340, whose region failed to compile at these counts.
 #[test]
+#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn folded_constants_cross_calls_in_recompiles() {
     let src = r##"
     local function emit(s) io.write(s, "\n") end
@@ -4480,6 +4484,7 @@ fn folded_constants_cross_calls_in_recompiles() {
 /// The programs of #340, whose regions failed to compile at these counts: a
 /// pointer live across a call through chained parameters.
 #[test]
+#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn chained_pointer_parameters_cross_calls() {
     let src = r##"
     local function f(a, b, c)
@@ -4502,6 +4507,7 @@ fn chained_pointer_parameters_cross_calls() {
 
 /// Through a parameter that is a constant's pointer.
 #[test]
+#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn constant_pointer_parameters_cross_calls() {
     let src = r##"
     local function emit(s) io.write(s, "\n") end

@@ -27,11 +27,11 @@
 //! - `target::unwind`: the DWARF registers and rules of `unwind::Fde`
 //!   (`CODE_ALIGN`, `RETURN_COLUMN`, `entry_rules`, `frame_rules`).
 
+// Off until stage 1 rebuilds them on the new IR; the files stay as the
+// source to port: `emit.rs`, `order.rs`, and each target's `inst.rs`,
+// `emit/` and `types.rs`.
 pub(crate) mod alloc;
 pub(crate) mod code;
-pub(crate) mod emit;
-pub(crate) mod lower;
-pub(crate) mod order;
 pub(crate) mod ra;
 pub(crate) mod reg;
 pub(crate) mod unwind;
@@ -49,5 +49,3 @@ cfg_select! {
         pub(crate) use x86_64 as target;
     }
 }
-
-pub(crate) use target::types::test_words;

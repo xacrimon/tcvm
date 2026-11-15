@@ -5,7 +5,8 @@ use crate::dmm::Gc;
 use crate::env::function::{LuaFn, Prototype};
 use crate::env::value::Value;
 use crate::instruction::{Instruction, Op};
-use crate::jit::ir::ExitKind;
+use crate::jit::compile::{Bail, BailAction};
+use crate::jit::ir::ops::ExitKind;
 use crate::jit::region::{ExitInfo, Loc, Region, SRep};
 use crate::jit::state::{
     EXIT_HOT, Entry, EntryState, JitState, JitStateRef, MAX_COMPILES, MAX_ENTRIES, MAX_RETRIES,
@@ -426,7 +427,7 @@ fn try_compile<'gc>(
             return None;
         }
     }
-    match compile_caught(ctx, closure, at, frame, &[]) {
+    match compile_on_host(ctx, closure, at, frame, &[]) {
         Ok(region) => {
             let entry = install(ctx, closure, state, at, word, region)?;
             stat(ctx, || format!("jit compiled {}", word.op().name()));
@@ -449,17 +450,13 @@ fn try_compile<'gc>(
                 )
             });
             stat(ctx, || format!("jit failed {}", e.class()));
-            #[cfg(feature = "tcvm-dev")]
-            if e.internal() {
-                let n = &ctx.jit().internal_errors;
-                n.set(n.get() + 1);
-            }
-            if matches!(e, crate::jit::compile::CompileError::OutOfCode) {
+            let action = e.action();
+            if action == BailAction::Exhaust {
                 ctx.jit().exhausted.set(true);
                 return None;
             }
             let mut st = state.borrow_mut(mc);
-            if !matches!(e, crate::jit::compile::CompileError::Useless) {
+            if action == BailAction::Strike {
                 st.strikes += 1;
             }
             st.refused.push(at);
@@ -468,31 +465,17 @@ fn try_compile<'gc>(
     }
 }
 
-fn compile_caught<'gc>(
+/// A compile, on the host stack.
+fn compile_on_host<'gc>(
     ctx: Context<'gc>,
     closure: LuaFn<'gc>,
     at: u32,
     frame: *const Value<'gc>,
     seen: &[(u8, crate::jit::ir::types::TypeSet)],
-) -> Result<Gc<'gc, Region<'gc>>, crate::jit::compile::CompileError> {
-    let r = crate::vm::stack::on_host(ctx, || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::jit::compile::compile(ctx, closure, at, frame, seen)
-        }))
-    });
-    match r {
-        Ok(r) => r,
-        Err(p) => {
-            let msg = p
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_default();
-            Err(crate::jit::compile::CompileError::Backend(format!(
-                "panic: {msg}"
-            )))
-        }
-    }
+) -> Result<Gc<'gc, Region<'gc>>, Bail> {
+    crate::vm::stack::on_host(ctx, || {
+        crate::jit::compile::compile(ctx, closure, at, frame, seen)
+    })
 }
 
 /// Install a compiled region over the counting word at `at`.
@@ -608,7 +591,8 @@ fn set_fast<'gc>(ctx: Context<'gc>, proto: &Prototype<'gc>, st: &mut JitState<'g
 /// The known entry (the target's `known_offset`) of a prototype of
 /// `nparams` parameters whose fast entry is `fast`, none without one.
 pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> Option<usize> {
-    (fast != 0).then(|| fast + crate::jit::backend::target::emit::known_offset(regs, nparams))
+    let _ = (regs, nparams);
+    (fast != 0).then(|| crate::jit::bug!("a fast entry before stage 3 brings direct calls back"))
 }
 
 /// Where a direct tail call branches while its callee has no fast entry.
@@ -716,8 +700,8 @@ fn on_exit<'gc>(
     // (`opt::miss::covered`), its element nil under a class with `__index`:
     // the load's miss, which tells the use's kinds nothing. The interpreter
     // records it (`ARR_MISS`, `gettable_general`) as it runs the load again.
-    let missed = (ops.named(crate::jit::ir::BLAME_TESTED)).is_some_and(|v| v.is_nil())
-        && (ops.named(crate::jit::ir::BLAME_TABLE))
+    let missed = (ops.named(crate::jit::ir::ops::BLAME_TESTED)).is_some_and(|v| v.is_nil())
+        && (ops.named(crate::jit::ir::ops::BLAME_TABLE))
             .is_some_and(|t| !ctx.mm_of(t, crate::env::MetamethodBits::INDEX).is_nil());
     // A `Before` exit's operands are in their home slots or its blame; the
     // other kinds follow a completed instruction and have no failed guard,
@@ -1045,7 +1029,7 @@ impl<'gc> Operands<'_, 'gc> {
                     unsafe { u.value }
                 })
             }
-            Operands::Blame(_) => self.named(crate::jit::ir::BLAME_TESTED),
+            Operands::Blame(_) => self.named(crate::jit::ir::ops::BLAME_TESTED),
         }
     }
 
@@ -1084,7 +1068,7 @@ fn on_entry_fail<'gc>(
         {
             for &r in &region.entry_regs {
                 // SAFETY: an entry guard tests a live register of the frame.
-                let kind = crate::jit::build::value_set(unsafe { *base.add(r as usize) });
+                let kind = crate::jit::ir::types::TypeSet::of(unsafe { *base.add(r as usize) });
                 match e.seen.iter_mut().find(|(x, _)| *x == r) {
                     Some((_, s)) => *s |= kind,
                     None => e.seen.push((r, kind)),
@@ -1205,7 +1189,7 @@ fn recompile<'gc>(
     };
     let jit = ctx.jit();
     let result = if budget_left && state.borrow().compiles < MAX_COMPILES && !jit.exhausted.get() {
-        compile_caught(ctx, closure, at, frame, &seen).map_err(|e| {
+        compile_on_host(ctx, closure, at, frame, &seen).map_err(|e| {
             stat(ctx, || format!("jit failed {}", e.class()));
             log(ctx, || {
                 format!(
@@ -1213,12 +1197,7 @@ fn recompile<'gc>(
                     crate::jit::compile::chunk_name(closure)
                 )
             });
-            #[cfg(feature = "tcvm-dev")]
-            if e.internal() {
-                let n = &jit.internal_errors;
-                n.set(n.get() + 1);
-            }
-            if matches!(e, crate::jit::compile::CompileError::OutOfCode) {
+            if e.action() == BailAction::Exhaust {
                 jit.exhausted.set(true);
             }
         })

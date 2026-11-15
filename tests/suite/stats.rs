@@ -42,6 +42,7 @@ fn interpreted_dispatches_are_counted() {
 }
 
 #[test]
+#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn compiled_code_dispatches_nothing() {
     let (got, stats) = counted(SUM, true);
     assert_eq!(got, "500500");
@@ -68,6 +69,7 @@ fn nothing_is_counted_until_asked() {
 }
 
 #[test]
+#[ignore = "asserts that a region compiled: back with the new compiler's stages"]
 fn functions_compile_after_the_jit_is_turned_back_on() {
     let mut lua = Lua::new();
     lua.set_jit_inline(false);

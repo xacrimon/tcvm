@@ -8,7 +8,7 @@ use crate::dmm::{Collect, Gc};
 use crate::env::function::Prototype;
 use crate::env::value::Value;
 use crate::jit::backend::alloc::{CodeAllocator, CodeBlock};
-use crate::jit::ir::ExitKind;
+use crate::jit::ir::ops::ExitKind;
 use crate::jit::ir::ops::ExitTag;
 
 /// How a snapshot entry's value is held.

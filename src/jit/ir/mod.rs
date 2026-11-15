@@ -1,22 +1,26 @@
-//! The region IR: a CFG of blocks with parameters, instructions in SSA form,
-//! snapshots in a side table, and a constant pool of the heap values the code
-//! embeds. Every list (a block's instructions and parameters, operands, edge
-//! arguments, snapshot entries) is a run of a flat pool.
+//! The SSA IR: instructions in CFG order, appended and never edited. A value
+//! is its instruction's index. A pass is a copy of one graph into another
+//! through the emitter (`emit`), which rewrites, numbers and tracks facts as
+//! it appends; analyses read the finished input.
+//!
+//! One container holds two dialects (`ops::Dialect`): the builder emits
+//! high-level ops, copy 1 lowers them, and everything after sees low-level
+//! ops only.
 
+pub(crate) mod emit;
 pub(crate) mod ops;
 #[cfg(feature = "tcvm-dev")]
-pub(crate) mod print;
+mod print;
+mod rules;
+mod table;
+#[cfg(test)]
+mod tests;
 pub(crate) mod types;
+#[cfg(feature = "tcvm-dev")]
 pub(crate) mod verify;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use crate::dmm::Gc;
-use crate::env::function::Prototype;
-use crate::env::value::Value;
-use crate::jit::ir::ops::{ExitTag, Op};
-use crate::jit::ir::types::{Ty, TypeSet};
+use ops::{Arg, Flags, Heaps, Op};
+use types::{Fact, Rep};
 
 macro_rules! idx {
     ($name:ident) => {
@@ -24,1019 +28,380 @@ macro_rules! idx {
         pub(crate) struct $name(pub(crate) u32);
 
         impl $name {
+            pub(crate) const NONE: $name = $name(u32::MAX);
+
             #[inline]
             pub(crate) fn idx(self) -> usize {
                 self.0 as usize
             }
+
+            #[inline]
+            pub(crate) fn is_none(self) -> bool {
+                self.0 == u32::MAX
+            }
         }
     };
 }
-
-idx!(Block);
-idx!(Inst);
 idx!(Val);
-idx!(Snap);
+idx!(Block);
+idx!(Loop);
 
-pub(crate) const NO_SNAP: u32 = u32::MAX;
-
-/// A run `pool[start..start + len]` of one of a `Func`'s pools. Growing a run
-/// that does not end its pool moves it to the end, so a copy of the old
-/// handle keeps reading the old elements.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) struct List {
-    pub(crate) start: u32,
-    pub(crate) len: u32,
-}
-
-impl List {
-    #[inline]
-    pub(crate) fn len(self) -> usize {
-        self.len as usize
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(self) -> bool {
-        self.len == 0
-    }
-
-    #[inline]
-    fn range(self) -> std::ops::Range<usize> {
-        self.start as usize..(self.start + self.len) as usize
-    }
-}
-
-fn list_push<T: Copy>(pool: &mut Vec<T>, l: &mut List, x: T) {
-    if l.range().end != pool.len() {
-        let s = pool.len();
-        pool.extend_from_within(l.range());
-        l.start = s as u32;
-    }
-    pool.push(x);
-    l.len += 1;
-}
-
-fn list_insert<T: Copy>(pool: &mut Vec<T>, l: &mut List, at: usize, x: T) {
-    let s = pool.len();
-    let r = l.range();
-    pool.extend_from_within(r.start..r.start + at);
-    pool.push(x);
-    pool.extend_from_within(r.start + at..r.end);
-    *l = List {
-        start: s as u32,
-        len: l.len + 1,
-    };
-}
-
-fn list_new<T: Copy>(pool: &mut Vec<T>, xs: &[T]) -> List {
-    let s = pool.len();
-    pool.extend_from_slice(xs);
-    List {
-        start: s as u32,
-        len: xs.len() as u32,
-    }
-}
-
-/// Where a value is defined.
+/// `a`, `b` and `c` are operands or immediates by the op's form
+/// (`ops::OpInfo::args`); `aux` a small immediate by its `ops::Aux`.
+#[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ValDef {
-    Inst(Inst, u8),
-    Param(Block, u16),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ValData {
-    pub(crate) ty: Ty,
-    pub(crate) def: ValDef,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct InstData {
+pub(crate) struct Inst {
     pub(crate) op: Op,
-    /// Operands: `vpool[a0..a0 + an]`.
-    pub(crate) a0: u32,
-    pub(crate) an: u16,
-    /// Results: `Val(r0)..Val(r0 + rn)`.
-    pub(crate) r0: u32,
-    pub(crate) rn: u8,
-    /// Successor edges of a terminator: `edges[e0..e0 + en]`.
-    pub(crate) e0: u32,
-    pub(crate) en: u8,
-    pub(crate) snap: u32,
-    /// A moved exit's blame: the pc and frame of the
-    /// instruction it failed for, with the values of the registers that
-    /// instruction reads by its own numbering, or constants of their kinds
-    /// (`Builder::blame`); `NO_SNAP` for an exit at its snapshot's pc.
-    pub(crate) blame: u32,
-    pub(crate) tag: ExitTag,
-    pub(crate) block: Block,
+    /// The result's representation.
+    pub(crate) rep: Rep,
+    pub(crate) aux: u16,
+    pub(crate) a: u32,
+    pub(crate) b: u32,
+    pub(crate) c: u32,
 }
 
-/// A branch target with the arguments for its parameters (a run of
-/// `vpool`).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct BlockCall {
-    pub(crate) target: Block,
-    pub(crate) args: List,
-}
+const _: () = assert!(size_of::<Inst>() == 16);
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct BlockData {
-    /// A run of `ppool`.
-    pub(crate) params: List,
-    /// A run of `layout`.
-    pub(crate) insts: List,
-    /// The resume block of a call: entered by a callee's return, not by a
-    /// branch.
-    pub(crate) resume: bool,
-    /// Deleted by a pass; skipped by everything.
-    pub(crate) dead: bool,
-    /// A loop header the region enters after a whole iteration of the loop (an
-    /// entry at its header), so peeling it again buys nothing.
-    pub(crate) peeled: bool,
-    /// An arm for what the site's feedback says is rare (a helper's slow case,
-    /// a metamethod): laid out last, its helpers called through trampolines
-    /// that keep the registers.
-    pub(crate) cold: bool,
-}
-
-/// How an exit resumes the interpreter.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum ExitKind {
-    /// Run the instruction at `pc`.
-    Before,
-    /// The instruction at `pc` is done: continue at `pc + 1`.
-    After,
-}
-
-/// The frame an exit rebuilds: home slots to write and where to resume.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SnapData {
-    pub(crate) pc: u32,
-    pub(crate) kind: ExitKind,
-    /// `(register, value)` by register: a run of `snap_pool`. Registers
-    /// count from the region's base, through inlined frames.
-    pub(crate) entries: List,
-    /// The inlined frame `pc` is in (`Func::inline_frames`), or `NO_FRAME`.
-    pub(crate) frame: u32,
-}
-
-pub(crate) const NO_FRAME: u32 = u32::MAX;
-
-/// The pc whose feedback an exit records, of the function of `frame` (an
-/// `inline_frames` index, or `NO_FRAME` for the region's): a moved exit's
-/// snapshot may be another frame's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ExitSite {
-    pub(crate) pc: u32,
-    pub(crate) frame: u32,
-}
-
-/// A blame entry's register for the value the exit's guard tested: a shape
-/// guard's table (an upvalue's is in no register), and the element of a
-/// type guard standing for an array load's miss guard (`opt::miss`), which
-/// names the table it came from too (`BLAME_TABLE`).
-pub(crate) const BLAME_TESTED: u8 = u8::MAX;
-pub(crate) const BLAME_TABLE: u8 = u8::MAX - 1;
-
-/// The register of a call snapshot's entry for a value no register holds, which
-/// the call keeps in the frame: past every region slot (the window ends by
-/// 255), so exits skip it.
-pub(crate) const KEPT: u8 = u8::MAX;
-
-/// An inlined call's frame: the callee (a pool index, or `region::DYNAMIC` with
-/// a `Func::protos` index), the `CALL`'s `a` and `c` and pc in the enclosing
-/// frame, which is `parent` or the region's. Its base is `a + 4` past the
-/// enclosing frame's; `code` is its prototype's, which a call in its body
-/// returns into.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct InlineFrame {
-    pub(crate) parent: u32,
-    pub(crate) func: u32,
-    pub(crate) a: u8,
-    pub(crate) c: u8,
-    pub(crate) caller_pc: u32,
-    pub(crate) code: usize,
-    /// The callee captures locals (`SnapFrame::open`).
-    pub(crate) open: bool,
-    /// It replaces the region's own frame, which tail-called it: at the same
-    /// base, base delta 0 in its snapshot frame.
-    pub(crate) replaces: bool,
-}
-
-/// What a region was compiled from.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RegionMeta {
-    pub(crate) entry_pc: u32,
-    pub(crate) loop_entry: bool,
-    /// The parameters every entry passes in registers (`Op::Param`): a function
-    /// region's first eight, none for a loop entry or a vararg function.
-    pub(crate) params: u8,
-}
-
-/// The control-flow facts passes share, computed on demand and dropped by
-/// any change to an edge's target or the set of blocks.
-pub(crate) struct CfgInfo {
-    /// Blocks reachable from the entry, in reverse post-order.
-    pub(crate) rpo: Vec<Block>,
-    preds_at: Vec<u32>,
-    preds: Vec<Block>,
-    inc_at: Vec<u32>,
-    inc: Vec<(Inst, u32)>,
-    pub(crate) idom: Vec<Option<Block>>,
-    /// The dominator tree: each reachable block's children.
-    kids_at: Vec<u32>,
-    kids: Vec<Block>,
-    /// Each block's (preorder, postorder) number in the dominator tree, for
-    /// constant-time dominance; `(u32::MAX, 0)` for an unreachable one.
-    dfs: Vec<(u32, u32)>,
-}
-
-impl CfgInfo {
-    /// The predecessors of `b`, once per edge.
+impl Inst {
     #[inline]
-    pub(crate) fn preds(&self, b: Block) -> &[Block] {
-        &self.preds[self.preds_at[b.idx()] as usize..self.preds_at[b.idx() + 1] as usize]
+    pub(crate) fn args(&self) -> [u32; 3] {
+        [self.a, self.b, self.c]
     }
 
-    /// The (terminator, edge index) pairs entering `b`.
+    /// A `K64` or `KF64`'s bits.
     #[inline]
-    pub(crate) fn incoming(&self, b: Block) -> &[(Inst, u32)] {
-        &self.inc[self.inc_at[b.idx()] as usize..self.inc_at[b.idx() + 1] as usize]
+    pub(crate) fn k64(&self) -> u64 {
+        self.a as u64 | (self.b as u64) << 32
+    }
+}
+
+/// A frame-state entry's register word: the frame slot holds the value
+/// already.
+pub(crate) const HOME: u32 = 1 << 31;
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) struct BlockFlags: u8 {
+        /// Laid out after the hot chain.
+        const COLD = 1;
+        /// Entered by a callee's return, not a branch.
+        const RESUME = 2;
+        const LOOP_HEADER = 4;
+        /// Ended by its terminator.
+        const SEALED = 8;
+    }
+}
+
+pub(crate) struct BlockData {
+    /// Its instructions, `insts[start..end]`: parameters first, a terminator
+    /// last.
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    /// Its predecessors, `preds[preds..preds + npreds]`: the forward ones,
+    /// known when it opens, then the late ones (back edges, cold arms),
+    /// `Block::NONE` until their terminators are emitted. A parameter's
+    /// inputs are in this order.
+    pub(crate) preds: u32,
+    pub(crate) npreds: u32,
+    /// How many of them are forward.
+    pub(crate) nfwd: u32,
+    pub(crate) idom: Block,
+    /// A dominator further up, for `Graph::dom_at` in logarithmic time.
+    jump: Block,
+    /// Its depth in the dominator tree.
+    pub(crate) depth: u32,
+    /// The innermost loop it is in.
+    pub(crate) lp: Loop,
+    pub(crate) flags: BlockFlags,
+}
+
+pub(crate) struct LoopData {
+    pub(crate) header: Block,
+    pub(crate) parent: Loop,
+    /// The heaps its body may write.
+    pub(crate) writes: Heaps,
+}
+
+/// Everything is appended; a graph is recycled by `reset`.
+#[derive(Default)]
+pub(crate) struct Graph {
+    pub(crate) insts: Vec<Inst>,
+    /// Each instruction's definition fact.
+    pub(crate) facts: Vec<Fact>,
+    /// Operand runs of the ops with more than three: parameter inputs and
+    /// frame-state entries.
+    pub(crate) extra: Vec<u32>,
+    pub(crate) blocks: Vec<BlockData>,
+    pub(crate) preds: Vec<Block>,
+    pub(crate) loops: Vec<LoopData>,
+    /// The opened blocks in emission order: a block comes after its forward
+    /// predecessors.
+    pub(crate) order: Vec<Block>,
+}
+
+impl Graph {
+    pub(crate) fn reset(&mut self) {
+        self.insts.clear();
+        self.facts.clear();
+        self.extra.clear();
+        self.blocks.clear();
+        self.preds.clear();
+        self.loops.clear();
+        self.order.clear();
+    }
+
+    #[inline]
+    pub(crate) fn inst(&self, v: Val) -> &Inst {
+        &self.insts[v.idx()]
+    }
+
+    #[inline]
+    pub(crate) fn op(&self, v: Val) -> Op {
+        self.insts[v.idx()].op
+    }
+
+    #[inline]
+    pub(crate) fn rep(&self, v: Val) -> Rep {
+        self.insts[v.idx()].rep
+    }
+
+    #[inline]
+    pub(crate) fn block(&self, b: Block) -> &BlockData {
+        &self.blocks[b.idx()]
+    }
+
+    pub(crate) fn preds(&self, b: Block) -> &[Block] {
+        let d = self.block(b);
+        &self.preds[d.preds as usize..(d.preds + d.npreds) as usize]
+    }
+
+    pub(crate) fn run(&self, at: u32, len: u32) -> &[u32] {
+        &self.extra[at as usize..(at + len) as usize]
+    }
+
+    /// The extra words of an instruction that has a run, else none.
+    pub(crate) fn run_of(&self, i: &Inst) -> &[u32] {
+        match i.op.info().args[0] {
+            Arg::Vals => self.run(i.a, i.b),
+            Arg::Entries => self.run(i.a, 1 + 2 * i.b),
+            _ => &[],
+        }
+    }
+
+    /// A parameter's inputs, by predecessor: `Val::NONE` for a late
+    /// predecessor not emitted yet.
+    pub(crate) fn inputs(&self, param: Val) -> &[u32] {
+        let i = self.inst(param);
+        debug_assert!(i.op == Op::Param);
+        self.run(i.a, i.b)
+    }
+
+    /// A frame state's pc and (register, value) entries.
+    pub(crate) fn entries(&self, fs: Val) -> (u32, &[[u32; 2]]) {
+        let i = self.inst(fs);
+        debug_assert!(i.op == Op::FrameState);
+        let (pc, rest) = self.run(i.a, 1 + 2 * i.b).split_first().unwrap();
+        (*pc, rest.as_chunks().0)
+    }
+
+    /// The block a sealed block's terminator is in is the block itself: its
+    /// last instruction.
+    pub(crate) fn term(&self, b: Block) -> &Inst {
+        let d = self.block(b);
+        debug_assert!(d.flags.contains(BlockFlags::SEALED));
+        &self.insts[d.end as usize - 1]
+    }
+
+    /// A terminator's successors.
+    pub(crate) fn succs(&self, t: &Inst) -> ([Block; 2], usize) {
+        let mut out = ([Block::NONE; 2], 0);
+        for (k, kind) in t.op.info().args.iter().enumerate() {
+            if *kind == Arg::Blk {
+                out.0[out.1] = Block(t.args()[k]);
+                out.1 += 1;
+            }
+        }
+        out
+    }
+
+    /// Every value an instruction uses: operands, a parameter's inputs, a
+    /// frame state's entries.
+    #[inline]
+    pub(crate) fn uses(&self, i: &Inst, mut f: impl FnMut(Val)) {
+        for (k, kind) in i.op.info().args.iter().enumerate() {
+            let w = i.args()[k];
+            match kind {
+                Arg::No | Arg::Imm | Arg::Blk | Arg::Len => {}
+                Arg::Val
+                | Arg::I32
+                | Arg::I64
+                | Arg::F64
+                | Arg::B1
+                | Arg::Ptr
+                | Arg::Int
+                | Arg::IntB
+                | Arg::W64
+                | Arg::Same
+                | Arg::Any
+                | Arg::Fs => f(Val(w)),
+                Arg::Opt | Arg::OptFs => {
+                    if w != u32::MAX {
+                        f(Val(w))
+                    }
+                }
+                Arg::Vals => {
+                    for &v in self.run(i.a, i.b) {
+                        if v != u32::MAX {
+                            f(Val(v))
+                        }
+                    }
+                }
+                Arg::Entries => {
+                    for e in self.run(i.a + 1, 2 * i.b).as_chunks::<2>().0 {
+                        f(Val(e[1]))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The frame state an exiting instruction takes.
+    pub(crate) fn frame_state(&self, i: &Inst) -> Val {
+        let k = (i.op.info().args.iter())
+            .position(|a| matches!(a, Arg::Fs | Arg::OptFs))
+            .unwrap_or_else(|| crate::jit::bug!("{:?} takes no frame state", i.op));
+        Val(i.args()[k])
+    }
+
+    /// Whether an instruction's operands and result fit its op's row
+    /// (`ops::OPS`), given the instructions before it.
+    pub(crate) fn form(&self, i: &Inst) -> Result<(), &'static str> {
+        let info = i.op.info();
+        let n = self.insts.len() as u32;
+        let rep_of = |w: u32| self.insts.get(w as usize).map_or(Rep::None, |d| d.rep);
+        // 32, 64, or 1 for `B1`.
+        let mut width = 0;
+        for (k, kind) in info.args.iter().enumerate() {
+            let w = i.args()[k];
+            let ok = match kind {
+                Arg::No | Arg::Imm | Arg::Len => true,
+                Arg::Blk => (w as usize) < self.blocks.len(),
+                Arg::Val => rep_of(w) == Rep::Val,
+                Arg::I32 => rep_of(w) == Rep::I32,
+                Arg::I64 => rep_of(w) == Rep::I64,
+                Arg::F64 => rep_of(w) == Rep::F64,
+                Arg::B1 => rep_of(w) == Rep::B1,
+                Arg::Ptr => rep_of(w) == Rep::Ptr,
+                Arg::W64 => rep_of(w).word64(),
+                Arg::Same => rep_of(w) == i.rep,
+                Arg::Any => rep_of(w) != Rep::None,
+                Arg::Opt => w == u32::MAX || rep_of(w) != Rep::None,
+                Arg::Fs | Arg::OptFs => {
+                    (w == u32::MAX && *kind == Arg::OptFs)
+                        || (w < n && self.insts[w as usize].op == Op::FrameState)
+                }
+                Arg::Int | Arg::IntB => {
+                    let here = match rep_of(w) {
+                        Rep::I32 => 32,
+                        Rep::B1 if *kind == Arg::IntB => 1,
+                        r if r.word64() => 64,
+                        _ => 0,
+                    };
+                    let first = std::mem::replace(&mut width, here);
+                    here != 0 && (first == 0 || first == here)
+                }
+                Arg::Vals | Arg::Entries => {
+                    let len = if *kind == Arg::Vals { i.b } else { 1 + 2 * i.b };
+                    (w as usize + len as usize) <= self.extra.len()
+                }
+            };
+            if !ok {
+                return Err(["operand a", "operand b", "operand c"][k]);
+            }
+        }
+        let set = types::TypeSet::from_bits_retain(i.aux & types::TypeSet::ANY.bits());
+        let ok = match info.res {
+            ops::Res::Is(r) => i.rep == r,
+            ops::Res::Int => match width {
+                32 => i.rep == Rep::I32,
+                64 => i.rep == Rep::I64,
+                _ => i.rep == Rep::B1,
+            },
+            ops::Res::Pass => {
+                i.rep
+                    == if i.c == u32::MAX {
+                        Rep::None
+                    } else {
+                        rep_of(i.c)
+                    }
+            }
+            ops::Res::Dyn => match i.op {
+                Op::K32 => matches!(i.rep, Rep::I32 | Rep::B1),
+                Op::K64 => i.rep.word64(),
+                Op::KObj => matches!(i.rep, Rep::Val | Rep::Ptr),
+                Op::Load | Op::LoadIdx | Op::Select | Op::Param => i.rep != Rep::None,
+                Op::CheckType => i.rep == set.unboxed(),
+                _ => false,
+            },
+        };
+        if !ok {
+            return Err("result");
+        }
+        let ok = match i.op {
+            Op::Cmp => (i.aux as usize) < 10,
+            Op::FCmp => (i.aux as usize) < 6,
+            // The `I32` forms can leave `I32`.
+            Op::LuaShl | Op::LuaShr => i.rep == Rep::I64 || i.c != u32::MAX,
+            _ => true,
+        };
+        if ok { Ok(()) } else { Err("aux") }
+    }
+
+    /// The dominator of `b` at depth `depth`, at most `b`'s.
+    pub(crate) fn dom_at(&self, mut b: Block, depth: u32) -> Block {
+        while self.block(b).depth > depth {
+            let d = self.block(b);
+            b = if self.block(d.jump).depth >= depth {
+                d.jump
+            } else {
+                d.idom
+            };
+        }
+        b
     }
 
     pub(crate) fn dominates(&self, a: Block, b: Block) -> bool {
-        let (x, y) = (self.dfs[a.idx()], self.dfs[b.idx()]);
-        a == b || x.0 <= y.0 && y.1 <= x.1 && self.idom[b.idx()].is_some()
+        let da = self.block(a).depth;
+        da <= self.block(b).depth && self.dom_at(b, da) == a
     }
 
-    /// The blocks `b` immediately dominates.
-    #[inline]
-    pub(crate) fn children(&self, b: Block) -> &[Block] {
-        &self.kids[self.kids_at[b.idx()] as usize..self.kids_at[b.idx() + 1] as usize]
-    }
-}
-
-pub(crate) struct Func<'gc> {
-    pub(crate) blocks: Vec<BlockData>,
-    pub(crate) insts: Vec<InstData>,
-    pub(crate) vals: Vec<ValData>,
-    /// Operands and edge arguments.
-    pub(crate) vpool: Vec<Val>,
-    /// Block parameters.
-    pub(crate) ppool: Vec<Val>,
-    /// Blocks' instructions.
-    pub(crate) layout: Vec<Inst>,
-    pub(crate) edges: Vec<BlockCall>,
-    pub(crate) snaps: Vec<SnapData>,
-    pub(crate) snap_pool: Vec<(u8, Val)>,
-    pub(crate) pool: Vec<Value<'gc>>,
-    /// The shapes guards compare against and transitions store.
-    pub(crate) shapes: Vec<crate::env::Shape<'gc>>,
-    /// Sets of `shapes` indices, sorted, for `GuardShapeIn` and `ShapeIn`.
-    pub(crate) shape_sets: Vec<Vec<u32>>,
-    pub(crate) entry: Block,
-    pub(crate) meta: RegionMeta,
-    /// Instructions of inlined bodies that failed: dead, but still in
-    /// `insts`.
-    pub(crate) undone: usize,
-    /// The `After` snapshot of a value's definition, where a definition guard
-    /// may exit: call results, loads after a call, upvalues.
-    pub(crate) def_snaps: Vec<(Val, Snap)>,
-    /// Guards of self-calls' results that only the ways back other than
-    /// the fast return run (`opt::selfcall`).
-    pub(crate) landings: Vec<Inst>,
-    /// The call-boundary pass ran: what is live across a call is a value its
-    /// snapshot names.
-    pub(crate) boundaries: bool,
-    /// By a call's snapshot: the registers below its callee whose home slots
-    /// hold what they will be read as after it, which the collector traces
-    /// while the call runs; it clears the frame's other slots there.
-    pub(crate) call_homes: crate::jit::FastMap<u32, crate::jit::build::cfg::RegSet>,
-    /// Where the builder started each checkpoint, for `verify::checkpoints`:
-    /// its snapshot, the block and the instruction there it follows.
-    #[cfg(feature = "tcvm-dev")]
-    pub(crate) ckpts: Vec<(u32, Block, Option<Inst>)>,
-    /// The region slots closures capture, of every frame the region inlines,
-    /// which a call may write through their cells.
-    pub(crate) captured: crate::jit::build::cfg::RegSet,
-    pub(crate) inline_frames: Vec<InlineFrame>,
-    /// The slots past the region's base its inlined frames, staged calls
-    /// and reads up to `top` take, which every entry makes sure of once
-    /// (`Lowered::window`): the stack never moves or shrinks, and every
-    /// exit and call comes after the entry.
-    pub(crate) window: u16,
-    /// The prototypes guards prove callees closures of, which the region
-    /// keeps alive.
-    pub(crate) protos: Vec<Gc<'gc, Prototype<'gc>>>,
-    /// What the code assumes of runtime objects, and which groups of facts;
-    /// without any, the lazy exits go.
-    pub(crate) deps: Vec<(DepOn<'gc>, u64)>,
-    /// Shapes (by `shapes` index) whose stability a shape fact the builder used
-    /// rests on, depended on when the build ends.
-    pub(crate) stable_used: RefCell<Vec<u32>>,
-    cfg: RefCell<Option<Rc<CfgInfo>>>,
-}
-
-impl<'gc> Func<'gc> {
-    /// Note that the code assumes `groups` of `on`.
-    pub(crate) fn depend(&mut self, on: DepOn<'gc>, groups: u64) {
-        match self.deps.iter_mut().find(|(o, _)| o.same(on)) {
-            Some((_, g)) => *g |= groups,
-            None => self.deps.push((on, groups)),
-        }
-    }
-}
-
-/// An object the region assumes something of (`Func::deps`).
-#[derive(Clone, Copy)]
-pub(crate) enum DepOn<'gc> {
-    /// A class's metamethods, by their bits.
-    Class(crate::env::MtCache<'gc>),
-    /// A shape: its tables stay (`deps::SHAPE_GROUP`), a watched holder's
-    /// slots keep their values (`deps::slot_group`).
-    Shape(crate::env::Shape<'gc>),
-    /// A named slot's kind.
-    Field(crate::env::shape::Field<'gc>),
-}
-
-impl DepOn<'_> {
-    fn word(self) -> u64 {
-        match self {
-            DepOn::Class(c) => c.as_word(),
-            DepOn::Shape(s) => s.as_word(),
-            DepOn::Field(f) => f.as_word(),
-        }
-    }
-
-    pub(crate) fn same(self, other: Self) -> bool {
-        self.word() == other.word()
-    }
-}
-
-/// The type set of a constant `Value` word.
-pub(crate) fn const_set(bits: u64) -> TypeSet {
-    let v: Value<'static> = unsafe { std::mem::transmute::<u64, Value<'static>>(bits) };
-    if v.is_nil() {
-        TypeSet::NIL
-    } else if let Some(b) = v.get_boolean() {
-        if b { TypeSet::TRUE } else { TypeSet::FALSE }
-    } else if v.get_small().is_some() {
-        TypeSet::SMALL
-    } else if v.is_float() {
-        TypeSet::FLOAT
-    } else {
-        TypeSet::ANY
-    }
-}
-
-impl<'gc> Func<'gc> {
-    pub(crate) fn new(meta: RegionMeta) -> Self {
-        Func {
-            blocks: Vec::new(),
-            insts: Vec::new(),
-            vals: Vec::new(),
-            vpool: Vec::new(),
-            ppool: Vec::new(),
-            layout: Vec::new(),
-            edges: Vec::new(),
-            snaps: Vec::new(),
-            snap_pool: Vec::new(),
-            pool: Vec::new(),
-            shapes: Vec::new(),
-            shape_sets: Vec::new(),
-            entry: Block(0),
-            meta,
-            undone: 0,
-            def_snaps: Vec::new(),
-            landings: Vec::new(),
-            boundaries: false,
-            call_homes: Default::default(),
-            #[cfg(feature = "tcvm-dev")]
-            ckpts: Vec::new(),
-            captured: Default::default(),
-            inline_frames: Vec::new(),
-            window: 0,
-            protos: Vec::new(),
-            deps: Vec::new(),
-            stable_used: RefCell::new(Vec::new()),
-            cfg: RefCell::new(None),
-        }
-    }
-
-    /// The instructions built, less failed inlined bodies': what size limits
-    /// count.
-    pub(crate) fn built(&self) -> usize {
-        self.insts.len() - self.undone
-    }
-
-    // --- control flow ---------------------------------------------------------
-
-    /// The shared control-flow facts.
-    pub(crate) fn cfg(&self) -> Rc<CfgInfo> {
-        if let Some(c) = &*self.cfg.borrow() {
-            return c.clone();
-        }
-        let c = Rc::new(self.compute_cfg());
-        *self.cfg.borrow_mut() = Some(c.clone());
-        c
-    }
-
-    /// Drop the control-flow facts after a change they depend on.
-    #[inline]
-    pub(crate) fn cfg_changed(&mut self) {
-        *self.cfg.get_mut() = None;
-    }
-
-    fn compute_cfg(&self) -> CfgInfo {
-        let rpo = self.rpo();
-        let n = self.blocks.len();
-        let mut preds_at = vec![0u32; n + 1];
-        for &b in &rpo {
-            for s in self.succs(b) {
-                preds_at[s.idx() + 1] += 1;
-            }
-        }
-        for k in 0..n {
-            preds_at[k + 1] += preds_at[k];
-        }
-        let inc_at = preds_at.clone();
-        let mut fill = preds_at.clone();
-        let mut preds = vec![Block(0); preds_at[n] as usize];
-        let mut inc = vec![(Inst(0), 0u32); preds_at[n] as usize];
-        for &b in &rpo {
-            let Some(t) = self.terminator(b) else {
-                continue;
-            };
-            for (k, e) in self.edges(t).iter().enumerate() {
-                let at = &mut fill[e.target.idx()];
-                preds[*at as usize] = b;
-                inc[*at as usize] = (t, k as u32);
-                *at += 1;
-            }
-        }
-        let mut info = CfgInfo {
-            rpo,
-            preds_at,
-            preds,
-            inc_at,
-            inc,
-            idom: Vec::new(),
-            kids_at: vec![0; n + 1],
-            kids: Vec::new(),
-            dfs: vec![(u32::MAX, 0); n],
-        };
-        info.idom = verify::dominators(self, &info);
-        let child = |b: Block| info.idom[b.idx()].filter(|_| b != self.entry);
-        for &b in &info.rpo {
-            if let Some(p) = child(b) {
-                info.kids_at[p.idx() + 1] += 1;
-            }
-        }
-        for k in 0..n {
-            info.kids_at[k + 1] += info.kids_at[k];
-        }
-        let mut fill = info.kids_at.clone();
-        info.kids = vec![Block(0); info.kids_at[n] as usize];
-        for &b in &info.rpo {
-            if let Some(p) = child(b) {
-                info.kids[fill[p.idx()] as usize] = b;
-                fill[p.idx()] += 1;
-            }
-        }
-        let mut count = 0;
-        let mut stack = vec![(self.entry, false)];
-        while let Some((b, done)) = stack.pop() {
-            count += 1;
-            if done {
-                info.dfs[b.idx()].1 = count;
-                continue;
-            }
-            info.dfs[b.idx()].0 = count;
-            stack.push((b, true));
-            stack.extend(info.children(b).iter().rev().map(|&c| (c, false)));
-        }
-        info
-    }
-
-    /// Blocks in reverse post-order from the entry.
-    pub(crate) fn rpo(&self) -> Vec<Block> {
-        let n = self.blocks.len();
-        let mut seen = vec![false; n];
-        let mut post = Vec::with_capacity(n);
-        let mut stack: Vec<(Block, usize)> = vec![(self.entry, 0)];
-        seen[self.entry.idx()] = true;
-        while let Some(&mut (b, ref mut i)) = stack.last_mut() {
-            let succs = match self.terminator(b) {
-                Some(t) => self.edges(t),
-                None => &[],
-            };
-            if *i < succs.len() {
-                let s = succs[*i].target;
-                *i += 1;
-                if !seen[s.idx()] {
-                    seen[s.idx()] = true;
-                    stack.push((s, 0));
-                }
+    pub(crate) fn common_dom(&self, mut a: Block, mut b: Block) -> Block {
+        let depth = self.block(a).depth.min(self.block(b).depth);
+        (a, b) = (self.dom_at(a, depth), self.dom_at(b, depth));
+        // At one depth their jumps are equally far up.
+        while a != b {
+            let (x, y) = (self.block(a), self.block(b));
+            (a, b) = if x.jump != y.jump {
+                (x.jump, y.jump)
             } else {
-                post.push(b);
-                stack.pop();
+                (x.idom, y.idom)
+            };
+        }
+        a
+    }
+
+    /// Whether loop `l` is `outer` or inside it.
+    pub(crate) fn loop_within(&self, mut l: Loop, outer: Loop) -> bool {
+        while !l.is_none() {
+            if l == outer {
+                return true;
             }
+            l = self.loops[l.idx()].parent;
         }
-        post.reverse();
-        post
+        outer.is_none()
     }
 
-    pub(crate) fn terminator(&self, b: Block) -> Option<Inst> {
-        let &last = self.insts_of(b).last()?;
-        self.op(last).is_terminator().then_some(last)
-    }
-
-    pub(crate) fn succs(&self, b: Block) -> impl Iterator<Item = Block> + '_ {
-        self.terminator(b)
-            .into_iter()
-            .flat_map(move |t| self.edges(t).iter().map(|e| e.target))
-    }
-
-    // --- blocks ---------------------------------------------------------------
-
-    pub(crate) fn new_block(&mut self) -> Block {
-        self.blocks.push(BlockData::default());
-        self.cfg_changed();
-        Block(self.blocks.len() as u32 - 1)
-    }
-
-    #[inline]
-    pub(crate) fn insts_of(&self, b: Block) -> &[Inst] {
-        &self.layout[self.blocks[b.idx()].insts.range()]
-    }
-
-    #[inline]
-    pub(crate) fn params(&self, b: Block) -> &[Val] {
-        &self.ppool[self.blocks[b.idx()].params.range()]
-    }
-
-    pub(crate) fn add_param(&mut self, b: Block, ty: Ty) -> Val {
-        let k = self.blocks[b.idx()].params.len as u16;
-        let v = Val(self.vals.len() as u32);
-        self.vals.push(ValData {
-            ty,
-            def: ValDef::Param(b, k),
-        });
-        list_push(&mut self.ppool, &mut self.blocks[b.idx()].params, v);
-        v
-    }
-
-    /// Replace `b`'s parameters, renumbering their definitions.
-    pub(crate) fn set_params(&mut self, b: Block, params: &[Val]) {
-        self.blocks[b.idx()].params = list_new(&mut self.ppool, params);
-        for (k, &p) in params.iter().enumerate() {
-            self.vals[p.idx()].def = ValDef::Param(b, k as u16);
-        }
-    }
-
-    pub(crate) fn append(&mut self, b: Block, inst: Inst) {
-        self.insts[inst.idx()].block = b;
-        list_push(&mut self.layout, &mut self.blocks[b.idx()].insts, inst);
-    }
-
-    /// Insert `inst` at position `at` of `b`.
-    pub(crate) fn insert(&mut self, b: Block, at: usize, inst: Inst) {
-        self.insts[inst.idx()].block = b;
-        list_insert(&mut self.layout, &mut self.blocks[b.idx()].insts, at, inst);
-    }
-
-    /// Insert `inst` into `b` before its terminator.
-    pub(crate) fn insert_before_term(&mut self, b: Block, inst: Inst) {
-        let n = self.blocks[b.idx()].insts.len();
-        let at = match self.terminator(b) {
-            Some(_) => n - 1,
-            None => n,
-        };
-        self.insert(b, at, inst);
-    }
-
-    /// Keep the instructions of `b` that `keep` accepts, in place.
-    pub(crate) fn retain(&mut self, b: Block, mut keep: impl FnMut(&Self, Inst) -> bool) {
-        let r = self.blocks[b.idx()].insts.range();
-        let mut out = r.start;
-        for k in r.clone() {
-            let i = self.layout[k];
-            if keep(self, i) {
-                self.layout[out] = i;
-                out += 1;
-            }
-        }
-        self.blocks[b.idx()].insts.len = (out - r.start) as u32;
-    }
-
-    // --- values -----------------------------------------------------------------
-
-    /// The pool index of a heap value.
-    pub(crate) fn intern_proto(&mut self, p: Gc<'gc, Prototype<'gc>>) -> u32 {
-        if let Some(i) = self.protos.iter().position(|&q| Gc::ptr_eq(q, p)) {
-            return i as u32;
-        }
-        self.protos.push(p);
-        self.protos.len() as u32 - 1
-    }
-
-    pub(crate) fn intern(&mut self, v: Value<'gc>) -> u32 {
-        if let Some(i) = self.pool.iter().position(|p| p.same_bits(&v)) {
-            return i as u32;
-        }
-        self.pool.push(v);
-        self.pool.len() as u32 - 1
-    }
-
-    #[inline]
-    pub(crate) fn vl(&self, l: List) -> &[Val] {
-        &self.vpool[l.range()]
-    }
-
-    #[inline]
-    pub(crate) fn vl_mut(&mut self, l: List) -> &mut [Val] {
-        &mut self.vpool[l.range()]
-    }
-
-    pub(crate) fn new_vlist(&mut self, vals: &[Val]) -> List {
-        list_new(&mut self.vpool, vals)
-    }
-
-    #[inline]
-    pub(crate) fn op(&self, inst: Inst) -> Op {
-        self.insts[inst.idx()].op
-    }
-
-    #[inline]
-    pub(crate) fn ty(&self, v: Val) -> Ty {
-        self.vals[v.idx()].ty
-    }
-
-    /// The instruction defining `v`, unless it is a parameter.
-    #[inline]
-    pub(crate) fn def_inst(&self, v: Val) -> Option<Inst> {
-        match self.vals[v.idx()].def {
-            ValDef::Inst(i, _) => Some(i),
-            ValDef::Param(..) => None,
-        }
-    }
-
-    pub(crate) fn def_op(&self, v: Val) -> Option<Op> {
-        self.def_inst(v).map(|i| self.op(i))
-    }
-
-    // --- instructions -----------------------------------------------------------
-
-    /// Create an instruction (not placed in a block).
-    pub(crate) fn make_inst(
-        &mut self,
-        op: Op,
-        args: &[Val],
-        snap: Option<Snap>,
-        tag: ExitTag,
-    ) -> Inst {
-        let inst = Inst(self.insts.len() as u32);
-        let a0 = self.vpool.len() as u32;
-        self.vpool.extend_from_slice(args);
-        let nres = op.num_results();
-        let r0 = self.vals.len() as u32;
-        if nres > 0 {
-            let ty = self.result_ty(op, args);
-            for k in 0..nres {
-                self.vals.push(ValData {
-                    ty,
-                    def: ValDef::Inst(inst, k as u8),
-                });
-            }
-        }
-        self.insts.push(InstData {
-            op,
-            a0,
-            an: args.len() as u16,
-            r0,
-            rn: nres as u8,
-            e0: 0,
-            en: 0,
-            snap: snap.map_or(NO_SNAP, |s| s.0),
-            blame: NO_SNAP,
-            tag,
-            block: Block(u32::MAX),
-        });
-        inst
-    }
-
-    /// The index of the set of `shapes` indices `set`, interned.
-    pub(crate) fn intern_shape_set(&mut self, set: &[u32]) -> u32 {
-        let mut v = set.to_vec();
-        v.sort_unstable();
-        v.dedup();
-        match self.shape_sets.iter().position(|x| *x == v) {
-            Some(k) => k as u32,
-            None => {
-                self.shape_sets.push(v);
-                self.shape_sets.len() as u32 - 1
-            }
-        }
-    }
-
-    /// `op`'s result type from its operands' (only the first three matter).
-    pub(crate) fn result_ty(&self, op: Op, args: &[Val]) -> Ty {
-        let mut tys = [Ty::ANY; 3];
-        let n = args.len().min(3);
-        for (t, &a) in tys.iter_mut().zip(&args[..n]) {
-            *t = self.vals[a.idx()].ty;
-        }
-        op.result_ty(&tys[..n])
-    }
-
-    pub(crate) fn set_edges(&mut self, inst: Inst, edges: &[BlockCall]) {
-        let e0 = self.edges.len() as u32;
-        self.edges.extend_from_slice(edges);
-        let d = &mut self.insts[inst.idx()];
-        d.e0 = e0;
-        d.en = edges.len() as u8;
-        self.cfg_changed();
-    }
-
-    /// Point edge `k` of `inst` at `target`.
-    pub(crate) fn set_target(&mut self, inst: Inst, k: usize, target: Block) {
-        let e0 = self.insts[inst.idx()].e0 as usize;
-        self.edges[e0 + k].target = target;
-        self.cfg_changed();
-    }
-
-    #[inline]
-    pub(crate) fn args(&self, inst: Inst) -> &[Val] {
-        let d = &self.insts[inst.idx()];
-        &self.vpool[d.a0 as usize..d.a0 as usize + d.an as usize]
-    }
-
-    /// Give `inst` the operands `args`, however many it had.
-    pub(crate) fn set_args(&mut self, inst: Inst, args: &[Val]) {
-        let a0 = self.vpool.len() as u32;
-        self.vpool.extend_from_slice(args);
-        let d = &mut self.insts[inst.idx()];
-        d.a0 = a0;
-        d.an = args.len() as u16;
-    }
-
-    #[inline]
-    pub(crate) fn args_mut(&mut self, inst: Inst) -> &mut [Val] {
-        let d = self.insts[inst.idx()];
-        &mut self.vpool[d.a0 as usize..d.a0 as usize + d.an as usize]
-    }
-
-    #[inline]
-    pub(crate) fn result(&self, inst: Inst) -> Val {
-        let d = &self.insts[inst.idx()];
-        debug_assert!(d.rn >= 1, "{:?} has no result", d.op);
-        Val(d.r0)
-    }
-
-    pub(crate) fn results(&self, inst: Inst) -> impl Iterator<Item = Val> + use<> {
-        let d = &self.insts[inst.idx()];
-        (d.r0..d.r0 + d.rn as u32).map(Val)
-    }
-
-    #[inline]
-    pub(crate) fn edges(&self, inst: Inst) -> &[BlockCall] {
-        let d = &self.insts[inst.idx()];
-        &self.edges[d.e0 as usize..d.e0 as usize + d.en as usize]
-    }
-
-    /// The arguments of edge `k` of `inst`.
-    #[inline]
-    pub(crate) fn edge_args(&self, inst: Inst, k: usize) -> &[Val] {
-        self.vl(self.edges(inst)[k].args)
-    }
-
-    #[inline]
-    pub(crate) fn edge_args_mut(&mut self, inst: Inst, k: usize) -> &mut [Val] {
-        let l = self.edges(inst)[k].args;
-        self.vl_mut(l)
-    }
-
-    pub(crate) fn push_edge_arg(&mut self, inst: Inst, k: usize, v: Val) {
-        let e = self.insts[inst.idx()].e0 as usize + k;
-        list_push(&mut self.vpool, &mut self.edges[e].args, v);
-    }
-
-    pub(crate) fn set_edge_args(&mut self, inst: Inst, k: usize, args: &[Val]) {
-        let e = self.insts[inst.idx()].e0 as usize + k;
-        self.edges[e].args = list_new(&mut self.vpool, args);
-    }
-
-    // --- snapshots --------------------------------------------------------------
-
-    /// A snapshot of the entries pushed to `snap_pool` since `from`; the
-    /// previous one when it is equal, as most guards of one instruction
-    /// share their snapshot.
-    pub(crate) fn finish_snap(&mut self, frame: u32, pc: u32, kind: ExitKind, from: usize) -> Snap {
-        let entries = List {
-            start: from as u32,
-            len: (self.snap_pool.len() - from) as u32,
-        };
-        if let Some(last) = self.snaps.last()
-            && last.pc == pc
-            && last.kind == kind
-            && last.frame == frame
-            && self.snap_pool[last.entries.range()] == self.snap_pool[entries.range()]
-        {
-            self.snap_pool.truncate(from);
-            return Snap(self.snaps.len() as u32 - 1);
-        }
-        self.snaps.push(SnapData {
-            pc,
-            kind,
-            entries,
-            frame,
-        });
-        Snap(self.snaps.len() as u32 - 1)
-    }
-
-    /// Whether exits with snapshots `a` and `b` leave alike: the same
-    /// snapshot, or copies of one (a clone's, a replaced value's).
-    pub(crate) fn same_snap(&self, a: u32, b: u32) -> bool {
-        a == b || {
-            let (x, y) = (&self.snaps[a as usize], &self.snaps[b as usize]);
-            (x.pc, x.kind, x.frame) == (y.pc, y.kind, y.frame) && self.entries(a) == self.entries(b)
-        }
-    }
-
-    /// The site of an exit with snapshot `s` that stays where it is.
-    pub(crate) fn snap_site(&self, s: Snap) -> ExitSite {
-        let d = self.snaps[s.0 as usize];
-        ExitSite {
-            pc: d.pc,
-            frame: d.frame,
-        }
-    }
-
-    /// A new snapshot with `s`'s frame and its values mapped by `map`.
-    pub(crate) fn map_snap(&mut self, s: Snap, mut map: impl FnMut(Val) -> Val) -> Snap {
-        let d = self.snaps[s.idx()];
-        let start = self.snap_pool.len();
-        for k in d.entries.range() {
-            let (r, v) = self.snap_pool[k];
-            self.snap_pool.push((r, map(v)));
-        }
-        self.snaps.push(SnapData {
-            pc: d.pc,
-            kind: d.kind,
-            entries: List {
-                start: start as u32,
-                len: d.entries.len,
-            },
-            frame: d.frame,
-        });
-        let ns = Snap(self.snaps.len() as u32 - 1);
-        if let Some(&homes) = self.call_homes.get(&s.0) {
-            self.call_homes.insert(ns.0, homes);
-        }
-        ns
-    }
-
-    #[inline]
-    pub(crate) fn entries(&self, s: u32) -> &[(u8, Val)] {
-        &self.snap_pool[self.snaps[s as usize].entries.range()]
-    }
-
-    /// The snapshot entries of `inst`, if it has a snapshot.
-    #[inline]
-    pub(crate) fn snap_entries(&self, inst: Inst) -> &[(u8, Val)] {
-        match self.insts[inst.idx()].snap {
-            NO_SNAP => &[],
-            s => self.entries(s),
-        }
-    }
-
-    /// The blame entries of `inst`, if it is a moved exit.
-    #[inline]
-    pub(crate) fn blame_entries(&self, inst: Inst) -> &[(u8, Val)] {
-        match self.insts[inst.idx()].blame {
-            NO_SNAP => &[],
-            s => self.entries(s),
-        }
-    }
-
-    /// The site whose feedback an exit of `inst` records: its blame's, else
-    /// its snapshot's.
-    pub(crate) fn exit_site(&self, inst: Inst) -> ExitSite {
-        let d = &self.insts[inst.idx()];
-        self.snap_site(Snap(if d.blame != NO_SNAP { d.blame } else { d.snap }))
-    }
-
-    /// The blame of `inst`'s exit taken elsewhere (a guard moved out of a
-    /// loop, or made from it): its site, with the entries `keep` admits
-    /// there.
-    pub(crate) fn moved_blame(&mut self, inst: Inst, keep: impl Fn(&Self, Val) -> bool) -> u32 {
-        let site = self.exit_site(inst);
-        let operands = self.insts[inst.idx()].tag.blames_operands();
-        let kept: Vec<(u8, Val)> = (self.blame_entries(inst).iter())
-            .copied()
-            .filter(|&(_, v)| operands && keep(self, v))
-            .collect();
-        let from = self.snap_pool.len();
-        self.snap_pool.extend_from_slice(&kept);
-        self.finish_snap(site.frame, site.pc, ExitKind::Before, from)
-            .0
-    }
-
-    /// `inst` exits no more: its snapshot and blame go.
-    pub(crate) fn drop_exit(&mut self, inst: Inst) {
-        let d = &mut self.insts[inst.idx()];
-        (d.snap, d.blame) = (NO_SNAP, NO_SNAP);
-    }
-
-    // --- uses -------------------------------------------------------------------
-
-    /// Make `inst` use `r` where it uses `v`; a snapshot or blame it may
-    /// share is copied first.
-    pub(crate) fn replace_uses(&mut self, inst: Inst, v: Val, r: Val) {
-        for a in self.args_mut(inst) {
-            if *a == v {
-                *a = r;
-            }
-        }
-        for e in 0..self.edges(inst).len() {
-            for a in self.edge_args_mut(inst, e) {
-                if *a == v {
-                    *a = r;
-                }
-            }
-        }
-        if self.snap_entries(inst).iter().any(|e| e.1 == v) {
-            let s = self.insts[inst.idx()].snap;
-            let ns = self.map_snap(Snap(s), |x| if x == v { r } else { x });
-            self.insts[inst.idx()].snap = ns.0;
-        }
-        if self.blame_entries(inst).iter().any(|e| e.1 == v) {
-            let s = self.insts[inst.idx()].blame;
-            let ns = self.map_snap(Snap(s), |x| if x == v { r } else { x });
-            self.insts[inst.idx()].blame = ns.0;
-        }
-    }
-
-    /// Every value `inst` uses: operands, edge arguments, snapshot and blame
-    /// entries.
-    pub(crate) fn for_each_use(&self, inst: Inst, mut f: impl FnMut(Val)) {
-        for &a in self.args(inst) {
-            f(a);
-        }
-        for e in self.edges(inst) {
-            for &a in self.vl(e.args) {
-                f(a);
-            }
-        }
-        for &(_, v) in self.snap_entries(inst) {
-            f(v);
-        }
-        for &(_, v) in self.blame_entries(inst) {
-            f(v);
-        }
-    }
-
-    /// Use counts of every value: operands, edge arguments and snapshot
-    /// entries of live instructions.
-    pub(crate) fn use_counts(&self) -> Vec<u32> {
-        let mut uses = vec![0u32; self.vals.len()];
-        for (b, bd) in self.blocks.iter().enumerate() {
-            if bd.dead {
-                continue;
-            }
-            for &i in self.insts_of(Block(b as u32)) {
-                self.for_each_use(i, |v| uses[v.idx()] += 1);
-            }
-        }
-        uses
-    }
-
-    /// Replace uses through a map from each value to its replacement (or
-    /// itself), resolving chains.
-    pub(crate) fn apply_replacements(&mut self, map: &mut [Val]) {
-        fn find(map: &mut [Val], v: Val) -> Val {
-            let mut r = v;
-            while map[r.idx()] != r {
-                r = map[r.idx()];
-            }
-            let mut c = v;
-            while map[c.idx()] != r {
-                let n = map[c.idx()];
-                map[c.idx()] = r;
-                c = n;
-            }
-            r
-        }
-        // Most values map to themselves: a load and a compare for those.
-        for v in &mut self.vpool {
-            if map.get(v.idx()).is_some_and(|m| m != v) {
-                *v = find(map, *v);
-            }
-        }
-        for e in &mut self.snap_pool {
-            if map.get(e.1.idx()).is_some_and(|&m| m != e.1) {
-                e.1 = find(map, e.1);
-            }
-        }
+    pub(crate) fn is_terminator(&self, v: Val) -> bool {
+        self.op(v).has(Flags::TERMINATOR)
     }
 }

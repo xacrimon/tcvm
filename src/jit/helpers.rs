@@ -13,7 +13,7 @@ use crate::env::thread::ThreadState;
 use crate::env::value::Value;
 use crate::instruction::ArithKind;
 use crate::instruction::TFOR_VARS;
-use crate::jit::ir::ops::{HELPER_FAIL_VAL, HelperId, Libm};
+use crate::jit::ir::ops::{HELPER_FAIL_VAL, Helper};
 use crate::lua::{Context, State};
 use crate::vm::frame::{self, NativeHdr, land_results};
 use crate::vm::native::{caught, continued, invoke, ok, set_wait, tag};
@@ -24,48 +24,60 @@ use crate::vm::ops::meta::{
 };
 
 /// The address a region calls for `h`.
-pub(crate) fn address(h: HelperId) -> usize {
-    match h {
-        HelperId::FMod => jit_fmod as *const () as usize,
-        HelperId::Libm(f) => libm_address(f),
-        HelperId::ArithCoerce(_) => jit_arith as *const () as usize,
-        HelperId::Unm => jit_unm as *const () as usize,
-        HelperId::BNot => jit_bnot as *const () as usize,
-        HelperId::Len => jit_len as *const () as usize,
-        HelperId::Concat => jit_concat as *const () as usize,
-        HelperId::UpvalBarrier => jit_upval_barrier as *const () as usize,
-        HelperId::Closure { .. } => jit_closure as *const () as usize,
-        HelperId::ClosureOf { .. } => jit_closure_of as *const () as usize,
-        HelperId::Close(_) => jit_close as *const () as usize,
-        HelperId::NewTable => jit_newtable as *const () as usize,
-        HelperId::SetList { .. } => jit_setlist as *const () as usize,
-        HelperId::VarargGet => jit_varargget as *const () as usize,
-        HelperId::VarargTable(_) => jit_vararg_table as *const () as usize,
-        HelperId::TforNext { .. } => jit_tfor_next as *const () as usize,
-        HelperId::TforIpairs => jit_tfor_ipairs as *const () as usize,
-        HelperId::TopArgs(_) => jit_top_args as *const () as usize,
-        HelperId::VarargAll(_) => jit_vararg_all as *const () as usize,
-        HelperId::Index => jit_index as *const () as usize,
-        HelperId::GetStr => jit_get_str as *const () as usize,
-        HelperId::SetStr => jit_set_str as *const () as usize,
-        HelperId::Mm(_) => jit_mm as *const () as usize,
-        HelperId::IndexFn => jit_index_fn as *const () as usize,
-        HelperId::NewIndexFn => jit_newindex_fn as *const () as usize,
-        HelperId::NewIndex { .. } => jit_newindex as *const () as usize,
-        HelperId::Type => jit_type as *const () as usize,
-        HelperId::GetMetatable => jit_getmetatable as *const () as usize,
-        HelperId::SetMetatable => jit_setmetatable as *const () as usize,
-        HelperId::RawGet => jit_rawget as *const () as usize,
-        HelperId::RawSet => jit_rawset as *const () as usize,
-        HelperId::RawEqual => jit_rawequal as *const () as usize,
-        HelperId::RawLen => jit_rawlen as *const () as usize,
-        HelperId::ToString => jit_tostring as *const () as usize,
-        HelperId::ToNumber => jit_tonumber as *const () as usize,
-        HelperId::StrSub => jit_strsub as *const () as usize,
-        HelperId::StrByte => jit_strbyte as *const () as usize,
-        HelperId::TInsert => jit_tinsert as *const () as usize,
-        HelperId::TRemove => jit_tremove as *const () as usize,
-    }
+pub(crate) fn address(h: Helper) -> usize {
+    let p: *const () = match h {
+        Helper::FMod => jit_fmod as _,
+        Helper::Sin => sin as _,
+        Helper::Cos => cos as _,
+        Helper::Tan => tan as _,
+        Helper::Asin => asin as _,
+        Helper::Acos => acos as _,
+        Helper::Exp => exp as _,
+        Helper::Log => log as _,
+        Helper::Log2 => log2 as _,
+        Helper::Log10 => log10 as _,
+        Helper::Pow => pow as _,
+        Helper::Atan2 => atan2 as _,
+        Helper::LibmFmod => fmod as _,
+        Helper::ArithCoerce => jit_arith as _,
+        Helper::Unm => jit_unm as _,
+        Helper::BNot => jit_bnot as _,
+        Helper::Len => jit_len as _,
+        Helper::Concat => jit_concat as _,
+        Helper::UpvalBarrier => jit_upval_barrier as _,
+        Helper::Closure => jit_closure as _,
+        Helper::ClosureOf => jit_closure_of as _,
+        Helper::Close => jit_close as _,
+        Helper::NewTable => jit_newtable as _,
+        Helper::SetList => jit_setlist as _,
+        Helper::VarargGet => jit_varargget as _,
+        Helper::VarargTable => jit_vararg_table as _,
+        Helper::TforNext => jit_tfor_next as _,
+        Helper::TforIpairs => jit_tfor_ipairs as _,
+        Helper::TopArgs => jit_top_args as _,
+        Helper::VarargAll => jit_vararg_all as _,
+        Helper::Index => jit_index as _,
+        Helper::GetStr => jit_get_str as _,
+        Helper::SetStr => jit_set_str as _,
+        Helper::Mm => jit_mm as _,
+        Helper::IndexFn => jit_index_fn as _,
+        Helper::NewIndexFn => jit_newindex_fn as _,
+        Helper::NewIndex => jit_newindex as _,
+        Helper::Type => jit_type as _,
+        Helper::GetMetatable => jit_getmetatable as _,
+        Helper::SetMetatable => jit_setmetatable as _,
+        Helper::RawGet => jit_rawget as _,
+        Helper::RawSet => jit_rawset as _,
+        Helper::RawEqual => jit_rawequal as _,
+        Helper::RawLen => jit_rawlen as _,
+        Helper::ToString => jit_tostring as _,
+        Helper::ToNumber => jit_tonumber as _,
+        Helper::StrSub => jit_strsub as _,
+        Helper::StrByte => jit_strbyte as _,
+        Helper::TInsert => jit_tinsert as _,
+        Helper::TRemove => jit_tremove as _,
+    };
+    p as usize
 }
 
 /// A float result as a `Value` holds it: NaNs canonical.
@@ -95,24 +107,6 @@ unsafe extern "C" {
     safe fn pow(x: f64, y: f64) -> f64;
     safe fn atan2(y: f64, x: f64) -> f64;
     safe fn fmod(x: f64, y: f64) -> f64;
-}
-
-fn libm_address(f: Libm) -> usize {
-    let p: *const () = match f {
-        Libm::Sin => sin as _,
-        Libm::Cos => cos as _,
-        Libm::Tan => tan as _,
-        Libm::Asin => asin as _,
-        Libm::Acos => acos as _,
-        Libm::Exp => exp as _,
-        Libm::Log => log as _,
-        Libm::Log2 => log2 as _,
-        Libm::Log10 => log10 as _,
-        Libm::Pow => pow as _,
-        Libm::Atan2 => atan2 as _,
-        Libm::Fmod => fmod as _,
-    };
-    p as usize
 }
 
 /// `arith_slow`'s numeric cases; everything it would raise or hand to a
@@ -463,7 +457,7 @@ pub(crate) extern "C" fn jit_vararg_table(
 
 /// `recv[key]` as `get_slow` resolves it without calling a function. A
 /// stale or not yet adopted class fails rather than be refreshed, so the
-/// walk writes nothing (`HelperId::Index` is a read).
+/// walk writes nothing (`Helper::Index` is a read).
 pub(crate) extern "C" fn jit_index(rt: *const State<'static>, recv: u64, key: u64) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
     let (mut recv, key) = unsafe { (Value::from_raw(recv), Value::from_raw(key)) };
