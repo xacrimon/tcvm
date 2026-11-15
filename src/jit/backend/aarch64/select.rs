@@ -5,7 +5,7 @@
 
 use crate::env::value::{PAYLOAD_MASK, SMALL_INT, Value};
 use crate::jit::backend::aarch64::abi;
-use crate::jit::backend::aarch64::asm::{Cond, Sz};
+use crate::jit::backend::aarch64::asm::{Cond, Sz, logical_imm};
 use crate::jit::backend::aarch64::inst::{MInst, MOp, Role};
 use crate::jit::backend::emit::{Exit, Selected, Src};
 use crate::jit::backend::reg::{
@@ -14,6 +14,7 @@ use crate::jit::backend::reg::{
 use crate::jit::backend::vcode::Remat;
 use crate::jit::bug;
 use crate::jit::compile::Bail;
+use crate::jit::ir::fields::Field;
 use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, Heaps, Helper, Op};
 use crate::jit::ir::types::Rep;
 use crate::jit::ir::{Block, Graph, HOME, Pool, Val};
@@ -280,16 +281,14 @@ impl Sel<'_> {
         self.s.insts.push((i, first, n, PRegSet::empty()));
     }
 
-    /// The condition code a branch on `c` takes.
+    /// The condition code a branch on `c` takes: a compare's, or for a
+    /// truth value that it is not zero.
     fn cond(&mut self, c: Val) -> Cond {
         let i = self.g.inst(c);
         match i.op {
             Op::Cmp => int_cond(Cc::of(i.aux)),
             Op::FCmp => float_cond(Cc::of(i.aux)),
-            _ => {
-                self.s.bail = Some(Bail::Unsupported("a branch on a value"));
-                Cond::Eq
-            }
+            _ => Cond::Ne,
         }
     }
 
@@ -301,7 +300,22 @@ impl Sel<'_> {
             let (x, y) = (self.reg(x), self.reg(y));
             return self.op(MOp::Fcmp, Sz::X, 0, &[x, y]);
         }
+        if i.op != Op::Cmp {
+            let c = self.reg(c);
+            return self.op(MOp::CmpImm, Sz::W, 0, &[c]);
+        }
         let sz = sz(self.g.rep(x));
+        // Bits tested against zero need no value.
+        let d = *self.g.inst(x);
+        if d.op == Op::And
+            && matches!(Cc::of(i.aux), Cc::Eq | Cc::Ne)
+            && self.imm(y) == Some(0)
+            && let Some(k) = self.imm(Val(d.b))
+            && logical_imm(k as u64, sz.bits()).is_some()
+        {
+            let x = self.reg(Val(d.a));
+            return self.op(MOp::TstImm, sz, k as u64, &[x]);
+        }
         let x = self.reg(x);
         match self.imm(y) {
             Some(k @ 0..4096) => self.op(MOp::CmpImm, sz, k as u64, &[x]),
@@ -340,8 +354,75 @@ impl Sel<'_> {
         match i.op {
             Param | FrameState | Trunc32 => {}
             Cmp | FCmp => {
-                if self.def(v).is_some() {
-                    self.s.bail = Some(Bail::Unsupported("a compare as a value"));
+                // Asked for as a value, beside what branches on it.
+                let Some(d) = self.def(v) else { return };
+                let cc = self.cond(v);
+                self.push(MOp::Cset, Sz::W, cc, 0, &[d]);
+                self.compare(v);
+            }
+            Base => {
+                let Some(d) = self.def(v) else { return };
+                self.op(MOp::MovBase, Sz::X, 0, &[d]);
+            }
+            Load => {
+                let Some(d) = self.def(v) else { return };
+                let base = self.reg(a);
+                let off = Field::offset(i.aux, i.c) as i64 as u64;
+                self.op(MOp::Ldr, w, off, &[d, base]);
+            }
+            Store => {
+                let (x, base) = (self.reg(b), self.reg(a));
+                let off = Field::offset(i.aux, i.c) as i64 as u64;
+                self.op(MOp::Str, Sz::X, off, &[x, base]);
+            }
+            LoadIdx | StoreIdx => {
+                let t = match i.op {
+                    LoadIdx => match self.def(v) {
+                        Some(d) => d,
+                        None => return,
+                    },
+                    _ => self.reg(Val(i.c)),
+                };
+                // A zero-extended index is the 32-bit register, extended by
+                // the access.
+                let x = *self.g.inst(b);
+                let (index, uxtw) = if x.op == ZExt32 {
+                    (self.reg(Val(x.a)), Cond::Ne)
+                } else {
+                    (self.reg(b), Cond::Eq)
+                };
+                let base = self.reg(a);
+                let op = if i.op == LoadIdx {
+                    MOp::LdrIdx
+                } else {
+                    MOp::StrIdx
+                };
+                self.push(op, Sz::X, uxtw, 0, &[t, base, index]);
+            }
+            ZExt32 => {
+                let Some(d) = self.def(v) else { return };
+                let x = self.reg(a);
+                self.op(MOp::Uxtw, Sz::X, 0, &[d, x]);
+            }
+            UnboxPtr | UnboxPtrPin => {
+                let Some(d) = self.def(v) else { return };
+                let x = self.reg(a);
+                self.op(MOp::AndImm, Sz::X, PAYLOAD_MASK, &[d, x]);
+            }
+            And | Or => {
+                let Some(d) = self.def(v) else { return };
+                let x = self.reg(a);
+                match self
+                    .imm(b)
+                    .filter(|&k| logical_imm(k as u64, w.bits()).is_some())
+                {
+                    Some(k) if i.op == And => self.op(MOp::AndImm, w, k as u64, &[d, x]),
+                    Some(k) => self.op(MOp::OrrImm, w, k as u64, &[d, x]),
+                    None => {
+                        let y = self.reg(b);
+                        let op = if i.op == And { MOp::AndRR } else { MOp::OrrRR };
+                        self.op(op, w, 0, &[d, x, y])
+                    }
                 }
             }
             K32 | K64 | KF64 | KObj => {

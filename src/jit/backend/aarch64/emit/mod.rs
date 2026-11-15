@@ -271,6 +271,28 @@ impl<'a> Em<'a> {
             MOp::FImm => self.fimm(self.fr(i, 0), imm),
             MOp::LdrSlot => self.a.ldr(self.r(i, 0), BASE, imm as i32 * 8),
             MOp::StrSlot => self.a.str(self.r(i, 0), BASE, imm as i32 * 8),
+            MOp::Ldr if sz == Sz::W => self.a.ldr_w(self.r(i, 0), self.r(i, 1), imm as i32),
+            MOp::Ldr => self.a.ldr(self.r(i, 0), self.r(i, 1), imm as i32),
+            MOp::Str => self.a.str(self.r(i, 0), self.r(i, 1), imm as i32),
+            MOp::LdrIdx | MOp::StrIdx => {
+                let ext = if m.cc == 1 { Extend::Uxtw } else { Extend::Lsl };
+                let (t, n, x) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
+                match m.op {
+                    MOp::LdrIdx => self.a.ldr_idx(t, n, x, ext, true),
+                    _ => self.a.str_idx(t, n, x, ext, true),
+                }
+            }
+            MOp::MovBase => self.a.mov(self.r(i, 0), BASE),
+            MOp::Uxtw => self.a.mov_w(self.r(i, 0), self.r(i, 1)),
+            MOp::Cset => {
+                // SAFETY: selection wrote an `asm::Cond`.
+                let cc: Cond = unsafe { std::mem::transmute(m.cc) };
+                self.a.cset(Sz::W, self.r(i, 0), cc)
+            }
+            MOp::AndRR => self.a.and(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::OrrRR => self.a.orr(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::AndImm => self.a.and_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::TstImm => self.a.tst_imm(sz, self.r(i, 0), imm),
             MOp::AddRR => self.a.add(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::SubRR => self.a.sub(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::MulRR => self.a.mul(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),

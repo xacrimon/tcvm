@@ -267,7 +267,7 @@ pub(crate) fn compile<'gc>(
     high.reset(false);
     let pool = &mut scratch.pool;
     pool.words.clear();
-    crate::jit::build::build(high, pool, &cfg, closure.proto, pc);
+    let shapes = crate::jit::build::build(high, pool, &cfg, closure.proto, pc);
     high.finish();
     stage(config, closure, pc, "build", high);
     if let Some(why) = high.bail {
@@ -424,7 +424,7 @@ pub(crate) fn compile<'gc>(
             pool: (pool.words.iter())
                 .map(|&w| unsafe { Value::from_raw(w) })
                 .collect(),
-            shapes: Box::new([]),
+            shapes: shapes.into_boxed_slice(),
             exits: exits.into_boxed_slice(),
             #[cfg(feature = "tcvm-dev")]
             fired: Box::new([]),

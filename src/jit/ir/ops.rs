@@ -250,6 +250,8 @@ bitflags::bitflags! {
     /// (prototype fields, string length and bytes) is none of them.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub(crate) struct Heaps: u16 {
+        /// Memory nothing writes: no heap.
+        const IMMUTABLE = 0;
         /// Frame slots, keyed by register.
         const SLOT = 1;
         /// Named table slots, keyed by their constant key.
@@ -440,6 +442,8 @@ ops! {
     Store       Both Field  (Ptr Any Imm)     None [] [BY_FIELD] [];
     LoadIdx     Both Field  (Ptr I64 Opt)     Dyn  [BY_FIELD] [] [];
     StoreIdx    Both Field  (Ptr I64 Any)     None [] [BY_FIELD] [];
+    // The frame's base, which frame fields are loaded from.
+    Base        Both No     (No No No)        Ptr  [] [] [];
     SlotLoad    Both Slot   (No No No)        Val  [SLOT] [] [];
     SlotStore   Both Slot   (Val No No)       None [] [SLOT] [];
 
@@ -645,6 +649,8 @@ helpers! {
     Len          RT     0 (Val)         Val  [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];
     Concat       RT     0 (Val Val)     Val  [] [] [ALLOCS];
     UpvalBarrier THREAD 0 (Ptr)         None [] [GC] [];
+    // The backward barrier of a table that is not gray.
+    Barrier      RT     0 (Ptr)         None [] [GC] [];
     // New open upvalues join the thread's list.
     Closure      FRAME  1 ()            Val  [SLOT] [FRAME] [ALLOCS];
     ClosureOf    FRAME  1 (Ptr)         Val  [SLOT] [] [ALLOCS];

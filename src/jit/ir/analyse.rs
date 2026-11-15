@@ -132,7 +132,8 @@ impl Analysis {
             }
         }
         for v in 0..n {
-            if !pending(v) || !every[v] || demand[v].unboxed() == Rep::None {
+            // Only a type a parameter is held unboxed for is checked on entry.
+            if !pending(v) || !every[v] || !matches!(demand[v].unboxed(), Rep::I32 | Rep::F64) {
                 demand[v] = TypeSet::ANY;
             }
         }

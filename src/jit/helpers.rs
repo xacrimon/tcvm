@@ -45,6 +45,7 @@ pub(crate) fn address(h: Helper) -> usize {
         Helper::Len => jit_len as _,
         Helper::Concat => jit_concat as _,
         Helper::UpvalBarrier => jit_upval_barrier as _,
+        Helper::Barrier => jit_barrier as _,
         Helper::Closure => jit_closure as _,
         Helper::ClosureOf => jit_closure_of as _,
         Helper::Close => jit_close as _,

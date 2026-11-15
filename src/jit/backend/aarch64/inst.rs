@@ -47,6 +47,21 @@ mops! {
     FImm      (Fd);
     LdrSlot   (D);
     StrSlot   (U);
+    // `imm` is the byte offset from the base, the last register; a `W`
+    // load is of 32 bits.
+    Ldr       (D U);
+    Str       (U U);
+    // The base, then an index of 8-byte elements: `cc` 1 for a 32-bit index
+    // zero-extended (`uxtw`).
+    LdrIdx    (D U U);
+    StrIdx    (U U U);
+    MovBase   (D);
+    Uxtw      (D U);
+    Cset      (D);
+    AndRR     (D U U);
+    OrrRR     (D U U);
+    AndImm    (D U);
+    TstImm    (U);
     AddRR     (D U U);
     SubRR     (D U U);
     MulRR     (D U U);

@@ -591,7 +591,7 @@ fn operand_representations_are_checked() {
 #[should_panic(expected = "high-level")]
 fn low_level_graphs_take_no_high_level_ops() {
     let t = start(true);
-    t.is_type(t.slot(0), TypeSet::TAB);
+    t.op1(Op::UnboxI64, Rep::I64, t.slot(0));
 }
 
 #[test]

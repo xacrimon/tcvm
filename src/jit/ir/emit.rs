@@ -52,7 +52,8 @@ fn heap_of(i: &Inst) -> (Heaps, Option<u32>) {
         _ => {
             let f = Field::info(i.aux);
             let spilled = (i.aux == Field::Spilled as u16) as u32;
-            (f.heap, f.indexed.then(|| FIELD_KEYS + 2 * i.c + spilled))
+            let keyed = f.indexed && !f.heap.is_empty();
+            (f.heap, keyed.then(|| FIELD_KEYS + 2 * i.c + spilled))
         }
     }
 }
@@ -515,6 +516,7 @@ impl Emitter {
                 crate::env::value::Value::from_raw(i.k64())
             })),
             (Op::KObj | Op::BoxPtr, _) => Fact::of(TypeSet::from_bits_retain(i.aux)),
+            (Op::Load | Op::LoadIdx, Rep::Val) => Fact::of(Field::info(i.aux).set),
             (Op::BoxI32, _) => Fact::of(TypeSet::SMALL),
             (Op::BoxF64, _) => Fact::of(TypeSet::FLOAT),
             (Op::BoxI64, _) => Fact::of(TypeSet::INT),

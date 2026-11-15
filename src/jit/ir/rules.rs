@@ -269,22 +269,9 @@ impl Emitter {
                 }
                 // Today's aarch64 sequences, as values: a small integer's
                 // upper word is all ones, a float is below every box.
-                let cond = match i.rep {
-                    Rep::I32 => {
-                        let k = self.k64(Rep::I64, 32);
-                        let hi = self.op2(Shr, Rep::I64, a, k);
-                        let hi = self.op1(Trunc32, Rep::I32, hi);
-                        let ones = self.k32(Rep::I32, u32::MAX);
-                        self.cmp(Cmp, Cc::Eq, hi, ones)
-                    }
-                    Rep::F64 => {
-                        let k = self.k64(Rep::I64, crate::env::value::BOX);
-                        self.cmp(Cmp, Cc::Lo, a, k)
-                    }
-                    _ => {
-                        self.bail(crate::jit::compile::Bail::Unsupported("type test"));
-                        return Some(Val(0));
-                    }
+                let Some(cond) = self.type_test(a, set) else {
+                    self.bail(crate::jit::compile::Bail::Unsupported("type test"));
+                    return Some(Val(0));
                 };
                 let tag = i.aux >> TypeSet::BITS;
                 let checked = self.emit(Guard, Rep::Val, tag, cond.0, i.b, a.0);
@@ -293,7 +280,9 @@ impl Emitter {
                 self.refine(a, super::types::Fact::of(set));
                 Some(match i.rep {
                     Rep::I32 => self.op1(Trunc32, Rep::I32, checked),
-                    _ => self.op1(UnboxF64, Rep::F64, checked),
+                    Rep::F64 => self.op1(UnboxF64, Rep::F64, checked),
+                    Rep::Ptr => self.op1(UnboxPtr, Rep::Ptr, checked),
+                    _ => Val::NONE,
                 })
             }
             IsType => {
@@ -305,6 +294,12 @@ impl Emitter {
                     Some(self.k32(Rep::B1, 1))
                 } else if !set.intersects(f.set) {
                     Some(self.k32(Rep::B1, 0))
+                } else if self.lowered {
+                    let c = self.type_test(a, set);
+                    if c.is_none() {
+                        self.bail(crate::jit::compile::Bail::Unsupported("type test"));
+                    }
+                    Some(c.unwrap_or(Val(0)))
                 } else {
                     None
                 }
@@ -481,9 +476,9 @@ impl Emitter {
                 let r = self.op2(op, Rep::F64, x, y);
                 Some(self.op1(BoxF64, Rep::Val, r))
             }
-            K32 | K64 | KF64 | KObj | Load | Store | LoadIdx | StoreIdx | SlotLoad | SlotStore
-            | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr | AbsOvf
-            | FMod | Unm | Truthy | CallHelper => None,
+            K32 | K64 | KF64 | KObj | Base | Load | Store | LoadIdx | StoreIdx | SlotLoad
+            | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr
+            | AbsOvf | FMod | Unm | Truthy | CallHelper => None,
         }
     }
 
@@ -513,6 +508,41 @@ impl Emitter {
             Rep::Ptr => self.op1(UnboxPtrPin, rep, v),
             _ => Val::NONE,
         }
+    }
+
+    /// Whether the `Val` is in `set`, as today's aarch64 sequences written
+    /// in values: a small integer's upper word is all ones, a float is below
+    /// every box, a heap value's top 16 bits, sign-extended, are its tag
+    /// less 8. None for a set that takes more than one compare.
+    fn type_test(&mut self, v: Val, set: TypeSet) -> Option<Val> {
+        use Op::*;
+
+        use crate::env::value::{
+            BOX, FUNCTION_BITS, STRING_BITS, TAG_BOXED_INT, TAG_SHIFT, TAG_TABLE,
+        };
+        let tag = |bits: u64| bits >> TAG_SHIFT & 7;
+        let tag = match set {
+            TypeSet::SMALL => {
+                let k = self.k64(Rep::I64, 32);
+                let hi = self.op2(Shr, Rep::I64, v, k);
+                let hi = self.op1(Trunc32, Rep::I32, hi);
+                let ones = self.k32(Rep::I32, u32::MAX);
+                return Some(self.cmp(Cmp, Cc::Eq, hi, ones));
+            }
+            TypeSet::FLOAT => {
+                let k = self.k64(Rep::I64, BOX);
+                return Some(self.cmp(Cmp, Cc::Lo, v, k));
+            }
+            TypeSet::STR => tag(STRING_BITS),
+            TypeSet::FUN => tag(FUNCTION_BITS),
+            TypeSet::TAB => TAG_TABLE,
+            TypeSet::BIGINT => TAG_BOXED_INT,
+            _ => return None,
+        };
+        let k = self.k64(Rep::I64, TAG_SHIFT as u64);
+        let top = self.op2(Sar, Rep::I64, v, k);
+        let want = self.k64(Rep::I64, (tag as i64 - 8) as u64);
+        Some(self.cmp(Cmp, Cc::Eq, top, want))
     }
 
     fn is_const(&self, v: Val) -> bool {

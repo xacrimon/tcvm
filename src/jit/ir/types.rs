@@ -94,6 +94,38 @@ impl TypeSet {
         }
     }
 
+    /// The types of `env::value::TYPE_WORDS`, by index.
+    pub(crate) const BY_WORDS: [TypeSet; 11] = [
+        TypeSet::FLOAT,
+        TypeSet::UDATA,
+        TypeSet::BIGINT,
+        TypeSet::STR,
+        TypeSet::TAB,
+        TypeSet::FUN,
+        TypeSet::THR,
+        TypeSet::NIL,
+        TypeSet::FALSE,
+        TypeSet::TRUE,
+        TypeSet::SMALL,
+    ];
+
+    /// The types of a slot kind's classes (`Kind::classes`): those of
+    /// `BY_WORDS` with nil and the booleans, which share an upper word, one.
+    pub(crate) fn of_classes(classes: u16) -> TypeSet {
+        let mut set = TypeSet::empty();
+        for (k, &t) in Self::BY_WORDS.iter().enumerate() {
+            let class = match k {
+                0..=6 => k,
+                7..=9 => 7,
+                _ => 8,
+            };
+            if classes >> class & 1 != 0 {
+                set |= t;
+            }
+        }
+        set
+    }
+
     /// The representation a value known to be in the set unboxes to: `None`
     /// where the set has no single one.
     pub(crate) fn unboxed(self) -> Rep {

@@ -6,6 +6,7 @@
 //! parameter stays generic, carrying what its feedback speculates.
 
 pub(crate) mod cfg;
+mod tables;
 
 use cfg::{Cfg, RegSet};
 
@@ -94,6 +95,8 @@ struct Builder<'a, 'gc> {
     pc: u32,
     /// The frame state before the instruction at `pc`, once an exit needs it.
     state: Val,
+    /// The shapes the code compares with, which the region keeps alive.
+    shapes: Vec<crate::env::Shape<'gc>>,
 }
 
 /// Build the region of `proto` entered at `entry_pc` into `e`, which was
@@ -104,7 +107,7 @@ pub(crate) fn build<'gc>(
     cfg: &Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
-) {
+) -> Vec<crate::env::Shape<'gc>> {
     let nb = cfg.blocks.len();
     let root = cfg.block_of[entry_pc as usize];
     let (rpo, order) = cfg::rpo_of(&cfg.blocks, root);
@@ -120,22 +123,23 @@ pub(crate) fn build<'gc>(
         bb: root,
         pc: entry_pc,
         state: Val::NONE,
+        shapes: Vec::new(),
     };
     // A captured register lives in its slot, which the closures holding it
     // read and write: registers here are values only.
     if cfg.captured != RegSet::EMPTY {
-        return b.e.bail(Bail::Unsupported("captured registers"));
-    }
-    if !b.find_loops(root, &rpo, &order) {
-        return b.e.bail(Bail::Unsupported("irreducible control flow"));
+        b.e.bail(Bail::Unsupported("captured registers"));
+    } else if !b.find_loops(root, &rpo, &order) {
+        b.e.bail(Bail::Unsupported("irreducible control flow"));
     }
     b.blocks = (0..nb).map(|_| b.e.new_block()).collect();
     for &bb in &rpo {
         if b.e.bail.is_some() {
-            return;
+            break;
         }
         b.block(bb, bb == root, entry_pc);
     }
+    b.shapes
 }
 
 impl Builder<'_, '_> {
@@ -548,6 +552,10 @@ impl Builder<'_, '_> {
                 let v = self.helped(Helper::Concat, 0, &[x, y]);
                 self.set(a, v);
             }
+            GETTABLE => self.gettable(pc, i),
+            SETTABLE => self.settable(pc, i),
+            GETUPVAL | GETUPVAL_REF => self.getupval(i),
+            SETUPVAL => self.setupval(i),
             LEN => {
                 let x = self.reg(b);
                 let v = self.helped(Helper::Len, 0, &[x]);
@@ -660,7 +668,11 @@ impl Builder<'_, '_> {
                         _ => self.br(c, jump, fall),
                     }
                 }
-                _ => self.deopt(ExitTag::Unsupported),
+                _ => match i.op().unquickened() {
+                    GETFIELD | GETTABUP | GETTABUP_REF => self.getfield(i),
+                    SETFIELD | SETTABUP | SETTABUP_REF => self.setfield(i),
+                    _ => self.deopt(ExitTag::Unsupported),
+                },
             },
         }
     }
