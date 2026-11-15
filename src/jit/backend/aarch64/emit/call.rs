@@ -200,7 +200,17 @@ impl<'a> Em<'a> {
         let (a, nargs, pc) = (imm & 0xff, imm >> 8 & 0xff, imm >> 32);
         let hdr = a as i32 * 8;
         let (slow, native, deep) = (self.a.new_label(), self.a.new_label(), self.a.new_label());
-        self.a.movz(Sz::X, INSN, nargs as u16, 0);
+        if nargs == 255 {
+            // Up to `top`.
+            self.a.ldr(X16, THREAD, layout::THREAD_STACK as i32);
+            self.a.ldr(X17, THREAD, layout::THREAD_TOP as i32);
+            self.a.add_shift(Sz::X, X16, X16, X17, Shift::Lsl, 3);
+            self.a.add_imm(Sz::X, X17, BASE, hdr as u64 + 32);
+            self.a.sub(Sz::X, X16, X16, X17);
+            self.a.lsr_imm(Sz::X, INSN, X16, 3);
+        } else {
+            self.a.movz(Sz::X, INSN, nargs as u16, 0);
+        }
         self.a.ldr(X16, BASE, hdr);
         self.a.lsr_imm(Sz::X, X17, X16, 48);
         self.a.movz(Sz::W, Gpr(9), FUNCTION_TAG, 0);
@@ -453,9 +463,33 @@ impl<'a> Em<'a> {
         // at least a header above `R[a]`, so copying up is safe, and reading
         // past them stays in the stack. The first is in x0: a compiled
         // callee returning one stores none.
-        let (at, n) = (a as i32 * 8, c - 1);
+        let (at, n) = (a as i32 * 8, c.wrapping_sub(1));
         let done = self.a.new_label();
-        if c <= 4 {
+        let helper = self.a.new_label();
+        if c == 0 {
+            // All of them, `top` past them: up to three here.
+            let top = self.a.new_label();
+            self.a.cmp_imm(Sz::X, INSN, 3);
+            self.a.b_cond(Cond::Hi, helper);
+            for k in 0..3 {
+                self.a.cmp_imm(Sz::X, INSN, k);
+                self.a.b_cond(Cond::Eq, top);
+                if k == 0 {
+                    self.a.str(Gpr(0), BASE, at);
+                } else {
+                    self.a.ldr(X16, PC, 8 * k as i32);
+                    self.a.str(X16, BASE, at + 8 * k as i32);
+                }
+            }
+            self.a.bind(top);
+            self.a.ldr(X16, THREAD, layout::THREAD_STACK as i32);
+            self.a.add_imm(Sz::X, X17, BASE, at as u64);
+            self.a.sub(Sz::X, X17, X17, X16);
+            self.a.add_shift(Sz::X, X17, INSN, X17, Shift::Lsr, 3);
+            self.a.str(X17, THREAD, layout::THREAD_TOP as i32);
+            self.a.b(done);
+        }
+        if (1..=4).contains(&c) {
             // All there (a callee's count rarely varies): copied.
             let fill = self.a.new_label();
             self.a.cmp_imm(Sz::X, INSN, n);
@@ -470,6 +504,7 @@ impl<'a> Em<'a> {
             }
             self.ool.push(Ool::Fill { fill, done, n, at });
         } else {
+            self.a.bind(helper);
             // Through the helper, which reads the first result from memory
             // too: (thread, base, a, values, nret, c).
             let first = self.a.new_label();

@@ -45,17 +45,21 @@ impl Builder<'_, '_> {
     /// `R[a], ... = R[a](R[a + 4], ...)`; a fused form's callee is `R[e]`.
     pub(super) fn call(&mut self, pc: u32, i: Instruction) {
         let (a, nb, c) = i.abc();
-        // Arguments or results up to `top` have no code yet.
-        if nb == 0 || c == 0 {
-            return self.deopt(ExitTag::Unsupported);
-        }
         let fused = matches!(i.op(), Bc::CALLS | Bc::CALLS_R0 | Bc::CALLS_R1);
         let callee = self.reg(if fused { i.e() as u8 } else { a });
         self.e
             .emit(Op::SlotStore, Rep::None, a as u16, callee.0, 0, 0);
-        for r in a as u16 + 4..a as u16 + 3 + nb as u16 {
+        // Arguments up to `top` (`nb == 0`): those before the ones a call
+        // landed there, which have no value here.
+        let end = match nb {
+            0 => self.cfg.nregs as u16,
+            _ => a as u16 + 3 + nb as u16,
+        };
+        for r in a as u16 + 4..end {
             let v = self.reg(r as u8);
-            self.e.emit(Op::SlotStore, Rep::None, r, v.0, 0, 0);
+            if !v.is_none() {
+                self.e.emit(Op::SlotStore, Rep::None, r, v.0, 0, 0);
+            }
         }
         // What the frame reads after the call, which writes from `R[a]` up:
         // kept in the native frame, or in its slot where that holds it.
@@ -78,7 +82,7 @@ impl Builder<'_, '_> {
             })
             .collect();
         let state = (self.e).frame_state(pc + 1, ExitKind::Before, Val::NONE, &entries);
-        let imm = a as u32 | (nb as u32 - 1) << 8 | (c as u32) << 16;
+        let imm = a as u32 | (nb.wrapping_sub(1) as u32) << 8 | (c as u32) << 16;
         let lp = self.e.g.block(self.e.cur).lp;
         let resume = self.e.new_block();
         self.e
@@ -87,9 +91,14 @@ impl Builder<'_, '_> {
         // One result comes in a register; more land in their slots.
         let rep = if c == 2 { Rep::Val } else { Rep::None };
         let first = self.e.emit(Op::Resume, rep, 0, imm, 0, 0);
+        // Results up to `top` (`c == 0`) stay in their slots, for the
+        // instruction that takes them from there.
+        for r in a as usize..self.cfg.nregs {
+            self.e.table.set(Key::reg(r as u32), Val::NONE.0);
+        }
         if c == 2 {
             self.set(a, first);
-        } else {
+        } else if c != 0 {
             for r in a..a + c - 1 {
                 let v = self.e.emit(Op::SlotLoad, Rep::Val, r as u16, 0, 0, 0);
                 self.set(r, v);

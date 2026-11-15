@@ -439,7 +439,9 @@ impl<'gc> Builder<'_, 'gc> {
             let k = self.e.next_pred(head);
             for n in 0..self.loops[l].params.len() {
                 let (r, p) = self.loops[l].params[n];
-                let v = self.reg(r);
+                // A register left without a value (a call's, above its
+                // results) is live only by the liveness's caution.
+                let v = Some(self.reg(r)).filter(|v| !v.is_none()).unwrap_or(p);
                 self.e.set_input(p, k, v);
             }
             return head;
@@ -760,7 +762,9 @@ impl<'gc> Builder<'_, 'gc> {
                     self.br(c, fall, jump)
                 }
             }
-            RETURN if b != 0 => {
+            // Results up to `top`: the interpreter's.
+            RETURN if b == 0 => self.dispatch(),
+            RETURN => {
                 // What a return would close is the interpreter's to close: a
                 // frame entered mid-way may have it.
                 // Open upvalues of its own registers it closes itself.
