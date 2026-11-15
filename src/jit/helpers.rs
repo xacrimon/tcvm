@@ -123,8 +123,8 @@ fn coerced<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Option<Value<'gc>> {
 
 /// `arith_slow`'s numeric cases, and a numeric string as the number it
 /// converts to: a string's arithmetic is its metatable's metamethod, which
-/// is taken to be the string library's while there is one (a region is to
-/// depend on that once regions can). Everything else that would raise or
+/// is taken to be the string library's, and numbers to have no metatable (a
+/// region is to depend on both once regions can). Everything else that would raise or
 /// call a metamethod fails.
 pub(crate) extern "C" fn jit_arith(rt: *const State<'static>, kind: u32, a: u64, b: u64) -> u64 {
     use ArithKind::*;
@@ -134,13 +134,9 @@ pub(crate) extern "C" fn jit_arith(rt: *const State<'static>, kind: u32, a: u64,
     const KINDS: [ArithKind; 13] = [
         None, Add, Sub, Mul, Mod, Pow, Div, IDiv, BAnd, BOr, BXor, Shl, Shr,
     ];
-    if let Some(s) = [a, b].into_iter().find(|v| v.get_string().is_some()) {
-        let kind = KINDS[kind as usize];
-        // No bitwise op converts a string. Numbers are taken to have no
-        // metatable, as the inline arms take them.
-        let bitwise = matches!(kind, BAnd | BOr | BXor | Shl | Shr);
-        let mm = crate::vm::ops::arith::kind_mm(kind);
-        if bitwise || ctx.mm_of(s, mm).is_nil() {
+    if a.get_string().is_some() || b.get_string().is_some() {
+        // No bitwise op converts a string.
+        if matches!(KINDS[kind as usize], BAnd | BOr | BXor | Shl | Shr) {
             return HELPER_FAIL_VAL;
         }
         match (coerced(ctx, a), coerced(ctx, b)) {
@@ -175,9 +171,6 @@ pub(crate) extern "C" fn jit_unm(rt: *const State<'static>, v: u64) -> u64 {
     let ctx = unsafe { Context::from_state(rt) };
     let mut v = unsafe { Value::from_raw(v) };
     if v.get_string().is_some() {
-        if ctx.mm_of(v, MetamethodBits::UNM).is_nil() {
-            return HELPER_FAIL_VAL;
-        }
         match coerced(ctx, v) {
             Some(n) => v = n,
             None => return HELPER_FAIL_VAL,
