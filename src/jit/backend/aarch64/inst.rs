@@ -45,6 +45,9 @@ mops! {
     // count and `c`, a byte each, and from bit 32 the pc after it. Its
     // operands are what the frame keeps across it, in stack slots.
     CallLua   ();
+    // Leave for the interpreter's handler of an instruction: `imm` indexes
+    // `Selected::dispatches`.
+    Dispatch  ();
     // An exit a broken dependency patches in over the next instruction:
     // `imm` its index.
     LazyExit  ();

@@ -386,6 +386,21 @@ impl<'gc> Builder<'_, 'gc> {
         self.e.emit(Op::LazyExit, Rep::None, 0, s.0, 0, 0);
     }
 
+    /// Leave for the interpreter's handler of the instruction being
+    /// emitted, with what is live stored: for one that ends the frame, or
+    /// replaces it.
+    fn dispatch(&mut self) {
+        for r in self.live(self.pc).iter() {
+            let v = self.reg(r as u8);
+            if !v.is_none() && !self.e.slot_holds(r as u16, v) {
+                self.e.emit(Op::SlotStore, Rep::None, r as u16, v.0, 0, 0);
+            }
+        }
+        let word = self.cfg.code[self.pc as usize].raw();
+        let (lo, hi) = (word as u32, (word >> 32) as u32);
+        self.e.emit(Op::Dispatch, Rep::None, 0, lo, hi, self.pc);
+    }
+
     fn deopt(&mut self, tag: ExitTag) {
         if tag == ExitTag::Unsupported {
             self.missing.push(self.cfg.code[self.pc as usize].op());
@@ -893,6 +908,9 @@ impl<'gc> Builder<'_, 'gc> {
                     SELF => self.self_(i),
                     CLOSURE => self.closure_new(pc, i),
                     CLOSE => self.close(i),
+                    // The interpreter's, until the frame can be replaced
+                    // in compiled code.
+                    TAILCALL => self.dispatch(),
                     SETFIELD | SETTABUP | SETTABUP_REF => self.setfield(i),
                     _ if matches!(
                         i.op(),

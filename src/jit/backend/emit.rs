@@ -64,6 +64,8 @@ pub(crate) struct Selected {
     pub(crate) exits: Vec<Exit>,
     pub(crate) entries: Vec<(u8, SRep, Src)>,
     pub(crate) sites: Vec<CallSite>,
+    /// The instructions left to the interpreter's handlers: word and pc.
+    pub(crate) dispatches: Vec<(u64, u32)>,
     pub(crate) layout: Layout,
 }
 
@@ -74,6 +76,7 @@ impl Default for Selected {
             exits: Vec::new(),
             entries: Vec::new(),
             sites: Vec::new(),
+            dispatches: Vec::new(),
             layout: Layout::default(),
         }
     }

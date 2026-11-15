@@ -137,7 +137,7 @@ impl<'a> Em<'a> {
     /// The frame is closed and `x16` holds the handler that goes on: one
     /// dispatch entered goes on in its level; a fast-called one starts a
     /// level returning to its caller, its header made to return through it.
-    fn tail_level(&mut self) {
+    pub(super) fn tail_level(&mut self) {
         self.handler_regs();
         self.a.ldr_lit(X17, abi::level_land() as u64);
         self.a.cmp(Sz::X, LR, X17);

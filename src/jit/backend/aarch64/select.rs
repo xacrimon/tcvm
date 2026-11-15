@@ -93,6 +93,7 @@ impl Select {
         out.exits.clear();
         out.entries.clear();
         out.sites.clear();
+        out.dispatches.clear();
         self.vreg.clear();
         self.vreg.resize(g.insts.len(), NONE);
         self.insts.clear();
@@ -726,6 +727,12 @@ impl Sel<'_> {
                 self.pass(pos, 1, here, Block(i.c));
             }
             Ret => self.op(MOp::Ret, Sz::X, i.a as u64 | (i.b as u64) << 8, &[]),
+            Dispatch => {
+                let word = i.a as u64 | (i.b as u64) << 32;
+                self.out.dispatches.push((word, i.c));
+                let k = self.out.dispatches.len() as u64 - 1;
+                self.op(MOp::Dispatch, Sz::X, k, &[]);
+            }
             CallEntry => {
                 self.call(pos, a, i.c);
                 self.pass(pos, 0, here, Block(i.b));

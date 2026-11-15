@@ -299,7 +299,10 @@ pub(crate) fn compile<'gc>(
     // A region that only leaves does no work: none of its loops comes
     // around and nothing returns.
     let around = |b: &crate::jit::ir::Block| low.g.block(*b).npreds > low.g.block(*b).nfwd;
-    let returns = (low.g.insts.iter()).any(|i| i.op == crate::jit::ir::ops::Op::Ret);
+    let returns = (low.g.insts.iter()).any(|i| {
+        use crate::jit::ir::ops::Op;
+        matches!(i.op, Op::Ret | Op::Dispatch | Op::CallEntry)
+    });
     if !low.g.order.iter().any(around) && !returns {
         return Err(Bail::Useless);
     }

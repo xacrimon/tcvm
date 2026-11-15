@@ -355,6 +355,16 @@ impl<'a> Em<'a> {
         let unmade = self.allocs(i).first().is_some_and(|a| a.is_none());
         match m.op {
             MOp::CallLua => self.call(i, block, next),
+            MOp::Dispatch => {
+                let (word, pc) = self.s.dispatches[imm as usize];
+                self.a.ldp(FP, LR, SP, 0);
+                self.a.add_imm(Sz::X, SP, SP, self.frame as u64);
+                self.a.ldr_lit(INSN, word);
+                self.a.ldr_lit(PC, self.code + (pc as u64 + 1) * 8);
+                self.a.ldr_lit(X16, self.rt);
+                self.a.ldr(X16, X16, (word & 0xff) as i32 * 8);
+                self.tail_level();
+            }
             MOp::Resume => self.on_resume(i, block),
             MOp::Entry => {
                 self.a.sub_imm(Sz::X, SP, SP, self.frame as u64);

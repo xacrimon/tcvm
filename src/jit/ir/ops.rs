@@ -519,6 +519,9 @@ ops! {
     // slots it does not name. `c`: the `CALL`'s `a`, argument count and `c`,
     // a byte each. `Resume` is first in the call's successor: the first
     // result when it has a value, else the results in their slots.
+    // Leave for the interpreter's handler of the instruction at pc `c`,
+    // whose word is `a` (low) and `b`: what is live is in its slots.
+    Dispatch    Both No     (Imm Imm Imm)     None [SLOT] [] [TERMINATOR];
     CallEntry   Both No     (Fs Blk Imm)      None [ALL] [ALL] [CALLS TERMINATOR];
     Resume      Both No     (Imm No No)       Dyn  [] [SLOT] [PINNED];
 
