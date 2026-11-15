@@ -485,10 +485,31 @@ impl Sel<'_> {
                     }
                 }
             }
-            Mul => {
+            Mul | SDiv | Xor => {
                 let Some(d) = self.def(v) else { return };
                 let (x, y) = (self.reg(a), self.reg(b));
-                self.op(MOp::MulRR, w, 0, &[d, x, y]);
+                let op = match i.op {
+                    Mul => MOp::MulRR,
+                    SDiv => MOp::SdivRR,
+                    _ => MOp::EorRR,
+                };
+                self.op(op, w, 0, &[d, x, y]);
+            }
+            SExt32 | Neg | FNeg | FFloor => {
+                let Some(d) = self.def(v) else { return };
+                let x = self.reg(a);
+                let op = match i.op {
+                    SExt32 => MOp::Sxtw,
+                    Neg => MOp::NegR,
+                    FNeg => MOp::FNeg,
+                    _ => MOp::Frintm,
+                };
+                self.op(op, w, 0, &[d, x]);
+            }
+            NegOvf => {
+                self.exit(MOp::BCondExit, Cond::Vs, b, i.aux);
+                let (d, x) = (self.fresh(v), self.reg(a));
+                self.op(MOp::NegsR, w, 0, &[d, x]);
             }
             Shl | Shr | Sar => {
                 let Some(d) = self.def(v) else { return };

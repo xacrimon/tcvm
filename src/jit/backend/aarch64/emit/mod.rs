@@ -297,6 +297,13 @@ impl<'a> Em<'a> {
             }
             MOp::AndRR => self.a.and(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::OrrRR => self.a.orr(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::EorRR => self.a.eor(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::SdivRR => self.a.sdiv(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::Sxtw => self.a.sxtw(self.r(i, 0), self.r(i, 1)),
+            MOp::NegR => self.a.neg(sz, self.r(i, 0), self.r(i, 1)),
+            MOp::NegsR => self.a.negs(sz, self.r(i, 0), self.r(i, 1)),
+            MOp::FNeg => self.a.fneg(self.fr(i, 0), self.fr(i, 1)),
+            MOp::Frintm => self.a.frintm(self.fr(i, 0), self.fr(i, 1)),
             MOp::AndImm => self.a.and_imm(sz, self.r(i, 0), self.r(i, 1), imm),
             MOp::TstImm => self.a.tst_imm(sz, self.r(i, 0), imm),
             MOp::AddRR => self.a.add(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),

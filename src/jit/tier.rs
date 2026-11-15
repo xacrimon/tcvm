@@ -756,10 +756,12 @@ fn on_exit<'gc>(
     }
     if e.tag == ExitTag::NeverRan && n == 1 {
         request_recompile(ctx, region_closure, region, true);
-    // An instruction the compiler has no code for leaves every time: its
-    // region is compiled again like one that learns nothing, until the
-    // entry is given up.
-    } else if (e.tag.widenable() || e.tag == ExitTag::Unsupported) && n == region.exit_hot.get() {
+    // An instruction the compiler has no code for leaves every time, and a
+    // slow path that is hot is no slow path: the region is compiled again
+    // like one that learns nothing, until the entry is given up.
+    } else if (e.tag.widenable() || matches!(e.tag, ExitTag::Unsupported | ExitTag::Slow))
+        && n == region.exit_hot.get()
+    {
         log(ctx, || {
             format!(
                 "hot exit {}:{} pc{} ({:?}) of the region at pc{}",

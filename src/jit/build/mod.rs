@@ -58,6 +58,19 @@ impl Spec {
     }
 }
 
+/// Whether an arithmetic op of `kind` (an `ArithKind`) on operands of these
+/// kinds makes an integer: the bitwise ones always (their operands are
+/// checked to be integers), a division or a power never.
+pub(crate) fn int_result(kind: u16, a: Spec, b: Spec) -> bool {
+    use ArithKind::*;
+    let is = |k: ArithKind| kind == k as u16;
+    if is(BAnd) || is(BOr) || is(BXor) {
+        true
+    } else {
+        a == Spec::I32 && b == Spec::I32 && !is(Div) && !is(Pow)
+    }
+}
+
 /// A generic op's `aux`: its low four bits (an `ArithKind`, a `Cc`), then
 /// each operand's speculated kind.
 pub(crate) const SPEC_SHIFT: [u32; 2] = [4, 7];
@@ -527,6 +540,10 @@ impl Builder<'_, '_> {
         let spec = self.spec(self.pc, self.cfg.code[self.pc as usize]);
         let mut aux = low;
         let own = [x, y].map(|v| Spec::by_fact(self.e.fact(v)));
+        // An equality nothing says is of numbers is of anything.
+        if op == Op::Compare && low == Cc::Eq as u16 && spec.is_none() && own == [None; 2] {
+            return Some(self.equal(x, y));
+        }
         for k in 0..2 {
             // A site that recorded nothing takes an operand as the other is.
             let Some(s) = own[k].or(spec.map(|s| s[k])).or(own[1 - k]) else {
@@ -564,10 +581,24 @@ impl Builder<'_, '_> {
                 self.set(a, v);
             }
             NEWTABLE => self.newtable(pc, i),
+            SETLIST => self.setlist(i),
             GETTABLE => self.gettable(pc, i),
             SETTABLE => self.settable(pc, i),
             GETUPVAL | GETUPVAL_REF => self.getupval(i),
             SETUPVAL => self.setupval(i),
+            UNM => {
+                let x = self.reg(b);
+                // The fast path of a small integer records nothing.
+                let seen = self.proto.feedback.bits(pc as usize);
+                let spec = (self.spec(pc, i).map(|s| s[0])).or((seen == 0).then_some(Spec::I32));
+                let Some(k) = Spec::by_fact(self.e.fact(x)).or(spec) else {
+                    return self.deopt(ExitTag::Unsupported);
+                };
+                let s = self.state();
+                let aux = (k as u16) << SPEC_SHIFT[0];
+                let v = self.e.emit(Op::Unm, Rep::Val, aux, x.0, s.0, 0);
+                self.set(a, v);
+            }
             LEN => {
                 let x = self.reg(b);
                 let v = self.helped(Helper::Len, 0, &[x]);
@@ -680,40 +711,31 @@ impl Builder<'_, '_> {
                 self.e.emit(Op::Ret, Rep::None, 0, a as u32, 1, 0);
             }
             FORPREP => self.forprep(pc, i, fall.unwrap(), jump.unwrap()),
-            FORLOOP_I => {
-                let state = self.state();
-                let small = |s: &mut Self, r: u8| {
-                    let v = s.reg(r);
-                    s.e.check_type(v, TypeSet::SMALL, ExitTag::Type, state)
-                };
-                let (last, step, idx) = (small(self, a), small(self, a + 1), small(self, a + 2));
-                let go = self.e.cmp(Op::Cmp, Cc::Ne, idx, last);
+            // A loop's kind is its form's, unless its site or its `FORPREP`'s
+            // saw the other since (a compiled float loop that met integers
+            // records them: no `FORPREP` rewrites a form that is a JIT word).
+            // A site that saw both kinds has no one representation.
+            FORLOOP_I | FORLOOP_F => {
+                let prep = (pc as i64 + i.branch_offset() as i64) as usize;
+                let seen = (self.proto.feedback.bits(pc as usize) | self.proto.feedback.bits(prep))
+                    & fb::KINDS;
+                let (ints, floats) = (seen & (fb::SMALL | fb::BIGINT) != 0, seen & fb::FLOAT != 0);
                 let (exit, back) = (fall.unwrap(), jump.unwrap());
-                if self.e.known(go).is_some() {
-                    return self.deopt(ExitTag::Unsupported);
+                if (ints && floats) || seen & fb::BIGINT != 0 {
+                    self.deopt(ExitTag::Unsupported)
+                } else if floats || (op == FORLOOP_F && !ints) {
+                    self.forloop_f(a, exit, back)
+                } else {
+                    self.forloop_i(a, exit, back)
                 }
-                // The step is taken on the edge back: `idx` walks to `last`
-                // exactly, so it stays in range.
-                let edge = self.e.new_block();
-                let out = self.target(exit);
-                self.e.br(go, edge, out);
-                let lp = self.ir_loop(self.bb);
-                self.e.begin(edge, lp, 0, BlockFlags::empty());
-                let next = self.e.op2(Op::Add, Rep::I32, idx, step);
-                let next = self.e.op1(Op::BoxI32, Rep::Val, next);
-                self.set(a + 2, next);
-                self.set(a + 3, next);
-                self.jump(back);
             }
             _ => match info.family {
-                Family::RegArith | Family::ImmArith
-                    if matches!(
-                        info.kind,
-                        ArithKind::Add | ArithKind::Sub | ArithKind::Mul | ArithKind::Div
-                    ) =>
+                Family::RegArith | Family::ImmArith | Family::RegBit | Family::ImmBit
+                    if !matches!(info.kind, ArithKind::Shl | ArithKind::Shr | ArithKind::None) =>
                 {
                     let reg = self.reg(b);
-                    let (x, y) = if info.family == Family::RegArith {
+                    let regs = matches!(info.family, Family::RegArith | Family::RegBit);
+                    let (x, y) = if regs {
                         (reg, self.reg(i.c()))
                     } else {
                         let k = if i.imm_is_int() {
@@ -798,39 +820,150 @@ impl Builder<'_, '_> {
         }
     }
 
-    /// An integer loop stepping by a constant 1 or -1, which the loop's
-    /// form says it has been; anything else is left to the interpreter.
+    /// The f64 of a loop value in a float loop: a small integer converts.
+    fn loop_f64(&mut self, v: Val, state: Val) -> Val {
+        if Spec::by_fact(self.e.fact(v)) == Some(Spec::I32) {
+            let x = self.e.check_type(v, TypeSet::SMALL, ExitTag::Type, state);
+            self.e.op1(Op::IToF, Rep::F64, x)
+        } else {
+            self.e.check_type(v, TypeSet::FLOAT, ExitTag::Type, state)
+        }
+    }
+
+    /// `FORPREP`, as the kind its loop has been: after it `R[a]` is the last
+    /// value the control variable takes (the limit, in a float loop),
+    /// `R[a+1]` the step, `R[a+2]` the variable and `R[a+3]` its copy.
     fn forprep(&mut self, pc: u32, i: Instruction, body: u32, skip: u32) {
         let a = i.a();
         let at = (pc as i64 + i.branch_offset() as i64) as usize;
-        let seen =
-            (self.proto.feedback.bits(pc as usize) | self.proto.feedback.bits(at)) & fb::KINDS;
+        let fb_of = |pc: usize| self.proto.feedback.bits(pc);
+        let seen = (fb_of(pc as usize) | fb_of(at)) & fb::KINDS;
         let (init, limit, step) = (self.reg(a), self.reg(a + 1), self.reg(a + 2));
-        let up = match self.e.g.inst(step).k64() {
-            _ if self.e.g.op(step) != Op::K64 => None,
-            w if w == Value::small(1).to_raw() => Some(true),
-            w if w == Value::small(-1).to_raw() => Some(false),
-            _ => None,
-        };
-        let (Some(up), true) = (
-            up,
-            self.cfg.code[at].op() == Bc::FORLOOP_I && seen & !fb::SMALL == 0,
-        ) else {
-            return self.deopt(ExitTag::Unsupported);
-        };
         let state = self.state();
-        let i0 = self
-            .e
-            .check_type(init, TypeSet::SMALL, ExitTag::Type, state);
-        let l = self
-            .e
-            .check_type(limit, TypeSet::SMALL, ExitTag::Type, state);
-        let past = self.e.cmp(Op::Cmp, if up { Cc::Gt } else { Cc::Lt }, i0, l);
-        // The last value, the step, the control variable and its copy.
-        self.set(a, limit);
-        self.set(a + 1, step);
-        self.set(a + 2, init);
-        self.set(a + 3, init);
-        self.br(past, skip, body);
+        let form = self.cfg.code[at].op();
+        let zero_step = ExitTag::Slow as u16;
+        if form == Bc::FORLOOP_I && seen & !fb::SMALL == 0 {
+            let small =
+                |s: &mut Self, v: Val| s.e.check_type(v, TypeSet::SMALL, ExitTag::Type, state);
+            let (i0, l, st) = (small(self, init), small(self, limit), small(self, step));
+            let zero = self.e.k32(Rep::I32, 0);
+            // A zero step raises.
+            let moves = self.e.cmp(Op::Cmp, Cc::Ne, st, zero);
+            (self.e).emit(Op::Guard, Rep::None, zero_step, moves.0, state.0, u32::MAX);
+            // last = init + (limit - init) / step * step: exact where the
+            // loop runs, when the quotient is not negative; unused where it
+            // does not.
+            let wide = |s: &mut Self, v: Val| s.e.op1(Op::SExt32, Rep::I64, v);
+            let (i64_, l64, s64) = (wide(self, i0), wide(self, l), wide(self, st));
+            let span = self.e.op2(Op::Sub, Rep::I64, l64, i64_);
+            let count = self.e.op2(Op::SDiv, Rep::I64, span, s64);
+            let off = self.e.op2(Op::Mul, Rep::I64, count, s64);
+            let last = self.e.op2(Op::Add, Rep::I64, i64_, off);
+            let last = self.e.op1(Op::Trunc32, Rep::I32, last);
+            let last = self.e.op1(Op::BoxI32, Rep::Val, last);
+            let up = self.e.cmp(Op::Cmp, Cc::Gt, st, zero);
+            let (over, under) = (
+                self.e.cmp(Op::Cmp, Cc::Gt, i0, l),
+                self.e.cmp(Op::Cmp, Cc::Lt, i0, l),
+            );
+            let past = self.e.emit(Op::Select, Rep::B1, 0, up.0, over.0, under.0);
+            self.set(a, last);
+            self.set(a + 1, step);
+            self.set(a + 2, init);
+            self.set(a + 3, init);
+            self.br(past, skip, body);
+        } else if form == Bc::FORLOOP_F && seen & !(fb::FLOAT | fb::SMALL) == 0 {
+            // Integer init and step are an integer loop, whatever ran before.
+            let int = |s: &Self, v: Val| Spec::by_fact(s.e.fact(v)) == Some(Spec::I32);
+            if int(self, init) && int(self, step) {
+                return self.deopt(ExitTag::Type);
+            }
+            let (i0, l, st) = (
+                self.loop_f64(init, state),
+                self.loop_f64(limit, state),
+                self.loop_f64(step, state),
+            );
+            let zero = self.e.kf64(0.0);
+            let moves = self.e.cmp(Op::FCmp, Cc::Ne, st, zero);
+            (self.e).emit(Op::Guard, Rep::None, zero_step, moves.0, state.0, u32::MAX);
+            let up = self.e.cmp(Op::FCmp, Cc::Gt, st, zero);
+            let (over, under) = (
+                self.e.cmp(Op::FCmp, Cc::Lt, l, i0),
+                self.e.cmp(Op::FCmp, Cc::Lt, i0, l),
+            );
+            let past = self.e.emit(Op::Select, Rep::B1, 0, up.0, over.0, under.0);
+            let boxed = |s: &mut Self, v: Val| s.e.op1(Op::BoxF64, Rep::Val, v);
+            let (lv, sv, iv) = (boxed(self, l), boxed(self, st), boxed(self, i0));
+            self.set(a, lv);
+            self.set(a + 1, sv);
+            self.set(a + 2, iv);
+            self.set(a + 3, iv);
+            self.br(past, skip, body);
+        } else if form == Bc::FORLOOP && seen == 0 {
+            // The loop never ran: its kind is not known yet.
+            self.deopt(ExitTag::NeverRan)
+        } else {
+            self.deopt(ExitTag::Unsupported)
+        }
+    }
+
+    /// `FORLOOP_I`: around while the control variable is not the last value.
+    fn forloop_i(&mut self, a: u8, exit: u32, back: u32) {
+        let state = self.state();
+        let small = |s: &mut Self, r: u8| {
+            let v = s.reg(r);
+            s.e.check_type(v, TypeSet::SMALL, ExitTag::Type, state)
+        };
+        let (last, step, idx) = (small(self, a), small(self, a + 1), small(self, a + 2));
+        let go = self.e.cmp(Op::Cmp, Cc::Ne, idx, last);
+        if self.e.known(go).is_some() {
+            return self.deopt(ExitTag::Unsupported);
+        }
+        // The step is taken on the edge back: `idx` walks to `last` exactly,
+        // so it stays in range.
+        let edge = self.e.new_block();
+        let out = self.target(exit);
+        self.e.br(go, edge, out);
+        let lp = self.ir_loop(self.bb);
+        self.e.begin(edge, lp, 0, BlockFlags::empty());
+        let next = self.e.op2(Op::Add, Rep::I32, idx, step);
+        let next = self.e.op1(Op::BoxI32, Rep::Val, next);
+        self.set(a + 2, next);
+        self.set(a + 3, next);
+        self.jump(back);
+    }
+
+    /// `FORLOOP_F`: the float loop steps, and goes around while the control
+    /// variable is within the limit, on the step's side.
+    fn forloop_f(&mut self, a: u8, exit: u32, back: u32) {
+        let state = self.state();
+        let float = |s: &mut Self, r: u8| {
+            let v = s.reg(r);
+            s.e.check_type(v, TypeSet::FLOAT, ExitTag::Type, state)
+        };
+        let (lim, step, idx) = (float(self, a), float(self, a + 1), float(self, a + 2));
+        let next = self.e.op2(Op::FAdd, Rep::F64, idx, step);
+        let zero = self.e.kf64(0.0);
+        let up = self.e.cmp(Op::FCmp, Cc::Gt, step, zero);
+        let (below, above) = (
+            self.e.cmp(Op::FCmp, Cc::Le, next, lim),
+            self.e.cmp(Op::FCmp, Cc::Le, lim, next),
+        );
+        let go = self.e.emit(Op::Select, Rep::B1, 0, up.0, below.0, above.0);
+        match self.e.known(go) {
+            Some(true) => {}
+            Some(false) => return self.jump(exit),
+            None => {
+                let edge = self.e.new_block();
+                let out = self.target(exit);
+                self.e.br(go, edge, out);
+                let lp = self.ir_loop(self.bb);
+                self.e.begin(edge, lp, 0, BlockFlags::empty());
+            }
+        }
+        let next = self.e.op1(Op::BoxF64, Rep::Val, next);
+        self.set(a + 2, next);
+        self.set(a + 3, next);
+        self.jump(back);
     }
 }

@@ -61,6 +61,15 @@ mops! {
     // The first register where `cc` holds, else the second.
     Csel      (D U U);
     AndRR     (D U U);
+    EorRR     (D U U);
+    SdivRR    (D U U);
+    Sxtw      (D U);
+    NegR      (D U);
+    // Flag-setting, as `AddsRR`.
+    NegsR     (D U);
+    FNeg      (Fd Fu);
+    // Round toward negative infinity.
+    Frintm    (Fd Fu);
     OrrRR     (D U U);
     AndImm    (D U);
     TstImm    (U);

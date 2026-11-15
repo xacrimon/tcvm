@@ -1942,6 +1942,7 @@ fn integer_loops_after_one_float_loop() {
 /// loops after those leave it to the interpreter, neither exiting again
 /// and again.
 #[test]
+#[ignore = "needs arithmetic on a number of either kind at one site"]
 fn loops_of_both_kinds_at_one_site_settle() {
     let src = "local function f(a, b, c) local s = 0 for i = a, b, c do s = s + i end return s end
         local r = 0

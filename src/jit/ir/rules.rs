@@ -5,7 +5,7 @@
 //! recursion.
 
 use super::emit::Emitter;
-use super::ops::{Cc, ExitTag, Flags, Op};
+use super::ops::{Cc, ExitTag, Flags, Helper, Op};
 use super::types::{Rep, TypeSet};
 use super::{Inst, Val};
 use crate::env::value::{SMALL_INT, Value};
@@ -370,47 +370,10 @@ impl Emitter {
                 let d = self.g.inst(a);
                 (d.op == SExt32).then_some(Val(d.a))
             }
-            DivFloor | ModFloor => {
-                let (y, div) = (self.ki(b)?, i.op == DivFloor);
-                let min = if i.rep == Rep::I32 {
-                    i32::MIN as i64
-                } else {
-                    i64::MIN
-                };
-                if let Some(x) = self.ki(a) {
-                    // A zero divisor raises and `MIN // -1` leaves `I32`.
-                    if y == 0 || (x == min && y == -1 && i.rep == Rep::I32) {
-                        return None;
-                    }
-                    // Toward negative infinity where the signs differ.
-                    let (q, r) = (x.wrapping_div(y), x.wrapping_rem(y));
-                    let down = r != 0 && (r ^ y) < 0;
-                    let r = if div {
-                        q - down as i64
-                    } else {
-                        r + if down { y } else { 0 }
-                    };
-                    return Some(self.kint(i.rep, r));
-                }
-                match (y, div) {
-                    (1, true) => Some(a),
-                    (1 | -1, false) => Some(self.kint(i.rep, 0)),
-                    (-1, true) if i.rep == Rep::I32 => {
-                        Some(self.emit(NegOvf, i.rep, i.aux, i.a, i.c, 0))
-                    }
-                    (-1, true) => Some(self.op1(Neg, i.rep, a)),
-                    _ => {
-                        let k = log2(y, 1)?;
-                        Some(if div {
-                            let k = self.kint(i.rep, k);
-                            self.op2(Sar, i.rep, a, k)
-                        } else {
-                            let m = self.kint(i.rep, y - 1);
-                            self.op2(And, i.rep, a, m)
-                        })
-                    }
-                }
-            }
+            DivFloor | ModFloor => match self.floor_const(i) {
+                None if self.lowered => Some(self.floor_lower(i)),
+                r => r,
+            },
             FIDiv => {
                 let y = self.kf(b)?;
                 let r = 1.0 / y;
@@ -421,64 +384,10 @@ impl Emitter {
                     self.op1(FFloor, Rep::F64, q)
                 })
             }
-            Arith | Compare => {
-                // Once both operands' facts are final, each has a kind: its
-                // fact's, or the one the site speculates, which is checked.
-                if self.fact(a).pending() || self.fact(b).pending() {
-                    return None;
-                }
-                // Copy 1 goes by definitions alone, as the analysis that
-                // typed the parameters did.
-                let kind = |e: &Self, v: Val, k: usize| {
-                    let f = if e.lowered {
-                        e.g.facts[v.idx()]
-                    } else {
-                        e.fact(v)
-                    };
-                    Spec::by_fact(f).unwrap_or(Spec::of(i.aux >> SPEC_SHIFT[k]))
-                };
-                let (ka, kb) = (kind(self, a, 0), kind(self, b, 1));
-                let fs = c;
-                let low = i.aux & 15;
-                let float = i.op == Arith && low == ArithKind::Div as u16;
-                if ka == Spec::I32 && kb == Spec::I32 && !float {
-                    let x = self.check_type(a, TypeSet::SMALL, ExitTag::Type, fs);
-                    let y = self.check_type(b, TypeSet::SMALL, ExitTag::Type, fs);
-                    if i.op == Compare {
-                        return Some(self.emit(Cmp, Rep::B1, low, x.0, y.0, 0));
-                    }
-                    let op = match low {
-                        _ if low == ArithKind::Add as u16 => AddOvf,
-                        _ if low == ArithKind::Sub as u16 => SubOvf,
-                        _ => MulOvf,
-                    };
-                    let tag = ExitTag::Overflow as u16;
-                    let r = self.emit(op, Rep::I32, tag, x.0, y.0, fs.0);
-                    return Some(self.op1(BoxI32, Rep::Val, r));
-                }
-                let f64_of = |e: &mut Self, v: Val, k: Spec| {
-                    let x = e.check_type(v, k.set(), ExitTag::Type, fs);
-                    match k {
-                        Spec::I32 => e.op1(IToF, Rep::F64, x),
-                        Spec::F64 => x,
-                    }
-                };
-                let (x, y) = (f64_of(self, a, ka), f64_of(self, b, kb));
-                if i.op == Compare {
-                    return Some(self.emit(FCmp, Rep::B1, low, x.0, y.0, 0));
-                }
-                let op = match low {
-                    _ if low == ArithKind::Add as u16 => FAdd,
-                    _ if low == ArithKind::Sub as u16 => FSub,
-                    _ if low == ArithKind::Mul as u16 => FMul,
-                    _ => FDiv,
-                };
-                let r = self.op2(op, Rep::F64, x, y);
-                Some(self.op1(BoxF64, Rep::Val, r))
-            }
+            Arith | Compare | Unm => self.specialise(i),
             K32 | K64 | KF64 | KObj | Base | Load | Store | LoadIdx | StoreIdx | SlotLoad
             | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr
-            | AbsOvf | FMod | Unm | CallHelper => None,
+            | AbsOvf | FMod | CallHelper => None,
             Truthy => self.truthy(a),
         }
     }
@@ -519,7 +428,8 @@ impl Emitter {
         use Op::*;
 
         use crate::env::value::{
-            BOX, FUNCTION_BITS, STRING_BITS, TAG_BOXED_INT, TAG_SHIFT, TAG_TABLE,
+            BOX, FUNCTION_BITS, STRING_BITS, TAG_BOXED_INT, TAG_SHIFT, TAG_TABLE, TAG_THREAD,
+            TAG_USERDATA,
         };
         let tag = |bits: u64| bits >> TAG_SHIFT & 7;
         let tag = match set {
@@ -538,12 +448,199 @@ impl Emitter {
             TypeSet::FUN => tag(FUNCTION_BITS),
             TypeSet::TAB => TAG_TABLE,
             TypeSet::BIGINT => TAG_BOXED_INT,
+            TypeSet::THR => TAG_THREAD,
+            TypeSet::UDATA => TAG_USERDATA,
             _ => return None,
         };
         let k = self.k64(Rep::I64, TAG_SHIFT as u64);
         let top = self.op2(Sar, Rep::I64, v, k);
         let want = self.k64(Rep::I64, (tag as i64 - 8) as u64);
         Some(self.cmp(Cmp, Cc::Eq, top, want))
+    }
+
+    /// A floor division or modulo by a constant that needs no division.
+    fn floor_const(&mut self, i: &Inst) -> Option<Val> {
+        use Op::*;
+        let (a, b) = (Val(i.a), Val(i.b));
+        let (y, div) = (self.ki(b)?, i.op == DivFloor);
+        let min = if i.rep == Rep::I32 {
+            i32::MIN as i64
+        } else {
+            i64::MIN
+        };
+        if let Some(x) = self.ki(a) {
+            // A zero divisor raises and `MIN // -1` leaves `I32`.
+            if y == 0 || (x == min && y == -1 && i.rep == Rep::I32) {
+                return None;
+            }
+            // Toward negative infinity where the signs differ.
+            let (q, r) = (x.wrapping_div(y), x.wrapping_rem(y));
+            let down = r != 0 && (r ^ y) < 0;
+            let r = if div {
+                q - down as i64
+            } else {
+                r + if down { y } else { 0 }
+            };
+            return Some(self.kint(i.rep, r));
+        }
+        match (y, div) {
+            (1, true) => Some(a),
+            (1 | -1, false) => Some(self.kint(i.rep, 0)),
+            (-1, true) if i.rep == Rep::I32 => Some(self.emit(NegOvf, i.rep, i.aux, i.a, i.c, 0)),
+            (-1, true) => Some(self.op1(Neg, i.rep, a)),
+            _ => {
+                let k = log2(y, 1)?;
+                Some(if div {
+                    let k = self.kint(i.rep, k);
+                    self.op2(Sar, i.rep, a, k)
+                } else {
+                    let m = self.kint(i.rep, y - 1);
+                    self.op2(And, i.rep, a, m)
+                })
+            }
+        }
+    }
+
+    /// A floor division or modulo as its pieces: the divisor checked, the
+    /// machine's division on what the checks passed, the remainder, and the
+    /// step toward negative infinity where it is not zero and its sign is
+    /// not the divisor's.
+    fn floor_lower(&mut self, i: &Inst) -> Val {
+        use Op::*;
+        let (rep, fs) = (i.rep, i.c);
+        let zero = self.kint(rep, 0);
+        let nonzero = self.cmp(Cmp, Cc::Ne, Val(i.b), zero);
+        let y = self.emit(Guard, rep, i.aux, nonzero.0, fs, i.b);
+        // `MIN // -1` leaves `I32`.
+        let x = if rep == Rep::I32 && i.op == DivFloor {
+            let min = self.kint(rep, i32::MIN as i64);
+            let ones = self.kint(rep, -1);
+            let (p, q) = (
+                self.cmp(Cmp, Cc::Ne, Val(i.a), min),
+                self.cmp(Cmp, Cc::Ne, y, ones),
+            );
+            let fits = self.op2(Or, Rep::B1, p, q);
+            self.emit(Guard, rep, ExitTag::Overflow as u16, fits.0, fs, i.a)
+        } else {
+            Val(i.a)
+        };
+        let q = self.op2(SDiv, rep, x, y);
+        let back = self.op2(Mul, rep, q, y);
+        let r = self.op2(Sub, rep, x, back);
+        let left = self.cmp(Cmp, Cc::Ne, r, zero);
+        let signs = self.op2(Xor, rep, r, y);
+        let differ = self.cmp(Cmp, Cc::Lt, signs, zero);
+        let down = self.op2(And, Rep::B1, left, differ);
+        let (stepped, plain) = if i.op == DivFloor {
+            let one = self.kint(rep, 1);
+            (self.op2(Sub, rep, q, one), q)
+        } else {
+            (self.op2(Add, rep, r, y), r)
+        };
+        self.emit(Select, rep, 0, down.0, stepped.0, plain.0)
+    }
+
+    /// A generic op whose operands' facts are final: each operand has a
+    /// kind, its fact's or the one the site speculates, which is checked.
+    fn specialise(&mut self, i: &Inst) -> Option<Val> {
+        use Op::*;
+        let (a, b) = (Val(i.a), Val(i.b));
+        let unary = i.op == Unm;
+        if self.fact(a).pending() || (!unary && self.fact(b).pending()) {
+            return None;
+        }
+        // Copy 1 goes by definitions alone, as the analysis that typed the
+        // parameters did.
+        let kind = |e: &Self, v: Val, k: usize| {
+            let f = if e.lowered {
+                e.g.facts[v.idx()]
+            } else {
+                e.fact(v)
+            };
+            Spec::by_fact(f).unwrap_or(Spec::of(i.aux >> SPEC_SHIFT[k]))
+        };
+        let fs = if unary { b } else { Val(i.c) };
+        let small = |e: &mut Self, v: Val| e.check_type(v, TypeSet::SMALL, ExitTag::Type, fs);
+        let float = |e: &mut Self, v: Val, k: Spec| {
+            let x = e.check_type(v, k.set(), ExitTag::Type, fs);
+            match k {
+                Spec::I32 => e.op1(IToF, Rep::F64, x),
+                Spec::F64 => x,
+            }
+        };
+        let ka = kind(self, a, 0);
+        if unary {
+            let r = match ka {
+                Spec::I32 => {
+                    let x = small(self, a);
+                    let r = self.emit(NegOvf, Rep::I32, ExitTag::Overflow as u16, x.0, fs.0, 0);
+                    self.op1(BoxI32, Rep::Val, r)
+                }
+                Spec::F64 => {
+                    let x = float(self, a, ka);
+                    let r = self.op1(FNeg, Rep::F64, x);
+                    self.op1(BoxF64, Rep::Val, r)
+                }
+            };
+            return Some(r);
+        }
+        let kb = kind(self, b, 1);
+        let low = i.aux & 15;
+        if i.op == Compare {
+            return Some(if ka == Spec::I32 && kb == Spec::I32 {
+                let (x, y) = (small(self, a), small(self, b));
+                self.emit(Cmp, Rep::B1, low, x.0, y.0, 0)
+            } else {
+                let (x, y) = (float(self, a, ka), float(self, b, kb));
+                self.emit(FCmp, Rep::B1, low, x.0, y.0, 0)
+            });
+        }
+        let is = |k: ArithKind| low == k as u16;
+        if crate::jit::build::int_result(low, ka, kb) {
+            let (x, y) = (small(self, a), small(self, b));
+            let exits = |e: &mut Self, op: Op, tag: ExitTag| {
+                e.emit(op, Rep::I32, tag as u16, x.0, y.0, fs.0)
+            };
+            let r = if is(ArithKind::Add) {
+                exits(self, AddOvf, ExitTag::Overflow)
+            } else if is(ArithKind::Sub) {
+                exits(self, SubOvf, ExitTag::Overflow)
+            } else if is(ArithKind::Mul) {
+                exits(self, MulOvf, ExitTag::Overflow)
+            } else if is(ArithKind::IDiv) {
+                // A zero divisor raises, in the interpreter.
+                exits(self, DivFloor, ExitTag::Slow)
+            } else if is(ArithKind::Mod) {
+                exits(self, ModFloor, ExitTag::Slow)
+            } else if is(ArithKind::BAnd) {
+                self.op2(And, Rep::I32, x, y)
+            } else if is(ArithKind::BOr) {
+                self.op2(Or, Rep::I32, x, y)
+            } else {
+                self.op2(Xor, Rep::I32, x, y)
+            };
+            return Some(self.op1(BoxI32, Rep::Val, r));
+        }
+        let (x, y) = (float(self, a, ka), float(self, b, kb));
+        let r = if is(ArithKind::Add) {
+            self.op2(FAdd, Rep::F64, x, y)
+        } else if is(ArithKind::Sub) {
+            self.op2(FSub, Rep::F64, x, y)
+        } else if is(ArithKind::Mul) {
+            self.op2(FMul, Rep::F64, x, y)
+        } else if is(ArithKind::Div) {
+            self.op2(FDiv, Rep::F64, x, y)
+        } else if is(ArithKind::IDiv) {
+            let q = self.op2(FDiv, Rep::F64, x, y);
+            self.op1(FFloor, Rep::F64, q)
+        } else if is(ArithKind::Mod) {
+            self.call(Helper::FMod, 0, &[x, y])
+        } else if self.kf(y) == Some(2.0) {
+            self.op2(FMul, Rep::F64, x, x)
+        } else {
+            self.call(Helper::Pow, 0, &[x, y])
+        };
+        Some(self.op1(BoxF64, Rep::Val, r))
     }
 
     /// Whether the `Val` is neither nil nor false, once its fact is final:

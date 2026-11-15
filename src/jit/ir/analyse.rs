@@ -128,6 +128,7 @@ impl Analysis {
                         want(i.args()[k], Spec::of(i.aux >> shift).set());
                     }
                 }
+                Op::Unm => want(i.a, Spec::of(i.aux >> SPEC_SHIFT[0]).set()),
                 _ => {}
             }
         }
@@ -149,14 +150,14 @@ impl Analysis {
                     Op::Param if i.rep == Rep::Val => (g.inputs(Val(v as u32)).iter())
                         .fold(TypeSet::empty(), |s, &x| s | self.ty[x as usize]),
                     Op::Arith if g.facts[v].pending() => {
-                        let ints = self.kind(i, 0) == Spec::I32 && self.kind(i, 1) == Spec::I32;
-                        let div = i.aux & 15 == crate::instruction::ArithKind::Div as u16;
-                        if ints && !div {
+                        let (a, b) = (self.kind(i, 0), self.kind(i, 1));
+                        if crate::jit::build::int_result(i.aux & 15, a, b) {
                             TypeSet::SMALL
                         } else {
                             TypeSet::FLOAT
                         }
                     }
+                    Op::Unm if g.facts[v].pending() => self.kind(i, 0).set(),
                     _ => g.facts[v].set,
                 };
             }
