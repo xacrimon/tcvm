@@ -90,6 +90,43 @@ pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
     KNOWN_ENTRY + if regs { 4 * nparams.min(8) as usize } else { 0 }
 }
 
+/// A trampoline: a C call of `target` that keeps x1-x15, d0-d7 and d16-d30
+/// (x0 or d0, the result's, left out) behind a frame record that keeps the
+/// frame chain walkable; and its frame's size.
+pub(crate) fn trampoline(target: usize, float: bool) -> (Asm, u32) {
+    let ints = (float as u8..16).map(Gpr);
+    let floats = (!float as u8..8).chain(16..31).map(Fpr);
+    let frame = (16 + 8 * (ints.len() + floats.clone().count()) as u64).next_multiple_of(16);
+    let mut a = Asm::new();
+    a.sub_imm(Sz::X, SP, SP, frame);
+    a.stp(FP, LR, SP, 0);
+    a.mov_sp(FP, SP);
+    for load in [false, true] {
+        let mut off = 16;
+        for x in ints.clone() {
+            match load {
+                false => a.str(x, SP, off),
+                true => a.ldr(x, SP, off),
+            }
+            off += 8;
+        }
+        for d in floats.clone() {
+            match load {
+                false => a.str_d(d, SP, off),
+                true => a.ldr_d(d, SP, off),
+            }
+            off += 8;
+        }
+        if !load {
+            a.bl_far(target);
+        }
+    }
+    a.ldp(FP, LR, SP, 0);
+    a.add_imm(Sz::X, SP, SP, frame);
+    a.ret();
+    (a, frame as u32)
+}
+
 /// `rt` is the runtime's address, which helpers take, and `code` that of
 /// the function's bytecode; `window` is how many slots the frame needs where
 /// that is more than its prototype's, else 0.
@@ -480,7 +517,7 @@ impl<'a> Em<'a> {
                 self.a.patch_point(at);
                 self.lazy.push((at, self.exit_labels[imm as usize]));
             }
-            MOp::Call => {
+            MOp::Call | MOp::CallCold => {
                 let h = Helper::of(imm as u16);
                 let info = h.info();
                 for (k, c) in info.ctx.iter().enumerate() {
@@ -493,7 +530,14 @@ impl<'a> Em<'a> {
                 if info.imm {
                     self.a.mov_imm(Gpr(info.ctx.len() as u8), imm >> 16);
                 }
-                self.a.bl_far(crate::jit::helpers::address(h));
+                let to = crate::jit::helpers::address(h);
+                self.a.bl_far(match m.op {
+                    MOp::Call => to,
+                    _ => match self.s.tramps.iter().find(|t| t.0 == to) {
+                        Some(t) => t.1,
+                        None => bug!("{h:?} has no trampoline"),
+                    },
+                });
             }
             MOp::Ret => {
                 // To a compiled caller, or to `level_land` for a frame

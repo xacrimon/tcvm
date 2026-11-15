@@ -140,6 +140,9 @@ mops! {
     // A C call of helper `imm & 0xffff` with immediate `imm >> 16`: its
     // operands are fixed to the argument registers past the pinned ones.
     Call      ();
+    // The same through the helper's trampoline, which keeps every register
+    // but the result's.
+    CallCold  ();
     // Return `imm >> 8` results from `R[imm & 0xff..]`.
     Ret       ();
 }

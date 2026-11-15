@@ -112,7 +112,9 @@ impl Select {
                     self.stored.fill(true);
                     calls = true;
                 }
-                Op::CallHelper if Helper::of(i.aux).info().writes.contains(Heaps::SLOT) => {
+                Op::CallHelper | Op::CallHelperCold
+                    if Helper::of(i.aux).info().writes.contains(Heaps::SLOT) =>
+                {
                     self.stored.fill(true)
                 }
                 _ => {}
@@ -821,10 +823,25 @@ impl Sel<'_> {
                 let n = self.s.ops.len() as u32 - at;
                 self.s.insts.push((m, at, n, clobbers));
             }
-            CallHelper => {
+            CallHelper | CallHelperCold => {
                 let h = Helper::of(i.aux).info();
                 let at = self.s.ops.len() as u32;
-                let mut clobbers = abi::caller_saved();
+                // A cold call's trampoline keeps all but the result's.
+                let cold = i.op == CallHelperCold;
+                let mut clobbers = if cold {
+                    let mut s = PRegSet::empty();
+                    s.add(match h.ret {
+                        Rep::F64 => abi::preg_float(0),
+                        _ => abi::preg_int(0),
+                    });
+                    // And those the call itself sets.
+                    for k in 0..h.ctx.len() as u8 + h.imm as u8 {
+                        s.add(abi::preg_int(k));
+                    }
+                    s
+                } else {
+                    abi::caller_saved()
+                };
                 if let Some(d) = self.def(v) {
                     let p = match i.rep {
                         Rep::F64 => abi::preg_float(0),
@@ -848,7 +865,7 @@ impl Sel<'_> {
                     self.s.ops.push(Operand::reg_fixed_use(x, p));
                 }
                 let m = MInst {
-                    op: MOp::Call,
+                    op: if cold { MOp::CallCold } else { MOp::Call },
                     cc: 0,
                     sz: Sz::X,
                     imm: i.aux as u64 | (i.c as u64) << 16,

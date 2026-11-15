@@ -369,7 +369,7 @@ impl Graph {
                 Op::KObj => matches!(i.rep, Rep::Val | Rep::Ptr),
                 Op::Load | Op::LoadIdx => i.rep == fields::Field::info(i.aux).rep,
                 Op::Select | Op::Param => i.rep != Rep::None,
-                Op::CallHelper => {
+                Op::CallHelper | Op::CallHelperCold => {
                     let h = &ops::HELPERS[i.aux as usize];
                     let reps = self.run(i.a, i.b).iter().map(|&v| rep_of(v));
                     i.rep == h.ret && reps.eq(h.args.iter().copied())

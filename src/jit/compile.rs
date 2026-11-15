@@ -363,6 +363,15 @@ pub(crate) fn compile<'gc>(
         max_stack: window.max(closure.proto.max_stack_size as u16),
         proto: closure.proto.ptr.as_ptr() as u64,
     });
+    sel.tramps.clear();
+    for i in &low.g.insts {
+        if i.op == crate::jit::ir::ops::Op::CallHelperCold {
+            let h = crate::jit::ir::ops::Helper::of(i.aux);
+            let to = crate::jit::helpers::address(h);
+            let float = h.info().ret == crate::jit::ir::types::Rep::F64;
+            sel.tramps.push((to, ctx.jit().trampoline(to, float)?));
+        }
+    }
     let code = closure.code as u64;
     let mut em = target::emit::emit(sel, out, rt, code, fast, !deps.is_empty(), window)?;
     let alloc = ctx.jit().code_alloc();

@@ -106,7 +106,7 @@ impl<'gc> Builder<'_, 'gc> {
         self.e
             .emit(Op::Store, Rep::None, Field::CellValue as u16, at.0, v.0, 0);
         if self.e.fact(v).set.intersects(TypeSet::HEAP) {
-            self.e.call(Helper::UpvalBarrier, 0, &[cell]);
+            self.e.call_cold(Helper::UpvalBarrier, 0, &[cell]);
         }
     }
 

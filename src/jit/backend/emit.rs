@@ -72,6 +72,9 @@ pub(crate) struct Selected {
     pub(crate) sites: Vec<CallSite>,
     /// The instructions left to the interpreter's handlers: word and pc.
     pub(crate) dispatches: Vec<(u64, u32)>,
+    /// The helpers called cold and their trampolines, which `compile`
+    /// makes: addresses.
+    pub(crate) tramps: Vec<(usize, usize)>,
     pub(crate) layout: Layout,
 }
 
@@ -83,6 +86,7 @@ impl Default for Selected {
             entries: Vec::new(),
             sites: Vec::new(),
             dispatches: Vec::new(),
+            tramps: Vec::new(),
             layout: Layout::default(),
         }
     }

@@ -209,14 +209,18 @@ impl Copy {
                         e.emit(Op::CallEntry, Rep::None, 0, state.0, to.0, i.c);
                         break;
                     }
-                    Op::CallHelper => {
+                    Op::CallHelper | Op::CallHelperCold => {
                         self.scratch.clear();
                         for &x in g.run(i.a, i.b) {
                             let v = self.map[x as usize];
                             let v = Copy::convert(e, v, g.rep(Val(x)), TypeSet::ANY, Val::NONE);
                             self.scratch.push(v);
                         }
-                        e.call(super::ops::Helper::of(i.aux), i.c, &self.scratch)
+                        let h = super::ops::Helper::of(i.aux);
+                        match i.op {
+                            Op::CallHelper => e.call(h, i.c, &self.scratch),
+                            _ => e.call_cold(h, i.c, &self.scratch),
+                        }
                     }
                     Op::CallArgs => {
                         self.scratch.clear();

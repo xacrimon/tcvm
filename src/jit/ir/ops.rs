@@ -546,6 +546,9 @@ ops! {
 
     // A C call of the helper in `aux` (`HELPERS`), its immediate in `c`.
     CallHelper  Both Helper (Vals Len Imm)    Dyn  [] [] [CALLS];
+    // The same call from a cold block, of a helper that does not allocate:
+    // it keeps every register but its result's.
+    CallHelperCold Both Helper (Vals Len Imm) Dyn  [] [] [CALLS];
 
     // Unit ops: optimized as wholes, lowered by copy 1.
     CheckType   H    SetTag (Val Fs No)       Dyn  [] [] [EXITS];

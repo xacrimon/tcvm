@@ -101,7 +101,7 @@ impl Emitter {
         let zero = self.k64(Rep::I64, 0);
         let due = self.cmp(Op::Cmp, Cc::Eq, gray, zero);
         self.unless(due, |e| {
-            e.call(Helper::Barrier, 0, &[t]);
+            e.call_cold(Helper::Barrier, 0, &[t]);
         });
     }
 

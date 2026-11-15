@@ -461,7 +461,7 @@ impl Emitter {
             }
         } else if !info.writes.is_empty() {
             self.kill(info.writes);
-        } else if i.op == Op::CallHelper {
+        } else if matches!(i.op, Op::CallHelper | Op::CallHelperCold) {
             // An allocation moves the collector's counter.
             let h = Helper::of(i.aux).info();
             let gc = if h.flags.contains(Flags::ALLOCS) {
@@ -737,6 +737,18 @@ impl Emitter {
         self.g.extra.extend(args.iter().map(|v| v.0));
         let n = args.len() as u32;
         self.emit(Op::CallHelper, h.info().ret, h as u16, at, n, imm)
+    }
+
+    /// `call` in a cold block, keeping the registers: nothing lives in one
+    /// across a collection, so not of a helper that allocates.
+    pub(crate) fn call_cold(&mut self, h: Helper, imm: u32, args: &[Val]) -> Val {
+        if h.info().flags.contains(Flags::ALLOCS) {
+            bug!("{h:?} allocates: its call cannot keep the registers");
+        }
+        let at = self.g.extra.len() as u32;
+        self.g.extra.extend(args.iter().map(|v| v.0));
+        let n = args.len() as u32;
+        self.emit(Op::CallHelperCold, h.info().ret, h as u16, at, n, imm)
     }
 
     /// Check that the `Val` is in `set`, leaving with `tag` to `fs`
