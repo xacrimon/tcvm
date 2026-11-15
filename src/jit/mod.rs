@@ -23,10 +23,6 @@ mod rails;
 pub(crate) mod region;
 #[cfg(jit)]
 pub(crate) mod state;
-// The old compiler's tests, off until the stages that bring their subjects
-// back.
-#[cfg(any())]
-mod tests;
 #[cfg(jit)]
 mod tier;
 

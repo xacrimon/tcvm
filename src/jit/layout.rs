@@ -113,8 +113,6 @@ pub(crate) const FN_MAX_STACK: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, max_stack_size);
 pub(crate) const FN_IS_VARARG: usize =
     FN_LUA + offset_of!(crate::env::function::LuaClosure<'static>, is_vararg);
-/// A native function's closure, from its function's payload.
-pub(crate) use crate::env::function::FN_NATIVE;
 /// A function value's top 16 bits.
 pub(crate) const FUNCTION_TAG: u16 = (crate::env::value::FUNCTION_BITS >> 48) as u16;
 /// A Lua closure's prototype pointer (a `Gc`, so the box), and from that

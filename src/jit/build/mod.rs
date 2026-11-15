@@ -17,7 +17,7 @@ use crate::instruction::{ArithKind, Family, Instruction, Op as Bc};
 use crate::jit::compile::Bail;
 use crate::jit::feedback as fb;
 use crate::jit::ir::emit::Emitter;
-use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, HELPER_FAIL_VAL, Heaps, Helper, Op};
+use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, Heaps, Helper, Op};
 use crate::jit::ir::table::{self, Key};
 use crate::jit::ir::types::{Fact, FactFlags, Rep, TypeSet};
 use crate::jit::ir::{Block, BlockFlags, HOME, Loop, Pool, Val};

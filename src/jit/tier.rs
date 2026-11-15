@@ -18,7 +18,7 @@ use crate::vm::frame;
 
 const PTR_MASK: u64 = (1 << 48) - 1;
 
-pub(crate) use crate::jit::backend::target::abi::{REG_ARGS, spill_addr};
+pub(crate) use crate::jit::backend::target::abi::spill_addr;
 
 /// A hash map with a fast, unkeyed hasher, for compile-time tables.
 pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::FixedState>;
