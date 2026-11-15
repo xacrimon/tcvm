@@ -135,7 +135,7 @@ impl Em<'_> {
             }
             MOp::Ret => {
                 // To a compiled caller, or to `level_land` for a frame
-                // dispatch entered; a tagged return address is a deep one's.
+                // dispatch entered.
                 let (a, n) = (imm & 0xff, imm >> 8);
                 if n == 0 {
                     self.a.mov_imm(Gpr(0), NIL);
@@ -146,12 +146,7 @@ impl Em<'_> {
                 self.a.add_imm(Sz::X, SP, SP, self.frame as u64);
                 self.a.movz(Sz::X, INSN, n as u16, 0);
                 self.a.add_imm(Sz::X, PC, BASE, a * 8);
-                let deep = self.a.new_label();
-                self.a.tbnz(LR, 0, deep);
                 self.a.ret();
-                self.a.bind(deep);
-                self.a.and_imm(Sz::X, LR, LR, !1u64);
-                self.a.br(LR);
             }
         }
     }
