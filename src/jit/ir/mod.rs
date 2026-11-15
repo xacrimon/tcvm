@@ -7,6 +7,7 @@
 //! high-level ops, copy 1 lowers them, and everything after sees low-level
 //! ops only.
 
+pub(crate) mod access;
 pub(crate) mod analyse;
 pub(crate) mod copy;
 pub(crate) mod emit;

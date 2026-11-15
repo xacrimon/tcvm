@@ -2,6 +2,7 @@
 //! instructions are live and how often each value is used, and the types
 //! and representations of the high-level graph's parameters.
 
+use super::access::ARRAY;
 use super::ops::{Flags, Op};
 use super::types::{Rep, TypeSet};
 use super::{Block, BlockFlags, Graph, Inst, Val};
@@ -129,6 +130,8 @@ impl Analysis {
                     }
                 }
                 Op::Unm => want(i.a, Spec::of(i.aux >> SPEC_SHIFT[0]).set()),
+                Op::GetIndex if i.aux & ARRAY != 0 => want(i.b, TypeSet::SMALL),
+                Op::SetIndex if i.aux & ARRAY != 0 => want(g.run(i.a, i.b)[1], TypeSet::SMALL),
                 _ => {}
             }
         }

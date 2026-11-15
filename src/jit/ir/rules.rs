@@ -385,6 +385,7 @@ impl Emitter {
                 })
             }
             Arith | Compare | Unm => self.specialise(i),
+            GetIndex | SetIndex => self.index(i),
             K32 | K64 | KF64 | KObj | Base | Load | Store | LoadIdx | StoreIdx | SlotLoad
             | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret | LuaShl | LuaShr
             | AbsOvf | FMod | CallHelper => None,

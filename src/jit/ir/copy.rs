@@ -211,6 +211,14 @@ impl Copy {
                         }
                         e.call(super::ops::Helper::of(i.aux), i.c, &self.scratch)
                     }
+                    Op::SetIndex => {
+                        let [recv, key, v] = [0, 1, 2].map(|k| {
+                            let x = self.map[g.run(i.a, i.b)[k] as usize];
+                            Copy::convert(e, x, Rep::Val, TypeSet::ANY, Val::NONE)
+                        });
+                        e.set_index(recv, key, v, i.aux, self.map[i.c as usize]);
+                        Val::NONE
+                    }
                     _ => self.inst(g, e, i),
                 };
                 if e.cur.is_none() {

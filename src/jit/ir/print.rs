@@ -82,6 +82,9 @@ impl Graph {
                 );
             }
         }
+        if matches!(i.op, Op::GetIndex | Op::SetIndex) && i.aux & super::access::ARRAY != 0 {
+            o.push_str(".array");
+        }
         // A generic op's speculated operand kinds.
         if matches!(i.op, Op::Arith | Op::Compare) {
             for shift in crate::jit::build::SPEC_SHIFT {

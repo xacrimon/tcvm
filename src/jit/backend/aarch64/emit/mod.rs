@@ -82,12 +82,13 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail>
     em.a.bind(em.region_word);
     em.a.emit(0);
     em.a.emit(0);
-    // Only blocks that end in a deopt or are cold are left out, so the hot
-    // ones keep their count.
-    let mut laid: Vec<u32> = (s.layout.emit.iter().copied())
-        .filter(|&b| !skip[b as usize])
-        .collect();
-    let (loops, hot) = (&s.layout.loops, s.layout.hot);
+    let kept = |b: &u32| !skip[*b as usize];
+    let mut laid: Vec<u32> = s.layout.emit.iter().copied().filter(kept).collect();
+    let hot = s.layout.emit[..s.layout.hot]
+        .iter()
+        .filter(|b| kept(b))
+        .count();
+    let loops = &s.layout.loops;
     let tops = rotate_loops(&s.vcode, loops, &em.labels, &em.dest, &mut laid, hot);
     for (at, &b) in laid.iter().enumerate() {
         let next = laid.get(at + 1).map(|&x| em.labels[x as usize]);

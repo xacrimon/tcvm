@@ -540,6 +540,9 @@ ops! {
     Unm         H    No     (Val Fs No)       Val  [ALL] [ALL] [EXITS CALLS GENERIC];
     Compare     H    Cc     (Val Val Fs)      B1   [ALL] [ALL] [EXITS CALLS GENERIC];
     Truthy      H    No     (Val No No)       B1   [] [] [GENERIC];
+    // Their result is no number to wait for: it is final under a pending key.
+    GetIndex    H    No     (Val Val Fs)      Val  [ALL] [ALL] [EXITS CALLS];
+    SetIndex    H    No     (Vals Len Fs)     None [ALL] [ALL] [EXITS CALLS];
 }
 
 impl Op {

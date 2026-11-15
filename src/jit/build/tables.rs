@@ -8,10 +8,10 @@ use super::Builder;
 use crate::env::function::InlineCache;
 use crate::env::shape::Kind;
 use crate::env::table::SlotLoc;
-use crate::env::value::NIL;
 use crate::env::{MetamethodBits, Shape};
 use crate::instruction::{Instruction, Op as Bc};
 use crate::jit::feedback as fb;
+use crate::jit::ir::access::ARRAY;
 use crate::jit::ir::fields::Field;
 use crate::jit::ir::ops::{Cc, ExitTag, Helper, Op};
 use crate::jit::ir::types::{Rep, TypeSet};
@@ -20,8 +20,7 @@ use crate::jit::layout;
 
 impl<'gc> Builder<'_, 'gc> {
     fn load(&mut self, f: Field, base: Val, k: u32) -> Val {
-        let rep = Field::info(f as u16).rep;
-        self.e.emit(Op::Load, rep, f as u16, base.0, u32::MAX, k)
+        self.e.load(f, base, k)
     }
 
     fn guard(&mut self, c: Val, tag: ExitTag) {
@@ -34,26 +33,6 @@ impl<'gc> Builder<'_, 'gc> {
     fn table(&mut self, v: Val) -> Val {
         let s = self.state();
         self.e.check_type(v, TypeSet::TAB, ExitTag::Type, s)
-    }
-
-    /// Run `slow` in a cold block where `c` holds, then go on.
-    fn unless(&mut self, c: Val, slow: impl FnOnce(&mut Self)) {
-        match self.e.known(c) {
-            Some(false) => return,
-            Some(true) => return slow(self),
-            None => {}
-        }
-        // Made here, so that it dominates what uses it after the blocks.
-        self.state();
-        let lp = self.e.g.block(self.e.cur).lp;
-        let (cold, on) = (self.e.new_block(), self.e.new_block());
-        self.e.br(c, cold, on);
-        self.e.begin(cold, lp, 0, BlockFlags::COLD);
-        slow(self);
-        if !self.e.cur.is_none() {
-            self.e.jump(on);
-        }
-        self.e.begin(on, lp, 0, BlockFlags::empty());
     }
 
     /// The running closure.
@@ -137,36 +116,6 @@ impl<'gc> Builder<'_, 'gc> {
         }
     }
 
-    fn is_nil(&mut self, v: Val) -> Val {
-        let nil = self.e.k64(Rep::Val, NIL);
-        self.e.cmp(Op::Cmp, Cc::Eq, v, nil)
-    }
-
-    /// Leave with `tag` if the class of table `t` has a metamethod of
-    /// `bits` now: a table without a class has none.
-    fn no_mm(&mut self, t: Val, bits: MetamethodBits, tag: ExitTag) {
-        let shape = self.load(Field::Shape, t, 0);
-        let class = self.load(Field::ShapeClass, shape, 0);
-        let zero = self.e.k64(Rep::I64, 0);
-        let classed = self.e.cmp(Op::Cmp, Cc::Ne, class, zero);
-        self.unless(classed, |b| {
-            let have = b.load(Field::ClassBits, class, 0);
-            let mask = b.e.k32(Rep::I32, bits.bits());
-            let hit = b.e.op2(Op::And, Rep::I32, have, mask);
-            let zero = b.e.k32(Rep::I32, 0);
-            let none = b.e.cmp(Op::Cmp, Cc::Eq, hit, zero);
-            b.guard(none, tag);
-        });
-    }
-
-    /// Where `v`, read from table `t`, is nil, leave if the table's class
-    /// has `bit`: the metamethod may answer there. The class is read only
-    /// for a nil.
-    fn nil_guard(&mut self, t: Val, v: Val, bit: MetamethodBits, tag: ExitTag) {
-        let nil = self.is_nil(v);
-        self.unless(nil, |b| b.no_mm(t, bit, tag));
-    }
-
     /// Whether `x == y` for values of any kind. The same word is equal
     /// unless it is a NaN; different words, in a cold block, go to the helper,
     /// which compares numbers and big integers by value, after leaving for
@@ -197,9 +146,10 @@ impl<'gc> Builder<'_, 'gc> {
             let table = self
                 .e
                 .emit(Op::IsType, Rep::B1, TypeSet::TAB.bits(), v.0, 0, 0);
-            self.unless(table, |b| {
-                let t = b.e.unboxed(v, TypeSet::TAB);
-                b.no_mm(t, MetamethodBits::EQ, ExitTag::Slow);
+            let s = self.state();
+            self.e.unless(table, |e| {
+                let t = e.unboxed(v, TypeSet::TAB);
+                e.no_mm(t, MetamethodBits::EQ, ExitTag::Slow, s);
             });
             let udata = self
                 .e
@@ -230,83 +180,26 @@ impl<'gc> Builder<'_, 'gc> {
         self.e.call(Helper::SetList, imm, &[]);
     }
 
-    /// The store's barrier, unless the value is never a heap object: the
-    /// helper where the table is not gray.
-    fn barrier(&mut self, t: Val, v: Val) {
-        if !self.e.fact(v).set.intersects(TypeSet::HEAP) {
-            return;
-        }
-        let header = self.load(Field::GcHeader, t, 0);
-        let one = self.e.k64(Rep::I64, 1);
-        let gray = self.e.op2(Op::And, Rep::I64, header, one);
-        let zero = self.e.k64(Rep::I64, 0);
-        let due = self.e.cmp(Op::Cmp, Cc::Eq, gray, zero);
-        self.unless(due, |b| {
-            b.e.call(Helper::Barrier, 0, &[t]);
-        });
-    }
-
-    /// The array part's cell and the checked index of a small-integer key
-    /// inside it, for a site that saw only tables with such keys in range.
-    fn element(&mut self, pc: u32, recv: Val, key: Val) -> Option<(Val, Val, Val)> {
+    /// Whether the site at `pc` speculates the array part: it never left
+    /// the interpreter's fast path, which is a small-integer key inside it.
+    fn array_site(&self, pc: u32) -> u16 {
         let seen = self.proto.feedback.bits(pc as usize);
-        let key_fact = self.e.fact(key);
-        let small = !key_fact.pending() && TypeSet::SMALL.contains(key_fact.set);
-        // `ARR_MISS` shares `BIGINT`'s bit; `OTHER` is also a receiver that
-        // is no table.
-        let other = fb::KINDS & !fb::SMALL;
-        if seen & other != 0 || (seen & fb::SMALL == 0 && !small) {
-            return None;
-        }
-        let state = self.state();
-        let t = self.table(recv);
-        let i = self.e.check_type(key, TypeSet::SMALL, ExitTag::Type, state);
-        let n = self.load(Field::ASize, t, 0);
-        let inside = self.e.cmp(Op::Cmp, Cc::Lo, i, n);
-        let tag = ExitTag::Bounds as u16;
-        let i = self
-            .e
-            .emit(Op::Guard, Rep::I32, tag, inside.0, state.0, i.0);
-        let arr = self.load(Field::Array, t, 0);
-        let at = self.e.op1(Op::ZExt32, Rep::I64, i);
-        Some((t, arr, at))
+        if seen & fb::KINDS == 0 { ARRAY } else { 0 }
     }
 
     /// `R[a] = R[b][R[c]]`.
     pub(super) fn gettable(&mut self, pc: u32, i: Instruction) {
         let (recv, key) = (self.reg(i.b()), self.reg(i.c()));
-        let v = match self.element(pc, recv, key) {
-            Some((t, arr, at)) => {
-                let item = Field::Item as u16;
-                let v = self
-                    .e
-                    .emit(Op::LoadIdx, Rep::Val, item, arr.0, at.0, u32::MAX);
-                self.nil_guard(t, v, MetamethodBits::INDEX, ExitTag::Bounds);
-                v
-            }
-            None => self.helped(Helper::Index, 0, &[recv, key]),
-        };
+        let (aux, s) = (self.array_site(pc), self.state());
+        let v = self.e.emit(Op::GetIndex, Rep::Val, aux, recv.0, key.0, s.0);
         self.set(i.a(), v);
     }
 
     /// `R[b][R[c]] = R[a]`.
     pub(super) fn settable(&mut self, pc: u32, i: Instruction) {
         let (recv, key, v) = (self.reg(i.b()), self.reg(i.c()), self.reg(i.a()));
-        match self.element(pc, recv, key) {
-            Some((t, arr, at)) => {
-                let item = Field::Item as u16;
-                // `__newindex` may fire over a nil.
-                let old = self
-                    .e
-                    .emit(Op::LoadIdx, Rep::Val, item, arr.0, at.0, u32::MAX);
-                self.nil_guard(t, old, MetamethodBits::NEWINDEX, ExitTag::Bounds);
-                self.barrier(t, v);
-                self.e.emit(Op::StoreIdx, Rep::None, item, arr.0, at.0, v.0);
-            }
-            None => {
-                self.helped(Helper::NewIndex, 1, &[recv, key, v]);
-            }
-        }
+        let (aux, s) = (self.array_site(pc), self.state());
+        self.e.set_index(recv, key, v, aux, s);
     }
 
     /// `R[a] = {}` from the site's template, then the collector's check:
@@ -365,7 +258,7 @@ impl<'gc> Builder<'_, 'gc> {
     /// `v`, read from an own slot of `recv`, or where it is nil what the
     /// index helper finds for constant `e`, in a cold block.
     fn or_index(&mut self, recv: Val, v: Val, e: u16) -> Val {
-        let nil = self.is_nil(v);
+        let nil = self.e.is_nil(v);
         if let Some(known) = self.e.known(nil) {
             return if known {
                 let key = self.konst(self.proto.constants[e as usize]);
@@ -427,9 +320,10 @@ impl<'gc> Builder<'_, 'gc> {
         // `__newindex` fires only on a nil slot.
         if shape.mt_cache().is_some() {
             let old = self.load(f, base, k);
-            self.nil_guard(t, old, MetamethodBits::NEWINDEX, ExitTag::Slow);
+            let s = self.state();
+            (self.e).nil_guard(t, old, MetamethodBits::NEWINDEX, ExitTag::Slow, s);
         }
-        self.barrier(t, v);
+        self.e.barrier(t, v);
         self.e.emit(Op::Store, Rep::None, f as u16, base.0, v.0, k);
     }
 }

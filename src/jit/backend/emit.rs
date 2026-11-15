@@ -127,7 +127,8 @@ pub(crate) fn rotate_loops<I: TargetInst, L: Copy + PartialEq>(
 }
 
 /// Where branches to each block go, and whether it is left out: a block
-/// whose only code is a deopt is its exit (`exit_of`).
+/// whose only code is a deopt is its exit (`exit_of`), and one that is only
+/// a jump is where the jump goes.
 pub(crate) fn thread_jumps<I: TargetInst, L: Copy>(
     v: &VCode<I>,
     out: &Output,
@@ -136,6 +137,7 @@ pub(crate) fn thread_jumps<I: TargetInst, L: Copy>(
 ) -> (Vec<L>, Vec<bool>) {
     let mut dest = labels.to_vec();
     let mut skip = vec![false; labels.len()];
+    let mut jumps = vec![usize::MAX; labels.len()];
     for b in 1..labels.len() {
         if v.blocks[b].resume {
             continue;
@@ -150,10 +152,26 @@ pub(crate) fn thread_jumps<I: TargetInst, L: Copy>(
                     !(v.insts[i.index()].is_remat() && out.inst_allocs(v, i)[0].is_none())
                 }
             });
-        if let (Some(InstOrEdit::Inst(i)), None) = (code.next(), code.next())
-            && let Flow::Deopt(exit) = v.insts[Inst::index(i)].flow()
-        {
-            dest[b] = exit_of(exit);
+        let (Some(InstOrEdit::Inst(i)), None) = (code.next(), code.next()) else {
+            continue;
+        };
+        match v.insts[Inst::index(i)].flow() {
+            Flow::Deopt(exit) => {
+                dest[b] = exit_of(exit);
+                skip[b] = true;
+            }
+            Flow::Jump => jumps[b] = v.succs(b)[0].index(),
+            _ => {}
+        }
+    }
+    for b in 1..labels.len() {
+        // The end of a chain of jumps; one that comes around is left alone.
+        let (mut to, mut steps) = (b, 0);
+        while jumps[to] != usize::MAX && steps <= labels.len() {
+            (to, steps) = (jumps[to], steps + 1);
+        }
+        if to != b && steps <= labels.len() {
+            dest[b] = dest[to];
             skip[b] = true;
         }
     }

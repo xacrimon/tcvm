@@ -333,18 +333,7 @@ impl Builder<'_, '_> {
     /// the instruction, which the helper left untouched.
     fn helped(&mut self, h: Helper, imm: u32, args: &[Val]) -> Val {
         let state = self.state();
-        let r = self.e.call(h, imm, args);
-        let fail = self.e.k64(Rep::I64, HELPER_FAIL_VAL);
-        let ok = self.e.cmp(Op::Cmp, Cc::Ne, r, fail);
-        self.e.emit(
-            Op::Guard,
-            Rep::None,
-            ExitTag::Mm as u16,
-            ok.0,
-            state.0,
-            u32::MAX,
-        );
-        r
+        self.e.helped(h, imm, args, state)
     }
 
     // --- blocks -----------------------------------------------------------
