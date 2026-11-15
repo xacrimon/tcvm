@@ -159,8 +159,10 @@ fn integer_rules() {
     assert_eq!(t.op(sum), Add);
     assert_eq!(t.i32(Add, y, x), sum);
     assert_eq!(t.i32(Mul, x, t.k(2)), t.i32(Add, x, x));
+    // `Not` has no machine instruction yet: `x ^ -1` stays as it is.
     let not = t.i32(Xor, x, t.k(-1));
-    assert_eq!(t.op(not), Not);
+    assert_eq!(t.op(not), Xor);
+    let not = t.op1(Not, Rep::I32, x);
     assert_eq!(t.op1(Not, Rep::I32, not), x);
     let neg = t.i32(Mul, x, t.k(-1));
     assert_eq!(t.op(neg), Neg);
@@ -795,6 +797,8 @@ fn table_columns() {
             ("CheckType", FactOf::AuxSet),
             ("BoxI64", FactOf::Set(TypeSet::INT)),
             ("NewTable", FactOf::Set(TypeSet::TAB)),
+            ("Arith", FactOf::Leaves),
+            ("Unm", FactOf::Leaves),
             ("Concat", FactOf::Set(TypeSet::STR)),
             ("Len", FactOf::Set(TypeSet::INT)),
         ]
@@ -827,6 +831,8 @@ fn table_columns() {
             "Jump",
             "Br",
             "CallHelper",
+            "Arith",
+            "Unm",
             "SetIndex",
             "ForLimit",
             "ForSkip",
@@ -837,7 +843,19 @@ fn table_columns() {
         .filter(|h| h.fact != TypeSet::ANY)
         .map(|h| h.name)
         .collect();
-    assert_eq!(tab, ["Len", "Concat", "BoxInt", "NewTable", "RawLen"]);
+    assert_eq!(
+        tab,
+        [
+            "ArithCoerce",
+            "Unm",
+            "BNot",
+            "Len",
+            "Concat",
+            "BoxInt",
+            "NewTable",
+            "RawLen"
+        ]
+    );
 }
 
 /// How many instructions of `op` the graph has.
@@ -1551,5 +1569,288 @@ mod lengths_and_loops {
         let k = t.e().next_pred(head);
         t.e().set_input(x, k, ops[0]);
         t.jump(head);
+    }
+}
+
+mod arithmetic {
+    use super::super::analyse::Analysis;
+    use super::super::arith::{self, BIG, FLOAT, MM, OVERFLOWED, SEEN_SHIFT, SMALL};
+    use super::super::copy::Copy;
+    use super::super::types::{Fact, FactFlags};
+    use super::*;
+    use crate::instruction::ArithKind as K;
+
+    fn aux(kind: K, a: u8, b: u8) -> u16 {
+        kind as u16 | (a as u16) << SEEN_SHIFT[0] | (b as u16) << SEEN_SHIFT[1]
+    }
+
+    fn arith(t: &T, aux: u16, a: Val, b: Val) -> Val {
+        t.e().lower(Op::Arith, Rep::Val, aux, a.0, b.0, t.fs.0)
+    }
+
+    /// Register `r` as a value known a small integer or a float.
+    fn number(t: &T, r: u16) -> Val {
+        let (s, f) = (small(t, r), float(t, r + 8));
+        let c = t.cmp(Op::Cmp, Cc::Eq, t.slot(r + 4), t.slot(r + 5));
+        let v = t.emit(Op::Select, Rep::Val, 0, c, s, f);
+        assert_eq!(t.set(v), TypeSet::SMALL | TypeSet::FLOAT);
+        v
+    }
+
+    fn small(t: &T, r: u16) -> Val {
+        let s = t.small(r);
+        t.op1(Op::BoxI32, Rep::Val, s)
+    }
+
+    fn float(t: &T, r: u16) -> Val {
+        let f = t.check(t.slot(r), TypeSet::FLOAT, ExitTag::Type);
+        t.op1(Op::BoxF64, Rep::Val, f)
+    }
+
+    #[test]
+    fn single_kinds_are_one_op() {
+        use Op::*;
+        let both = |k: u8| (k, k);
+        for (kind, (a, b), op, set) in [
+            (K::Add, both(SMALL), AddOvf, TypeSet::SMALL),
+            (K::Add, both(FLOAT), FAdd, TypeSet::FLOAT),
+            (K::Mul, (SMALL, FLOAT), FMul, TypeSet::FLOAT),
+            (K::Div, both(SMALL), FDiv, TypeSet::FLOAT),
+            (K::BAnd, both(SMALL), And, TypeSet::SMALL),
+            (K::IDiv, both(FLOAT), FFloor, TypeSet::FLOAT),
+        ] {
+            let t = start(true);
+            let r = arith(&t, aux(kind, a, b), t.slot(0), t.slot(1));
+            assert_eq!(
+                (count(&t, op), count(&t, Br), t.set(r)),
+                (1, 0, set),
+                "{kind:?}"
+            );
+            t.done();
+        }
+        // Unary minus.
+        let t = start(true);
+        let x = t.slot(0);
+        let r = (t.e()).lower(Unm, Rep::Val, (SMALL as u16) << 4, x.0, t.fs.0, 0);
+        assert_eq!((count(&t, NegOvf), t.set(r)), (1, TypeSet::SMALL));
+        t.done();
+    }
+
+    #[test]
+    fn integers_stay_integers_and_floats_take_the_rest() {
+        use Op::*;
+        let either = SMALL | FLOAT;
+        // Either kind on both sides: a test of each on a path, one integer
+        // op, one float op, the result boxed where they join.
+        let t = start(true);
+        let (a, b) = (number(&t, 0), number(&t, 1));
+        let brs = count(&t, Br);
+        let r = arith(&t, aux(K::Add, either, either), a, b);
+        assert_eq!((count(&t, AddOvf), count(&t, FAdd)), (1, 1));
+        assert_eq!((count(&t, Br) - brs, count(&t, Deopt)), (3, 0));
+        assert_eq!(
+            (t.op(r), t.set(r)),
+            (Param, TypeSet::SMALL | TypeSet::FLOAT)
+        );
+        t.done();
+        // The left one always an integer: one test, of the right.
+        let t = start(true);
+        let (a, b) = (small(&t, 0), number(&t, 1));
+        let brs = count(&t, Br);
+        arith(&t, aux(K::Sub, either, either), a, b);
+        assert_eq!((count(&t, SubOvf), count(&t, FSub)), (1, 1));
+        assert_eq!(count(&t, Br) - brs, 1);
+        t.done();
+        // One side always a float: no integer op, the other converts.
+        let t = start(true);
+        let (a, b) = (float(&t, 0), number(&t, 1));
+        let brs = count(&t, Br);
+        let r = arith(&t, aux(K::Mul, either, either), a, b);
+        assert_eq!(
+            (count(&t, MulOvf), count(&t, FMul), count(&t, IToF)),
+            (0, 1, 1)
+        );
+        assert_eq!((count(&t, Br) - brs, t.set(r)), (1, TypeSet::FLOAT));
+        t.done();
+        // `/`: each side converts on its own.
+        let t = start(true);
+        let (a, b) = (small(&t, 0), number(&t, 1));
+        let brs = count(&t, Br);
+        arith(&t, aux(K::Div, either, either), a, b);
+        assert_eq!((count(&t, FDiv), count(&t, Br) - brs), (1, 1));
+        t.done();
+    }
+
+    #[test]
+    fn what_the_site_did_not_see_leaves() {
+        use Op::*;
+        // A kind the type allows and the site never saw: its test fails to
+        // an exit, and no code is made for it.
+        let t = start(true);
+        let (a, b) = (number(&t, 0), small(&t, 1));
+        let r = arith(&t, aux(K::Add, SMALL, SMALL), a, b);
+        assert_eq!(
+            (count(&t, AddOvf), count(&t, FAdd), t.set(r)),
+            (1, 0, TypeSet::SMALL)
+        );
+        t.done();
+        // A type known to be what the site never saw is what it is.
+        let t = start(true);
+        let (a, b) = (float(&t, 0), float(&t, 1));
+        let r = arith(&t, aux(K::Add, SMALL, SMALL), a, b);
+        assert_eq!(
+            (count(&t, FAdd), count(&t, Deopt), t.set(r)),
+            (1, 0, TypeSet::FLOAT)
+        );
+        t.done();
+        // Nothing an arm can be made for: the op leaves, with `Mm` where a
+        // metamethod ran there.
+        let t = start(true);
+        let template = t.e().k64(Rep::I64, 0);
+        let table = (t.e()).call(super::super::ops::Helper::NewTable, 0, &[template]);
+        arith(&t, aux(K::Add, SMALL, SMALL) | MM, table, t.slot(1));
+        let e = t.e();
+        let last = e.g.insts.last().unwrap();
+        assert_eq!((last.op, last.aux), (Deopt, ExitTag::Mm as u16));
+        assert!(e.cur.is_none());
+    }
+
+    #[test]
+    fn wide_sites_work_in_64_bits() {
+        use Op::*;
+        // A site that overflowed: the wrapping op on `I64`s, its result
+        // left unboxed where nothing but an integer comes of it.
+        let t = start(true);
+        let r = arith(
+            &t,
+            aux(K::Mul, SMALL, SMALL) | OVERFLOWED,
+            small(&t, 0),
+            small(&t, 1),
+        );
+        assert_eq!(
+            (t.op(r), t.inst(r).rep, count(&t, MulOvf)),
+            (Mul, Rep::I64, 0)
+        );
+        t.done();
+        // 64-bit integers seen: each operand small or boxed, by its arms.
+        let t = start(true);
+        let ints = SMALL | BIG;
+        let r = arith(&t, aux(K::Add, ints, ints), t.slot(0), t.slot(1));
+        assert_eq!((t.op(r), t.inst(r).rep), (Add, Rep::I64));
+        assert_eq!((count(&t, Br), count(&t, Deopt)), (4, 2));
+        t.done();
+        // With a float possible too the integer result is boxed.
+        let t = start(true);
+        let all = SMALL | BIG | FLOAT;
+        let r = arith(&t, aux(K::Add, all, all), number(&t, 0), t.slot(1));
+        assert_eq!((t.inst(r).rep, count(&t, CallHelper)), (Rep::Val, 1));
+        assert_eq!(t.set(r), TypeSet::NUM);
+        t.done();
+        // A bitwise op of a float: its exact integer, or leave.
+        let t = start(true);
+        let r = arith(&t, aux(K::BOr, FLOAT, SMALL), float(&t, 0), small(&t, 1));
+        assert_eq!((t.op(r), t.inst(r).rep, count(&t, FToL)), (Or, Rep::I64, 1));
+        t.done();
+        // An integer of either size unboxed, anything else leaving.
+        let t = start(true);
+        let tag = ExitTag::Type as u16;
+        let v = t.slot(0);
+        let x = (t.e()).lower(UnboxI64, Rep::I64, tag, v.0, t.fs.0, 0);
+        let ins = t.e().g.inputs(x).to_vec();
+        let ins: Vec<Op> = ins.iter().map(|&v| t.op(Val(v))).collect();
+        assert_eq!((t.op(x), ins), (Param, vec![SExt32, Load]));
+        assert_eq!((count(&t, Br), count(&t, Deopt)), (2, 1));
+        t.done();
+    }
+
+    #[test]
+    fn results_by_kinds() {
+        let (s, f, n) = (
+            TypeSet::SMALL,
+            TypeSet::FLOAT,
+            TypeSet::SMALL | TypeSet::FLOAT,
+        );
+        let either = SMALL | FLOAT;
+        let r = |aux: u16, a, b| arith::result(aux, a, Some(b));
+        assert_eq!(r(aux(K::Add, either, either), n, n), n);
+        assert_eq!(r(aux(K::Add, either, either), s, s), s);
+        assert_eq!(r(aux(K::Add, either, either), s, f), f);
+        assert_eq!(r(aux(K::Div, either, either), s, s), f);
+        assert_eq!(
+            r(aux(K::Add, SMALL, SMALL) | OVERFLOWED, s, s),
+            TypeSet::INT
+        );
+        assert_eq!(r(aux(K::BOr, either, SMALL), n, s), TypeSet::INT);
+        assert_eq!(
+            r(aux(K::Add, SMALL, SMALL), TypeSet::TAB, s),
+            TypeSet::empty()
+        );
+        assert_eq!(arith::result((either as u16) << 4, n, None), n);
+    }
+
+    /// A loop summing into a parameter: the analysis types it by what comes
+    /// around, and holds an integer of either size as `I64`.
+    #[test]
+    fn loop_parameters_take_their_inputs_types() {
+        for (seen, flags, want, rep) in [
+            (SMALL | FLOAT, 0, TypeSet::SMALL | TypeSet::FLOAT, Rep::Val),
+            (SMALL | BIG, OVERFLOWED, TypeSet::INT, Rep::I64),
+        ] {
+            let t = start(false);
+            let zero = t
+                .e()
+                .k64(Rep::Val, crate::env::value::Value::small(0).to_raw());
+            let step = number(&t, 0);
+            let (head, body, exit, lp) = {
+                let mut e = t.e();
+                let (head, body, exit) = (e.new_block(), e.new_block(), e.new_block());
+                e.jump(head);
+                let lp = e.new_loop(head, Loop::NONE, Heaps::empty(), t.fs);
+                assert!(e.begin(head, lp, 1, BlockFlags::LOOP_HEADER));
+                (head, body, exit, lp)
+            };
+            let pending = Fact {
+                set: TypeSet::ANY,
+                flags: FactFlags::PENDING,
+            };
+            let sum = t.e().param(Rep::Val, Some(pending), &[zero]);
+            let more = t.cmp(Op::Cmp, Cc::Eq, t.slot(6), t.slot(7));
+            t.e().br(more, body, exit);
+            assert!(t.e().begin(body, lp, 0, BlockFlags::empty()));
+            let next = t.emit(
+                Op::Arith,
+                Rep::Val,
+                aux(K::Add, seen, seen) | flags,
+                sum,
+                step,
+                t.fs,
+            );
+            assert_eq!(t.op(next), Op::Arith);
+            let k = t.e().next_pred(head);
+            t.e().set_input(sum, k, next);
+            t.jump(head);
+            t.block(exit);
+            let out = t.e().param(Rep::Val, None, &[sum]);
+            t.emit(Op::SlotStore, Rep::None, 0, out, Val(0), Val(0));
+            t.done();
+            let e = t.e();
+            let mut a = Analysis::default();
+            a.uses(&e.g);
+            a.types(&e.g);
+            assert_eq!(a.ty[sum.idx()], want, "{seen}");
+            assert_eq!(a.wide.contains(&sum), rep == Rep::I64);
+            let mut low = Emitter::default();
+            low.reset(true);
+            Copy::default().run(&e.g, &a, &mut low);
+            assert!(low.bail.is_none());
+            let params: Vec<Rep> = (low.g.insts.iter())
+                .filter(|i| i.op == Op::Param)
+                .map(|i| i.rep)
+                .collect();
+            assert_eq!(params[0], rep, "{seen}");
+            if let Err(why) = verify(&low.g, true) {
+                panic!("{why}\n{}", low.g.print());
+            }
+        }
     }
 }

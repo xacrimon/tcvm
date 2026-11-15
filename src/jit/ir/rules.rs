@@ -9,7 +9,6 @@ use super::ops::{Cc, ExitTag, Flags, Helper, Op};
 use super::types::{Rep, TypeSet};
 use super::{Inst, Val};
 use crate::env::value::{SMALL_INT, Value};
-use crate::instruction::ArithKind;
 use crate::jit::bug;
 use crate::jit::build::{SPEC_SHIFT, Spec};
 
@@ -410,7 +409,8 @@ impl Emitter {
                 };
                 Some(self.op1(FFloor, Rep::F64, q))
             }
-            Arith | Compare | Unm => self.specialise(i),
+            Arith | Unm => self.arith_rule(i),
+            Compare => self.specialise(i),
             // It folds where its branch is gone: on a constant condition, a
             // folded branch's, and on one known here though no branch on
             // it stands above (a copy folds a branch on a condition a guard
@@ -644,13 +644,12 @@ impl Emitter {
         self.emit(Select, rep, 0, down.0, stepped.0, plain.0)
     }
 
-    /// A generic op whose operands' facts are final: each operand has a
-    /// kind, its fact's or the one the site speculates, which is checked.
+    /// A `Compare` whose operands' facts are final: each operand has a kind,
+    /// its fact's or the one the site speculates, which is checked.
     fn specialise(&mut self, i: &Inst) -> Option<Val> {
         use Op::*;
-        let (a, b) = (Val(i.a), Val(i.b));
-        let unary = i.op == Unm;
-        if self.fact(a).pending() || (!unary && self.fact(b).pending()) {
+        let (a, b, fs) = (Val(i.a), Val(i.b), Val(i.c));
+        if self.fact(a).pending() || self.fact(b).pending() {
             return None;
         }
         // Copy 1 goes by definitions alone, as the analysis that typed the
@@ -663,7 +662,6 @@ impl Emitter {
             };
             Spec::by_fact(f).unwrap_or(Spec::of(i.aux >> SPEC_SHIFT[k]))
         };
-        let fs = if unary { b } else { Val(i.c) };
         let small = |e: &mut Self, v: Val| e.check_type(v, TypeSet::SMALL, ExitTag::Type, fs);
         let float = |e: &mut Self, v: Val, k: Spec| {
             let x = e.check_type(v, k.set(), ExitTag::Type, fs);
@@ -672,78 +670,15 @@ impl Emitter {
                 Spec::F64 => x,
             }
         };
-        let ka = kind(self, a, 0);
-        if unary {
-            let r = match ka {
-                Spec::I32 => {
-                    let x = small(self, a);
-                    let r = self.emit(NegOvf, Rep::I32, ExitTag::Overflow as u16, x.0, fs.0, 0);
-                    self.op1(BoxI32, Rep::Val, r)
-                }
-                Spec::F64 => {
-                    let x = float(self, a, ka);
-                    let r = self.op1(FNeg, Rep::F64, x);
-                    self.op1(BoxF64, Rep::Val, r)
-                }
-            };
-            return Some(r);
-        }
-        let kb = kind(self, b, 1);
+        let (ka, kb) = (kind(self, a, 0), kind(self, b, 1));
         let low = i.aux & 15;
-        if i.op == Compare {
-            return Some(if ka == Spec::I32 && kb == Spec::I32 {
-                let (x, y) = (small(self, a), small(self, b));
-                self.emit(Cmp, Rep::B1, low, x.0, y.0, 0)
-            } else {
-                let (x, y) = (float(self, a, ka), float(self, b, kb));
-                self.emit(FCmp, Rep::B1, low, x.0, y.0, 0)
-            });
-        }
-        let is = |k: ArithKind| low == k as u16;
-        if crate::jit::build::int_result(low, ka, kb) {
+        Some(if ka == Spec::I32 && kb == Spec::I32 {
             let (x, y) = (small(self, a), small(self, b));
-            let exits = |e: &mut Self, op: Op, tag: ExitTag| {
-                e.emit(op, Rep::I32, tag as u16, x.0, y.0, fs.0)
-            };
-            let r = if is(ArithKind::Add) {
-                exits(self, AddOvf, ExitTag::Overflow)
-            } else if is(ArithKind::Sub) {
-                exits(self, SubOvf, ExitTag::Overflow)
-            } else if is(ArithKind::Mul) {
-                exits(self, MulOvf, ExitTag::Overflow)
-            } else if is(ArithKind::IDiv) {
-                // A zero divisor raises, in the interpreter.
-                exits(self, DivFloor, ExitTag::Slow)
-            } else if is(ArithKind::Mod) {
-                exits(self, ModFloor, ExitTag::Slow)
-            } else if is(ArithKind::BAnd) {
-                self.op2(And, Rep::I32, x, y)
-            } else if is(ArithKind::BOr) {
-                self.op2(Or, Rep::I32, x, y)
-            } else {
-                self.op2(Xor, Rep::I32, x, y)
-            };
-            return Some(self.op1(BoxI32, Rep::Val, r));
-        }
-        let (x, y) = (float(self, a, ka), float(self, b, kb));
-        let r = if is(ArithKind::Add) {
-            self.op2(FAdd, Rep::F64, x, y)
-        } else if is(ArithKind::Sub) {
-            self.op2(FSub, Rep::F64, x, y)
-        } else if is(ArithKind::Mul) {
-            self.op2(FMul, Rep::F64, x, y)
-        } else if is(ArithKind::Div) {
-            self.op2(FDiv, Rep::F64, x, y)
-        } else if is(ArithKind::IDiv) {
-            self.op2(FIDiv, Rep::F64, x, y)
-        } else if is(ArithKind::Mod) {
-            self.op2(FMod, Rep::F64, x, y)
-        } else if self.kf(y) == Some(2.0) {
-            self.op2(FMul, Rep::F64, x, x)
+            self.emit(Cmp, Rep::B1, low, x.0, y.0, 0)
         } else {
-            self.call(Helper::Pow, 0, &[x, y])
-        };
-        Some(self.op1(BoxF64, Rep::Val, r))
+            let (x, y) = (float(self, a, ka), float(self, b, kb));
+            self.emit(FCmp, Rep::B1, low, x.0, y.0, 0)
+        })
     }
 
     /// Whether the `Val` is neither nil nor false, once its fact is final:
@@ -834,7 +769,8 @@ impl Emitter {
             (Shl | Shr | Sar, _) if k & (bits - 1) == 0 => return Some(a),
             (Mul | And, 0) => return Some(b),
             (And | Or, _) if k == ones => return Some(if i.op == And { a } else { b }),
-            (Xor, -1) if bits != 1 => return Some(self.op1(Not, rep, a)),
+            // `x ^ -1` stays an exclusive-or: `Not` has no machine
+            // instruction yet (aarch64's `mvn` is no opcode of the table).
             (Mul, -1) => return Some(self.op1(Neg, rep, a)),
             (Mul, 2) => return Some(self.op2(Add, rep, a, a)),
             (Sub, _) => {

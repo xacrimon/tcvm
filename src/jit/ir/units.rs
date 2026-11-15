@@ -148,28 +148,60 @@ impl Emitter {
         self.join(on).map_or(Val::NONE, |[v]| v)
     }
 
-    /// `UnboxI64` of a value that is a small or a boxed integer.
+    /// `UnboxI64` where more than one kind is possible: an arm for a small
+    /// and one for a boxed integer, the last untested where the value is
+    /// known an integer; with a frame state, anything else leaves in a last
+    /// arm.
     pub(super) fn unbox_rewrite(&mut self, i: &Inst) -> Val {
         use Op::*;
-        let v = Val(i.a);
-        if !TypeSet::INT.contains(self.fact(v).set) {
+        let (v, fs) = (Val(i.a), i.b);
+        let has = self.fact(v).set;
+        let outside = !TypeSet::INT.contains(has);
+        if outside && fs == u32::MAX {
             bug!("{v:?} unboxed as an integer is not known to be one");
         }
-        let small = self.emit(IsType, Rep::B1, TypeSet::SMALL.bits(), v.0, 0, 0);
+        let kinds = [TypeSet::SMALL, TypeSet::BIGINT].map(|k| has.intersects(k).then_some(k));
+        let n = kinds.iter().flatten().count();
         let mut on = self.new_join::<1>();
-        let (yes, no) = self.fork(small, false, false);
-        if self.arm(yes) {
-            let p = self.proved(small, true, v, TypeSet::SMALL);
-            let x = self.op1(Trunc32, Rep::I32, p);
-            let x = self.op1(SExt32, Rep::I64, x);
+        // The test whose false arm is open.
+        let mut failed = None;
+        for (at, k) in kinds.into_iter().flatten().enumerate() {
+            let last = at + 1 == n;
+            let p = match failed {
+                Some(c) if last && !outside => self.proved(c, false, v, k),
+                None if last && !outside => v,
+                _ => {
+                    let c = self.emit(IsType, Rep::B1, k.bits(), v.0, 0, 0);
+                    let (yes, no) = self.fork(c, false, false);
+                    if self.arm(yes) {
+                        let p = self.proved(c, true, v, k);
+                        let x = self.as_i64(p, k);
+                        self.leave(&mut on, [x]);
+                    }
+                    if !self.arm(no) {
+                        break;
+                    }
+                    failed = Some(c);
+                    continue;
+                }
+            };
+            let x = self.as_i64(p, k);
             self.leave(&mut on, [x]);
         }
-        if self.arm(no) {
-            let p = self.proved(small, false, v, TypeSet::BIGINT);
-            let x = self.boxed_int(p);
-            self.leave(&mut on, [x]);
+        if !self.cur.is_none() {
+            self.emit(Deopt, Rep::None, i.aux, fs, 0, 0);
         }
         self.join(on).map_or(Val::NONE, |[v]| v)
+    }
+
+    /// The `I64` of `v`, typed by its definition as integer kind `k`.
+    fn as_i64(&mut self, v: Val, k: TypeSet) -> Val {
+        if k == TypeSet::SMALL {
+            let x = self.op1(Op::Trunc32, Rep::I32, v);
+            self.op1(Op::SExt32, Rep::I64, x)
+        } else {
+            self.boxed_int(v)
+        }
     }
 
     /// `ToF64` where more than one kind is possible: an arm per kind the

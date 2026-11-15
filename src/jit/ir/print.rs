@@ -93,8 +93,27 @@ impl Graph {
                 );
             }
         }
-        // A generic op's speculated operand kinds.
-        if matches!(i.op, Op::Arith | Op::Compare) {
+        // The kinds a site saw for each operand (`s`mall, `b`ig, `f`loat),
+        // then `w` where it overflowed and `m` where a metamethod ran.
+        if matches!(i.op, Op::Arith | Op::Unm) {
+            use super::arith::{BIG, FLOAT, MM, OVERFLOWED, SEEN_SHIFT, SMALL};
+            let n = if i.op == Op::Unm { 1 } else { 2 };
+            for shift in SEEN_SHIFT.into_iter().take(n) {
+                o.push('.');
+                for (bit, c) in [(SMALL, 's'), (BIG, 'b'), (FLOAT, 'f')] {
+                    if (i.aux >> shift) as u8 & bit != 0 {
+                        o.push(c);
+                    }
+                }
+            }
+            for (bit, c) in [(OVERFLOWED, 'w'), (MM, 'm')] {
+                if i.aux & bit != 0 {
+                    o.push(c);
+                }
+            }
+        }
+        // A compare's speculated operand kinds.
+        if i.op == Op::Compare {
             for shift in crate::jit::build::SPEC_SHIFT {
                 o.push_str(match crate::jit::build::Spec::of(i.aux >> shift) {
                     crate::jit::build::Spec::I32 => ".i",

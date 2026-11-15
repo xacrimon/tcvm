@@ -5176,3 +5176,100 @@ fn concatenation_in_loops() {
     compiles_cleanly(src, false);
     compiles_at_first_count(src, false);
 }
+
+/// Operands that are an integer on some iterations and a float on others,
+/// integers overflowing into 64 bits and back, loop-carried 64-bit
+/// integers, shifts and unary ops on them, `//` and `%` of `mininteger`,
+/// bitwise ops on floats with integer values, numeric strings.
+#[test]
+fn arithmetic_of_each_kind_in_loops() {
+    let src = "local out = {}
+        -- operands that are an integer on some iterations and a float on others
+        local vals = {1, 2.5, 3, 4.25, -7, 0.5}
+        local s, p = 0, 1
+        for i = 1, 3000 do
+          local v = vals[i % 6 + 1]
+          s = s + v
+          p = p * 1.0001 + v - i % 3
+          s = s - v // 2 + v % 3
+        end
+        out[#out + 1] = s .. ':' .. string.format('%.10g', p)
+        -- overflow into 64 bits and back
+        local x, y = 1, 0
+        for i = 1, 3000 do
+          x = x * 3 + i
+          if x > 1000000000000 then x = x // 1000000007 end
+          y = y + (x << 3) - (x >> 1) + -x
+        end
+        out[#out + 1] = math.type(x) .. x .. ':' .. math.type(y) .. y
+        -- a loop-carried 64-bit integer
+        local seed, acc = 42, 0
+        for i = 1, 5000 do
+          seed = seed * 6364136223846793005 + 1442695040888963407
+          acc = acc ~ (seed >> 33)
+        end
+        out[#out + 1] = seed .. ':' .. acc
+        -- xorshift, and unary ops
+        local z, w = 88172645463325252, 0
+        for i = 1, 3000 do
+          z = z ~ (z << 13); z = z ~ (z >> 7); z = z ~ (z << 17)
+          w = w + (~z & 0xff) - (-z % 7)
+        end
+        out[#out + 1] = z .. ':' .. w
+        -- division and modulo
+        local d, m = 0, 0
+        local mins = {math.mininteger, 7, -7, 1 << 40}
+        for i = 1, 3000 do
+          local a = mins[i % 4 + 1]
+          d = d + (a // -1) % 1000 + a % -3 + a // 5
+          m = m + 7.5 // (i % 5 + 1) + i % 2.5
+        end
+        out[#out + 1] = d .. ':' .. m
+        -- bitwise on floats with integer values
+        local b = 0
+        local fl = {3.0, 8.0, 2^40, 5}
+        for i = 1, 3000 do b = b + (fl[i % 4 + 1] | 1) + (fl[i % 4 + 1] & 6) end
+        out[#out + 1] = math.type(b) .. b
+        -- numeric strings
+        local n = 0
+        local strs = {'10', '0x10', '1e1', 3}
+        for i = 1, 3000 do n = n + strs[i % 4 + 1] * 2 + -strs[i % 4 + 1] end
+        out[#out + 1] = math.type(n) .. n
+        return table.concat(out, ' ')";
+    assert_eq!(
+        result(src, false),
+        "5750.0:-1018.363951 integer161128458:integer955454792987825 1122341017991637906:1504978315 -2277383315927291294:376247 164926745221950:11400.0 integer824633720850000 float29250.0"
+    );
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}
+
+/// What arithmetic raises (a zero divisor, a float with no integer value,
+/// a string in a bitwise op, a string that is no number, a table) is
+/// raised by the interpreter after compiled code leaves.
+#[test]
+fn arithmetic_errors_reach_the_interpreter() {
+    let src = "-- the errors: each raised by the interpreter after compiled code leaves
+        local out = {}
+        local function try(f, ...)
+          local ok, err = pcall(f, ...)
+          out[#out + 1] = ok and tostring(err) or (tostring(err):gsub('^.-:%d+: ', ''):gsub(' %(.-%)', ''))
+        end
+        local function idiv(a, b) local s = 0 for i = 1, 200 do s = s + a // b end return s end
+        local function mod(a, b) local s = 0 for i = 1, 200 do s = s + a % b end return s end
+        local function bor(a, b) local s = 0 for i = 1, 200 do s = s + (a | b) end return s end
+        local function add(a, b) local s = 0 for i = 1, 200 do s = s + (a + b) end return s end
+        for r = 1, 2 do
+          try(idiv, 7, 2) try(idiv, 7, 0) try(idiv, 7.0, 0)
+          try(mod, 7, 3) try(mod, 7, 0)
+          try(bor, 1, 2) try(bor, 1, 1.5) try(bor, 1, 2.0) try(bor, '3', 0)
+          try(add, 1, 2) try(add, '10', 1) try(add, 'a', 1) try(add, {}, 1)
+        end
+        return table.concat(out, ' | ')";
+    assert_eq!(
+        result(src, false),
+        "600 | attempt to divide by zero | inf | 200 | attempt to perform 'n%0' | 600 | number has no integer representation | 600 | attempt to perform bitwise operation on a string value | 600 | 2200 | attempt to add a 'string' with a 'number' | attempt to perform arithmetic on a table value | 600 | attempt to divide by zero | inf | 200 | attempt to perform 'n%0' | 600 | number has no integer representation | 600 | attempt to perform bitwise operation on a string value | 600 | 2200 | attempt to add a 'string' with a 'number' | attempt to perform arithmetic on a table value"
+    );
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}

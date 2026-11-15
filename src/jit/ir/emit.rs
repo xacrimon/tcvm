@@ -520,6 +520,7 @@ impl Emitter {
             Op::GetIndex | Op::SetIndex => self.index(&i),
             Op::GetField | Op::SetField => self.field(&i),
             Op::Len => self.len_rewrite(&i),
+            Op::Arith | Op::Unm => self.arith_rewrite(&i),
             Op::Barrier => self.barrier_rewrite(&i),
             Op::BoxI64 => self.box_rewrite(&i),
             Op::UnboxI64 => self.unbox_rewrite(&i),
@@ -539,8 +540,6 @@ impl Emitter {
             | Op::AbsOvf
             | Op::FIDiv
             | Op::FMod
-            | Op::Arith
-            | Op::Unm
             | Op::Compare
             | Op::Concat
             | Op::ForStart
@@ -823,6 +822,10 @@ impl Emitter {
             FactOf::Konst => by_rep,
             FactOf::Helper if i.rep == Rep::Val => Fact::of(Helper::of(i.aux).info().fact),
             FactOf::Helper => by_rep,
+            FactOf::Leaves => match self.arith_fact(i) {
+                set if set.is_empty() => by_rep,
+                set => Fact::of(set),
+            },
         };
         // A generic op's result is as unresolved as its operands.
         if i.op.has(Flags::GENERIC) {

@@ -20,7 +20,7 @@ pub(crate) fn kind_of(start: Option<Spec>, step: Option<Spec>, speculated: Spec)
 impl Emitter {
     /// What decides a kind: copy 1 goes by definitions alone, as the
     /// analysis that typed the parameters did.
-    fn deciding(&self, v: Val) -> Fact {
+    pub(super) fn deciding(&self, v: Val) -> Fact {
         if self.lowered {
             self.g.facts[v.idx()]
         } else {

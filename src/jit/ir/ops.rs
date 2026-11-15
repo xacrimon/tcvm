@@ -434,6 +434,8 @@ pub(crate) enum FactOf {
     Konst,
     /// Its helper's (`HelperInfo::fact`).
     Helper,
+    /// The union of what its leaves give (`arith::result`).
+    Leaves,
 }
 
 /// An op as a memory access.
@@ -497,6 +499,9 @@ macro_rules! res {
 macro_rules! fact {
     (Rep) => {
         FactOf::Rep
+    };
+    (Leaves) => {
+        FactOf::Leaves
     };
     (AuxSet) => {
         FactOf::AuxSet
@@ -651,7 +656,7 @@ ops! {
     CheckType   H    SetTag (Val Fs No)       Unboxed  AuxSet No        [] [] [EXITS PLAIN];
     IsType      H    Set    (Val No No)       B1       Rep    No        [] [] [PLAIN];
     BoxI64      H    No     (I64 No No)       Val      INT    No        [] [] [ALLOCS PLAIN];
-    UnboxI64    H    No     (Val No No)       I64      Rep    No        [] [] [PLAIN];
+    UnboxI64    H    Tag    (Val OptFs No)    I64      Rep    No        [] [] [PLAIN];
     ToF64       H    SetTag (Val Fs No)       F64      Rep    No        [] [] [EXITS PLAIN];
     DivFloor    H    Tag    (Int Int Fs)      Int      Rep    No        [] [] [EXITS PLAIN];
     ModFloor    H    Tag    (Int Int Fs)      Int      Rep    No        [] [] [EXITS PLAIN];
@@ -674,8 +679,8 @@ ops! {
     GcCheck     H    Tag    (Fs No No)        None     Rep    No        [GC] [] [EXITS PLAIN];
 
     // Generic ops: the frame state's pc is the feedback site.
-    Arith       H    Kind   (Val Val Fs)      Val      Rep    No        [ALL] [ALL] [EXITS CALLS GENERIC PLAIN];
-    Unm         H    No     (Val Fs No)       Val      Rep    No        [ALL] [ALL] [EXITS CALLS GENERIC PLAIN];
+    Arith       H    Kind   (Any Any Fs)      Val      Leaves No        [] [] [EXITS CALLS ALLOCS GENERIC];
+    Unm         H    No     (Any Fs No)       Val      Leaves No        [] [] [EXITS CALLS ALLOCS GENERIC];
     Compare     H    Cc     (Val Val Fs)      B1       Rep    No        [ALL] [ALL] [EXITS CALLS GENERIC PLAIN];
     Truthy      H    No     (Val No No)       B1       Rep    No        [] [] [GENERIC PLAIN];
     // Their result is no number to wait for: it is final under a pending key.
@@ -808,11 +813,11 @@ helpers! {
     Pow          NONE   0 (F64 F64)     F64  ANY [] [] [];
     Atan2        NONE   0 (F64 F64)     F64  ANY [] [] [];
     LibmFmod     NONE   0 (F64 F64)     F64  ANY [] [] [];
-    // Arithmetic of numbers and numeric strings; integers out of i32 are
-    // boxed.
-    ArithCoerce  RT     1 (Val Val)     Val  ANY [] [] [ALLOCS];
-    Unm          RT     0 (Val)         Val  ANY [] [] [ALLOCS];
-    BNot         RT     0 (Val)         Val  ANY [] [] [ALLOCS];
+    // Arithmetic of numbers of any kinds (not of strings, whose arithmetic
+    // is their metatable's); integers out of i32 are boxed.
+    ArithCoerce  RT     1 (Val Val)     Val  NUM [] [] [ALLOCS];
+    Unm          RT     0 (Val)         Val  NUM [] [] [ALLOCS];
+    BNot         RT     0 (Val)         Val  INT [] [] [ALLOCS];
     // A metamethod lookup moves a table off a stale class or adopts a
     // metatable's class.
     Len          RT     0 (Val)         Val  INT [FIELD ARR LOOKUP] [LOOKUP] [ALLOCS];

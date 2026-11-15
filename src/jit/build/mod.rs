@@ -16,6 +16,7 @@ use crate::env::value::Value;
 use crate::instruction::{ArithKind, Family, Instruction, Op as Bc};
 use crate::jit::compile::Bail;
 use crate::jit::feedback as fb;
+use crate::jit::ir::arith;
 use crate::jit::ir::emit::Emitter;
 use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, Heaps, Helper, Op};
 use crate::jit::ir::table::{self, Key};
@@ -55,19 +56,6 @@ impl Spec {
         } else {
             None
         }
-    }
-}
-
-/// Whether an arithmetic op of `kind` (an `ArithKind`) on operands of these
-/// kinds makes an integer: the bitwise ones always (their operands are
-/// checked to be integers), a division or a power never.
-pub(crate) fn int_result(kind: u16, a: Spec, b: Spec) -> bool {
-    use ArithKind::*;
-    let is = |k: ArithKind| kind == k as u16;
-    if is(BAnd) || is(BOr) || is(BXor) {
-        true
-    } else {
-        a == Spec::I32 && b == Spec::I32 && !is(Div) && !is(Pow)
     }
 }
 
@@ -523,6 +511,78 @@ impl Builder<'_, '_> {
         }
     }
 
+    /// The kinds the arithmetic site at `pc` saw for each of its operands,
+    /// and whether it overflowed or ran a metamethod, as `Arith`'s `aux`
+    /// above the op: by its quickened form, else its feedback; for a site
+    /// that never ran, by what the operands are known to be. `unrecorded`
+    /// is what a site that ran leaves no record of. None, after a deopt,
+    /// where nothing says anything.
+    fn seen(&mut self, pc: u32, i: Instruction, vals: [Val; 2], unrecorded: u8) -> Option<u16> {
+        let bits = self.proto.feedback.bits(pc as usize);
+        let (op, generic) = (i.op(), i.generic_op());
+        let info = generic.info();
+        let i_adaptive = i.adaptive();
+        let site = [
+            (fb::SMALL, arith::SMALL),
+            (fb::BIGINT, arith::BIG),
+            (fb::FLOAT, arith::FLOAT),
+        ]
+        .iter()
+        .fold(0, |k, &(bit, kind)| {
+            k | if bits & bit != 0 { kind } else { 0 }
+        });
+        let mm = matches!(op, Bc::ARITH_MM | Bc::ARITH_MM_R | Bc::ARITH_MMI);
+        // A form no compiled code left on kinds says each operand's.
+        let form = (op != generic && !mm && bits & fb::KIND_EXIT == 0)
+            .then(|| info.forms.iter().position(|f| *f == Some(op)))
+            .flatten();
+        let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
+        let (i, f) = (arith::SMALL, arith::FLOAT);
+        let wider = site & arith::BIG;
+        // A site whose kinds kept changing is locked to its any-numbers
+        // form, or to its generic opcode, and records no more of them.
+        let (misses, locked) = match generic.info().adaptive_shift {
+            0 => (0, false),
+            _ => i_adaptive,
+        };
+        let mut kinds = match form {
+            Some(0) => [i, i],
+            Some(1) => [f, f],
+            Some(2) if imm => [i, i],
+            Some(2) => [i, f],
+            Some(3) => [f, i],
+            Some(_) => [i | f; 2],
+            None if !mm && (locked || misses != 0) => [site | i | f; 2],
+            None => [site | unrecorded; 2],
+        };
+        if form.is_some() {
+            kinds = kinds.map(|k| k | wider);
+        }
+        // A site that never ran: what the operands are known to be, each
+        // as itself or else as the other.
+        if kinds == [0; 2] && !mm && bits & fb::MM == 0 {
+            let own = vals.map(|v| {
+                let f = self.e.fact(v);
+                let known = !f.pending() && TypeSet::NUM.contains(f.set);
+                if known { arith::kinds_of(f.set) } else { 0 }
+            });
+            kinds = [own[0] | own[1]; 2];
+            if kinds == [0; 2] {
+                self.deopt(ExitTag::NeverRan);
+                return None;
+            }
+        }
+        let mut aux =
+            (kinds[0] as u16) << arith::SEEN_SHIFT[0] | (kinds[1] as u16) << arith::SEEN_SHIFT[1];
+        if bits & fb::OVERFLOW != 0 {
+            aux |= arith::OVERFLOWED;
+        }
+        if mm || bits & fb::MM != 0 {
+            aux |= arith::MM;
+        }
+        Some(aux)
+    }
+
     /// A generic op on `x` and `y`, or a deopt where neither their facts
     /// nor the site's speculation give both a kind.
     fn generic(&mut self, op: Op, rep: Rep, low: u16, x: Val, y: Val) -> Option<Val> {
@@ -581,18 +641,27 @@ impl Builder<'_, '_> {
             SETTABLE => self.settable(pc, i),
             GETUPVAL | GETUPVAL_REF => self.getupval(i),
             SETUPVAL => self.setupval(i),
+            // The fast paths of a small integer record nothing.
             UNM => {
                 let x = self.reg(b);
-                // The fast path of a small integer records nothing.
-                let seen = self.proto.feedback.bits(pc as usize);
-                let spec = (self.spec(pc, i).map(|s| s[0])).or((seen == 0).then_some(Spec::I32));
-                let Some(k) = Spec::by_fact(self.e.fact(x)).or(spec) else {
-                    return self.deopt(ExitTag::Unsupported);
-                };
-                let s = self.state();
-                let aux = (k as u16) << SPEC_SHIFT[0];
-                let v = self.e.emit(Op::Unm, Rep::Val, aux, x.0, s.0, 0);
-                self.set(a, v);
+                if let Some(aux) = self.seen(pc, i, [x, x], arith::SMALL) {
+                    let s = self.state();
+                    let v = self
+                        .e
+                        .emit(Op::Unm, Rep::Val, aux & !(15 << 8), x.0, s.0, 0);
+                    self.set(a, v);
+                }
+            }
+            // `~x` is `x ~ -1`: the same coercions.
+            BNOT => {
+                let x = self.reg(b);
+                let ones = self.e.k64(Rep::Val, Value::small(-1).to_raw());
+                if let Some(aux) = self.seen(pc, i, [x, ones], arith::SMALL) {
+                    let s = self.state();
+                    let aux = aux | ArithKind::BXor as u16;
+                    let v = self.e.emit(Op::Arith, Rep::Val, aux, x.0, ones.0, s.0);
+                    self.set(a, v);
+                }
             }
             LEN => {
                 let x = self.reg(b);
@@ -728,8 +797,13 @@ impl Builder<'_, '_> {
             }
             _ => match info.family {
                 Family::RegArith | Family::ImmArith | Family::RegBit | Family::ImmBit
-                    if !matches!(info.kind, ArithKind::Shl | ArithKind::Shr | ArithKind::None) =>
+                    if info.kind != ArithKind::None =>
                 {
+                    // A metamethod form keeps the op it was in another
+                    // field: read the operands of the instruction as made.
+                    let mm = matches!(op, ARITH_MM | ARITH_MM_R | ARITH_MMI);
+                    let i = if mm { i.unquickened() } else { i };
+                    let (a, b) = (i.a(), i.b());
                     let reg = self.reg(b);
                     let regs = matches!(info.family, Family::RegArith | Family::RegBit);
                     let (x, y) = if regs {
@@ -745,7 +819,10 @@ impl Builder<'_, '_> {
                         };
                         if info.reversed { (k, reg) } else { (reg, k) }
                     };
-                    if let Some(v) = self.generic(Op::Arith, Rep::Val, info.kind as u16, x, y) {
+                    if let Some(aux) = self.seen(pc, self.cfg.code[pc as usize], [x, y], 0) {
+                        let s = self.state();
+                        let aux = aux | info.kind as u16;
+                        let v = self.e.emit(Op::Arith, Rep::Val, aux, x.0, y.0, s.0);
                         self.set(a, v);
                     }
                 }

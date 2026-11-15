@@ -5,6 +5,7 @@
 //! or its rewrite (`Emitter::lower`).
 
 use super::analyse::Analysis;
+use super::arith;
 use super::emit::Emitter;
 use super::ops::{Arg, Dialect, ExitKind, ExitTag, Flags, Op};
 use super::types::{Fact, Rep, TypeSet};
@@ -30,9 +31,11 @@ pub(crate) struct Copy {
 }
 
 /// The representation a parameter of this type has.
-fn rep_of(i: &Inst, set: TypeSet) -> Rep {
+fn rep_of(a: &Analysis, p: Val, i: &Inst, set: TypeSet) -> Rep {
     match set.unboxed() {
         r @ (Rep::I32 | Rep::F64) if i.rep == Rep::Val => r,
+        // Integers of either size, as the analysis decided.
+        _ if a.wide.contains(&p) => Rep::I64,
         _ => i.rep,
     }
 }
@@ -49,6 +52,14 @@ impl Copy {
                 e.check_type(v, set, ExitTag::Type, state)
             }
             (Rep::Val, Rep::I32 | Rep::F64) if set.contains(e.fact(v).set) => e.unboxed(v, set),
+            // Integers of either size: each of its arms, and with a state
+            // one that leaves for anything else. These make blocks.
+            (Rep::Val, Rep::I64) => {
+                let tag = ExitTag::Type as u16;
+                e.lower(Op::UnboxI64, Rep::I64, tag, v.0, state.0, 0)
+            }
+            (Rep::I32, Rep::I64) => e.op1(Op::SExt32, Rep::I64, v),
+            (Rep::I64, Rep::Val) => e.lower(Op::BoxI64, Rep::Val, 0, v.0, 0, 0),
             (have, want) => bug!(
                 "no conversion of {v:?} ({:?}, {:?}) from {have:?} to {want:?} of {set:?}",
                 e.g.op(v),
@@ -76,7 +87,7 @@ impl Copy {
             } else {
                 Val::NONE
             };
-            let v = Copy::convert(e, v, rep_of(i, set), set, state);
+            let v = Copy::convert(e, v, rep_of(a, Val(p), i, set), set, state);
             self.scratch.push(v);
         }
     }
@@ -165,7 +176,11 @@ impl Copy {
                         self.scratch.clear();
                         (self.scratch).extend(came.iter().map(|&at| self.vals[at as usize + j]));
                         let set = a.ty[v as usize];
-                        e.param(rep_of(i, set), Some(Fact::of(set)), &self.scratch)
+                        e.param(
+                            rep_of(a, Val(v), i, set),
+                            Some(Fact::of(set)),
+                            &self.scratch,
+                        )
                     }
                     _ if !a.live(Val(v), i) => continue,
                     Op::FrameState => {
@@ -211,6 +226,31 @@ impl Copy {
                             self.scratch.push(v);
                         }
                         e.call_with(super::ops::Helper::of(i.aux), &self.scratch)
+                    }
+                    // An integer held as `I64` goes to its op as it is:
+                    // boxed, it would be tested and unboxed again.
+                    Op::Arith | Op::Unm => {
+                        let mut w = i.args();
+                        let n = if i.op == Op::Unm { 1 } else { 2 };
+                        let fs = self.map[w[n] as usize];
+                        w[n] = fs.0;
+                        for (k, x) in w[..n].iter_mut().enumerate() {
+                            let v = self.map[*x as usize];
+                            let wide = arith::takes_i64(i.aux, k);
+                            *x = match e.g.rep(v) {
+                                Rep::I64 if wide => v.0,
+                                // The site saw this operand small: an
+                                // integer that is not leaves, as its type
+                                // told the analysis.
+                                Rep::I64 => {
+                                    let tag = ExitTag::Type as u16;
+                                    let x = e.emit(Op::LToI, Rep::I32, tag, v.0, fs.0, 0);
+                                    e.op1(Op::BoxI32, Rep::Val, x).0
+                                }
+                                _ => Copy::convert(e, v, Rep::Val, TypeSet::ANY, Val::NONE).0,
+                            };
+                        }
+                        e.lower(i.op, i.rep, i.aux, w[0], w[1], w[2])
                     }
                     // Three boxed operands in the extra pool, and a state.
                     Op::SetIndex | Op::ForLimit | Op::ForSkip | Op::ForMore => {
@@ -259,7 +299,7 @@ impl Copy {
                 .take_while(|&p| g.insts[p as usize].op == Op::Param)
                 .any(|p| {
                     let v = s.map[g.inputs(Val(p))[pred] as usize];
-                    e.g.rep(v) != rep_of(&g.insts[p as usize], a.ty[p as usize])
+                    e.g.rep(v) != rep_of(a, Val(p), &g.insts[p as usize], a.ty[p as usize])
                 })
         };
         let split = [needs(self, e, t, 0), needs(self, e, f, same as usize)];

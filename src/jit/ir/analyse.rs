@@ -3,6 +3,7 @@
 //! and representations of the high-level graph's parameters.
 
 use super::access::ARRAY;
+use super::arith;
 use super::ops::{Flags, Op};
 use super::types::{Rep, TypeSet};
 use super::{Block, BlockFlags, Graph, Inst, Val};
@@ -20,6 +21,8 @@ pub(crate) struct Analysis {
     /// The loop parameters that get their type from a check on the loop's
     /// entry edge.
     pub(crate) guarded: Vec<Val>,
+    /// The loop parameters held as `I64`: integers of either size.
+    pub(crate) wide: Vec<Val>,
     block_of: Vec<Block>,
 }
 
@@ -59,18 +62,6 @@ impl Analysis {
                 }
                 *n = n.saturating_add(1);
             });
-        }
-    }
-
-    /// The kind a generic op takes operand `k` as, given its type.
-    fn kind(&self, i: &Inst, k: usize) -> Spec {
-        let set = self.ty[i.args()[k] as usize];
-        if !set.is_empty() && TypeSet::SMALL.contains(set) {
-            Spec::I32
-        } else if !set.is_empty() && TypeSet::FLOAT.contains(set) {
-            Spec::F64
-        } else {
-            Spec::of(i.aux >> SPEC_SHIFT[k])
         }
     }
 
@@ -151,12 +142,26 @@ impl Analysis {
             };
             match i.op {
                 Op::CheckType => want(i.a, TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits())),
-                Op::Arith | Op::Compare => {
+                Op::Compare => {
                     for (k, shift) in SPEC_SHIFT.into_iter().enumerate() {
                         want(i.args()[k], Spec::of(i.aux >> shift).set());
                     }
                 }
-                Op::Unm => want(i.a, Spec::of(i.aux >> SPEC_SHIFT[0]).set()),
+                // An operand the site saw as one kind is held as it; one it
+                // saw only as integers, 64-bit ones among them, as `I64`.
+                Op::Arith | Op::Unm => {
+                    let n = if i.op == Op::Unm { 1 } else { 2 };
+                    for (k, shift) in arith::SEEN_SHIFT.into_iter().enumerate().take(n) {
+                        match (i.aux >> shift) as u8 & 15 {
+                            arith::SMALL => want(i.args()[k], TypeSet::SMALL),
+                            arith::FLOAT => want(i.args()[k], TypeSet::FLOAT),
+                            s if s & arith::BIG != 0 && TypeSet::INT.contains(arith::set_of(s)) => {
+                                want(i.args()[k], TypeSet::INT)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 Op::GetIndex if i.aux & ARRAY != 0 => want(i.b, TypeSet::SMALL),
                 Op::SetIndex if i.aux & ARRAY != 0 => want(g.run(i.a, i.b)[1], TypeSet::SMALL),
                 Op::GetIndex | Op::SetIndex => {}
@@ -263,133 +268,140 @@ impl Analysis {
         }
         for v in 0..n {
             // Only a type a parameter is held unboxed for is checked on entry.
-            if !pending(v) || !every[v] || !matches!(demand[v].unboxed(), Rep::I32 | Rep::F64) {
+            let held =
+                matches!(demand[v].unboxed(), Rep::I32 | Rep::F64) || demand[v] == TypeSet::INT;
+            if !pending(v) || !every[v] || !held {
                 demand[v] = TypeSet::ANY;
             }
         }
         // Types forward under the demands, dropping a demand a value coming
         // around does not meet, until none drops.
-        self.ty.clear();
-        self.ty.resize(n, TypeSet::ANY);
         loop {
-            for v in 0..n {
-                let i = &g.insts[v];
-                self.ty[v] = match i.op {
-                    Op::Param if pending(v) => demand[v],
-                    Op::Param if i.rep == Rep::Val => (g.inputs(Val(v as u32)).iter())
-                        .fold(TypeSet::empty(), |s, &x| s | self.ty[x as usize]),
-                    Op::Arith if g.facts[v].pending() => {
-                        let (a, b) = (self.kind(i, 0), self.kind(i, 1));
-                        if crate::jit::build::int_result(i.aux & 15, a, b) {
-                            TypeSet::SMALL
-                        } else {
-                            TypeSet::FLOAT
+            // A parameter nothing holds unboxed has the types its inputs
+            // have: from nothing, growing, until nothing grows.
+            self.ty.clear();
+            self.ty.resize(n, TypeSet::empty());
+            let mut grew = true;
+            while std::mem::take(&mut grew) {
+                for v in 0..n {
+                    let i = &g.insts[v];
+                    let was = self.ty[v];
+                    self.ty[v] = match i.op {
+                        Op::Param if pending(v) && demand[v] != TypeSet::ANY => demand[v],
+                        Op::Param if i.rep == Rep::Val => (g.inputs(Val(v as u32)).iter())
+                            .filter(|&&x| x != u32::MAX)
+                            .fold(TypeSet::empty(), |s, &x| s | self.ty[x as usize]),
+                        Op::Arith if g.facts[v].pending() => {
+                            arith::result(i.aux, self.ty[i.a as usize], Some(self.ty[i.b as usize]))
                         }
-                    }
-                    Op::Unm if g.facts[v].pending() => self.kind(i, 0).set(),
-                    Op::ForStart | Op::ForStep | Op::ForLimit | Op::ForNext
-                        if g.facts[v].pending() =>
-                    {
-                        self.loop_kind(g, i).set()
-                    }
-                    Op::Param | Op::Arith | Op::Unm => g.facts[v].set,
-                    // Every other op's type is its fact's.
-                    Op::K32
-                    | Op::K64
-                    | Op::KF64
-                    | Op::KObj
-                    | Op::Load
-                    | Op::Store
-                    | Op::LoadIdx
-                    | Op::StoreIdx
-                    | Op::Base
-                    | Op::Thread
-                    | Op::SlotLoad
-                    | Op::SlotStore
-                    | Op::Add
-                    | Op::Sub
-                    | Op::Mul
-                    | Op::And
-                    | Op::Or
-                    | Op::Xor
-                    | Op::Not
-                    | Op::Neg
-                    | Op::Shl
-                    | Op::Shr
-                    | Op::Sar
-                    | Op::SDiv
-                    | Op::UDiv
-                    | Op::ZExt32
-                    | Op::SExt32
-                    | Op::Trunc32
-                    | Op::Cmp
-                    | Op::Select
-                    | Op::AddOvf
-                    | Op::SubOvf
-                    | Op::MulOvf
-                    | Op::NegOvf
-                    | Op::FAdd
-                    | Op::FSub
-                    | Op::FMul
-                    | Op::FDiv
-                    | Op::FNeg
-                    | Op::FAbs
-                    | Op::FSqrt
-                    | Op::FFloor
-                    | Op::FCeil
-                    | Op::FCmp
-                    | Op::IToF
-                    | Op::LToF
-                    | Op::FToI
-                    | Op::FToL
-                    | Op::BoxI32
-                    | Op::BoxF64
-                    | Op::BoxPtr
-                    | Op::UnboxF64
-                    | Op::UnboxPtr
-                    | Op::Guard
-                    | Op::GuardNot
-                    | Op::Proved
-                    | Op::Deopt
-                    | Op::LazyExit
-                    | Op::FrameState
-                    | Op::Jump
-                    | Op::Br
-                    | Op::Ret
-                    | Op::CallHelper
-                    | Op::CheckType
-                    | Op::IsType
-                    | Op::BoxI64
-                    | Op::UnboxI64
-                    | Op::ToF64
-                    | Op::DivFloor
-                    | Op::ModFloor
-                    | Op::LuaShl
-                    | Op::LuaShr
-                    | Op::FToIExact
-                    | Op::FToLExact
-                    | Op::LToI
-                    | Op::AbsOvf
-                    | Op::FIDiv
-                    | Op::FMod
-                    | Op::Barrier
-                    | Op::NewTable
-                    | Op::GcCheck
-                    | Op::Compare
-                    | Op::Truthy
-                    | Op::GetIndex
-                    | Op::SetIndex
-                    | Op::GetField
-                    | Op::SetField
-                    | Op::Concat
-                    | Op::Len
-                    | Op::ForStart
-                    | Op::ForStep
-                    | Op::ForLimit
-                    | Op::ForSkip
-                    | Op::ForMore
-                    | Op::ForNext => g.facts[v].set,
-                };
+                        Op::Unm if g.facts[v].pending() => {
+                            arith::result(i.aux, self.ty[i.a as usize], None)
+                        }
+                        Op::ForStart | Op::ForStep | Op::ForLimit | Op::ForNext
+                            if g.facts[v].pending() =>
+                        {
+                            self.loop_kind(g, i).set()
+                        }
+                        Op::Param | Op::Arith | Op::Unm => g.facts[v].set,
+                        // Every other op's type is its fact's.
+                        Op::K32
+                        | Op::K64
+                        | Op::KF64
+                        | Op::KObj
+                        | Op::Load
+                        | Op::Store
+                        | Op::LoadIdx
+                        | Op::StoreIdx
+                        | Op::Base
+                        | Op::Thread
+                        | Op::SlotLoad
+                        | Op::SlotStore
+                        | Op::Add
+                        | Op::Sub
+                        | Op::Mul
+                        | Op::And
+                        | Op::Or
+                        | Op::Xor
+                        | Op::Not
+                        | Op::Neg
+                        | Op::Shl
+                        | Op::Shr
+                        | Op::Sar
+                        | Op::SDiv
+                        | Op::UDiv
+                        | Op::ZExt32
+                        | Op::SExt32
+                        | Op::Trunc32
+                        | Op::Cmp
+                        | Op::Select
+                        | Op::AddOvf
+                        | Op::SubOvf
+                        | Op::MulOvf
+                        | Op::NegOvf
+                        | Op::FAdd
+                        | Op::FSub
+                        | Op::FMul
+                        | Op::FDiv
+                        | Op::FNeg
+                        | Op::FAbs
+                        | Op::FSqrt
+                        | Op::FFloor
+                        | Op::FCeil
+                        | Op::FCmp
+                        | Op::IToF
+                        | Op::LToF
+                        | Op::FToI
+                        | Op::FToL
+                        | Op::BoxI32
+                        | Op::BoxF64
+                        | Op::BoxPtr
+                        | Op::UnboxF64
+                        | Op::UnboxPtr
+                        | Op::Guard
+                        | Op::GuardNot
+                        | Op::Proved
+                        | Op::Deopt
+                        | Op::LazyExit
+                        | Op::FrameState
+                        | Op::Jump
+                        | Op::Br
+                        | Op::Ret
+                        | Op::CallHelper
+                        | Op::CheckType
+                        | Op::IsType
+                        | Op::BoxI64
+                        | Op::UnboxI64
+                        | Op::ToF64
+                        | Op::DivFloor
+                        | Op::ModFloor
+                        | Op::LuaShl
+                        | Op::LuaShr
+                        | Op::FToIExact
+                        | Op::FToLExact
+                        | Op::LToI
+                        | Op::AbsOvf
+                        | Op::FIDiv
+                        | Op::FMod
+                        | Op::Barrier
+                        | Op::NewTable
+                        | Op::GcCheck
+                        | Op::Compare
+                        | Op::Truthy
+                        | Op::GetIndex
+                        | Op::SetIndex
+                        | Op::GetField
+                        | Op::SetField
+                        | Op::Concat
+                        | Op::Len
+                        | Op::ForStart
+                        | Op::ForStep
+                        | Op::ForLimit
+                        | Op::ForSkip
+                        | Op::ForMore
+                        | Op::ForNext => g.facts[v].set,
+                    };
+                    grew |= self.ty[v] != was;
+                }
             }
             let mut dropped = false;
             for v in 0..n {
@@ -412,7 +424,11 @@ impl Analysis {
             }
         }
         self.guarded.clear();
+        self.wide.clear();
         for (v, &want) in demand.iter().enumerate() {
+            if pending(v) && want == TypeSet::INT {
+                self.wide.push(Val(v as u32));
+            }
             if pending(v) && want != TypeSet::ANY {
                 let entry = g.inputs(Val(v as u32))[0] as usize;
                 if !want.contains(self.ty[entry]) {
