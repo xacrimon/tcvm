@@ -6,7 +6,7 @@
 
 use super::emit::Emitter;
 use super::fields::Field;
-use super::ops::{Cc, ExitTag, HELPER_FAIL_VAL, Helper, Op};
+use super::ops::{Cc, ExitKind, ExitTag, HELPER_FAIL_VAL, Helper, Op};
 use super::types::{Rep, TypeSet};
 use super::{BlockFlags, Inst, Val};
 use crate::env::MetamethodBits;
@@ -105,6 +105,17 @@ impl Emitter {
         });
     }
 
+    /// A lazy exit past the instruction `state` is before, which wrote no
+    /// register: after a call or a table write, where a dependency may have
+    /// broken.
+    pub(crate) fn lazy_after(&mut self, state: Val) {
+        let parent = Val(self.g.inst(state).c);
+        let (pc, entries) = self.g.entries(state);
+        let entries: Vec<(u32, Val)> = entries.iter().map(|e| (e[0], Val(e[1]))).collect();
+        let after = self.frame_state(pc, ExitKind::After, parent, &entries);
+        self.emit(Op::LazyExit, Rep::None, 0, after.0, 0, 0);
+    }
+
     /// `recv[key] = v`, generic.
     pub(crate) fn set_index(&mut self, recv: Val, key: Val, v: Val, aux: u16, state: Val) {
         let at = self.g.extra.len() as u32;
@@ -130,6 +141,7 @@ impl Emitter {
                 self.helped(Helper::Index, 0, &[recv, key], state)
             } else {
                 self.helped(Helper::NewIndex, 1, &[recv, key, v], state);
+                self.lazy_after(state);
                 Val::NONE
             });
         }

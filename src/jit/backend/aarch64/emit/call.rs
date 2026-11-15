@@ -122,6 +122,47 @@ impl<'a> Em<'a> {
         self.a.b_far(addr!(abi::direct_miss));
     }
 
+    /// An invalidated region's entry, its frame not open yet: on to
+    /// `jit_dead_entry`, which runs the function in the interpreter.
+    pub(super) fn dead_entry(&mut self) {
+        let dead = self.a.new_label();
+        self.a.bind(dead);
+        self.a.ldr_label(INSN, self.region_word);
+        self.a
+            .ldr_lit(X16, addr!(crate::jit::jit_dead_entry) as u64);
+        self.tail_level();
+        self.lazy.insert(0, (self.labels[0], dead));
+    }
+
+    /// The frame is closed and `x16` holds the handler that goes on: one
+    /// dispatch entered goes on in its level; a fast-called one starts a
+    /// level returning to its caller, its header made to return through it.
+    fn tail_level(&mut self) {
+        self.handler_regs();
+        self.a.ldr_lit(X17, abi::level_land() as u64);
+        self.a.cmp(Sz::X, LR, X17);
+        self.a.b_cond(Cond::Ne, self.level_tail.0);
+        self.level_tail.1 = true;
+        self.a.ldr_lit(LR, abi::level_return_addr() as u64);
+        self.a.br(X16);
+    }
+
+    /// `tail_level`'s level, once.
+    pub(super) fn level_tail_stub(&mut self) {
+        if !self.level_tail.1 {
+            return;
+        }
+        self.a.bind(self.level_tail.0);
+        self.a.ldr(Gpr(9), BASE, -24);
+        self.a
+            .and_imm(Sz::X, Gpr(9), Gpr(9), crate::vm::frame::flag::MASK);
+        self.a.ldr_lit(Gpr(10), addr!(abi::ret_to_native) as u64);
+        self.a.orr(Sz::X, Gpr(9), Gpr(9), Gpr(10));
+        self.a.str(Gpr(9), BASE, -24);
+        self.a.mov(X17, BASE);
+        self.a.b_far(addr!(abi::jit_level));
+    }
+
     /// `x17 = BASE + 8 * slots`, the end of a window to check.
     fn window_end(&mut self, slots: u16) {
         let off = slots as u64 * 8;

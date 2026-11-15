@@ -161,6 +161,9 @@ pub(crate) struct Graph {
     /// The opened blocks in emission order: a block comes after its forward
     /// predecessors.
     pub(crate) order: Vec<Block>,
+    /// The region assumes something that may stop holding: its lazy exits
+    /// stay.
+    pub(crate) invalidable: bool,
 }
 
 impl Graph {
@@ -172,6 +175,7 @@ impl Graph {
         self.preds.clear();
         self.loops.clear();
         self.order.clear();
+        self.invalidable = false;
     }
 
     #[inline]

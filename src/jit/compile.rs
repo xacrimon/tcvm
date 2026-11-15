@@ -267,7 +267,11 @@ pub(crate) fn compile<'gc>(
     high.reset(false);
     let pool = &mut scratch.pool;
     pool.words.clear();
-    let (shapes, missing) = {
+    let crate::jit::build::Built {
+        shapes,
+        deps,
+        missing,
+    } = {
         let metrics = crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64;
         crate::jit::build::build(high, pool, &cfg, closure.proto, pc, metrics)
     };
@@ -347,7 +351,7 @@ pub(crate) fn compile<'gc>(
         num_params: closure.proto.num_params,
         max_stack: closure.proto.max_stack_size as u16,
     });
-    let mut em = target::emit::emit(sel, out, rt, closure.code as u64, fast)?;
+    let mut em = target::emit::emit(sel, out, rt, closure.code as u64, fast, !deps.is_empty())?;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc.reserve(em.asm.max_len())?;
     let start = block.rx();
@@ -490,7 +494,7 @@ pub(crate) fn compile<'gc>(
             retired: std::cell::Cell::new(false),
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
             sites: sites.into_boxed_slice(),
-            lazy: Box::new([]),
+            lazy: std::mem::take(&mut em.lazy).into_boxed_slice(),
             landings: Box::new([]),
             invalidated: std::cell::Cell::new(false),
         },
@@ -499,6 +503,14 @@ pub(crate) fn compile<'gc>(
         em.region_word as usize,
         crate::dmm::Gc::as_ptr(region) as u64,
     );
+    for (on, groups) in deps {
+        match on {
+            crate::jit::build::DepOn::Class(c) => {
+                let bits = crate::env::MetamethodBits::from_bits_retain(groups as u32);
+                c.depend(ctx.mutation(), region, bits);
+            }
+        }
+    }
     Ok(region)
 }
 

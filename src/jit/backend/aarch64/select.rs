@@ -713,6 +713,7 @@ impl Sel<'_> {
                 self.compare(a);
             }
             Deopt => self.exit(MOp::BExit, Cond::Eq, a, i.aux),
+            LazyExit => self.exit(MOp::LazyExit, Cond::Eq, a, ExitTag::Lazy as u16),
             Jump => {
                 self.op(MOp::B, Sz::X, 0, &[]);
                 self.pass(pos, 0, here, Block(i.a));
@@ -850,7 +851,7 @@ impl Sel<'_> {
                 let (i, ops, len, clobbers) = self.s.insts[k as usize];
                 let ops = &self.s.ops[ops as usize..(ops + len) as usize];
                 let at = self.out.vcode.push(i, ops, clobbers);
-                if matches!(i.op, MOp::BCondExit | MOp::BExit) {
+                if matches!(i.op, MOp::BCondExit | MOp::BExit | MOp::LazyExit) {
                     self.out.exits[i.imm as usize].inst = at.index() as u32;
                 }
                 if i.op == MOp::CallLua {

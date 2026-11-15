@@ -111,6 +111,9 @@ pub(crate) struct Emitted {
     pub(crate) region_word: u32,
     pub(crate) exits: Vec<ExitOut>,
     pub(crate) sites: Vec<SiteOut>,
+    /// What `Region::invalidate` writes: (patch point, jump target), the
+    /// entry's first.
+    pub(crate) lazy: Vec<(u32, u32)>,
 }
 
 /// Loop rotation (V8's `ComputeAssemblyOrder`, with any exiting block as the

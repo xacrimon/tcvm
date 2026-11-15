@@ -126,6 +126,7 @@ impl Copy {
         self.pending.resize(g.blocks.len(), NONE);
         self.edges.clear();
         self.vals.clear();
+        e.g.invalidable = g.invalidable;
         for l in &g.loops {
             e.new_loop(self.blocks[l.header.idx()], l.parent, l.writes, Val::NONE);
         }

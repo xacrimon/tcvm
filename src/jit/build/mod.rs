@@ -92,6 +92,21 @@ struct RLoop {
     params: Vec<(u8, Val)>,
 }
 
+/// What a region assumes, and of whom (`jit::deps`).
+#[derive(Clone, Copy)]
+pub(crate) enum DepOn<'gc> {
+    /// A class keeps the metamethod bits as they are.
+    Class(crate::env::shape::MtCache<'gc>),
+}
+
+/// What `build` hands on besides the graph: the shapes the code compares
+/// with, what it assumes, and the instructions it has no code for.
+pub(crate) struct Built<'gc> {
+    pub(crate) shapes: Vec<crate::env::Shape<'gc>>,
+    pub(crate) deps: Vec<(DepOn<'gc>, u64)>,
+    pub(crate) missing: Vec<Bc>,
+}
+
 struct Builder<'a, 'gc> {
     e: &'a mut Emitter,
     pool: &'a mut Pool,
@@ -111,6 +126,7 @@ struct Builder<'a, 'gc> {
     state: Val,
     /// The shapes the code compares with, which the region keeps alive.
     shapes: Vec<crate::env::Shape<'gc>>,
+    deps: Vec<(DepOn<'gc>, u64)>,
     /// The address of the arena's metrics, where the collector's counters
     /// are.
     metrics: u64,
@@ -127,7 +143,7 @@ pub(crate) fn build<'gc>(
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
     metrics: u64,
-) -> (Vec<crate::env::Shape<'gc>>, Vec<Bc>) {
+) -> Built<'gc> {
     let nb = cfg.blocks.len();
     let root = cfg.block_of[entry_pc as usize];
     let (rpo, order) = cfg::rpo_of(&cfg.blocks, root);
@@ -144,6 +160,7 @@ pub(crate) fn build<'gc>(
         pc: entry_pc,
         state: Val::NONE,
         shapes: Vec::new(),
+        deps: Vec::new(),
         metrics,
         missing: Vec::new(),
     };
@@ -161,10 +178,15 @@ pub(crate) fn build<'gc>(
         }
         b.block(bb, bb == root, entry_pc);
     }
-    (b.shapes, b.missing)
+    b.e.g.invalidable = !b.deps.is_empty();
+    Built {
+        shapes: b.shapes,
+        deps: b.deps,
+        missing: b.missing,
+    }
 }
 
-impl Builder<'_, '_> {
+impl<'gc> Builder<'_, 'gc> {
     /// The loops of the control flow from `root`; false where it is
     /// irreducible.
     fn find_loops(&mut self, root: u32, rpo: &[u32], order: &[usize]) -> bool {
@@ -311,6 +333,22 @@ impl Builder<'_, '_> {
             .collect();
         self.e
             .frame_state(pc, ExitKind::Before, Val::NONE, &entries)
+    }
+
+    /// Assume `class` keeps `bits` as they are now.
+    fn depend_class(
+        &mut self,
+        class: crate::env::shape::MtCache<'gc>,
+        bits: crate::env::MetamethodBits,
+    ) {
+        self.deps.push((DepOn::Class(class), bits.bits() as u64));
+    }
+
+    /// A lazy exit to before the instruction at `pc`, a successor of the
+    /// one being emitted.
+    fn lazy_exit(&mut self, pc: u32) {
+        let s = self.state_at(pc);
+        self.e.emit(Op::LazyExit, Rep::None, 0, s.0, 0, 0);
     }
 
     fn deopt(&mut self, tag: ExitTag) {

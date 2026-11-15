@@ -50,6 +50,10 @@ struct Em<'a> {
     ool: Vec<call::Ool>,
     /// The calls' sites, with their return addresses and miss paths.
     sites: Vec<call::Site>,
+    /// The patch points and where each jumps once the region is invalid.
+    lazy: Vec<(Label, Label)>,
+    /// `tail_level`'s level path, shared; whether anything uses it.
+    level_tail: (Label, bool),
     rt: u64,
     /// The address of the function's bytecode.
     code: u64,
@@ -89,6 +93,7 @@ pub(crate) fn emit(
     rt: u64,
     code: u64,
     fast: Option<FastEntry>,
+    invalidable: bool,
 ) -> Result<Emitted, Bail> {
     if out.num_spillslots > MAX_SPILLS {
         return Err(Bail::TooLarge);
@@ -107,6 +112,8 @@ pub(crate) fn emit(
         resume: Vec::new(),
         ool: Vec::new(),
         sites: Vec::new(),
+        lazy: Vec::new(),
+        level_tail: (a.new_label(), false),
         rt,
         code,
         s,
@@ -164,6 +171,10 @@ pub(crate) fn emit(
     if let (Some(fe), Some(e)) = (fast, entries) {
         em.fast_stubs(fe, e);
     }
+    if invalidable {
+        em.dead_entry();
+    }
+    em.level_tail_stub();
     // Where dispatch enters: through `level_enter`, which returns to
     // `level_land`, on to the entry block.
     let dispatch = em.a.new_label();
@@ -191,8 +202,10 @@ pub(crate) fn emit(
             ..site
         })
         .collect();
+    let lazy = em.lazy.iter().map(|&(x, y)| (at(x), at(y))).collect();
     Ok(Emitted {
         sites,
+        lazy,
         fast: entries.map(|e| at(e.fast)),
         entry: at(dispatch),
         num_spills: out.num_spillslots as u32,
@@ -444,6 +457,11 @@ impl<'a> Em<'a> {
                 self.a.b_cond(cc, self.exit_labels[imm as usize]);
             }
             MOp::BExit => self.a.b(self.exit_labels[imm as usize]),
+            MOp::LazyExit => {
+                let at = self.a.new_label();
+                self.a.patch_point(at);
+                self.lazy.push((at, self.exit_labels[imm as usize]));
+            }
             MOp::Call => {
                 let h = Helper::of(imm as u16);
                 let info = h.info();

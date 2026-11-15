@@ -241,10 +241,15 @@ impl<'gc> Builder<'_, 'gc> {
                 let v = self.load(f, base, k);
                 // A nil is the answer only where no `__index` may give one:
                 // under a class, the helper walks for it.
-                if shape.mt_cache().is_some() {
-                    self.or_index(recv, v, e)
-                } else {
-                    v
+                match shape.mt_cache() {
+                    Some(class) if class.get().contains(MetamethodBits::INDEX) => {
+                        self.or_index(recv, v, e)
+                    }
+                    Some(class) => {
+                        self.depend_class(class, MetamethodBits::INDEX);
+                        v
+                    }
+                    None => v,
                 }
             }
             None => {
@@ -304,6 +309,8 @@ impl<'gc> Builder<'_, 'gc> {
         let Some((shape, loc)) = own else {
             let key = self.konst(kv);
             self.helped(Helper::NewIndex, 0, &[recv, key, v]);
+            let s = self.state();
+            self.e.lazy_after(s);
             return;
         };
         let t = self.table(recv);
@@ -318,7 +325,10 @@ impl<'gc> Builder<'_, 'gc> {
         }
         let (base, f, k) = self.slot(t, loc);
         // `__newindex` fires only on a nil slot.
-        if shape.mt_cache().is_some() {
+        let class = shape.mt_cache();
+        if let Some(class) = class.filter(|c| !c.get().contains(MetamethodBits::NEWINDEX)) {
+            self.depend_class(class, MetamethodBits::NEWINDEX);
+        } else if class.is_some() {
             let old = self.load(f, base, k);
             let s = self.state();
             (self.e).nil_guard(t, old, MetamethodBits::NEWINDEX, ExitTag::Slow, s);

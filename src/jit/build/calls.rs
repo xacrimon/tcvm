@@ -52,5 +52,7 @@ impl Builder<'_, '_> {
             }
         }
         self.state = Val::NONE;
+        // The callee may have broken what the region assumes.
+        self.lazy_exit(pc + 1);
     }
 }

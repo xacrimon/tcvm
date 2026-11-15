@@ -45,6 +45,9 @@ mops! {
     // count and `c`, a byte each, and from bit 32 the pc after it. Its
     // operands are what the frame keeps across it, in stack slots.
     CallLua   ();
+    // An exit a broken dependency patches in over the next instruction:
+    // `imm` its index.
+    LazyExit  ();
     // Where the call's returns land, first in its block: `imm` as the
     // call's, bit 31 where the first result is its operand, in x0.
     Resume    ();
