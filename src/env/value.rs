@@ -121,6 +121,15 @@ impl<'gc> Value<'gc> {
         }
     }
 
+    /// The value of the heap object at `ptr` whose tag is `tag`.
+    ///
+    /// # Safety
+    /// `ptr` is a live object of that kind.
+    #[cfg(jit)]
+    pub(crate) unsafe fn of_pointer(tag: u64, ptr: u64) -> Self {
+        Self::boxed(tag, ptr)
+    }
+
     #[inline(always)]
     fn boxed(tag: u64, payload: u64) -> Self {
         debug_assert!(tag != 0 && payload & !PAYLOAD_MASK == 0);

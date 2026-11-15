@@ -41,6 +41,13 @@ macro_rules! mops {
 mops! {
     // Opens the native frame.
     Entry     ();
+    // A Lua call, last in its block: `imm` is the `CALL`'s `a`, argument
+    // count and `c`, a byte each, and from bit 32 the pc after it. Its
+    // operands are what the frame keeps across it, in stack slots.
+    CallLua   ();
+    // Where the call's returns land, first in its block: `imm` as the
+    // call's, bit 31 where the first result is its operand, in x0.
+    Resume    ();
     // Values the allocator may make again where used: left without an
     // allocation they have no code.
     MovImm    (D);
@@ -135,10 +142,18 @@ impl MOp {
     }
 }
 
+impl MInst {
+    /// A `Resume` that reads at most the first result, in its register:
+    /// not the result count or the values behind it.
+    pub(crate) fn plain_resume(&self) -> bool {
+        self.imm >> 31 & 1 != 0 || self.imm >> 16 & 0xff == 1
+    }
+}
+
 impl TargetInst for MInst {
     #[cfg(feature = "tcvm-dev")]
     fn is_branch(&self) -> bool {
-        matches!(self.op, MOp::B | MOp::BCond)
+        matches!(self.op, MOp::B | MOp::BCond | MOp::CallLua)
     }
 
     fn flow(&self) -> Flow {
@@ -146,6 +161,9 @@ impl TargetInst for MInst {
             MOp::B => Flow::Jump,
             MOp::BCond => Flow::Branch,
             MOp::BExit => Flow::Deopt(self.imm as u32),
+            MOp::Resume => Flow::Resume {
+                plain: self.plain_resume(),
+            },
             _ => Flow::Other,
         }
     }

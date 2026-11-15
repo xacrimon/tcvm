@@ -310,6 +310,7 @@ fn entry_value<'gc>(mc: &crate::dmm::Mutation<'gc>, rep: SRep, w: u64) -> Value<
         SRep::I64 => Value::integer(mc, w as i64),
         SRep::F64 => Value::float(f64::from_bits(w)),
         SRep::B1 => Value::boolean(w & 1 != 0),
+        SRep::Ptr => crate::jit::bug!("a raw pointer in an exit's snapshot"),
     }
 }
 

@@ -5,6 +5,7 @@
 //! are final specialises as it is emitted; one that hangs on a loop
 //! parameter stays generic, carrying what its feedback speculates.
 
+mod calls;
 pub(crate) mod cfg;
 mod tables;
 
@@ -301,6 +302,7 @@ impl Builder<'_, '_> {
 
     fn state_at(&mut self, pc: u32) -> Val {
         let entries: Vec<(u32, Val)> = (self.live(pc).iter())
+            .filter(|&r| !self.reg(r as u8).is_none())
             .map(|r| {
                 let v = self.reg(r as u8);
                 let home = self.e.slot_holds(r as u16, v);
@@ -471,8 +473,11 @@ impl Builder<'_, '_> {
             let key = Key::reg(r as u32);
             vals.clear();
             vals.extend((0..npreds).map(|k| Val(self.e.table.pred_value(key, k))));
+            // Liveness takes a conditional write (`JTSET`) for a read: a
+            // register some path never gave a value has none to read.
             if vals.iter().any(|v| v.is_none()) {
-                crate::jit::bug!("r{r} is live into pc {pc} without a value");
+                self.e.table.set(key, Val::NONE.0);
+                continue;
             }
             if closed.contains(r) || vals.iter().any(|&v| v != vals[0]) {
                 let p = self.e.param(Rep::Val, None, &vals);
@@ -803,6 +808,13 @@ impl Builder<'_, '_> {
                 _ => match i.op().unquickened() {
                     GETFIELD | GETTABUP | GETTABUP_REF => self.getfield(i),
                     SETFIELD | SETTABUP | SETTABUP_REF => self.setfield(i),
+                    _ if matches!(
+                        i.op(),
+                        CALL | CALL_R0 | CALL_R1 | CALLS | CALLS_R0 | CALLS_R1
+                    ) =>
+                    {
+                        self.call(pc, i)
+                    }
                     _ => self.deopt(ExitTag::Unsupported),
                 },
             },

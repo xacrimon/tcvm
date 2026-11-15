@@ -18,6 +18,32 @@ pub(crate) enum Src {
     Operand(u16),
     /// A boxed constant.
     Const(u64),
+    /// A call site's: the register's frame slot holds it.
+    Home,
+}
+
+/// A call of the code: what the frame keeps across it, for the collector.
+pub(crate) struct CallSite {
+    /// Its entries, `Selected::entries[at..at + len]`; one with register
+    /// `TRACED` is a value no register of the frame names.
+    pub(crate) at: u32,
+    pub(crate) len: u32,
+    /// The call's block and instruction.
+    pub(crate) block: u32,
+    pub(crate) inst: u32,
+}
+
+pub(crate) const TRACED: u8 = 255;
+
+/// A call site after allocation: its return addresses (with whether each
+/// is a level's), its slow path, and its entries.
+pub(crate) struct SiteOut {
+    pub(crate) keys: Vec<(u32, bool)>,
+    pub(crate) miss: u32,
+    pub(crate) entries: Vec<SnapEntry>,
+    pub(crate) consts: Vec<u64>,
+    pub(crate) hdr: u16,
+    pub(crate) pc_after: u64,
 }
 
 /// An exit of the code: the frame it rebuilds, from its frame state.
@@ -37,6 +63,7 @@ pub(crate) struct Selected {
     pub(crate) vcode: VCode<MInst>,
     pub(crate) exits: Vec<Exit>,
     pub(crate) entries: Vec<(u8, SRep, Src)>,
+    pub(crate) sites: Vec<CallSite>,
     pub(crate) layout: Layout,
 }
 
@@ -46,6 +73,7 @@ impl Default for Selected {
             vcode: VCode::new(),
             exits: Vec::new(),
             entries: Vec::new(),
+            sites: Vec::new(),
             layout: Layout::default(),
         }
     }
@@ -72,6 +100,7 @@ pub(crate) struct Emitted {
     /// The 8-byte word holding the region pointer.
     pub(crate) region_word: u32,
     pub(crate) exits: Vec<ExitOut>,
+    pub(crate) sites: Vec<SiteOut>,
 }
 
 /// Loop rotation (V8's `ComputeAssemblyOrder`, with any exiting block as the

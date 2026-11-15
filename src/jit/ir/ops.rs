@@ -514,6 +514,13 @@ ops! {
     Jump        Both No     (Blk No No)       None [] [] [TERMINATOR];
     Br          Both No     (B1 Blk Blk)      None [] [] [TERMINATOR];
     Ret         Both No     (Imm Imm No)      None [SLOT] [] [TERMINATOR];
+    // The Lua call protocol. The callee and its arguments are in its slots;
+    // the state's values live on in the frame, and the collector clears the
+    // slots it does not name. `c`: the `CALL`'s `a`, argument count and `c`,
+    // a byte each. `Resume` is first in the call's successor: the first
+    // result when it has a value, else the results in their slots.
+    CallEntry   Both No     (Fs Blk Imm)      None [ALL] [ALL] [CALLS TERMINATOR];
+    Resume      Both No     (Imm No No)       Dyn  [] [SLOT] [PINNED];
 
     // A C call of the helper in `aux` (`HELPERS`), its immediate in `c`.
     CallHelper  Both Helper (Vals Len Imm)    Dyn  [] [] [CALLS];

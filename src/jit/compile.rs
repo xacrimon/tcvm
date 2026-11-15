@@ -338,7 +338,8 @@ pub(crate) fn compile<'gc>(
         }
     }
     mark!(3);
-    let mut em = target::emit::emit(sel, out, crate::jit::layout::rt_word(ctx) as u64)?;
+    let rt = crate::jit::layout::rt_word(ctx) as u64;
+    let mut em = target::emit::emit(sel, out, rt, closure.code as u64)?;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc.reserve(em.asm.max_len())?;
     let start = block.rx();
@@ -411,6 +412,36 @@ pub(crate) fn compile<'gc>(
             NO_BLAME,
         ));
     }
+    // The sites, their snapshots after the exits'.
+    let mut sites: Vec<crate::jit::region::Site> = Vec::new();
+    for site in &mut em.sites {
+        for s in &mut site.entries {
+            if let Loc::Const(c) = s.loc {
+                let w = site.consts[c as usize];
+                let k = consts.iter().position(|&x| x == w).unwrap_or_else(|| {
+                    consts.push(w);
+                    consts.len() - 1
+                });
+                s.loc = Loc::Const(k as u32);
+            }
+        }
+        let at = snaps.len() as u32;
+        let after = crate::jit::ir::ops::ExitKind::After;
+        encode_snap(&mut snaps, after, 0, &[], &site.entries);
+        sites.extend(
+            site.keys
+                .iter()
+                .map(|&(key, level)| crate::jit::region::Site {
+                    key,
+                    snap: at,
+                    hdr: site.hdr,
+                    pc_after: site.pc_after,
+                    level,
+                    miss: site.miss,
+                }),
+        );
+    }
+    sites.sort_unstable_by_key(|s| s.key);
     let mut nest = Vec::new();
     if cfg.code[pc as usize].op() != crate::instruction::Op::FUNC {
         let mut l = cfg.loop_of[cfg.block_of[pc as usize] as usize];
@@ -449,7 +480,7 @@ pub(crate) fn compile<'gc>(
             frame_size: em.frame_size,
             retired: std::cell::Cell::new(false),
             exit_hot: std::cell::Cell::new(crate::jit::state::EXIT_HOT),
-            sites: Box::new([]),
+            sites: sites.into_boxed_slice(),
             lazy: Box::new([]),
             landings: Box::new([]),
             invalidated: std::cell::Cell::new(false),

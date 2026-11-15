@@ -202,6 +202,12 @@ impl Copy {
                         }
                         break;
                     }
+                    Op::CallEntry => {
+                        let state = self.map[i.a as usize];
+                        let to = self.edge(g, a, e, b, Block(i.b), 0);
+                        e.emit(Op::CallEntry, Rep::None, 0, state.0, to.0, i.c);
+                        break;
+                    }
                     Op::CallHelper => {
                         self.scratch.clear();
                         for &x in g.run(i.a, i.b) {

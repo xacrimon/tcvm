@@ -371,6 +371,7 @@ impl Graph {
                     i.rep == h.ret && reps.eq(h.args.iter().copied())
                 }
                 Op::CheckType => i.rep == set.unboxed(),
+                Op::Resume => matches!(i.rep, Rep::Val | Rep::None),
                 _ => false,
             },
         };

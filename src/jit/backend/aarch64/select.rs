@@ -7,7 +7,7 @@ use crate::env::value::{PAYLOAD_MASK, SMALL_INT, Value};
 use crate::jit::backend::aarch64::abi;
 use crate::jit::backend::aarch64::asm::{Cond, Sz, logical_imm};
 use crate::jit::backend::aarch64::inst::{MInst, MOp, Role};
-use crate::jit::backend::emit::{Exit, Selected, Src};
+use crate::jit::backend::emit::{CallSite, Exit, Selected, Src, TRACED};
 use crate::jit::backend::reg::{
     Block as RBlock, Operand, OperandConstraint, OperandKind, OperandPos, PRegSet, RegClass, VReg,
 };
@@ -16,8 +16,8 @@ use crate::jit::bug;
 use crate::jit::compile::Bail;
 use crate::jit::ir::fields::Field;
 use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, Heaps, Helper, Op};
-use crate::jit::ir::types::Rep;
-use crate::jit::ir::{Block, Graph, HOME, Pool, Val};
+use crate::jit::ir::types::{Rep, TypeSet};
+use crate::jit::ir::{Block, BlockFlags, Graph, HOME, Pool, Val};
 use crate::jit::region::SRep;
 
 const NONE: u32 = u32::MAX;
@@ -70,6 +70,12 @@ pub(crate) struct Select {
     args: Vec<VReg>,
     /// The frame slots the region stores to.
     stored: Vec<bool>,
+    /// For a region that calls: the layout position of each value's block,
+    /// and of the last block that may use it (`spans`); and the values the
+    /// collector must find if a call runs while they live.
+    defined: Vec<u32>,
+    last: Vec<u32>,
+    traced: Vec<(u32, u8)>,
     bail: Option<Bail>,
 }
 
@@ -86,6 +92,7 @@ impl Select {
         out.vcode.clear();
         out.exits.clear();
         out.entries.clear();
+        out.sites.clear();
         self.vreg.clear();
         self.vreg.resize(g.insts.len(), NONE);
         self.insts.clear();
@@ -95,9 +102,15 @@ impl Select {
         self.bail = None;
         self.stored.clear();
         self.stored.resize(256, false);
+        let mut calls = false;
         for i in &g.insts {
             match i.op {
                 Op::SlotStore => self.stored[i.aux as usize] = true,
+                // The collector clears the slots a call's site does not name.
+                Op::CallEntry => {
+                    self.stored.fill(true);
+                    calls = true;
+                }
                 Op::CallHelper if Helper::of(i.aux).info().writes.contains(Heaps::SLOT) => {
                     self.stored.fill(true)
                 }
@@ -112,6 +125,10 @@ impl Select {
             s: self,
             out,
         };
+        sel.s.traced.clear();
+        if calls {
+            sel.spans();
+        }
         for pos in (0..n).rev() {
             let b = sel.out.layout.order[pos];
             let d = g.block(b);
@@ -208,16 +225,170 @@ impl Sel<'_> {
         self.push(op, sz, Cond::Eq, imm, regs)
     }
 
+    /// For a region that calls, where each value lives: from its block to
+    /// the last block using it, in layout order, or to the end of the
+    /// outermost loop that holds the use and not the definition. A value
+    /// lives at no other block, and only at those its block dominates.
+    fn spans(&mut self) {
+        let g = self.g;
+        let n = g.insts.len();
+        self.s.defined.clear();
+        self.s.defined.resize(n, 0);
+        self.s.last.clear();
+        self.s.last.resize(n, 0);
+        for (pos, &b) in self.out.layout.order.iter().enumerate() {
+            let d = g.block(b);
+            self.s.defined[d.start as usize..d.end as usize].fill(pos as u32);
+        }
+        for pos in 0..self.out.layout.order.len() {
+            let b = self.out.layout.order[pos];
+            let d = g.block(b);
+            for v in d.start..d.end {
+                let i = &g.insts[v as usize];
+                if i.op == Op::Param {
+                    // An input is used where its edge leaves.
+                    for (k, &x) in g.inputs(Val(v)).iter().enumerate() {
+                        let from = self.out.layout.pos[g.preds(b)[k].idx()];
+                        self.used(Val(x), from);
+                    }
+                } else {
+                    g.uses(i, |x| self.used(x, pos as u32));
+                }
+            }
+        }
+        for v in 0..n as u32 {
+            let i = &g.insts[v as usize];
+            if !matches!(i.rep, Rep::Val | Rep::Ptr)
+                || self.root(Val(v)) != Val(v)
+                || matches!(i.op, Op::K32 | Op::K64 | Op::KF64 | Op::KObj | Op::Base)
+                || self.s.last[v as usize] <= self.s.defined[v as usize]
+            {
+                continue;
+            }
+            // A pointer of unknown kind is of something its owner keeps: a
+            // closure's cell, a shape's class.
+            let set = g.facts[v as usize].set;
+            let tag = match (i.rep, set) {
+                (Rep::Val, _) if set.intersects(TypeSet::HEAP) => TRACED,
+                (Rep::Ptr, TypeSet::UDATA) => crate::env::value::TAG_USERDATA as u8,
+                (Rep::Ptr, TypeSet::BIGINT) => crate::env::value::TAG_BOXED_INT as u8,
+                (Rep::Ptr, TypeSet::STR) => crate::env::value::TAG_STRING as u8,
+                (Rep::Ptr, TypeSet::TAB) => crate::env::value::TAG_TABLE as u8,
+                (Rep::Ptr, TypeSet::FUN) => (crate::env::value::FUNCTION_BITS >> 48 & 7) as u8,
+                (Rep::Ptr, TypeSet::THR) => crate::env::value::TAG_THREAD as u8,
+                _ => continue,
+            };
+            self.s.traced.push((v, tag));
+        }
+    }
+
+    fn used(&mut self, x: Val, at: u32) {
+        let g = self.g;
+        let x = self.root(x);
+        let def = self.s.defined[x.idx()];
+        let mut end = at;
+        let mut l = g.block(self.out.layout.order[at as usize]).lp;
+        while !l.is_none() {
+            let (first, last) = self.out.layout.loops[l.idx()];
+            if (first..=last).contains(&def) {
+                break;
+            }
+            end = end.max(last);
+            l = g.loops[l.idx()].parent;
+        }
+        let last = &mut self.s.last[x.idx()];
+        *last = (*last).max(end);
+    }
+
     /// A branch to the exit that rebuilds frame state `fs`, taken where
     /// `cc` holds: the state's values ride on it as operands the allocator
     /// may leave anywhere.
     fn exit(&mut self, op: MOp, cc: Cond, fs: Val, tag: u16) {
+        let g = self.g;
+        let (pc, at, first) = self.state(fs, false);
+        let exit = self.out.exits.len() as u64;
+        self.out.exits.push(Exit {
+            pc,
+            kind: if g.inst(fs).aux == 0 {
+                ExitKind::Before
+            } else {
+                ExitKind::After
+            },
+            tag: ExitTag::of(tag),
+            at,
+            len: self.out.entries.len() as u32 - at,
+            inst: 0,
+            own: 0,
+        });
+        let i = MInst {
+            op,
+            cc: cc as u8,
+            sz: Sz::X,
+            imm: exit,
+        };
+        let n = self.s.ops.len() as u32 - first;
+        self.s.insts.push((i, first, n, PRegSet::empty()));
+    }
+
+    /// A Lua call. What its state names lives on in stack slots, or in the
+    /// frame slot that holds it; so does every other value the collector
+    /// must find that lives across it.
+    fn call(&mut self, pos: usize, fs: Val, imm: u32) {
+        let g = self.g;
+        let here = self.out.layout.order[pos];
+        let (pc, at, first) = self.state(fs, true);
+        for k in 0..self.s.traced.len() {
+            let (v, tag) = self.s.traced[k];
+            let (def, last) = (self.s.defined[v as usize], self.s.last[v as usize]);
+            let block = self.out.layout.order[def as usize];
+            if def as usize > pos || last as usize <= pos || !g.dominates(block, here) {
+                continue;
+            }
+            let reg = self.reg(Val(v));
+            if self.s.ops[first as usize..].iter().any(|o| o.vreg() == reg) {
+                continue;
+            }
+            let k = self.s.ops.len() as u32 - first;
+            (self.s.ops).push(Operand::new(
+                reg,
+                OperandConstraint::Stack,
+                OperandKind::Use,
+                OperandPos::Late,
+            ));
+            let rep = if tag == TRACED { SRep::Val } else { SRep::Ptr };
+            self.out.entries.push((tag, rep, Src::Operand(k as u16)));
+        }
+        self.out.sites.push(CallSite {
+            at,
+            len: self.out.entries.len() as u32 - at,
+            block: pos as u32,
+            inst: 0,
+        });
+        let i = MInst {
+            op: MOp::CallLua,
+            cc: 0,
+            sz: Sz::X,
+            imm: imm as u64 | (pc as u64) << 32,
+        };
+        let n = self.s.ops.len() as u32 - first;
+        self.s.insts.push((i, first, n, abi::allocatable()));
+    }
+
+    /// The values of frame state `fs` as late operands, appended, with
+    /// their entries: for a call's `site` in stack slots, a register whose
+    /// frame slot holds its value named so; for an exit anywhere, such a
+    /// register left out. Returns the state's pc, and where the entries and
+    /// the operands start.
+    fn state(&mut self, fs: Val, site: bool) -> (u32, u32, u32) {
         let g = self.g;
         let (pc, entries) = g.entries(fs);
         let at = self.out.entries.len() as u32;
         let first = self.s.ops.len() as u32;
         for &[r, v] in entries {
             if r & HOME != 0 {
+                if site {
+                    (self.out.entries).push(((r & !HOME) as u8, SRep::Val, Src::Home));
+                }
                 continue;
             }
             let (v, i) = (Val(v), g.inst(Val(v)));
@@ -246,9 +417,14 @@ impl Sel<'_> {
                 None => {
                     let reg = self.reg(v);
                     let k = self.s.ops.len() as u32 - first;
+                    let constraint = if site {
+                        OperandConstraint::Stack
+                    } else {
+                        OperandConstraint::Any
+                    };
                     (self.s.ops).push(Operand::new(
                         reg,
-                        OperandConstraint::Any,
+                        constraint,
                         OperandKind::Use,
                         OperandPos::Late,
                     ));
@@ -257,28 +433,7 @@ impl Sel<'_> {
             };
             self.out.entries.push(src);
         }
-        let exit = self.out.exits.len() as u64;
-        self.out.exits.push(Exit {
-            pc,
-            kind: if g.inst(fs).aux == 0 {
-                ExitKind::Before
-            } else {
-                ExitKind::After
-            },
-            tag: ExitTag::of(tag),
-            at,
-            len: self.out.entries.len() as u32 - at,
-            inst: 0,
-            own: 0,
-        });
-        let i = MInst {
-            op,
-            cc: cc as u8,
-            sz: Sz::X,
-            imm: exit,
-        };
-        let n = self.s.ops.len() as u32 - first;
-        self.s.insts.push((i, first, n, PRegSet::empty()));
+        (pc, at, first)
     }
 
     /// The condition code a branch on `c` takes: a compare's, or for a
@@ -570,6 +725,35 @@ impl Sel<'_> {
                 self.pass(pos, 1, here, Block(i.c));
             }
             Ret => self.op(MOp::Ret, Sz::X, i.a as u64 | (i.b as u64) << 8, &[]),
+            CallEntry => {
+                self.call(pos, a, i.c);
+                self.pass(pos, 0, here, Block(i.b));
+            }
+            Resume => {
+                // Nothing is in a register here: what lives across the call
+                // is in the frame, and its reloads come after.
+                let at = self.s.ops.len() as u32;
+                let mut clobbers = abi::allocatable();
+                let mut imm = i.a as u64;
+                match self.def(v) {
+                    Some(d) => {
+                        clobbers.remove(abi::preg_int(0));
+                        self.s.ops.push(Operand::reg_fixed_def(d, abi::preg_int(0)));
+                        imm |= 1 << 31;
+                    }
+                    // One result nothing reads is none.
+                    None if i.rep == Rep::Val => imm = imm & !0xff_0000 | 1 << 16,
+                    None => {}
+                }
+                let m = MInst {
+                    op: MOp::Resume,
+                    cc: 0,
+                    sz: Sz::X,
+                    imm,
+                };
+                let n = self.s.ops.len() as u32 - at;
+                self.s.insts.push((m, at, n, clobbers));
+            }
             CallHelper => {
                 let h = Helper::of(i.aux).info();
                 let at = self.s.ops.len() as u32;
@@ -669,6 +853,10 @@ impl Sel<'_> {
                 if matches!(i.op, MOp::BCondExit | MOp::BExit) {
                     self.out.exits[i.imm as usize].inst = at.index() as u32;
                 }
+                if i.op == MOp::CallLua {
+                    let site = self.out.sites.iter_mut().find(|s| s.block == pos as u32);
+                    site.unwrap().inst = at.index() as u32;
+                }
             }
             params.clear();
             for p in d.start..d.end {
@@ -695,7 +883,7 @@ impl Sel<'_> {
                 params.iter().copied(),
                 &self.s.args[args as usize..args as usize + total],
                 &nargs[..ns],
-                false,
+                d.flags.contains(BlockFlags::RESUME),
             );
         }
         self.out.vcode.loop_of.clone_from(&self.out.layout.loop_of);

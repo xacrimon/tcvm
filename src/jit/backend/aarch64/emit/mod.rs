@@ -10,7 +10,9 @@ use crate::jit::backend::aarch64::asm::{
     Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
 };
 use crate::jit::backend::aarch64::inst::{MInst, MOp};
-use crate::jit::backend::emit::{Emitted, ExitOut, Selected, Src, rotate_loops, thread_jumps};
+use crate::jit::backend::emit::{
+    Emitted, ExitOut, Selected, SiteOut, Src, rotate_loops, thread_jumps,
+};
 use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
 use crate::jit::backend::reg::{Allocation, Block, Inst, PReg, RegClass};
 use crate::jit::backend::vcode::{Remat, VCode};
@@ -26,8 +28,11 @@ macro_rules! addr {
     };
 }
 
+mod call;
+
 struct Em<'a> {
     a: Asm,
+    s: &'a Selected,
     v: &'a VCode<MInst>,
     out: &'a Output,
     frame: u32,
@@ -40,7 +45,14 @@ struct Em<'a> {
     /// The moves of the edges that do not fall through: where the stub is,
     /// the branch and its edge, and where the stub goes on to.
     stubs: Vec<(Label, usize, usize, Label)>,
+    /// By block, for the resume blocks.
+    resume: Vec<Option<call::ResumeLabels>>,
+    ool: Vec<call::Ool>,
+    /// The calls' sites, with their return addresses and miss paths.
+    sites: Vec<call::Site>,
     rt: u64,
+    /// The address of the function's bytecode.
+    code: u64,
 }
 
 fn gpr(p: PReg) -> Gpr {
@@ -58,8 +70,9 @@ fn spill_off(slot: usize) -> i32 {
     (FRAME_SPILLS + 8 * slot) as i32
 }
 
-/// `rt` is the runtime's address, which helpers take.
-pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail> {
+/// `rt` is the runtime's address, which helpers take, and `code` that of
+/// the function's bytecode.
+pub(crate) fn emit(s: &Selected, out: &Output, rt: u64, code: u64) -> Result<Emitted, Bail> {
     if out.num_spillslots > MAX_SPILLS {
         return Err(Bail::TooLarge);
     }
@@ -74,7 +87,12 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail>
         region_word: a.new_label(),
         frame: ((FRAME_SPILLS + 8 * out.num_spillslots) as u32).next_multiple_of(16),
         stubs: Vec::new(),
+        resume: Vec::new(),
+        ool: Vec::new(),
+        sites: Vec::new(),
         rt,
+        code,
+        s,
         v: &s.vcode,
         out,
         a,
@@ -82,6 +100,10 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail>
     em.a.bind(em.region_word);
     em.a.emit(0);
     em.a.emit(0);
+    for b in &s.vcode.blocks {
+        let r = b.resume.then(|| em.resume_labels());
+        em.resume.push(r);
+    }
     let kept = |b: &u32| !skip[*b as usize];
     let mut laid: Vec<u32> = s.layout.emit.iter().copied().filter(kept).collect();
     let hot = s.layout.emit[..s.layout.hot]
@@ -98,8 +120,13 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail>
             em.a.align(16);
         }
         em.a.bind(em.labels[b as usize]);
-        for ie in out.block_insts_and_edits(&s.vcode, Block::new(b as usize)) {
+        let resume = s.vcode.blocks[b as usize].resume;
+        let insts = out.block_insts_and_edits(&s.vcode, Block::new(b as usize));
+        for (k, ie) in insts.enumerate() {
             match ie {
+                // A fast callee's `ret` lands at the `Resume`, past anything
+                // before it.
+                InstOrEdit::Edit(_) if resume && k == 0 => bug!("a move before a call's resume"),
                 InstOrEdit::Edit(e) => em.edit(e),
                 InstOrEdit::Inst(i) => em.inst(i.index(), b as usize, next),
             }
@@ -112,6 +139,9 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail>
             em.edit(e);
         }
         em.a.b(to);
+    }
+    for o in std::mem::take(&mut em.ool) {
+        em.out_of_line(o);
     }
     // Where dispatch enters: through `level_enter`, which returns to
     // `level_land`, on to the entry block.
@@ -132,7 +162,16 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail>
     em.a.orr_shift(Sz::X, X16, X17, X16, Shift::Lsl, 48);
     em.a.b_far(addr!(abi::exit_common));
     let at = |l: Label| em.a.label_offset(l) as u32;
+    let sites = std::mem::take(&mut em.sites);
+    let sites = (sites.into_iter())
+        .map(|(keys, miss, site)| SiteOut {
+            keys: keys.iter().map(|&(l, level)| (at(l), level)).collect(),
+            miss: at(miss),
+            ..site
+        })
+        .collect();
     Ok(Emitted {
+        sites,
         entry: at(dispatch),
         num_spills: out.num_spillslots as u32,
         frame_size: em.frame,
@@ -155,6 +194,7 @@ fn exit_out(s: &Selected, out: &Output, k: usize) -> ExitOut {
                     consts.push(w);
                     Loc::Const(consts.len() as u32 - 1)
                 }
+                Src::Home => bug!("an exit's entry in its frame slot"),
                 Src::Operand(k) => {
                     let al = allocs[(e.own + k as u32) as usize];
                     match (al.as_reg(), al.as_stack()) {
@@ -279,6 +319,8 @@ impl<'a> Em<'a> {
         // A value left for the allocator to make where used has no code.
         let unmade = self.allocs(i).first().is_some_and(|a| a.is_none());
         match m.op {
+            MOp::CallLua => self.call(i, block, next),
+            MOp::Resume => self.on_resume(i, block),
             MOp::Entry => {
                 self.a.sub_imm(Sz::X, SP, SP, self.frame as u64);
                 self.a.stp(FP, LR, SP, 0);
