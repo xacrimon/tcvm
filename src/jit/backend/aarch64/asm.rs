@@ -712,6 +712,10 @@ impl Asm {
         self.mem_op(0xB940_0000, 0xB840_0000, 4, r(t), n, off);
     }
 
+    pub(crate) fn str_w(&mut self, t: Gpr, n: Gpr, off: i32) {
+        self.mem_op(0xB900_0000, 0xB800_0000, 4, r(t), n, off);
+    }
+
     pub(crate) fn ldrb(&mut self, t: Gpr, n: Gpr, off: i32) {
         self.mem_op(0x3940_0000, 0x3840_0000, 1, r(t), n, off);
     }

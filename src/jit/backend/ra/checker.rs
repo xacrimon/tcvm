@@ -103,7 +103,7 @@ use crate::jit::backend::reg::{
     Allocation, AllocationKind, Block, Inst, InstPosition, Operand, OperandConstraint, OperandKind,
     OperandPos, PReg, VReg,
 };
-use crate::jit::backend::vcode::{TargetInst, VCode};
+use crate::jit::backend::vcode::{CAbi, VCode};
 
 // Vendored from regalloc2 0.15.2 `src/checker.rs`: std maps for FxHash, `Vec`
 // for `SmallVec`, no tracing; `Edit::Remat` defines its target as the value,
@@ -287,12 +287,12 @@ impl CheckerValue {
     }
 }
 
-fn visit_all_vregs<I: TargetInst, V: FnMut(VReg)>(f: &VCode<I>, mut v: V) {
+fn visit_all_vregs<V: FnMut(VReg)>(f: &VCode, abi: &CAbi, mut v: V) {
     for block in 0..f.num_blocks() {
         let block = Block::new(block);
         for inst in f.block_insns(block).iter() {
-            for op in f.inst_operands(inst) {
-                v(op.vreg());
+            for k in 0..f.operands_of(inst.index()).1 {
+                v(f.operand(abi, inst.index(), k).vreg());
             }
             if f.is_branch(inst) {
                 for succ_idx in 0..f.block_succs(block).len() {
@@ -740,8 +740,9 @@ pub(crate) enum CheckerInst {
     },
 }
 
-pub struct Checker<'a, I: TargetInst> {
-    f: &'a VCode<I>,
+pub struct Checker<'a> {
+    f: &'a VCode,
+    abi: CAbi,
     bb_in: FxHashMap<Block, CheckerState>,
     bb_insts: FxHashMap<Block, Vec<CheckerInst>>,
     edge_insts: FxHashMap<(Block, Block), Vec<CheckerInst>>,
@@ -751,12 +752,12 @@ pub struct Checker<'a, I: TargetInst> {
     remat_src: Vec<Option<VReg>>,
 }
 
-impl<'a, I: TargetInst> Checker<'a, I> {
+impl<'a> Checker<'a> {
     /// Create a new checker for the given function, initializing CFG
     /// info immediately.  The client should call the `add_*()`
     /// methods to add abstract instructions to each BB before
     /// invoking `run()` to check for errors.
-    pub fn new(f: &'a VCode<I>) -> Checker<'a, I> {
+    pub fn new(f: &'a VCode, abi: CAbi) -> Checker<'a> {
         let mut bb_in = FxHashMap::default();
         let mut bb_insts = FxHashMap::default();
         let mut edge_insts = FxHashMap::default();
@@ -777,6 +778,7 @@ impl<'a, I: TargetInst> Checker<'a, I> {
 
         Checker {
             f,
+            abi,
             bb_in,
             bb_insts,
             edge_insts,
@@ -815,11 +817,9 @@ impl<'a, I: TargetInst> Checker<'a, I> {
     fn handle_inst(&mut self, block: Block, inst: Inst, out: &Output) {
         // Process uses, defs, and clobbers; a constant's definition left
         // unmaterialized defines nothing.
-        let (operands, allocs): (Vec<_>, Vec<_>) = self
-            .f
-            .inst_operands(inst)
-            .iter()
-            .cloned()
+        let n = self.f.operands_of(inst.index()).1;
+        let (operands, allocs): (Vec<_>, Vec<_>) = (0..n)
+            .map(|k| self.f.operand(&self.abi, inst.index(), k))
             .zip(out.inst_allocs(self.f, inst).iter().cloned())
             .filter(|(op, a)| {
                 !(op.kind() == OperandKind::Def
@@ -827,7 +827,9 @@ impl<'a, I: TargetInst> Checker<'a, I> {
                     && self.remat.get(op.vreg().vreg()).copied().unwrap_or(false))
             })
             .unzip();
-        let clobbers: Vec<_> = self.f.inst_clobbers(inst).into_iter().collect();
+        let clobbers: Vec<_> = (self.f.inst_clobbers(&self.abi, inst))
+            .into_iter()
+            .collect();
         let checkinst = CheckerInst::Op {
             inst,
             operands,

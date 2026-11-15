@@ -265,6 +265,7 @@ pub(crate) fn compile<'gc>(
     let scratch = &mut *ctx.jit().scratch.borrow_mut();
     let high = &mut scratch.high;
     high.reset(false);
+    high.rt = crate::jit::layout::rt_word(ctx) as u64;
     let pool = &mut scratch.pool;
     pool.words.clear();
     let (shapes, missing) = {
@@ -287,6 +288,7 @@ pub(crate) fn compile<'gc>(
     analysis.uses(&high.g);
     analysis.types(&high.g);
     low.reset(true);
+    low.rt = high.rt;
     scratch.copy.run(&high.g, analysis, low);
     stage(config, closure, pc, "lower", low);
     if let Some(why) = low.bail {
@@ -308,6 +310,7 @@ pub(crate) fn compile<'gc>(
         .unwrap_or_else(|e| crate::jit::bug!("regalloc: {e}"));
     #[cfg(feature = "tcvm-dev")]
     {
+        let abi = target::abi::c_abi();
         if config.dev.dump.ra {
             let ra = ctx.jit().ra.borrow();
             eprintln!(
@@ -321,18 +324,18 @@ pub(crate) fn compile<'gc>(
                 "-- jit vcode {} pc{pc}, {} spill slots\n{}",
                 chunk_name(closure),
                 out.num_spillslots,
-                sel.vcode.print(out, &sel.layout.emit)
+                sel.vcode.print(&abi, out, &sel.layout.emit)
             );
         }
         if config.dev.check {
-            let mut checker = crate::jit::backend::ra::checker::Checker::new(&sel.vcode);
+            let mut checker = crate::jit::backend::ra::checker::Checker::new(&sel.vcode, abi);
             let (remat, src) = crate::jit::backend::ra::remat_table(&sel.vcode);
             checker.allow_unmaterialized(remat, src);
             checker.prepare(out);
             if let Err(e) = checker.run() {
                 crate::jit::bug!("regalloc checker: {e:?}");
             }
-            if let Err(e) = crate::jit::backend::ra::check_operands(&sel.vcode, out) {
+            if let Err(e) = crate::jit::backend::ra::check_operands(&sel.vcode, &abi, out) {
                 crate::jit::bug!("regalloc checker: {e}");
             }
         }

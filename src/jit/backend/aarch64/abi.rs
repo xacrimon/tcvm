@@ -75,6 +75,20 @@ pub(crate) fn ra_env() -> crate::jit::backend::ra::Env {
         ],
         scratch: [preg_int(17), preg_float(31)],
         transport: preg_int(16),
+        c: c_abi(),
+    }
+}
+
+/// The C convention as the opcode table's rows name it: arguments in x0
+/// to x7 and d0 to d7, a result in x0 or d0.
+pub(crate) fn c_abi() -> crate::jit::backend::vcode::CAbi {
+    crate::jit::backend::vcode::CAbi {
+        args: [
+            std::array::from_fn(|k| preg_int(k as u8)),
+            std::array::from_fn(|k| preg_float(k as u8)),
+        ],
+        ret: [preg_int(0), preg_float(0)],
+        caller_saved: caller_saved(),
     }
 }
 

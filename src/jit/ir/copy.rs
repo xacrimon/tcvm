@@ -209,7 +209,7 @@ impl Copy {
                             let v = Copy::convert(e, v, g.rep(Val(x)), TypeSet::ANY, Val::NONE);
                             self.scratch.push(v);
                         }
-                        e.call(super::ops::Helper::of(i.aux), i.c, &self.scratch)
+                        e.call_with(super::ops::Helper::of(i.aux), &self.scratch)
                     }
                     Op::SetIndex => {
                         let [recv, key, v] = [0, 1, 2].map(|k| {

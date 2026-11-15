@@ -2,13 +2,12 @@
 //! instruction per `MInst` (`inst`), the edges' move stubs, the dispatch
 //! entry, the exit stubs and the region's exit trampoline.
 
-use crate::jit::backend::aarch64::abi::{self, BASE, FRAME_SPILLS, MAX_SPILLS, X16, X17};
+use crate::jit::backend::aarch64::abi::{self, BASE, FRAME_SPILLS, MAX_SPILLS, THREAD, X16, X17};
 use crate::jit::backend::aarch64::asm::{Asm, FP, Fpr, Gpr, Label, Shift, Sz, ZR};
-use crate::jit::backend::aarch64::inst::MInst;
 use crate::jit::backend::emit::{Emitted, ExitOut, Selected, Src, rotate_loops, thread_jumps};
 use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
 use crate::jit::backend::reg::{Allocation, Block, Inst, PReg, RegClass};
-use crate::jit::backend::vcode::{Remat, VCode};
+use crate::jit::backend::vcode::{Pin, Remat, VCode};
 use crate::jit::bug;
 use crate::jit::compile::Bail;
 use crate::jit::region::{Loc, SnapEntry};
@@ -24,7 +23,7 @@ macro_rules! addr {
 
 struct Em<'a> {
     a: Asm,
-    v: &'a VCode<MInst>,
+    v: &'a VCode,
     out: &'a Output,
     frame: u32,
     labels: Vec<Label>,
@@ -207,6 +206,8 @@ impl<'a> Em<'a> {
                     }
                     Remat::Float(bits) => self.fimm(fpr(r), bits),
                     Remat::Slot(slot) => self.a.ldr(gpr(r), BASE, slot as i32 * 8),
+                    Remat::Pinned(Pin::Base) => self.a.mov(gpr(r), BASE),
+                    Remat::Pinned(Pin::Thread) => self.a.mov(gpr(r), THREAD),
                     Remat::AndImm { .. } | Remat::None => bug!("{vreg:?} cannot be made again"),
                 }
             }

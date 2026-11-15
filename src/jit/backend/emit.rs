@@ -4,10 +4,9 @@
 
 use crate::jit::backend::order::Layout;
 use crate::jit::backend::ra::{InstOrEdit, Output};
-use crate::jit::backend::reg::{Block, Inst};
+use crate::jit::backend::reg::Block;
 use crate::jit::backend::target::asm::Asm;
-use crate::jit::backend::target::inst::MInst;
-use crate::jit::backend::vcode::{Flow, TargetInst, VCode};
+use crate::jit::backend::vcode::{Flow, VCode};
 use crate::jit::ir::ops::{ExitKind, ExitTag};
 use crate::jit::region::{SRep, SnapEntry};
 
@@ -34,7 +33,7 @@ pub(crate) struct Exit {
 }
 
 pub(crate) struct Selected {
-    pub(crate) vcode: VCode<MInst>,
+    pub(crate) vcode: VCode,
     pub(crate) exits: Vec<Exit>,
     pub(crate) entries: Vec<(u8, SRep, Src)>,
     pub(crate) layout: Layout,
@@ -43,7 +42,7 @@ pub(crate) struct Selected {
 impl Default for Selected {
     fn default() -> Self {
         Selected {
-            vcode: VCode::new(),
+            vcode: VCode::new(&crate::jit::backend::target::inst::ROWS),
             exits: Vec::new(),
             entries: Vec::new(),
             layout: Layout::default(),
@@ -81,8 +80,8 @@ pub(crate) struct Emitted {
 /// into the header; entering then takes a jump to the header. `loops` and
 /// `hot` are the layout's, `laid` its emit order less the blocks left out.
 /// Returns the rotated loops' new first blocks.
-pub(crate) fn rotate_loops<I: TargetInst, L: Copy + PartialEq>(
-    v: &VCode<I>,
+pub(crate) fn rotate_loops<L: Copy + PartialEq>(
+    v: &VCode,
     loops: &[(u32, u32)],
     labels: &[L],
     dest: &[L],
@@ -90,7 +89,7 @@ pub(crate) fn rotate_loops<I: TargetInst, L: Copy + PartialEq>(
     hot: usize,
 ) -> Vec<u32> {
     let mut tops = Vec::new();
-    let term = |b: u32| v.insts[v.blocks[b as usize].end as usize - 1].flow();
+    let term = |b: u32| v.row(v.blocks[b as usize].end as usize - 1).flow;
     for &(first, last) in loops {
         let inside = |b: u32| (first..=last).contains(&b);
         let Some(s) = laid[..hot].iter().position(|&b| inside(b)) else {
@@ -129,8 +128,8 @@ pub(crate) fn rotate_loops<I: TargetInst, L: Copy + PartialEq>(
 /// Where branches to each block go, and whether it is left out: a block
 /// whose only code is a deopt is its exit (`exit_of`), and one that is only
 /// a jump is where the jump goes.
-pub(crate) fn thread_jumps<I: TargetInst, L: Copy>(
-    v: &VCode<I>,
+pub(crate) fn thread_jumps<L: Copy>(
+    v: &VCode,
     out: &Output,
     labels: &[L],
     exit_of: impl Fn(u32) -> L,
@@ -149,15 +148,15 @@ pub(crate) fn thread_jumps<I: TargetInst, L: Copy>(
             .filter(|ie| match ie {
                 InstOrEdit::Edit(_) => true,
                 &InstOrEdit::Inst(i) => {
-                    !(v.insts[i.index()].is_remat() && out.inst_allocs(v, i)[0].is_none())
+                    !(v.row(i.index()).remat && out.inst_allocs(v, i)[0].is_none())
                 }
             });
         let (Some(InstOrEdit::Inst(i)), None) = (code.next(), code.next()) else {
             continue;
         };
-        match v.insts[Inst::index(i)].flow() {
-            Flow::Deopt(exit) => {
-                dest[b] = exit_of(exit);
+        match v.row(i.index()).flow {
+            Flow::Exit => {
+                dest[b] = exit_of(v.exit_of(i.index()));
                 skip[b] = true;
             }
             Flow::Jump => jumps[b] = v.succs(b)[0].index(),

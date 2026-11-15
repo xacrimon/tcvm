@@ -6,44 +6,62 @@
 use super::Em;
 use crate::env::value::NIL;
 use crate::jit::backend::aarch64::abi::{BASE, INSN, PC, THREAD};
-use crate::jit::backend::aarch64::asm::{Cond, Extend, FP, Gpr, LR, Label, SP, Sz};
-use crate::jit::backend::aarch64::inst::MOp;
-use crate::jit::ir::ops::{Ctx, Helper};
+use crate::jit::backend::aarch64::asm::{self, Cond, Extend, FP, Gpr, LR, Label, SP};
+use crate::jit::backend::aarch64::inst::{MOp, Sz};
+use crate::jit::bug;
+use crate::jit::ir::ops::Helper;
 
 impl Em<'_> {
     pub(super) fn inst(&mut self, i: usize, block: usize, next: Option<Label>) {
         let m = self.v.insts[i];
-        let (sz, imm) = (m.sz, m.imm);
+        let op = MOp::of(m.op);
+        // The slot after the registers, where the row has an immediate
+        // there; an operation's width, where it has one.
+        let imm = m.ops[self.v.row(i).regs().min(2)];
+        let sz = match Sz::of(m.sz) {
+            Sz::W => asm::Sz::W,
+            _ => asm::Sz::X,
+        };
         // A value left for the allocator to make where used has no code.
-        let unmade = self.allocs(i).first().is_some_and(|a| a.is_none());
-        match m.op {
+        if self.v.row(i).remat && self.allocs(i)[0].is_none() {
+            return;
+        }
+        match op {
             MOp::Entry => {
-                self.a.sub_imm(Sz::X, SP, SP, self.frame as u64);
+                self.a.sub_imm(asm::Sz::X, SP, SP, self.frame as u64);
                 self.a.stp(FP, LR, SP, 0);
                 self.a.mov_sp(FP, SP);
             }
-            MOp::MovImm | MOp::FImm | MOp::LdrSlot if unmade => {}
-            MOp::MovImm => self.a.mov_imm(self.r(i, 0), imm),
-            MOp::FImm => self.fimm(self.fr(i, 0), imm),
+            MOp::MovImm => self.a.mov_imm(self.r(i, 0), imm as u64),
+            MOp::MovWide => self.a.mov_imm(self.r(i, 0), self.v.wide(imm)),
+            MOp::FImm => self.fimm(self.fr(i, 0), self.v.wide(imm)),
             MOp::LdrSlot => self.a.ldr(self.r(i, 0), BASE, imm as i32 * 8),
             MOp::StrSlot => self.a.str(self.r(i, 0), BASE, imm as i32 * 8),
-            MOp::Ldr if sz == Sz::W => self.a.ldr_w(self.r(i, 0), self.r(i, 1), imm as i32),
-            MOp::Ldr => self.a.ldr(self.r(i, 0), self.r(i, 1), imm as i32),
-            MOp::Str => self.a.str(self.r(i, 0), self.r(i, 1), imm as i32),
+            MOp::Ldr | MOp::Str => {
+                let (t, n, off) = (self.r(i, 0), self.r(i, 1), imm as i32);
+                match (op, Sz::of(m.sz)) {
+                    (MOp::Ldr, Sz::X) => self.a.ldr(t, n, off),
+                    (MOp::Ldr, Sz::W) => self.a.ldr_w(t, n, off),
+                    (_, Sz::X) => self.a.str(t, n, off),
+                    (_, Sz::W) => self.a.str_w(t, n, off),
+                    (_, w) => bug!("no load or store of {w:?}"),
+                }
+            }
             MOp::LdrIdx | MOp::StrIdx => {
                 let ext = if m.cc == 1 { Extend::Uxtw } else { Extend::Lsl };
                 let (t, n, x) = (self.r(i, 0), self.r(i, 1), self.r(i, 2));
-                match m.op {
+                match op {
                     MOp::LdrIdx => self.a.ldr_idx(t, n, x, ext, true),
                     _ => self.a.str_idx(t, n, x, ext, true),
                 }
             }
             MOp::MovBase => self.a.mov(self.r(i, 0), BASE),
+            MOp::MovThread => self.a.mov(self.r(i, 0), THREAD),
             MOp::Uxtw => self.a.mov_w(self.r(i, 0), self.r(i, 1)),
             MOp::Cset => {
                 // SAFETY: selection wrote an `asm::Cond`.
                 let cc: Cond = unsafe { std::mem::transmute(m.cc) };
-                self.a.cset(Sz::W, self.r(i, 0), cc)
+                self.a.cset(asm::Sz::W, self.r(i, 0), cc)
             }
             MOp::Csel => {
                 // SAFETY: selection wrote an `asm::Cond`.
@@ -60,27 +78,36 @@ impl Em<'_> {
             MOp::NegsR => self.a.negs(sz, self.r(i, 0), self.r(i, 1)),
             MOp::FNeg => self.a.fneg(self.fr(i, 0), self.fr(i, 1)),
             MOp::Frintm => self.a.frintm(self.fr(i, 0), self.fr(i, 1)),
-            MOp::AndImm => self.a.and_imm(sz, self.r(i, 0), self.r(i, 1), imm),
-            MOp::TstImm => self.a.tst_imm(sz, self.r(i, 0), imm),
+            MOp::AndImm => self.a.and_imm(sz, self.r(i, 0), self.r(i, 1), imm as u64),
+            MOp::AndWide => {
+                let k = self.v.wide(imm);
+                self.a.and_imm(sz, self.r(i, 0), self.r(i, 1), k)
+            }
+            MOp::TstImm => self.a.tst_imm(sz, self.r(i, 0), imm as u64),
+            MOp::TstWide => self.a.tst_imm(sz, self.r(i, 0), self.v.wide(imm)),
             MOp::AddRR => self.a.add(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::SubRR => self.a.sub(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::MulRR => self.a.mul(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
-            MOp::AddImm => self.a.add_imm(sz, self.r(i, 0), self.r(i, 1), imm),
-            MOp::SubImm => self.a.sub_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::AddImm => self.a.add_imm(sz, self.r(i, 0), self.r(i, 1), imm as u64),
+            MOp::SubImm => self.a.sub_imm(sz, self.r(i, 0), self.r(i, 1), imm as u64),
             MOp::AddsRR => self.a.adds(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::SubsRR => self.a.subs(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
-            MOp::AddsImm => self.a.adds_imm(sz, self.r(i, 0), self.r(i, 1), imm),
-            MOp::SubsImm => self.a.subs_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::AddsImm => self.a.adds_imm(sz, self.r(i, 0), self.r(i, 1), imm as u64),
+            MOp::SubsImm => self.a.subs_imm(sz, self.r(i, 0), self.r(i, 1), imm as u64),
             MOp::CmpRR => self.a.cmp(sz, self.r(i, 0), self.r(i, 1)),
-            MOp::CmpImm => self.a.cmp_imm(sz, self.r(i, 0), imm),
-            MOp::CmnImm => self.a.cmn_imm(sz, self.r(i, 0), imm),
+            MOp::CmpImm => self.a.cmp_imm(sz, self.r(i, 0), imm as u64),
+            MOp::CmnImm => self.a.cmn_imm(sz, self.r(i, 0), imm as u64),
             MOp::CmpSxtw => self.a.cmp_ext(self.r(i, 0), self.r(i, 1), Extend::Sxtw),
             MOp::Fcmp => self.a.fcmp(self.fr(i, 0), self.fr(i, 1)),
-            MOp::LslImm => self.a.lsl_imm(sz, self.r(i, 0), self.r(i, 1), imm as u32),
-            MOp::LsrImm => self.a.lsr_imm(sz, self.r(i, 0), self.r(i, 1), imm as u32),
-            MOp::AsrImm => self.a.asr_imm(sz, self.r(i, 0), self.r(i, 1), imm as u32),
+            MOp::LslImm => self.a.lsl_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::LsrImm => self.a.lsr_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::AsrImm => self.a.asr_imm(sz, self.r(i, 0), self.r(i, 1), imm),
             MOp::Smull => self.a.smull(self.r(i, 0), self.r(i, 1), self.r(i, 2)),
-            MOp::OrrImm => self.a.orr_imm(sz, self.r(i, 0), self.r(i, 1), imm),
+            MOp::OrrImm => self.a.orr_imm(sz, self.r(i, 0), self.r(i, 1), imm as u64),
+            MOp::OrrWide => {
+                let k = self.v.wide(imm);
+                self.a.orr_imm(sz, self.r(i, 0), self.r(i, 1), k)
+            }
             MOp::Scvtf => self.a.scvtf(sz, self.fr(i, 0), self.r(i, 1)),
             MOp::FmovToGpr => self.a.fmov_to_gpr(self.r(i, 0), self.fr(i, 1)),
             MOp::FmovFromGpr => self.a.fmov_from_gpr(self.fr(i, 0), self.r(i, 1)),
@@ -118,34 +145,20 @@ impl Em<'_> {
                 self.a.b_cond(cc, self.exit_labels[imm as usize]);
             }
             MOp::BExit => self.a.b(self.exit_labels[imm as usize]),
-            MOp::Call => {
-                let h = Helper::of(imm as u16);
-                let info = h.info();
-                for (k, c) in info.ctx.iter().enumerate() {
-                    match c {
-                        Ctx::Rt => self.a.mov_imm(Gpr(k as u8), self.rt),
-                        Ctx::Thread => self.a.mov(Gpr(k as u8), THREAD),
-                        Ctx::Base => self.a.mov(Gpr(k as u8), BASE),
-                    }
-                }
-                if info.imm {
-                    self.a.mov_imm(Gpr(info.ctx.len() as u8), imm >> 16);
-                }
-                self.a.bl_far(crate::jit::helpers::address(h));
-            }
+            MOp::Call => (self.a).bl_far(crate::jit::helpers::address(Helper::of(imm as u16))),
             MOp::Ret => {
                 // To a compiled caller, or to `level_land` for a frame
                 // dispatch entered.
-                let (a, n) = (imm & 0xff, imm >> 8);
+                let (a, n) = (imm as u64 & 0xff, imm as u64 >> 8);
                 if n == 0 {
                     self.a.mov_imm(Gpr(0), NIL);
                 } else {
                     self.a.ldr(Gpr(0), BASE, a as i32 * 8);
                 }
                 self.a.ldp(FP, LR, SP, 0);
-                self.a.add_imm(Sz::X, SP, SP, self.frame as u64);
-                self.a.movz(Sz::X, INSN, n as u16, 0);
-                self.a.add_imm(Sz::X, PC, BASE, a * 8);
+                self.a.add_imm(asm::Sz::X, SP, SP, self.frame as u64);
+                self.a.movz(asm::Sz::X, INSN, n as u16, 0);
+                self.a.add_imm(asm::Sz::X, PC, BASE, a * 8);
                 self.a.ret();
             }
         }

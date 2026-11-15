@@ -368,7 +368,7 @@ impl Graph {
                 Op::CallHelper => {
                     let h = &ops::HELPERS[i.aux as usize];
                     let reps = self.run(i.a, i.b).iter().map(|&v| rep_of(v));
-                    i.rep == h.ret && reps.eq(h.args.iter().copied())
+                    i.rep == h.ret && reps.eq(h.operands())
                 }
                 Op::CheckType => i.rep == set.unboxed(),
                 _ => false,

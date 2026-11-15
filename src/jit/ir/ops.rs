@@ -444,6 +444,7 @@ ops! {
     StoreIdx    Both Field  (Ptr I64 Any)     None [] [BY_FIELD] [];
     // The frame's base, which frame fields are loaded from.
     Base        Both No     (No No No)        Ptr  [] [] [];
+    Thread      Both No     (No No No)        Ptr  [] [] [];
     SlotLoad    Both Slot   (No No No)        Val  [SLOT] [] [];
     SlotStore   Both Slot   (Val No No)       None [] [SLOT] [];
 
@@ -515,8 +516,9 @@ ops! {
     Br          Both No     (B1 Blk Blk)      None [] [] [TERMINATOR];
     Ret         Both No     (Imm Imm No)      None [SLOT] [] [TERMINATOR];
 
-    // A C call of the helper in `aux` (`HELPERS`), its immediate in `c`.
-    CallHelper  Both Helper (Vals Len Imm)    Dyn  [] [] [CALLS];
+    // A C call of the helper in `aux` (`HELPERS`): its context values, its
+    // immediate where it has one, then its operands (`Emitter::call`).
+    CallHelper  Both Helper (Vals Len No)     Dyn  [] [] [CALLS];
 
     // Unit ops: optimized as wholes, lowered by copy 1.
     CheckType   H    SetTag (Val Fs No)       Dyn  [] [] [EXITS];
@@ -571,7 +573,8 @@ impl Op {
     }
 }
 
-/// A pinned register a helper takes ahead of its operands.
+/// What a helper takes ahead of its operands: the runtime's address, the
+/// thread, the frame's base. Each is an operand of its call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Ctx {
     Rt,
@@ -579,13 +582,13 @@ pub(crate) enum Ctx {
     Base,
 }
 
-/// A helper's C signature and effects: the pinned registers, then an
+/// A helper's C signature and effects: the context values, then an
 /// immediate where its call has one, then the operands, each in the next
 /// argument register of its class.
 pub(crate) struct HelperInfo {
     pub(crate) name: &'static str,
     pub(crate) ctx: &'static [Ctx],
-    /// Whether an immediate follows the pinned registers.
+    /// Whether an immediate follows the context values.
     pub(crate) imm: bool,
     pub(crate) args: &'static [Rep],
     pub(crate) ret: Rep,
@@ -689,6 +692,17 @@ helpers! {
     StrByte      NONE   0 (Ptr I32)     Val  [] [] [];
     TInsert      RT     0 (Val Val)     Val  [TABLE] [TABLE] [ALLOCS];
     TRemove      RT     0 (Val)         Val  [TABLE] [TABLE] [ALLOCS];
+}
+
+impl HelperInfo {
+    /// The representations of a call's whole operand list.
+    pub(crate) fn operands(&self) -> impl Iterator<Item = Rep> + '_ {
+        let ctx = self.ctx.iter().map(|c| match c {
+            Ctx::Rt => Rep::I64,
+            Ctx::Thread | Ctx::Base => Rep::Ptr,
+        });
+        (ctx.chain(self.imm.then_some(Rep::I64))).chain(self.args.iter().copied())
+    }
 }
 
 impl Helper {

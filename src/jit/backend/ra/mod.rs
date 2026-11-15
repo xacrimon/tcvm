@@ -30,7 +30,7 @@ mod scan;
 mod tests;
 
 use crate::jit::backend::reg::{Allocation, Block, Inst, PReg, ProgPoint, RegClass, VReg};
-use crate::jit::backend::vcode::{TargetInst, VCode};
+use crate::jit::backend::vcode::VCode;
 
 /// What goes between two instructions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,9 +65,9 @@ pub(crate) enum InstOrEdit<'a> {
 }
 
 impl Output {
-    pub(crate) fn inst_allocs<I: TargetInst>(&self, f: &VCode<I>, inst: Inst) -> &[Allocation] {
-        let (a, b) = f.ops[inst.index()];
-        &self.allocs[a as usize..b as usize]
+    pub(crate) fn inst_allocs(&self, f: &VCode, inst: Inst) -> &[Allocation] {
+        let (a, n) = f.operands_of(inst.index());
+        &self.allocs[a as usize..a as usize + n]
     }
 
     /// The edits on edge `k` of the branch `inst`.
@@ -79,9 +79,9 @@ impl Output {
     }
 
     /// A block's instructions with the edits before each.
-    pub(crate) fn block_insts_and_edits<'a, I: TargetInst>(
+    pub(crate) fn block_insts_and_edits<'a>(
         &'a self,
-        f: &VCode<I>,
+        f: &VCode,
         block: Block,
     ) -> impl Iterator<Item = InstOrEdit<'a>> + 'a {
         let range = f.block_insns(block);
@@ -118,6 +118,8 @@ pub(crate) struct Env {
     /// An integer register never allocated, carrying stack-to-stack moves
     /// (64 bits, any class).
     pub(crate) transport: PReg,
+    /// The C convention's registers, which the opcode table's rows name.
+    pub(crate) c: crate::jit::backend::vcode::CAbi,
 }
 
 fn class_index(c: RegClass) -> usize {
@@ -420,12 +422,7 @@ impl Ctx {
 
     /// Allocate `f`'s registers, its blocks taken in `order`: the first
     /// `hot` of them hot, the rest (exits, cold arms) after them all.
-    pub(crate) fn run<I: TargetInst>(
-        &mut self,
-        f: &VCode<I>,
-        order: &[u32],
-        hot: usize,
-    ) -> Result<Output, String> {
+    pub(crate) fn run(&mut self, f: &VCode, order: &[u32], hot: usize) -> Result<Output, String> {
         let Parts {
             ra,
             live,
@@ -567,15 +564,19 @@ struct Ra {
 /// definition with any use, a late definition with a late use, two
 /// definitions.
 #[cfg(feature = "tcvm-dev")]
-pub(crate) fn check_operands<I: TargetInst>(v: &VCode<I>, out: &Output) -> Result<(), String> {
+pub(crate) fn check_operands(
+    v: &VCode,
+    abi: &crate::jit::backend::vcode::CAbi,
+    out: &Output,
+) -> Result<(), String> {
     use crate::jit::backend::reg::OperandKind::{Def, Use};
     use crate::jit::backend::reg::OperandPos::{Early, Late};
     for i in 0..v.insts.len() {
-        let ops = v.inst_operands_of(i);
+        let n = v.operands_of(i).1;
         let al = out.inst_allocs(v, Inst::new(i));
-        for a in 0..ops.len() {
-            for b in a + 1..ops.len() {
-                let (oa, ob) = (ops[a], ops[b]);
+        for a in 0..n {
+            for b in a + 1..n {
+                let (oa, ob) = (v.operand(abi, i, a), v.operand(abi, i, b));
                 if !al[a].is_reg() || al[a] != al[b] || oa.vreg() == ob.vreg() {
                     continue;
                 }
@@ -599,7 +600,7 @@ pub(crate) fn check_operands<I: TargetInst>(v: &VCode<I>, out: &Output) -> Resul
 /// For the checker: per vreg, whether it may be computed again, and the
 /// value it is computed from.
 #[cfg(feature = "tcvm-dev")]
-pub(crate) fn remat_table<I: TargetInst>(f: &VCode<I>) -> (Vec<bool>, Vec<Option<VReg>>) {
+pub(crate) fn remat_table(f: &VCode) -> (Vec<bool>, Vec<Option<VReg>>) {
     use crate::jit::backend::vcode::Remat;
     let remat = f.remat.iter().map(|&r| r != Remat::None).collect();
     let src = (f.remat.iter())
@@ -710,12 +711,7 @@ impl Ra {
 
     /// The linear order (`order.rs`'s `emit`, over blocks numbered by its
     /// `order`), its loops (`VCode::loop_of`), and the static frequencies.
-    fn layout<I: TargetInst>(
-        &mut self,
-        f: &VCode<I>,
-        order: &[u32],
-        hot: usize,
-    ) -> Result<(), String> {
+    fn layout(&mut self, f: &VCode, order: &[u32], hot: usize) -> Result<(), String> {
         let nb = f.num_blocks();
         if order.len() != nb {
             return Err("an order not of every block".into());
@@ -795,11 +791,12 @@ impl Ra {
     }
 
     /// Live-in sets by a backward dataflow fixpoint.
-    fn liveness<I: TargetInst>(&mut self, f: &VCode<I>, t: &mut Live) -> Result<(), String> {
+    fn liveness(&mut self, f: &VCode, t: &mut Live) -> Result<(), String> {
         use crate::jit::backend::reg::{OperandConstraint, OperandKind};
         let nb = f.num_blocks();
         let w = f.num_vregs().div_ceil(64);
         self.words = w;
+        let abi = &self.env.c;
         let Live {
             gen_,
             kill,
@@ -827,8 +824,10 @@ impl Ra {
                 kill.push(p.vreg() as u32);
             }
             for i in f.block_insns(Block::new(b)).iter() {
-                let ops = f.inst_operands(i);
-                for op in ops {
+                let i = i.index();
+                let n = f.operands_of(i).1;
+                for k in 0..n {
+                    let op = f.operand(abi, i, k);
                     if op.kind() == OperandKind::Use {
                         let v = op.vreg().vreg();
                         if !has(out, v) {
@@ -842,7 +841,8 @@ impl Ra {
                         }
                     }
                 }
-                for op in ops {
+                for k in 0..n {
+                    let op = f.operand(abi, i, k);
                     if op.kind() == OperandKind::Def {
                         set(out, op.vreg().vreg());
                         kill.push(op.vreg().vreg() as u32);
@@ -1036,7 +1036,7 @@ impl Ra {
 impl Ctx {
     /// Each group's intervals, uses and pieces with their locations and
     /// what cut them (`TCVM_JIT_DUMP=ra`), positions as `<inst><e|l>`.
-    pub(crate) fn print<I: TargetInst>(&self, f: &VCode<I>) -> String {
+    pub(crate) fn print(&self, f: &VCode) -> String {
         use std::fmt::Write;
         let ra = &self.0.ra;
         let pos = |p: Pos| {

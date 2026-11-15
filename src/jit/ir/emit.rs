@@ -5,7 +5,7 @@
 //! the instruction makes known.
 
 use super::fields::Field;
-use super::ops::{Arg, Aux, Cc, Dialect, ExitKind, ExitTag, Flags, Heaps, Helper, Op};
+use super::ops::{Arg, Aux, Cc, Ctx, Dialect, ExitKind, ExitTag, Flags, Heaps, Helper, Op};
 use super::table::{self, Key, Snap, Table};
 use super::types::{Fact, FactFlags, Rep, TypeSet};
 use super::{Block, BlockData, BlockFlags, Graph, Inst, Loop, LoopData, Val};
@@ -91,7 +91,11 @@ pub(crate) struct Emitter {
     /// Sticky: once set, `emit` appends nothing and its results mean
     /// nothing; the caller stops at its next block.
     pub(crate) bail: Option<Bail>,
+    /// The runtime's address, which helpers take (`call`).
+    pub(crate) rt: u64,
     scratch: Vec<Snap>,
+    /// A call's operand list while `call` builds it.
+    list: Vec<Val>,
 }
 
 impl Default for Block {
@@ -745,11 +749,34 @@ impl Emitter {
     }
 
     /// A C call of `h` with `args`, and `imm` where it takes an immediate.
+    /// A call of `h`: its context values and immediate, by its row, ahead
+    /// of `args`.
     pub(crate) fn call(&mut self, h: Helper, imm: u32, args: &[Val]) -> Val {
+        let info = h.info();
+        let mut list = std::mem::take(&mut self.list);
+        list.clear();
+        for c in info.ctx {
+            list.push(match c {
+                Ctx::Rt => self.k64(Rep::I64, self.rt),
+                Ctx::Thread => self.emit(Op::Thread, Rep::Ptr, 0, 0, 0, 0),
+                Ctx::Base => self.emit(Op::Base, Rep::Ptr, 0, 0, 0, 0),
+            });
+        }
+        if info.imm {
+            list.push(self.k64(Rep::I64, imm as u64));
+        }
+        list.extend_from_slice(args);
+        let v = self.call_with(h, &list);
+        self.list = list;
+        v
+    }
+
+    /// A call of `h` with its whole operand list.
+    pub(crate) fn call_with(&mut self, h: Helper, list: &[Val]) -> Val {
         let at = self.g.extra.len() as u32;
-        self.g.extra.extend(args.iter().map(|v| v.0));
-        let n = args.len() as u32;
-        self.emit(Op::CallHelper, h.info().ret, h as u16, at, n, imm)
+        self.g.extra.extend(list.iter().map(|v| v.0));
+        let n = list.len() as u32;
+        self.emit(Op::CallHelper, h.info().ret, h as u16, at, n, 0)
     }
 
     /// Check that the `Val` is in `set`, leaving with `tag` to `fs`

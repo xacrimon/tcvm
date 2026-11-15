@@ -7,7 +7,7 @@ use super::{Edit, Ivs, Loc, NONE, Need, Output, Pos, Ra, STACK, Want, class_inde
 use crate::jit::backend::reg::{
     Allocation, Block, Inst, OperandKind, ProgPoint, RegClass, SpillSlot, VReg,
 };
-use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
+use crate::jit::backend::vcode::{Remat, VCode};
 
 /// A move of a value of class `cls`, or with `remat` its computation
 /// again from `from` (`Allocation::none()` for a constant).
@@ -95,11 +95,7 @@ impl Resolve {
 }
 
 impl Ra {
-    pub(super) fn resolve<I: TargetInst>(
-        &mut self,
-        f: &VCode<I>,
-        t: &mut Resolve,
-    ) -> Result<Output, String> {
+    pub(super) fn resolve(&mut self, f: &VCode, t: &mut Resolve) -> Result<Output, String> {
         self.index_pieces(&mut t.split);
         self.slot_derived(f);
         self.color_slots(t);
@@ -216,7 +212,7 @@ impl Ra {
         for k in 0..self.ties.len() {
             let (t, d, at) = self.ties[k];
             let to = self.allocs[d as usize];
-            let v = f.operands[t as usize].vreg().vreg() as u32;
+            let v = f.operand_at(&self.env.c, t).vreg().vreg() as u32;
             let m = self.mv(f, v, at, to, self.vregs[v as usize].class);
             if m.remat || m.from != m.to {
                 moves.push((at / 2, FIXED_COPY, m));
@@ -316,15 +312,7 @@ impl Ra {
 
     /// A move of group `g`'s value at `p` (`mv`), named for the member live
     /// there; for none, it names no value.
-    fn mv_member<I: TargetInst>(
-        &self,
-        f: &VCode<I>,
-        g: u32,
-        p: Pos,
-        at: Pos,
-        to: Allocation,
-        cls: u8,
-    ) -> Mv {
+    fn mv_member(&self, f: &VCode, g: u32, p: Pos, at: Pos, to: Allocation, cls: u8) -> Mv {
         let v = self.member_at(g, p);
         let mut m = self.mv(f, v.unwrap_or(g), at, to, cls);
         if v.is_none() {
@@ -357,7 +345,7 @@ impl Ra {
     /// Dropping a dead write can leave an older value in place, so the passes
     /// repeat while the backward one finds more.
     #[inline(never)]
-    fn cleanup<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve) {
+    fn cleanup(&self, f: &VCode, t: &mut Resolve) {
         t.dead.resize(t.sorted.len(), false);
         if f.num_vregs() >= UNKNOWN as usize {
             return;
@@ -392,9 +380,10 @@ impl Ra {
                 k += 1;
             }
             // Reads before writes: backward, the writes kill first.
-            let base = f.ops[i.index()].0 as usize;
-            let ops = f.inst_operands(i);
-            for (k, op) in ops.iter().enumerate() {
+            let (base, n) = f.operands_of(i.index());
+            let base = base as usize;
+            for k in 0..n {
+                let op = f.operand(&self.env.c, i.index(), k);
                 if op.kind() == OperandKind::Use
                     && self.allocs[base + k].is_reg()
                     && let Some(l) = self.loc_index(self.allocs[base + k])
@@ -403,7 +392,7 @@ impl Ra {
                 }
             }
             let mut m = [0u32; 2];
-            for r in f.inst_clobbers(i) {
+            for r in f.inst_clobbers(&self.env.c, i) {
                 let k = self.reg_idx[r.index()];
                 if k != NONE {
                     m[class_index(r.class())] |= 1 << k;
@@ -414,7 +403,8 @@ impl Ra {
                     eff.push((*tag, m));
                 }
             }
-            for (k, op) in ops.iter().enumerate() {
+            for k in 0..n {
+                let op = f.operand(&self.env.c, i.index(), k);
                 if op.kind() == OperandKind::Def
                     && let Some(l) = self.loc_index(self.allocs[base + k])
                 {
@@ -429,12 +419,7 @@ impl Ra {
     }
 
     /// Block `b`'s effects, and its last instruction's.
-    fn effects<I: TargetInst>(
-        &self,
-        f: &VCode<I>,
-        eoff: &[u32],
-        b: usize,
-    ) -> ((usize, usize), (usize, usize)) {
+    fn effects(&self, f: &VCode, eoff: &[u32], b: usize) -> ((usize, usize), (usize, usize)) {
         let r = f.block_insns(Block::new(b));
         let (first, last) = (r.first().index(), r.last().index());
         (
@@ -515,7 +500,7 @@ impl Ra {
     /// Forward: what each location holds on every path (`NONE` for
     /// unknown), a fixpoint from the entry; then a pass marking the moves
     /// changing nothing. Whether any was.
-    fn redundant<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve, width: usize) -> bool {
+    fn redundant(&self, f: &VCode, t: &mut Resolve, width: usize) -> bool {
         let Resolve {
             sorted,
             dead,
@@ -709,7 +694,7 @@ impl Ra {
     /// block's reads before any write (`reads`) and writes (`kill`) are
     /// summarized once, the fixpoint from the end runs on the sets, and one
     /// exact walk marks the unread moves. Whether any was.
-    fn unread<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve, width: usize) -> bool {
+    fn unread(&self, f: &VCode, t: &mut Resolve, width: usize) -> bool {
         let Resolve {
             sorted,
             dead,
@@ -861,7 +846,7 @@ impl Ra {
     /// a load and the computation where reloading it costs the load alone:
     /// one spilled where its source is on the stack gets a slot, stored
     /// after its definition, when that is in a register.
-    fn slot_derived<I: TargetInst>(&mut self, f: &VCode<I>) {
+    fn slot_derived(&mut self, f: &VCode) {
         for v in 0..self.vregs.len() {
             let Remat::AndImm { src, .. } = f.remat[v] else {
                 continue;
@@ -959,21 +944,13 @@ impl Ra {
     /// The move of `v` to `to` from where it is at `at`: computed again when
     /// it is there (a constant from nothing, a derived value from its
     /// source's location at `at`).
-    fn mv<I: TargetInst>(&self, f: &VCode<I>, v: u32, at: Pos, to: Allocation, cls: u8) -> Mv {
+    fn mv(&self, f: &VCode, v: u32, at: Pos, to: Allocation, cls: u8) -> Mv {
         let from = self.alloc_at(v, at).expect("live where it moves");
         self.mv_from(f, v, from, at, to, cls)
     }
 
     /// `mv` with `v`'s location at `at` known.
-    fn mv_from<I: TargetInst>(
-        &self,
-        f: &VCode<I>,
-        v: u32,
-        from: Allocation,
-        at: Pos,
-        to: Allocation,
-        cls: u8,
-    ) -> Mv {
+    fn mv_from(&self, f: &VCode, v: u32, from: Allocation, at: Pos, to: Allocation, cls: u8) -> Mv {
         match (from.is_none(), f.remat[v as usize]) {
             // The source nowhere is in its frame slot (`Remat::Slot`).
             (true, Remat::AndImm { src, .. }) => {
@@ -990,7 +967,7 @@ impl Ra {
     /// which a return enters past its moves), else on the predecessor's.
     /// Only values of split groups can be in two places.
     #[inline(never)]
-    fn edge_moves<I: TargetInst>(&self, f: &VCode<I>, t: &mut Resolve) -> Result<(), String> {
+    fn edge_moves(&self, f: &VCode, t: &mut Resolve) -> Result<(), String> {
         let Resolve {
             split,
             moves,

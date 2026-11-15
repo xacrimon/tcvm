@@ -6,7 +6,7 @@ use std::cmp::Reverse;
 
 use super::{FIXED, Held, Loc, MAX_REGS, NONE, Piece, Pos, Ra, Want, Why, intersect};
 use crate::jit::backend::reg::PReg;
-use crate::jit::backend::vcode::{TargetInst, VCode};
+use crate::jit::backend::vcode::VCode;
 
 type Regs = [Pos; MAX_REGS];
 
@@ -23,7 +23,7 @@ struct Avail {
 }
 
 impl Ra {
-    pub(super) fn scan<I: TargetInst>(&mut self, f: &VCode<I>) -> Result<(), String> {
+    pub(super) fn scan(&mut self, f: &VCode) -> Result<(), String> {
         // Every step moves forward, so a function of `n` instructions takes
         // far fewer; past this the scan is going round in circles.
         let mut budget = 64 * self.at_lin.len() + 10_000;
@@ -342,7 +342,7 @@ impl Ra {
         self.pieces[c as usize].loc = Loc::Reg(r);
     }
 
-    fn process<I: TargetInst>(&mut self, f: &VCode<I>, c: u32) -> Result<(), String> {
+    fn process(&mut self, f: &VCode, c: u32) -> Result<(), String> {
         // A value computed again is made where a register first serves it
         // (V8 spills a range with a spill operand until then): holding it
         // before costs a materialization on each path into the stretch
@@ -521,7 +521,7 @@ impl Ra {
 
     /// The first block inside piece `c` that a hot edge from outside it
     /// enters, back edges aside.
-    fn entered_without<I: TargetInst>(&self, f: &VCode<I>, c: u32) -> Option<Pos> {
+    fn entered_without(&self, f: &VCode, c: u32) -> Option<Pos> {
         let (s, e) = (self.start(c), self.end(c));
         for &b in &self.order[self.rank[self.block_of_pos(s) as usize] as usize + 1..] {
             let j = b.index() as u32;

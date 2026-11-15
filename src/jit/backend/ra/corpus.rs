@@ -6,21 +6,69 @@ use super::{Edit, Env, Output};
 use crate::jit::backend::reg::Allocation;
 #[cfg(test)]
 use crate::jit::backend::reg::{Inst, PReg, ProgPoint, RegClass, VReg};
-use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
-
-const MAGIC: u32 = 0x5241_0003;
-/// Format 2: no edge edits (every edge was split).
 #[cfg(test)]
-const MAGIC_2: u32 = 0x5241_0002;
+use crate::jit::backend::vcode::{CAbi, Clobbers, Flow, List, MInst, Pin, Row};
+use crate::jit::backend::vcode::{Constraint, Remat, Slot, VCode};
+
+/// Format 4: instruction records, the pool and the opcode table they are
+/// read through. Earlier formats held operand lists and are refused.
+const MAGIC: u32 = 0x5241_0004;
+
+fn slot_bits(s: Slot) -> u32 {
+    match s {
+        Slot::None => 0,
+        Slot::Imm => 1,
+        Slot::Wide => 2,
+        Slot::Start => 3,
+        Slot::Len => 4,
+        Slot::Reg {
+            class,
+            def,
+            late,
+            constraint,
+        } => {
+            let (tag, x) = match constraint {
+                Constraint::Any => (0, 0),
+                Constraint::Tied(k) => (1, k as u32),
+                Constraint::Fixed(p) => (2, p.index() as u32),
+            };
+            5 | (class as u32) << 4 | (def as u32) << 6 | (late as u32) << 7 | tag << 8 | x << 12
+        }
+    }
+}
+
+#[cfg(test)]
+fn slot(bits: u32) -> Slot {
+    match bits & 15 {
+        0 => Slot::None,
+        1 => Slot::Imm,
+        2 => Slot::Wide,
+        3 => Slot::Start,
+        4 => Slot::Len,
+        _ => Slot::Reg {
+            class: class(bits >> 4 & 3),
+            def: bits >> 6 & 1 != 0,
+            late: bits >> 7 & 1 != 0,
+            constraint: match bits >> 8 & 15 {
+                0 => Constraint::Any,
+                1 => Constraint::Tied((bits >> 12) as u8),
+                _ => Constraint::Fixed(PReg::from_index((bits >> 12) as usize)),
+            },
+        },
+    }
+}
+
+#[cfg(test)]
+fn class(x: u32) -> RegClass {
+    match x {
+        0 => RegClass::Int,
+        1 => RegClass::Float,
+        _ => RegClass::Vector,
+    }
+}
 
 /// One compile's allocation problem and the allocation it got.
-pub(crate) fn write<I: TargetInst>(
-    f: &VCode<I>,
-    env: &Env,
-    order: &[u32],
-    hot: usize,
-    out: &Output,
-) -> Vec<u8> {
+pub(crate) fn write(f: &VCode, env: &Env, order: &[u32], hot: usize, out: &Output) -> Vec<u8> {
     let mut w = W(Vec::new());
     w.u32(MAGIC);
     for regs in &env.regs {
@@ -28,16 +76,25 @@ pub(crate) fn write<I: TargetInst>(
     }
     w.list(env.scratch.iter().map(|r| r.index() as u32));
     w.u32(env.transport.index() as u32);
-    w.u32(f.num_insts() as u32);
-    for i in 0..f.num_insts() {
-        w.u32(f.insts[i].is_branch() as u32);
-        let ops = f.inst_operands_of(i);
-        w.u32(ops.len() as u32);
-        for op in ops {
-            w.u64(op.bits());
-        }
-        w.list(f.clobbers[i].into_iter().map(|r| r.index() as u32));
+    for args in &env.c.args {
+        w.list(args.iter().map(|r| r.index() as u32));
     }
+    w.list(env.c.ret.iter().map(|r| r.index() as u32));
+    w.list(env.c.caller_saved.into_iter().map(|r| r.index() as u32));
+    w.u32(f.rows.len() as u32);
+    for row in f.rows {
+        w.list(row.slots.iter().map(|&s| slot_bits(s)));
+        w.u32(row.list as u32);
+        w.u32(row.clobbers as u32);
+        w.u32(row.flow as u32);
+        w.u32(row.remat as u32 | (row.pseudo as u32) << 1);
+    }
+    w.u32(f.num_insts() as u32);
+    for m in &f.insts {
+        w.u32(m.op as u32 | (m.sz as u32) << 8 | (m.cc as u32) << 16 | (m.n as u32) << 24);
+        w.list(m.ops);
+    }
+    w.list(f.pool.iter().copied());
     w.u32(f.num_blocks() as u32);
     for b in 0..f.num_blocks() {
         let rb = crate::jit::backend::reg::Block::new(b);
@@ -60,6 +117,7 @@ pub(crate) fn write<I: TargetInst>(
             Remat::Float(x) => (2, x, 0),
             Remat::AndImm { src, imm } => (3, src as u64, imm),
             Remat::Slot(r) => (4, r as u64, 0),
+            Remat::Pinned(p) => (5, p as u64, 0),
         };
         w.u32(tag);
         w.u64(a);
@@ -99,11 +157,11 @@ pub(crate) fn write<I: TargetInst>(
     w.0
 }
 
-/// A recorded compile: the function (each instruction made by `mk` from
-/// whether it is a branch), the registers, the order, and its allocation.
+/// A recorded compile: the function with its opcode table, the registers,
+/// the order, and its allocation.
 #[cfg(test)]
-pub(crate) struct Case<I> {
-    pub(crate) f: VCode<I>,
+pub(crate) struct Case {
+    pub(crate) f: VCode,
     pub(crate) env: Env,
     pub(crate) order: Vec<u32>,
     pub(crate) hot: usize,
@@ -111,28 +169,68 @@ pub(crate) struct Case<I> {
 }
 
 #[cfg(test)]
-pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Case<I>, String> {
-    use crate::jit::backend::reg::{Block, Operand, PRegSet};
+pub(crate) fn read(d: &[u8]) -> Result<Case, String> {
+    use crate::jit::backend::reg::{Block, PRegSet};
     let mut r = R(d, 0);
-    let magic = r.u32();
-    if magic != MAGIC && magic != MAGIC_2 {
-        return Err("not a recorded allocation".into());
+    if r.u32() != MAGIC {
+        return Err("not a recorded allocation of this format".into());
     }
     let preg = |x: u32| PReg::from_index(x as usize);
     let regs = [r.list().map(preg).collect(), r.list().map(preg).collect()];
     let s: Vec<PReg> = r.list().map(preg).collect();
+    let transport = preg(r.u32());
+    let args: Vec<Vec<PReg>> = (0..2).map(|_| r.list().map(preg).collect()).collect();
+    let ret: Vec<PReg> = r.list().map(preg).collect();
+    let caller_saved: PRegSet = r.list().map(preg).collect();
     let env = Env {
         regs,
         scratch: [s[0], s[1]],
-        transport: preg(r.u32()),
+        transport,
+        c: CAbi {
+            args: [0, 1].map(|c| std::array::from_fn(|k| args[c][k])),
+            ret: [ret[0], ret[1]],
+            caller_saved,
+        },
     };
-    let mut f = VCode::new();
-    for _ in 0..r.u32() {
-        let br = r.u32() != 0;
-        let n = r.u32();
-        let ops: Vec<Operand> = (0..n).map(|_| Operand::from_bits(r.u64())).collect();
-        let clob: PRegSet = r.list().map(preg).collect();
-        f.push(mk(br), &ops, clob);
+    let rows: Vec<Row> = (0..r.u32())
+        .map(|_| {
+            let slots: Vec<Slot> = r.list().map(slot).collect();
+            let (list, clobbers, flow, flags) = (r.u32(), r.u32(), r.u32(), r.u32());
+            Row {
+                name: "",
+                slots: [slots[0], slots[1], slots[2]],
+                list: [List::None, List::CArgs, List::AnyLoc][list as usize],
+                clobbers: [Clobbers::None, Clobbers::CallerSaved][clobbers as usize],
+                flow: [
+                    Flow::Fall,
+                    Flow::Jump,
+                    Flow::Branch,
+                    Flow::CondExit,
+                    Flow::Exit,
+                ][flow as usize],
+                remat: flags & 1 != 0,
+                pseudo: flags & 2 != 0,
+            }
+        })
+        .collect();
+    // The pool is read before the instructions count their lists.
+    let insts: Vec<MInst> = (0..r.u32())
+        .map(|_| {
+            let w = r.u32();
+            let ops: Vec<u32> = r.list().collect();
+            MInst {
+                op: w as u8,
+                sz: (w >> 8) as u8,
+                cc: (w >> 16) as u8,
+                n: (w >> 24) as u8,
+                ops: [ops[0], ops[1], ops[2]],
+            }
+        })
+        .collect();
+    let mut f = VCode::new(rows.leak());
+    f.pool = r.list().collect();
+    for m in insts {
+        f.push(m);
     }
     for _ in 0..r.u32() {
         let (start, end, resume) = (r.u32(), r.u32(), r.u32() != 0);
@@ -148,12 +246,7 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
         f.push_block(start, end, &succs, preds, params, &args, &nargs, resume);
     }
     for _ in 0..r.u32() {
-        let class = match r.u32() {
-            0 => RegClass::Int,
-            1 => RegClass::Float,
-            _ => RegClass::Vector,
-        };
-        let v = f.new_vreg(class);
+        let v = f.new_vreg(class(r.u32()));
         let (tag, a, b) = (r.u32(), r.u64(), r.u64());
         f.remat[v.vreg()] = match tag {
             0 => Remat::None,
@@ -163,7 +256,8 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
                 src: a as u32,
                 imm: b,
             },
-            _ => Remat::Slot(a as u8),
+            4 => Remat::Slot(a as u8),
+            _ => Remat::Pinned([Pin::Base, Pin::Thread][a as usize]),
         };
     }
     f.entry = Block::new(r.u32() as usize);
@@ -189,7 +283,7 @@ pub(crate) fn read<I: TargetInst>(d: &[u8], mk: impl Fn(bool) -> I) -> Result<Ca
             (p, edit(&mut r))
         })
         .collect();
-    let edge_edits = (0..if magic == MAGIC { r.u32() } else { 0 })
+    let edge_edits = (0..r.u32())
         .map(|_| {
             let i = Inst::new(r.u32() as usize);
             let k = r.u32() as u8;

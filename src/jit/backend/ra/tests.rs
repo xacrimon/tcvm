@@ -1,41 +1,18 @@
-//! Random functions shaped like lowering's (loops and joins with block
-//! parameters, calls into resume blocks clobbering everything, helpers with
-//! fixed registers, snapshot uses), allocated with few registers and
-//! checked by the vendored checker and for operands sharing a register
-//! within an instruction, which that checker does not see.
+//! Random functions shaped like selection's (loops and joins with block
+//! parameters, helpers with fixed registers, frame-state uses), allocated
+//! with few registers and checked by the vendored checker and for operands
+//! sharing a register within an instruction, which that checker does not
+//! see. An instruction is a record read through a row of a table each
+//! function makes for itself: what no row can say, no test asks.
 
 use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg64;
 
 use super::{Ctx, Env, Output};
-use crate::jit::backend::reg::{
-    Block as RBlock, Inst, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
-    ProgPoint, RegClass, VReg,
+use crate::jit::backend::reg::{Block as RBlock, Inst, PReg, PRegSet, ProgPoint, RegClass, VReg};
+use crate::jit::backend::vcode::{
+    CAbi, Clobbers, Constraint, Flow, List, MInst, Remat, Row, Slot, VCode,
 };
-use crate::jit::backend::vcode::{Flow, Remat, TargetInst, VCode};
-
-#[derive(Clone, Debug)]
-enum T {
-    Op,
-    Jump,
-    Br,
-    Call,
-    Ret,
-}
-
-impl TargetInst for T {
-    fn is_branch(&self) -> bool {
-        matches!(self, T::Jump | T::Br | T::Call)
-    }
-
-    fn flow(&self) -> Flow {
-        Flow::Other
-    }
-
-    fn is_remat(&self) -> bool {
-        false
-    }
-}
 
 const INTS: [usize; 8] = [0, 1, 2, 3, 4, 5, 19, 20];
 const FLOATS: [usize; 5] = [0, 1, 2, 3, 8];
@@ -48,6 +25,7 @@ fn float(r: usize) -> PReg {
     PReg::new(r, RegClass::Float)
 }
 
+/// Arguments in x0.. and d0.., a result in x0 or d0.
 fn env() -> Env {
     Env {
         regs: [
@@ -56,6 +34,11 @@ fn env() -> Env {
         ],
         scratch: [int(17), float(31)],
         transport: int(16),
+        c: CAbi {
+            args: [INTS.map(int), [0, 1, 2, 3, 8, 9, 10, 11].map(float)],
+            ret: [int(0), float(0)],
+            caller_saved: caller_saved(),
+        },
     }
 }
 
@@ -73,19 +56,81 @@ fn caller_saved() -> PRegSet {
     s
 }
 
+/// A register slot's part: defined or used, at the late point or the
+/// early one, and where.
+type Part = (bool, bool, Constraint);
+const USE: Part = (false, false, Constraint::Any);
+const DEF: Part = (true, true, Constraint::Any);
+
+/// An instruction before its row has a number: its register slots, its
+/// list (`n` definitions first), and the row's other columns.
+#[derive(Clone)]
+struct I {
+    regs: Vec<(VReg, Part)>,
+    list: List,
+    words: Vec<VReg>,
+    n: u8,
+    clobbers: Clobbers,
+    flow: Flow,
+}
+
+impl I {
+    fn new(regs: &[(VReg, Part)]) -> I {
+        I {
+            regs: regs.to_vec(),
+            list: List::None,
+            words: Vec::new(),
+            n: 0,
+            clobbers: Clobbers::None,
+            flow: Flow::Fall,
+        }
+    }
+
+    fn with_list(mut self, list: List, n: u8, words: Vec<VReg>) -> I {
+        (self.list, self.n, self.words) = (list, n, words);
+        self
+    }
+
+    fn row(&self) -> Row {
+        let mut slots = [Slot::None; 3];
+        for (s, &(v, (def, late, constraint))) in slots.iter_mut().zip(&self.regs) {
+            *s = Slot::Reg {
+                class: v.class(),
+                def,
+                late,
+                constraint,
+            };
+        }
+        if self.list != List::None {
+            let k = self.regs.len();
+            (slots[k], slots[k + 1]) = (Slot::Start, Slot::Len);
+        }
+        let row = Row {
+            name: "t",
+            slots,
+            list: self.list,
+            clobbers: self.clobbers,
+            flow: self.flow,
+            remat: false,
+            pseudo: false,
+        };
+        row.check().expect("a row the decoder reads");
+        row
+    }
+}
+
 #[derive(Default)]
 struct B {
-    insts: Vec<(T, Vec<Operand>, PRegSet)>,
+    insts: Vec<I>,
     params: Vec<VReg>,
     succs: Vec<u32>,
     args: Vec<Vec<VReg>>,
     preds: Vec<u32>,
-    resume: bool,
 }
 
 struct Gen {
     rng: Pcg64,
-    v: VCode<T>,
+    v: VCode,
     blocks: Vec<B>,
     /// Blocks made inside a cold arm, which the order puts last.
     cold: Vec<bool>,
@@ -93,6 +138,16 @@ struct Gen {
 }
 
 impl Gen {
+    fn new(seed: u64, v: VCode) -> Gen {
+        Gen {
+            rng: Pcg64::seed_from_u64(seed),
+            v,
+            blocks: Vec::new(),
+            cold: Vec::new(),
+            in_cold: false,
+        }
+    }
+
     fn block(&mut self) -> u32 {
         self.cold.push(self.in_cold);
         self.blocks.push(B::default());
@@ -118,9 +173,7 @@ impl Gen {
             return v;
         }
         let v = self.v.new_vreg(c);
-        self.blocks[b as usize]
-            .insts
-            .push((T::Op, vec![Operand::reg_def(v)], PRegSet::empty()));
+        self.blocks[b as usize].insts.push(I::new(&[(v, DEF)]));
         avail.push(v);
         v
     }
@@ -144,17 +197,11 @@ impl Gen {
             .collect()
     }
 
-    fn snapshot(&mut self, ops: &mut Vec<Operand>, avail: &[VReg]) {
-        for _ in 0..self.rng.random_range(0..6) {
-            if let Some(v) = self.pick(avail) {
-                ops.push(Operand::new(
-                    v,
-                    OperandConstraint::Any,
-                    OperandKind::Use,
-                    OperandPos::Late,
-                ));
-            }
-        }
+    /// A frame state's values.
+    fn snapshot(&mut self, avail: &[VReg]) -> Vec<VReg> {
+        (0..self.rng.random_range(0..6))
+            .filter_map(|_| self.pick(avail))
+            .collect()
     }
 
     fn op(&mut self, b: u32, avail: &mut Vec<VReg>) {
@@ -169,11 +216,7 @@ impl Gen {
             } else {
                 Remat::Int(self.rng.random())
             };
-            self.blocks[b as usize].insts.push((
-                T::Op,
-                vec![Operand::reg_def(d)],
-                PRegSet::empty(),
-            ));
+            self.blocks[b as usize].insts.push(I::new(&[(d, DEF)]));
             avail.push(d);
             return;
         }
@@ -191,20 +234,17 @@ impl Gen {
                     src: src.vreg() as u32,
                     imm: self.rng.random(),
                 };
-                self.blocks[b as usize].insts.push((
-                    T::Op,
-                    vec![Operand::reg_def(d), Operand::reg_use(src)],
-                    PRegSet::empty(),
-                ));
+                (self.blocks[b as usize].insts).push(I::new(&[(d, DEF), (src, USE)]));
                 avail.push(d);
                 return;
             }
         }
-        let mut ops = Vec::new();
-        let mut clob = PRegSet::empty();
         let mut defs = Vec::new();
-        match self.rng.random_range(0..10) {
+        let i = match self.rng.random_range(0..10) {
             0..=5 => {
+                // A list takes two of the three slots.
+                let snap = self.rng.random_ratio(30, 100);
+                let room = if snap { 1 } else { 3 };
                 // Registers the instruction needs at its early and late
                 // points, per class, kept within what the classes have.
                 let mut need = [[0u32; 2]; 2];
@@ -217,107 +257,73 @@ impl Gen {
                     n[1] += late as u32;
                     true
                 };
+                let mut regs: Vec<(VReg, Part)> = Vec::new();
                 for _ in 0..self.rng.random_range(0..4) {
                     let Some(v) = self.pick(avail) else { break };
-                    let pos = if self.rng.random_ratio(70, 100) {
-                        OperandPos::Early
-                    } else {
-                        OperandPos::Late
-                    };
-                    let late = pos == OperandPos::Late;
-                    let c = if self.rng.random_ratio(75, 100)
-                        && fits(&mut need, v.class(), true, late)
-                    {
-                        OperandConstraint::Reg
-                    } else {
-                        OperandConstraint::Any
-                    };
-                    ops.push(Operand::new(v, c, OperandKind::Use, pos));
-                }
-                if self.rng.random_ratio(30, 100) {
-                    self.snapshot(&mut ops, avail);
+                    let late = !self.rng.random_ratio(70, 100);
+                    if regs.len() < room && fits(&mut need, v.class(), true, late) {
+                        regs.push((v, (false, late, Constraint::Any)));
+                    }
                 }
                 for _ in 0..self.rng.random_range(0..3) {
                     let c = self.class();
-                    let pos = if self.rng.random_ratio(80, 100) {
-                        OperandPos::Late
-                    } else {
-                        OperandPos::Early
-                    };
-                    if !fits(&mut need, c, pos == OperandPos::Early, true) {
+                    let late = self.rng.random_ratio(80, 100);
+                    if regs.len() == room || !fits(&mut need, c, !late, true) {
                         continue;
                     }
                     let d = self.v.new_vreg(c);
-                    ops.push(Operand::new(
-                        d,
-                        OperandConstraint::Reg,
-                        OperandKind::Def,
-                        pos,
-                    ));
+                    regs.push((d, (true, late, Constraint::Any)));
                     defs.push(d);
-                }
-                if self.rng.random_ratio(15, 100) {
-                    let c = self.class();
-                    if fits(&mut need, c, true, true) {
-                        ops.push(Operand::reg_temp(self.v.new_vreg(c)));
-                    }
                 }
                 // A definition reusing an input (a two-address instruction):
                 // the other inputs are then held to the late point too.
-                let tied = (0..ops.len()).find(|&d| {
-                    ops[d].kind() == OperandKind::Def && ops[d].pos() == OperandPos::Late
-                });
-                let input = (0..ops.len()).find(|&t| {
-                    ops[t].kind() == OperandKind::Use
-                        && ops[t].pos() == OperandPos::Early
-                        && ops[t].constraint() == OperandConstraint::Reg
-                        && tied.is_some_and(|d| ops[d].class() == ops[t].class())
+                let tied = regs.iter().position(|r| r.1 == DEF);
+                let input = regs.iter().position(|r| {
+                    r.1 == USE && tied.is_some_and(|d| regs[d].0.class() == r.0.class())
                 });
                 if let (Some(d), Some(t)) = (tied, input)
                     && need.iter().all(|n| n[0] + n[1] <= 4)
                     && self.rng.random_ratio(40, 100)
                 {
-                    ops[d] = Operand::reg_reuse_def(ops[d].vreg(), t);
+                    regs[d].1 = (true, true, Constraint::Tied(t as u8));
+                }
+                let i = I::new(&regs);
+                if snap {
+                    i.with_list(List::AnyLoc, 0, self.snapshot(avail))
+                } else {
+                    i
                 }
             }
             6..=7 => {
-                // A helper: arguments in x0.. and d0.., the result in x0 or d0.
-                let (mut xn, mut dn) = (0, 0);
-                for _ in 0..self.rng.random_range(0..4) {
-                    let Some(v) = self.pick(avail) else { break };
-                    let r = if v.class() == RegClass::Int {
-                        xn += 1;
-                        int(INTS[xn - 1])
-                    } else {
-                        dn += 1;
-                        float(FLOATS[dn - 1])
-                    };
-                    ops.push(Operand::reg_fixed_use(v, r));
-                }
-                clob = caller_saved();
+                // A helper: the result, if any, then the arguments.
+                let mut words = Vec::new();
                 if self.rng.random_ratio(60, 100) {
                     let c = self.class();
                     let d = self.v.new_vreg(c);
-                    let r = if c == RegClass::Int { int(0) } else { float(0) };
-                    ops.push(Operand::reg_fixed_def(d, r));
-                    clob.remove(r);
+                    words.push(d);
                     defs.push(d);
                 }
-                if self.rng.random_ratio(30, 100) {
-                    self.snapshot(&mut ops, avail);
+                let n = words.len() as u8;
+                for _ in 0..self.rng.random_range(0..4) {
+                    let Some(v) = self.pick(avail) else { break };
+                    words.push(v);
                 }
+                let mut i = I::new(&[]).with_list(List::CArgs, n, words);
+                i.clobbers = Clobbers::CallerSaved;
+                i
             }
             _ => {
-                // An exit's snapshot.
+                // An exit's frame state.
+                let mut regs = Vec::new();
                 if let Some(v) = self.pick(avail)
                     && self.rng.random_ratio(50, 100)
                 {
-                    ops.push(Operand::reg_use(v));
+                    regs.push((v, USE));
                 }
-                self.snapshot(&mut ops, avail);
+                I::new(&regs).with_list(List::AnyLoc, 0, self.snapshot(avail))
             }
-        }
-        self.blocks[b as usize].insts.push((T::Op, ops, clob));
+        };
+        self.blocks[b as usize].insts.push(i);
         avail.extend(defs);
     }
 
@@ -327,7 +333,6 @@ impl Gen {
             match self.rng.random_range(0..10) {
                 4..=5 if depth < 3 => cur = self.diamond(cur, depth, avail),
                 6..=7 if depth < 3 => cur = self.looop(cur, depth, avail),
-                8 => cur = self.call(cur, avail),
                 _ => {
                     for _ in 0..self.rng.random_range(1..=4) {
                         self.op(cur, avail);
@@ -347,20 +352,19 @@ impl Gen {
     }
 
     fn br(&mut self, b: u32, avail: &[VReg]) {
-        let mut ops = Vec::new();
+        let mut i = I::new(&[]);
         if let Some(v) = self.pick(avail) {
-            ops.push(Operand::reg_use(v));
+            i = I::new(&[(v, USE)]);
         }
-        self.blocks[b as usize]
-            .insts
-            .push((T::Br, ops, PRegSet::empty()));
+        i.flow = Flow::Branch;
+        self.blocks[b as usize].insts.push(i);
     }
 
     fn jump(&mut self, from: u32, to: u32, avail: &mut Vec<VReg>) {
         let args = self.args_for(from, to, avail);
-        self.blocks[from as usize]
-            .insts
-            .push((T::Jump, Vec::new(), PRegSet::empty()));
+        let mut i = I::new(&[]);
+        i.flow = Flow::Jump;
+        self.blocks[from as usize].insts.push(i);
         self.edge(from, to, args);
     }
 
@@ -434,51 +438,41 @@ impl Gen {
         x
     }
 
-    fn call(&mut self, cur: u32, avail: &mut Vec<VReg>) -> u32 {
+    /// The function, read through the table of the rows its instructions
+    /// have.
+    fn finish(mut self) -> VCode {
+        let mut rows: Vec<Row> = Vec::new();
         let mut ops = Vec::new();
-        let ints: Vec<VReg> = avail
-            .iter()
-            .copied()
-            .filter(|v| v.class() == RegClass::Int)
-            .collect();
-        for &r in &INTS[..self.rng.random_range(0..3)] {
-            if let Some(v) = self.pick(&ints) {
-                ops.push(Operand::reg_fixed_use(v, int(r)));
-            }
+        for i in self.blocks.iter().flat_map(|b| &b.insts) {
+            let row = i.row();
+            let k = rows.iter().position(|r| *r == row).unwrap_or_else(|| {
+                rows.push(row);
+                rows.len() - 1
+            });
+            ops.push(u8::try_from(k).expect("at most 256 rows"));
         }
-        for _ in 0..self.rng.random_range(0..5) {
-            if let Some(v) = self.pick(avail) {
-                ops.push(Operand::new(
-                    v,
-                    OperandConstraint::Stack,
-                    OperandKind::Use,
-                    OperandPos::Late,
-                ));
-            }
-        }
-        self.blocks[cur as usize]
-            .insts
-            .push((T::Call, ops, all_regs()));
-        let r = self.block();
-        self.blocks[r as usize].resume = true;
-        self.edge(cur, r, Vec::new());
-        let mut clob = all_regs();
-        let mut ops = Vec::new();
-        for &r in &INTS[..self.rng.random_range(0..3)] {
-            let d = self.v.new_vreg(RegClass::Int);
-            ops.push(Operand::reg_fixed_def(d, int(r)));
-            clob.remove(int(r));
-            avail.push(d);
-        }
-        self.blocks[r as usize].insts.push((T::Op, ops, clob));
-        r
-    }
-
-    fn finish(mut self) -> VCode<T> {
+        self.v.rows = rows.leak();
+        let mut ops = ops.into_iter();
         for (bi, b) in self.blocks.iter().enumerate() {
             let start = self.v.insts.len() as u32;
-            for (t, ops, clob) in &b.insts {
-                self.v.push(t.clone(), ops, *clob);
+            for i in &b.insts {
+                let mut m = MInst {
+                    op: ops.next().unwrap(),
+                    sz: 0,
+                    cc: 0,
+                    n: i.n,
+                    ops: [0; 3],
+                };
+                for (o, r) in m.ops.iter_mut().zip(&i.regs) {
+                    *o = r.0.vreg() as u32;
+                }
+                if i.list != List::None {
+                    let k = i.regs.len();
+                    m.ops[k] = self.v.pool.len() as u32;
+                    m.ops[k + 1] = i.words.len() as u32;
+                    self.v.pool.extend(i.words.iter().map(|v| v.vreg() as u32));
+                }
+                self.v.push(m);
             }
             let end = self.v.insts.len() as u32;
             let succs: Vec<RBlock> = b.succs.iter().map(|&s| RBlock::new(s as usize)).collect();
@@ -493,7 +487,7 @@ impl Gen {
                 b.params.iter().copied(),
                 &args,
                 &nargs,
-                b.resume,
+                false,
             );
         }
         self.v.entry = RBlock::new(0);
@@ -502,34 +496,26 @@ impl Gen {
 }
 
 /// A function, and its blocks in allocation order with how many are hot.
-fn generate(seed: u64) -> (VCode<T>, Vec<u32>, usize) {
-    let mut g = Gen {
-        rng: Pcg64::seed_from_u64(seed),
-        v: VCode::new(),
-        blocks: Vec::new(),
-        cold: Vec::new(),
-        in_cold: false,
-    };
+fn generate(seed: u64) -> (VCode, Vec<u32>, usize) {
+    let mut g = Gen::new(seed, VCode::new(&[]));
     let entry = g.block();
     let mut avail = Vec::new();
-    // The entry's parameters, fixed in x0.. as `MInst::Params`.
-    let mut ops = Vec::new();
+    // The entry's parameters, fixed in x0.. .
+    let mut regs = Vec::new();
     for &r in &INTS[..g.rng.random_range(1..=3)] {
         let p = g.v.new_vreg(RegClass::Int);
-        ops.push(Operand::reg_fixed_def(p, int(r)));
+        regs.push((p, (true, true, Constraint::Fixed(int(r)))));
         avail.push(p);
     }
-    g.blocks[0].insts.push((T::Op, ops, PRegSet::empty()));
+    g.blocks[0].insts.push(I::new(&regs));
     let end = g.region(entry, 0, &mut avail);
-    let mut ops = Vec::new();
+    let mut regs = Vec::new();
     for _ in 0..g.rng.random_range(0..3) {
         if let Some(v) = g.pick(&avail) {
-            ops.push(Operand::reg_use(v));
+            regs.push((v, USE));
         }
     }
-    g.blocks[end as usize]
-        .insts
-        .push((T::Ret, ops, PRegSet::empty()));
+    g.blocks[end as usize].insts.push(I::new(&regs));
     // Odd blocks cold too: loop headers and blocks dominating hot ones
     // laid out after them.
     for b in 1..g.blocks.len() {
@@ -548,7 +534,7 @@ fn generate(seed: u64) -> (VCode<T>, Vec<u32>, usize) {
 
 /// What `order.rs` gives lowering: each block's innermost natural loop
 /// (its header) and each header's enclosing loop, from the dominators.
-fn loops(f: &VCode<T>) -> (Vec<u32>, Vec<u32>) {
+fn loops(f: &VCode) -> (Vec<u32>, Vec<u32>) {
     const NONE: u32 = u32::MAX;
     let nb = f.num_blocks();
     let entry = f.entry_block().index();
@@ -664,21 +650,13 @@ fn loops(f: &VCode<T>) -> (Vec<u32>, Vec<u32>) {
     (inner, outer)
 }
 
-fn check_operands(v: &VCode<T>, out: &Output) -> Result<(), String> {
-    super::check_operands(v, out)?;
-    for (b, blk) in v.blocks.iter().enumerate() {
-        if blk.resume
-            && out
-                .edits
-                .iter()
-                .any(|(p, _)| *p == ProgPoint::before(Inst::new(blk.start as usize)))
-        {
-            return Err(format!(
-                "a move before resume block b{b}'s first instruction"
-            ));
-        }
-    }
-    Ok(())
+fn check(v: &VCode, abi: CAbi, out: &Output) -> Result<(), String> {
+    let mut checker = super::checker::Checker::new(v, abi);
+    let (remat, src) = super::remat_table(v);
+    checker.allow_unmaterialized(remat, src);
+    checker.prepare(out);
+    checker.run().map_err(|e| format!("{e:?}"))?;
+    super::check_operands(v, &abi, out)
 }
 
 /// 300 functions by default; `TCVM_RA_CASES` runs more (a change to the
@@ -707,15 +685,8 @@ fn random_functions_allocate_correctly() {
             let rec = super::corpus::write(&v, &env, &order, hot, &out);
             std::fs::write(format!("{dir}/seed-{seed:07}.ra"), rec).expect("writing a record");
         }
-        let mut checker = super::checker::Checker::new(&v);
-        let (remat, src) = super::remat_table(&v);
-        checker.allow_unmaterialized(remat, src);
-        checker.prepare(&out);
-        if let Err(e) = checker.run() {
-            panic!("seed {seed}: {e:?}\n{}", v.print(&out, &order));
-        }
-        if let Err(e) = check_operands(&v, &out) {
-            panic!("seed {seed}: {e}\n{}", v.print(&out, &order));
+        if let Err(e) = check(&v, env.c, &out) {
+            panic!("seed {seed}: {e}\n{}", v.print(&env.c, &out, &order));
         }
     }
 }
@@ -740,8 +711,7 @@ fn recorded_allocations_stay_the_same() {
     let cases: Vec<_> = (paths.iter())
         .map(|p| {
             let d = std::fs::read(p).expect("a record");
-            let mk = |b: bool| if b { T::Br } else { T::Op };
-            super::corpus::read(&d, mk).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+            super::corpus::read(&d).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
         })
         .collect();
     // One allocator for all of them, as the JIT runs: its buffers carry over.
@@ -761,16 +731,16 @@ fn recorded_allocations_stay_the_same() {
                 eprintln!("{}: allocation differs", p.display());
             }
             if differ == 1 {
-                let (got, want) = (c.f.print(&out, &c.order), c.f.print(&c.out, &c.order));
+                let abi = &c.env.c;
+                let (got, want) = (
+                    c.f.print(abi, &out, &c.order),
+                    c.f.print(abi, &c.out, &c.order),
+                );
                 eprintln!("-- got\n{got}\n-- recorded\n{want}");
             }
         }
-        let mut checker = super::checker::Checker::new(&c.f);
-        let (remat, src) = super::remat_table(&c.f);
-        checker.allow_unmaterialized(remat, src);
-        checker.prepare(&out);
-        if let Err(e) = checker.run() {
-            panic!("{}: {e:?}", p.display());
+        if let Err(e) = check(&c.f, c.env.c, &out) {
+            panic!("{}: {e}", p.display());
         }
     }
     let insts: usize = cases.iter().map(|c| c.f.num_insts()).sum();
@@ -792,61 +762,39 @@ fn recorded_allocations_stay_the_same() {
     assert_eq!(differ, 0, "{differ} of {} allocations differ", cases.len());
 }
 
-/// Instructions as their operands and clobbers.
-type Insts = Vec<(Vec<Operand>, PRegSet)>;
-
-/// One block of `insts` and a return of `ret`, allocated and checked.
-fn straight(v: VCode<T>, insts: Insts, ret: &[VReg]) -> (VCode<T>, Output) {
-    let mut g = Gen {
-        rng: Pcg64::seed_from_u64(1),
-        v,
-        blocks: Vec::new(),
-        cold: Vec::new(),
-        in_cold: false,
-    };
+/// One block of `insts` and a return of `ret`, allocated with `env` and
+/// checked.
+fn straight(v: VCode, env: Env, insts: Vec<I>, ret: &[VReg]) -> (VCode, Output) {
+    let mut g = Gen::new(1, v);
     let b = g.block() as usize;
-    for (ops, clob) in insts {
-        g.blocks[b].insts.push((T::Op, ops, clob));
-    }
-    let ret = ret.iter().map(|&r| Operand::reg_use(r)).collect();
-    g.blocks[b].insts.push((T::Ret, ret, PRegSet::empty()));
+    g.blocks[b].insts = insts;
+    let ret: Vec<(VReg, Part)> = ret.iter().map(|&r| (r, USE)).collect();
+    g.blocks[b].insts.push(I::new(&ret));
     let mut v = g.finish();
     (v.loop_of, v.loop_parent) = loops(&v);
-    let out = Ctx::new(env()).run(&v, &[0], 1).expect("allocated");
-    let mut checker = super::checker::Checker::new(&v);
-    let (remat, src) = super::remat_table(&v);
-    checker.allow_unmaterialized(remat, src);
-    checker.prepare(&out);
-    if let Err(e) = checker.run() {
-        panic!("{e:?}\n{}", v.print(&out, &[0]));
+    let out = Ctx::new(env.clone()).run(&v, &[0], 1).expect("allocated");
+    if let Err(e) = check(&v, env.c, &out) {
+        panic!("{e}\n{}", v.print(&env.c, &out, &[0]));
     }
-    check_operands(&v, &out).expect("operands apart");
     (v, out)
 }
 
-/// `a`, `b`, then `d = op a, b` reusing `a` as instruction 2 (`mid` between).
-fn two_address(mid: Option<PRegSet>, konst: bool) -> (VCode<T>, [VReg; 3], Insts) {
-    let mut v = VCode::new();
+/// `a`, `b`, then `d = op a, b` reusing `a` as instruction 2, or 3 after
+/// one that clobbers the caller-saved registers (`mid`).
+fn two_address(mid: bool, konst: bool) -> (VCode, [VReg; 3], Vec<I>) {
+    let mut v = VCode::new(&[]);
     let [a, b, d] = [(); 3].map(|_| v.new_vreg(RegClass::Int));
     if konst {
         v.remat[a.vreg()] = Remat::Int(7);
     }
-    let none = PRegSet::empty();
-    let mut insts = vec![
-        (vec![Operand::reg_def(a)], none),
-        (vec![Operand::reg_def(b)], none),
-    ];
-    if let Some(clob) = mid {
-        insts.push((vec![], clob));
+    let mut insts = vec![I::new(&[(a, DEF)]), I::new(&[(b, DEF)])];
+    if mid {
+        let mut i = I::new(&[]);
+        i.clobbers = Clobbers::CallerSaved;
+        insts.push(i);
     }
-    insts.push((
-        vec![
-            Operand::reg_reuse_def(d, 1),
-            Operand::reg_use(a),
-            Operand::reg_use(b),
-        ],
-        none,
-    ));
+    let tied = (true, true, Constraint::Tied(1));
+    insts.push(I::new(&[(d, tied), (a, USE), (b, USE)]));
     (v, [a, b, d], insts)
 }
 
@@ -859,8 +807,8 @@ fn edits_before(out: &Output, i: usize) -> Vec<super::Edit> {
 
 #[test]
 fn reused_input_ending_there_gives_its_register() {
-    let (v, [_, _, d], insts) = two_address(None, false);
-    let (v, out) = straight(v, insts, &[d]);
+    let (v, [_, _, d], insts) = two_address(false, false);
+    let (v, out) = straight(v, env(), insts, &[d]);
     let al = out.inst_allocs(&v, Inst::new(2));
     assert!(out.edits.is_empty(), "{:?}", out.edits);
     assert!(al[0].is_reg() && al[0] == al[1] && al[2] != al[0]);
@@ -869,8 +817,8 @@ fn reused_input_ending_there_gives_its_register() {
 
 #[test]
 fn reused_input_live_after_is_copied() {
-    let (v, [a, _, d], insts) = two_address(None, false);
-    let (v, out) = straight(v, insts, &[d, a]);
+    let (v, [a, _, d], insts) = two_address(false, false);
+    let (v, out) = straight(v, env(), insts, &[d, a]);
     let al = out.inst_allocs(&v, Inst::new(2));
     let from = out.inst_allocs(&v, Inst::new(0))[0];
     assert!(al[0] == al[1] && al[2] != al[0] && from != al[0]);
@@ -883,8 +831,12 @@ fn reused_input_live_after_is_copied() {
 
 #[test]
 fn reused_input_on_the_stack_is_loaded_into_the_definition() {
-    let (v, [_, b, d], insts) = two_address(Some(all_regs()), false);
-    let (v, out) = straight(v, insts, &[d, b]);
+    // Every register is caller-saved here, so both inputs wait on the stack.
+    let mut env = env();
+    env.c.caller_saved = all_regs();
+    let abi = env.c;
+    let (v, [_, b, d], insts) = two_address(true, false);
+    let (v, out) = straight(v, env, insts, &[d, b]);
     let al = out.inst_allocs(&v, Inst::new(3));
     assert!(al[0].is_reg() && al[0] == al[1] && al[2].is_reg() && al[2] != al[0]);
     let loads: Vec<_> = (edits_before(&out, 3).into_iter())
@@ -893,54 +845,65 @@ fn reused_input_on_the_stack_is_loaded_into_the_definition() {
     assert!(
         matches!(loads[..], [super::Edit::Move { from, .. }] if from.is_stack()),
         "{}",
-        v.print(&out, &[0])
+        v.print(&abi, &out, &[0])
     );
 }
 
 #[test]
 fn reused_constant_is_made_in_the_definition() {
-    let (v, [a, _, d], insts) = two_address(None, true);
-    let (v, out) = straight(v, insts, &[d]);
+    let (v, [a, _, d], insts) = two_address(false, true);
+    let (v, out) = straight(v, env(), insts, &[d]);
     let al = out.inst_allocs(&v, Inst::new(2));
     assert!(al[0].is_reg() && al[0] == al[1] && al[2] != al[0]);
     assert!(
         matches!(out.edits[..], [(p, super::Edit::Remat { to, vreg, .. })]
             if p == ProgPoint::before(Inst::new(2)) && to == al[0] && vreg == a),
         "{}",
-        v.print(&out, &[0])
+        v.print(&env().c, &out, &[0])
     );
 }
 
 #[test]
 fn reused_input_twice_is_read_where_it_is() {
-    let mut v = VCode::new();
+    let mut v = VCode::new(&[]);
     let [a, d] = [(); 2].map(|_| v.new_vreg(RegClass::Int));
-    let none = PRegSet::empty();
+    let tied = (true, true, Constraint::Tied(1));
     let insts = vec![
-        (vec![Operand::reg_def(a)], none),
-        (
-            vec![
-                Operand::reg_reuse_def(d, 1),
-                Operand::reg_use(a),
-                Operand::reg_use(a),
-            ],
-            none,
-        ),
+        I::new(&[(a, DEF)]),
+        I::new(&[(d, tied), (a, USE), (a, USE)]),
     ];
-    let (v, out) = straight(v, insts, &[d]);
+    let (v, out) = straight(v, env(), insts, &[d]);
     let al = out.inst_allocs(&v, Inst::new(1));
     assert!(out.edits.is_empty() && al[0] == al[1] && al[1] == al[2]);
 }
 
 #[test]
 fn reused_input_is_made_where_the_definition_is_wanted() {
-    let (v, [_, _, d], mut insts) = two_address(None, false);
-    insts.push((
-        vec![Operand::reg_fixed_use(d, int(INTS[3]))],
-        PRegSet::empty(),
-    ));
-    let (v, out) = straight(v, insts, &[]);
-    assert!(out.edits.is_empty(), "{}", v.print(&out, &[0]));
+    let (v, [_, _, d], mut insts) = two_address(false, false);
+    let fixed = (false, false, Constraint::Fixed(int(INTS[3])));
+    insts.push(I::new(&[(d, fixed)]));
+    let (v, out) = straight(v, env(), insts, &[]);
+    assert!(out.edits.is_empty(), "{}", v.print(&env().c, &out, &[0]));
     let made = out.inst_allocs(&v, Inst::new(0))[0];
     assert_eq!(made.as_reg(), Some(int(INTS[3])));
+}
+
+/// A recorded allocation reads back as the function it was made from: it
+/// allocates the same again.
+#[test]
+fn a_record_reads_back() {
+    let env = env();
+    let mut ctx = Ctx::new(env.clone());
+    for seed in 0..20 {
+        let (v, order, hot) = generate(seed);
+        let out = ctx.run(&v, &order, hot).expect("allocated");
+        let rec = super::corpus::write(&v, &env, &order, hot, &out);
+        let c = super::corpus::read(&rec).expect("a record");
+        assert!(c.env == env && c.order == order && c.hot == hot);
+        assert!(c.f.insts == v.insts && c.f.pool == v.pool && c.f.offs == v.offs);
+        let again = ctx.run(&c.f, &c.order, c.hot).expect("allocated");
+        assert!(
+            again.allocs == out.allocs && again.edits == out.edits && c.out.allocs == out.allocs
+        );
+    }
 }

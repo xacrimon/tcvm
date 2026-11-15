@@ -1,17 +1,16 @@
 //! Instruction selection: the low-level graph to `MInst`s, backward, so
 //! that a value nothing asked for costs nothing and a compare is made where
 //! its branch or guard reads the flags. An op is one instruction, except
-//! the flag-coupled pairs and `MulOvf`.
+//! the flag-coupled pairs and `MulOvf`. What a record's slots hold is its
+//! opcode's row's to say (`inst::ROWS`); a list and a 64-bit constant go to
+//! the pool.
 
 use crate::env::value::{PAYLOAD_MASK, SMALL_INT, Value};
-use crate::jit::backend::aarch64::abi;
-use crate::jit::backend::aarch64::asm::{Cond, Sz, logical_imm};
-use crate::jit::backend::aarch64::inst::{MInst, MOp, Role};
+use crate::jit::backend::aarch64::asm::{Cond, logical_imm};
+use crate::jit::backend::aarch64::inst::{MOp, ROWS, Sz};
 use crate::jit::backend::emit::{Exit, Selected, Src};
-use crate::jit::backend::reg::{
-    Block as RBlock, Operand, OperandConstraint, OperandKind, OperandPos, PRegSet, RegClass, VReg,
-};
-use crate::jit::backend::vcode::Remat;
+use crate::jit::backend::reg::{Block as RBlock, RegClass, VReg};
+use crate::jit::backend::vcode::{MInst, Pin, Remat, Slot};
 use crate::jit::bug;
 use crate::jit::compile::Bail;
 use crate::jit::ir::fields::Field;
@@ -57,13 +56,21 @@ fn sz(rep: Rep) -> Sz {
     }
 }
 
+/// The bytes a load or store of field `aux` moves.
+fn width(aux: u16) -> Sz {
+    match Field::info(aux).width {
+        4 => Sz::W,
+        8 => Sz::X,
+        w => bug!("no load or store of {w} bytes"),
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Select {
     /// Each value's virtual register.
     vreg: Vec<u32>,
-    /// The instructions, last first, each with its run of `ops`.
-    insts: Vec<(MInst, u32, u32, PRegSet)>,
-    ops: Vec<Operand>,
+    /// The instructions, last first.
+    insts: Vec<MInst>,
     /// Per block of the layout: its run of `insts`, and the arguments its
     /// terminator passes each successor, a run of `args`.
     blocks: Vec<(u32, u32, u32, [u32; 2])>,
@@ -89,7 +96,6 @@ impl Select {
         self.vreg.clear();
         self.vreg.resize(g.insts.len(), NONE);
         self.insts.clear();
-        self.ops.clear();
         self.args.clear();
         self.blocks.clear();
         self.bail = None;
@@ -183,29 +189,51 @@ impl Sel<'_> {
         }
     }
 
-    fn push(&mut self, op: MOp, sz: Sz, cc: Cond, imm: u64, regs: &[VReg]) {
-        let roles = op.info().roles;
-        if roles.len() != regs.len() {
-            bug!("{op:?} takes {} registers", roles.len());
+    /// An instruction of `regs`, then `rest` in the slots after them.
+    fn push(&mut self, op: MOp, sz: Sz, cc: Cond, regs: &[VReg], rest: &[u32]) {
+        let row = &ROWS[op as usize];
+        if row.regs() != regs.len() {
+            bug!("{op:?} takes {} registers", row.regs());
         }
-        let at = self.s.ops.len() as u32;
-        for (r, &v) in roles.iter().zip(regs) {
-            self.s.ops.push(match r {
-                Role::D | Role::Fd => Operand::reg_def(v),
-                Role::U | Role::Fu => Operand::reg_use(v),
-            });
+        let mut ops = [0; 3];
+        for (o, v) in ops.iter_mut().zip(regs) {
+            *o = v.vreg() as u32;
         }
-        let i = MInst {
-            op,
+        ops[regs.len()..regs.len() + rest.len()].copy_from_slice(rest);
+        self.s.insts.push(MInst {
+            op: op as u8,
+            sz: sz as u8,
             cc: cc as u8,
-            sz,
-            imm,
-        };
-        (self.s.insts).push((i, at, regs.len() as u32, PRegSet::empty()));
+            n: 0,
+            ops,
+        });
     }
 
-    fn op(&mut self, op: MOp, sz: Sz, imm: u64, regs: &[VReg]) {
-        self.push(op, sz, Cond::Eq, imm, regs)
+    fn op(&mut self, op: MOp, sz: Sz, regs: &[VReg]) {
+        self.push(op, sz, Cond::Eq, regs, &[])
+    }
+
+    /// With an immediate in the slot after the registers.
+    fn imm_op(&mut self, op: MOp, sz: Sz, imm: u32, regs: &[VReg]) {
+        debug_assert_eq!(ROWS[op as usize].slots[regs.len()], Slot::Imm);
+        self.push(op, sz, Cond::Eq, regs, &[imm])
+    }
+
+    /// With constant `k` after the registers: in the slot where it fits 32
+    /// bits zero-extended (`imm`), else in the pool (`wide`).
+    fn const_op(&mut self, imm: MOp, wide: MOp, sz: Sz, k: u64, regs: &[VReg]) {
+        let k = if sz == Sz::W { k & 0xffff_ffff } else { k };
+        if let Ok(k) = u32::try_from(k) {
+            return self.imm_op(imm, sz, k, regs);
+        }
+        self.wide_op(wide, sz, k, regs)
+    }
+
+    fn wide_op(&mut self, op: MOp, sz: Sz, k: u64, regs: &[VReg]) {
+        debug_assert_eq!(ROWS[op as usize].slots[regs.len()], Slot::Wide);
+        let at = self.out.vcode.pool.len() as u32;
+        self.out.vcode.pool.extend([k as u32, (k >> 32) as u32]);
+        self.push(op, sz, Cond::Eq, regs, &[at])
     }
 
     /// A branch to the exit that rebuilds frame state `fs`, taken where
@@ -215,7 +243,7 @@ impl Sel<'_> {
         let g = self.g;
         let (pc, entries) = g.entries(fs);
         let at = self.out.entries.len() as u32;
-        let first = self.s.ops.len() as u32;
+        let first = self.out.vcode.pool.len() as u32;
         for &[r, v] in entries {
             if r & HOME != 0 {
                 continue;
@@ -245,19 +273,14 @@ impl Sel<'_> {
                 Some((rep, w)) => (r as u8, rep, Src::Const(w)),
                 None => {
                     let reg = self.reg(v);
-                    let k = self.s.ops.len() as u32 - first;
-                    (self.s.ops).push(Operand::new(
-                        reg,
-                        OperandConstraint::Any,
-                        OperandKind::Use,
-                        OperandPos::Late,
-                    ));
+                    let k = self.out.vcode.pool.len() as u32 - first;
+                    self.out.vcode.pool.push(reg.vreg() as u32);
                     (r as u8, rep, Src::Operand(k as u16))
                 }
             };
             self.out.entries.push(src);
         }
-        let exit = self.out.exits.len() as u64;
+        let exit = self.out.exits.len() as u32;
         self.out.exits.push(Exit {
             pc,
             kind: if g.inst(fs).aux == 0 {
@@ -271,14 +294,8 @@ impl Sel<'_> {
             inst: 0,
             own: 0,
         });
-        let i = MInst {
-            op,
-            cc: cc as u8,
-            sz: Sz::X,
-            imm: exit,
-        };
-        let n = self.s.ops.len() as u32 - first;
-        self.s.insts.push((i, first, n, PRegSet::empty()));
+        let n = self.out.vcode.pool.len() as u32 - first;
+        self.push(op, Sz::X, cc, &[], &[exit, first, n]);
     }
 
     /// The condition code a branch on `c` takes: a compare's, or for a
@@ -298,11 +315,11 @@ impl Sel<'_> {
         let (x, y) = (Val(i.a), Val(i.b));
         if i.op == Op::FCmp {
             let (x, y) = (self.reg(x), self.reg(y));
-            return self.op(MOp::Fcmp, Sz::X, 0, &[x, y]);
+            return self.op(MOp::Fcmp, Sz::X, &[x, y]);
         }
         if i.op != Op::Cmp {
             let c = self.reg(c);
-            return self.op(MOp::CmpImm, Sz::W, 0, &[c]);
+            return self.imm_op(MOp::CmpImm, Sz::W, 0, &[c]);
         }
         let sz = sz(self.g.rep(x));
         // Bits tested against zero need no value.
@@ -314,15 +331,15 @@ impl Sel<'_> {
             && logical_imm(k as u64, sz.bits()).is_some()
         {
             let x = self.reg(Val(d.a));
-            return self.op(MOp::TstImm, sz, k as u64, &[x]);
+            return self.const_op(MOp::TstImm, MOp::TstWide, sz, k as u64, &[x]);
         }
         let x = self.reg(x);
         match self.imm(y) {
-            Some(k @ 0..4096) => self.op(MOp::CmpImm, sz, k as u64, &[x]),
-            Some(k @ -4095..0) => self.op(MOp::CmnImm, sz, -k as u64, &[x]),
+            Some(k @ 0..4096) => self.imm_op(MOp::CmpImm, sz, k as u32, &[x]),
+            Some(k @ -4095..0) => self.imm_op(MOp::CmnImm, sz, -k as u32, &[x]),
             _ => {
                 let y = self.reg(y);
-                self.op(MOp::CmpRR, sz, 0, &[x, y])
+                self.op(MOp::CmpRR, sz, &[x, y])
             }
         }
     }
@@ -357,30 +374,35 @@ impl Sel<'_> {
                 // Asked for as a value, beside what branches on it.
                 let Some(d) = self.def(v) else { return };
                 let cc = self.cond(v);
-                self.push(MOp::Cset, Sz::W, cc, 0, &[d]);
+                self.push(MOp::Cset, Sz::W, cc, &[d], &[]);
                 self.compare(v);
             }
             Select if i.rep != Rep::F64 => {
                 let Some(d) = self.def(v) else { return };
                 let cc = self.cond(a);
                 let (x, y) = (self.reg(b), self.reg(Val(i.c)));
-                self.push(MOp::Csel, w, cc, 0, &[d, x, y]);
+                self.push(MOp::Csel, w, cc, &[d, x, y], &[]);
                 self.compare(a);
             }
-            Base => {
+            Base | Thread => {
                 let Some(d) = self.def(v) else { return };
-                self.op(MOp::MovBase, Sz::X, 0, &[d]);
+                let (op, pin) = match i.op {
+                    Base => (MOp::MovBase, Pin::Base),
+                    _ => (MOp::MovThread, Pin::Thread),
+                };
+                self.out.vcode.remat[d.vreg()] = Remat::Pinned(pin);
+                self.op(op, Sz::X, &[d]);
             }
             Load => {
                 let Some(d) = self.def(v) else { return };
                 let base = self.reg(a);
-                let off = Field::offset(i.aux, i.c) as i64 as u64;
-                self.op(MOp::Ldr, w, off, &[d, base]);
+                let off = Field::offset(i.aux, i.c) as u32;
+                self.imm_op(MOp::Ldr, width(i.aux), off, &[d, base]);
             }
             Store => {
                 let (x, base) = (self.reg(b), self.reg(a));
-                let off = Field::offset(i.aux, i.c) as i64 as u64;
-                self.op(MOp::Str, Sz::X, off, &[x, base]);
+                let off = Field::offset(i.aux, i.c) as u32;
+                self.imm_op(MOp::Str, width(i.aux), off, &[x, base]);
             }
             LoadIdx | StoreIdx => {
                 let t = match i.op {
@@ -404,17 +426,17 @@ impl Sel<'_> {
                 } else {
                     MOp::StrIdx
                 };
-                self.push(op, Sz::X, uxtw, 0, &[t, base, index]);
+                self.push(op, Sz::X, uxtw, &[t, base, index], &[]);
             }
             ZExt32 => {
                 let Some(d) = self.def(v) else { return };
                 let x = self.reg(a);
-                self.op(MOp::Uxtw, Sz::X, 0, &[d, x]);
+                self.op(MOp::Uxtw, Sz::X, &[d, x]);
             }
             UnboxPtr | UnboxPtrPin => {
                 let Some(d) = self.def(v) else { return };
                 let x = self.reg(a);
-                self.op(MOp::AndImm, Sz::X, PAYLOAD_MASK, &[d, x]);
+                self.const_op(MOp::AndImm, MOp::AndWide, Sz::X, PAYLOAD_MASK, &[d, x]);
             }
             And | Or => {
                 let Some(d) = self.def(v) else { return };
@@ -423,38 +445,33 @@ impl Sel<'_> {
                     .imm(b)
                     .filter(|&k| logical_imm(k as u64, w.bits()).is_some())
                 {
-                    Some(k) if i.op == And => self.op(MOp::AndImm, w, k as u64, &[d, x]),
-                    Some(k) => self.op(MOp::OrrImm, w, k as u64, &[d, x]),
+                    Some(k) if i.op == And => {
+                        self.const_op(MOp::AndImm, MOp::AndWide, w, k as u64, &[d, x])
+                    }
+                    Some(k) => self.const_op(MOp::OrrImm, MOp::OrrWide, w, k as u64, &[d, x]),
                     None => {
                         let y = self.reg(b);
                         let op = if i.op == And { MOp::AndRR } else { MOp::OrrRR };
-                        self.op(op, w, 0, &[d, x, y])
+                        self.op(op, w, &[d, x, y])
                     }
                 }
             }
             K32 | K64 | KF64 | KObj => {
                 let Some(d) = self.def(v) else { return };
-                let (op, remat) = match i.op {
-                    K32 => (MOp::MovImm, Remat::Int(i.a as u64)),
-                    K64 => (MOp::MovImm, Remat::Int(i.k64())),
+                let k = match i.op {
+                    K32 => i.a as u64,
                     // The heap is non-moving: the object's word is a constant,
                     // and its pointer the word's payload.
-                    KObj => {
-                        let w = self.pool.words[i.a as usize];
-                        let w = if i.rep == Rep::Ptr {
-                            w & PAYLOAD_MASK
-                        } else {
-                            w
-                        };
-                        (MOp::MovImm, Remat::Int(w))
-                    }
-                    _ => (MOp::FImm, Remat::Float(i.k64())),
+                    KObj if i.rep == Rep::Ptr => self.pool.words[i.a as usize] & PAYLOAD_MASK,
+                    KObj => self.pool.words[i.a as usize],
+                    _ => i.k64(),
                 };
-                self.out.vcode.remat[d.vreg()] = remat;
-                let (Remat::Int(imm) | Remat::Float(imm)) = remat else {
-                    unreachable!()
-                };
-                self.op(op, Sz::X, imm, &[d]);
+                if i.op == KF64 {
+                    self.out.vcode.remat[d.vreg()] = Remat::Float(k);
+                    return self.wide_op(MOp::FImm, Sz::X, k, &[d]);
+                }
+                self.out.vcode.remat[d.vreg()] = Remat::Int(k);
+                self.const_op(MOp::MovImm, MOp::MovWide, Sz::X, k, &[d]);
             }
             SlotLoad => {
                 let Some(d) = self.def(v) else { return };
@@ -463,11 +480,11 @@ impl Sel<'_> {
                 if !self.s.stored[i.aux as usize] {
                     self.out.vcode.remat[d.vreg()] = Remat::Slot(i.aux as u8);
                 }
-                self.op(MOp::LdrSlot, Sz::X, i.aux as u64, &[d]);
+                self.imm_op(MOp::LdrSlot, Sz::X, i.aux as u32, &[d]);
             }
             SlotStore => {
                 let x = self.reg(a);
-                self.op(MOp::StrSlot, Sz::X, i.aux as u64, &[x]);
+                self.imm_op(MOp::StrSlot, Sz::X, i.aux as u32, &[x]);
             }
             Add | Sub => {
                 let Some(d) = self.def(v) else { return };
@@ -477,11 +494,11 @@ impl Sel<'_> {
                     _ => (MOp::SubImm, MOp::SubRR, MOp::AddImm),
                 };
                 match self.imm(b) {
-                    Some(k @ 0..4096) => self.op(imm, w, k as u64, &[d, x]),
-                    Some(k @ -4095..0) => self.op(other, w, -k as u64, &[d, x]),
+                    Some(k @ 0..4096) => self.imm_op(imm, w, k as u32, &[d, x]),
+                    Some(k @ -4095..0) => self.imm_op(other, w, -k as u32, &[d, x]),
                     _ => {
                         let y = self.reg(b);
-                        self.op(rr, w, 0, &[d, x, y])
+                        self.op(rr, w, &[d, x, y])
                     }
                 }
             }
@@ -493,7 +510,7 @@ impl Sel<'_> {
                     SDiv => MOp::SdivRR,
                     _ => MOp::EorRR,
                 };
-                self.op(op, w, 0, &[d, x, y]);
+                self.op(op, w, &[d, x, y]);
             }
             SExt32 | Neg | FNeg | FFloor => {
                 let Some(d) = self.def(v) else { return };
@@ -504,12 +521,12 @@ impl Sel<'_> {
                     FNeg => MOp::FNeg,
                     _ => MOp::Frintm,
                 };
-                self.op(op, w, 0, &[d, x]);
+                self.op(op, w, &[d, x]);
             }
             NegOvf => {
                 self.exit(MOp::BCondExit, Cond::Vs, b, i.aux);
                 let (d, x) = (self.fresh(v), self.reg(a));
-                self.op(MOp::NegsR, w, 0, &[d, x]);
+                self.op(MOp::NegsR, w, &[d, x]);
             }
             Shl | Shr | Sar => {
                 let Some(d) = self.def(v) else { return };
@@ -523,7 +540,7 @@ impl Sel<'_> {
                     _ => MOp::AsrImm,
                 };
                 let x = self.reg(a);
-                self.op(op, w, k as u64 & (w.bits() as u64 - 1), &[d, x]);
+                self.imm_op(op, w, k as u32 & (w.bits() - 1), &[d, x]);
             }
             AddOvf | SubOvf => {
                 self.exit(MOp::BCondExit, Cond::Vs, Val(i.c), i.aux);
@@ -533,11 +550,11 @@ impl Sel<'_> {
                     _ => (MOp::SubsImm, MOp::SubsRR, MOp::AddsImm),
                 };
                 match self.imm(b) {
-                    Some(k @ 0..4096) => self.op(imm, w, k as u64, &[d, x]),
-                    Some(k @ -4095..0) => self.op(other, w, -k as u64, &[d, x]),
+                    Some(k @ 0..4096) => self.imm_op(imm, w, k as u32, &[d, x]),
+                    Some(k @ -4095..0) => self.imm_op(other, w, -k as u32, &[d, x]),
                     _ => {
                         let y = self.reg(b);
-                        self.op(rr, w, 0, &[d, x, y])
+                        self.op(rr, w, &[d, x, y])
                     }
                 }
             }
@@ -545,9 +562,9 @@ impl Sel<'_> {
                 // The 64-bit product fits when it is its low half extended.
                 self.exit(MOp::BCondExit, Cond::Ne, Val(i.c), i.aux);
                 let d = self.fresh(v);
-                self.op(MOp::CmpSxtw, Sz::X, 0, &[d, d]);
+                self.op(MOp::CmpSxtw, Sz::X, &[d, d]);
                 let (x, y) = (self.reg(a), self.reg(b));
-                self.op(MOp::Smull, Sz::X, 0, &[d, x, y]);
+                self.op(MOp::Smull, Sz::X, &[d, x, y]);
             }
             Guard | GuardNot => {
                 let cc = self.cond(a);
@@ -559,57 +576,38 @@ impl Sel<'_> {
             }
             Deopt => self.exit(MOp::BExit, Cond::Eq, a, i.aux),
             Jump => {
-                self.op(MOp::B, Sz::X, 0, &[]);
+                self.op(MOp::B, Sz::X, &[]);
                 self.pass(pos, 0, here, Block(i.a));
             }
             Br => {
                 let cc = self.cond(a);
-                self.push(MOp::BCond, Sz::X, cc, 0, &[]);
+                self.push(MOp::BCond, Sz::X, cc, &[], &[]);
                 self.compare(a);
                 self.pass(pos, 0, here, Block(i.b));
                 self.pass(pos, 1, here, Block(i.c));
             }
-            Ret => self.op(MOp::Ret, Sz::X, i.a as u64 | (i.b as u64) << 8, &[]),
+            Ret => self.imm_op(MOp::Ret, Sz::X, i.a | i.b << 8, &[]),
             CallHelper => {
-                let h = Helper::of(i.aux).info();
-                let at = self.s.ops.len() as u32;
-                let mut clobbers = abi::caller_saved();
-                if let Some(d) = self.def(v) {
-                    let p = match i.rep {
-                        Rep::F64 => abi::preg_float(0),
-                        _ => abi::preg_int(0),
-                    };
-                    clobbers.remove(p);
-                    self.s.ops.push(Operand::reg_fixed_def(d, p));
+                // The list: the result if anything reads it, then the
+                // operands, which the row fixes to the argument registers.
+                let first = self.out.vcode.pool.len() as u32;
+                let d = self.def(v);
+                if let Some(d) = d {
+                    self.out.vcode.pool.push(d.vreg() as u32);
                 }
-                // Integers after the pinned registers and the immediate.
-                let (mut ints, mut floats) = (h.ctx.len() as u8 + h.imm as u8, 0);
                 for k in 0..i.b {
-                    let x = Val(self.g.run(i.a, i.b)[k as usize]);
-                    let p = if self.g.rep(x) == Rep::F64 {
-                        floats += 1;
-                        abi::preg_float(floats - 1)
-                    } else {
-                        ints += 1;
-                        abi::preg_int(ints - 1)
-                    };
-                    let x = self.reg(x);
-                    self.s.ops.push(Operand::reg_fixed_use(x, p));
+                    let x = self.reg(Val(self.g.run(i.a, i.b)[k as usize]));
+                    self.out.vcode.pool.push(x.vreg() as u32);
                 }
-                let m = MInst {
-                    op: MOp::Call,
-                    cc: 0,
-                    sz: Sz::X,
-                    imm: i.aux as u64 | (i.c as u64) << 16,
-                };
-                let n = self.s.ops.len() as u32 - at;
-                self.s.insts.push((m, at, n, clobbers));
+                let n = self.out.vcode.pool.len() as u32 - first;
+                self.push(MOp::Call, Sz::X, Cond::Eq, &[], &[i.aux as u32, first, n]);
+                self.s.insts.last_mut().unwrap().n = d.is_some() as u8;
             }
             BoxI32 => {
                 let Some(d) = self.def(v) else { return };
                 // Whatever the upper half held, it is the tag's ones now.
                 let x = self.reg(a);
-                self.op(MOp::OrrImm, Sz::X, SMALL_INT, &[d, x]);
+                self.const_op(MOp::OrrImm, MOp::OrrWide, Sz::X, SMALL_INT, &[d, x]);
             }
             BoxF64 | UnboxF64 | IToF => {
                 let Some(d) = self.def(v) else { return };
@@ -619,7 +617,7 @@ impl Sel<'_> {
                     UnboxF64 => (MOp::FmovFromGpr, Sz::X),
                     _ => (MOp::Scvtf, Sz::W),
                 };
-                self.op(op, sz, 0, &[d, x]);
+                self.op(op, sz, &[d, x]);
             }
             FAdd | FSub | FMul | FDiv => {
                 let Some(d) = self.def(v) else { return };
@@ -630,7 +628,7 @@ impl Sel<'_> {
                     FMul => MOp::FMul,
                     _ => MOp::FDiv,
                 };
-                self.op(op, Sz::X, 0, &[d, x, y]);
+                self.op(op, Sz::X, &[d, x, y]);
             }
             _ => {
                 if i.op.info().dialect == crate::jit::ir::ops::Dialect::H {
@@ -653,21 +651,20 @@ impl Sel<'_> {
             let d = g.block(b);
             let start = self.out.vcode.insts.len() as u32;
             if pos == 0 {
-                let entry = MInst {
-                    op: MOp::Entry,
+                self.out.vcode.push(MInst {
+                    op: MOp::Entry as u8,
+                    sz: Sz::X as u8,
                     cc: 0,
-                    sz: Sz::X,
-                    imm: 0,
-                };
-                self.out.vcode.push(entry, &[], PRegSet::empty());
+                    n: 0,
+                    ops: [0; 3],
+                });
             }
             let (at, end, args, nargs) = self.s.blocks[pos];
             for k in (at..end).rev() {
-                let (i, ops, len, clobbers) = self.s.insts[k as usize];
-                let ops = &self.s.ops[ops as usize..(ops + len) as usize];
-                let at = self.out.vcode.push(i, ops, clobbers);
-                if matches!(i.op, MOp::BCondExit | MOp::BExit) {
-                    self.out.exits[i.imm as usize].inst = at.index() as u32;
+                let i = self.s.insts[k as usize];
+                let at = self.out.vcode.push(i);
+                if matches!(MOp::of(i.op), MOp::BCondExit | MOp::BExit) {
+                    self.out.exits[i.ops[0] as usize].inst = at.index() as u32;
                 }
             }
             params.clear();

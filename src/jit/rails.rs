@@ -9,7 +9,7 @@ fn words(s: &str) -> Vec<&str> {
 }
 
 const OPS_BOTH: &str = "\
-    K32 K64 KF64 KObj Load Store LoadIdx StoreIdx Base SlotLoad SlotStore \
+    K32 K64 KF64 KObj Load Store LoadIdx StoreIdx Base Thread SlotLoad SlotStore \
     Add Sub Mul And Or Xor Not Neg Shl Shr Sar SDiv UDiv ZExt32 SExt32 \
     Trunc32 Cmp Select AddOvf SubOvf MulOvf NegOvf FAdd FSub FMul FDiv FNeg \
     FAbs FSqrt FFloor FCeil FCmp IToF LToF FToI FToL BoxI32 BoxF64 BoxPtr \
@@ -54,27 +54,25 @@ fn helpers_are_the_listed_ones() {
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
     use super::words;
-    use crate::jit::backend::aarch64::inst::MOPS;
+    use crate::jit::backend::aarch64::inst::ROWS;
 
     /// The frame's open and close; everything else is one instruction, or
     /// one of selection's and the encoder's agreed cases (section 8.3).
     const PSEUDO: &str = "Entry Ret";
     const MOP_LIST: &str = "\
-        Entry MovImm FImm LdrSlot StrSlot Ldr Str LdrIdx StrIdx MovBase Uxtw \
-        Cset Csel AndRR EorRR SdivRR Sxtw NegR NegsR FNeg Frintm OrrRR AndImm \
-        TstImm AddRR SubRR MulRR AddImm SubImm AddsRR SubsRR AddsImm SubsImm \
-        CmpRR CmpImm CmnImm CmpSxtw Fcmp LslImm LsrImm AsrImm Smull OrrImm Scvtf \
-        FmovToGpr FmovFromGpr FAdd FSub FMul FDiv B BCond BCondExit BExit Call \
-        Ret";
+        Entry MovImm MovWide FImm LdrSlot StrSlot Ldr Str LdrIdx StrIdx MovBase \
+        MovThread Uxtw Cset Csel AndRR EorRR SdivRR Sxtw NegR NegsR FNeg Frintm \
+        OrrRR AndImm AndWide OrrImm OrrWide TstImm TstWide AddRR SubRR MulRR \
+        AddImm SubImm AddsRR SubsRR AddsImm SubsImm CmpRR CmpImm CmnImm CmpSxtw \
+        Fcmp LslImm LsrImm AsrImm Smull Scvtf FmovToGpr FmovFromGpr FAdd FSub \
+        FMul FDiv B BCond BCondExit BExit Call Ret";
 
     #[test]
     fn machine_opcodes_are_the_listed_ones() {
-        let table: Vec<&str> = MOPS.iter().map(|m| m.name).collect();
-        let list = words(MOP_LIST);
-        assert_eq!(table, list);
-        for p in words(PSEUDO) {
-            assert!(list.contains(&p), "{p}");
-        }
+        let table: Vec<&str> = ROWS.iter().map(|m| m.name).collect();
+        assert_eq!(table, words(MOP_LIST));
+        let pseudo: Vec<&str> = (ROWS.iter().filter(|m| m.pseudo)).map(|m| m.name).collect();
+        assert_eq!(pseudo, words(PSEUDO));
     }
 
     /// Named in any arm: the pinned registers.
@@ -83,9 +81,7 @@ mod aarch64 {
     const FRAME: [&str; 3] = ["SP", "FP", "LR"];
     /// The registers the encoder names at the base, by arm, each with the
     /// step that removes it. Nothing is added here.
-    const KNOWN: [(&str, &str); 4] = [
-        // Step 1: the helper call's context arguments and immediate.
-        ("Call", "Gpr("),
+    const KNOWN: [(&str, &str); 3] = [
         // Step 4: the first result, the count and the results pointer.
         ("Ret", "Gpr("),
         ("Ret", "INSN"),

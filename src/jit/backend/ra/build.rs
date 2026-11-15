@@ -5,16 +5,12 @@ use super::{FIXED, Ivs, Loc, NONE, Need, Piece, Pos, Ra, Use, VInfo, Why, class_
 use crate::jit::backend::reg::{
     Allocation, Block, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
 };
-use crate::jit::backend::vcode::{Remat, TargetInst, VCode};
+use crate::jit::backend::vcode::{Remat, VCode};
 
 impl Ra {
-    pub(super) fn build<I: TargetInst>(
-        &mut self,
-        f: &VCode<I>,
-        w: &mut Build,
-    ) -> Result<(), String> {
+    pub(super) fn build(&mut self, f: &VCode, w: &mut Build) -> Result<(), String> {
         let nv = f.num_vregs();
-        let n = f.operands.len() as u32;
+        let n = f.num_operands() as u32;
         if n >= 1 << 22 {
             return Err("too many operands".into());
         }
@@ -49,7 +45,7 @@ impl Ra {
 
     /// Each value's run of uses (`uoff`) and of snapshot operands
     /// (`snap_off`), counted ahead for the walk to fill from the end.
-    fn count<I: TargetInst>(&mut self, f: &VCode<I>, w: &mut Build) {
+    fn count(&mut self, f: &VCode, w: &mut Build) {
         let nv = self.vregs.len();
         let Build {
             uoff,
@@ -60,7 +56,10 @@ impl Ra {
         } = w;
         uoff.resize(nv + 1, 0);
         self.snap_off.resize(nv + 1, 0);
-        for op in &f.operands {
+        let abi = self.env.c;
+        let all = (0..f.num_insts())
+            .flat_map(|i| (0..f.operands_of(i).1).map(move |k| f.operand(&abi, i, k)));
+        for op in all {
             let v = op.vreg().vreg();
             match (op.kind(), op.constraint()) {
                 (OperandKind::Use, OperandConstraint::Any | OperandConstraint::Stack) => {
@@ -94,8 +93,9 @@ impl Ra {
 
     /// The backward walk: interval, use and reservation records.
     #[inline(never)]
-    fn walk<I: TargetInst>(&mut self, f: &VCode<I>, n: u32, w: &mut Build) -> Result<(), String> {
+    fn walk(&mut self, f: &VCode, n: u32, w: &mut Build) -> Result<(), String> {
         let nv = f.num_vregs();
+        let abi = self.env.c;
         // Intervals as `(vreg, ..)` records, uses and snapshot operands into
         // their runs from the end: blocks last to first, an instruction's
         // late point before its early one, operands last to first, so each
@@ -145,10 +145,11 @@ impl Ra {
             }
             for l in (self.first[b]..=self.last[b]).rev() {
                 let i = self.at_lin[l as usize];
-                let base = f.ops[i.index()].0;
-                let ops = f.inst_operands(i);
+                let i = i.index();
+                let (base, n) = f.operands_of(i);
+                let op_at = |k: usize| f.operand(&abi, i, k);
                 let (early, late) = (2 * l, 2 * l + 1);
-                let tie = if *reuse { tie_of(ops)? } else { None };
+                let tie = if *reuse { tie_of(n, op_at)? } else { None };
                 // The definition may sit where the reused input was, so the
                 // other inputs are read at the late point to stay clear of
                 // it (regalloc2's rule, from IonMonkey). The reused value's
@@ -158,12 +159,13 @@ impl Ra {
                     tie.is_some_and(|(_, t)| {
                         op.kind() == OperandKind::Use
                             && k != t
-                            && (op.vreg() != ops[t].vreg()
+                            && (op.vreg() != op_at(t).vreg()
                                 || matches!(op.constraint(), OperandConstraint::FixedReg(_)))
                     })
                 };
                 for pos in [late, early] {
-                    for (k, op) in ops.iter().enumerate().rev() {
+                    for k in (0..n).rev() {
+                        let op = &op_at(k);
                         let v = op.vreg().vreg();
                         let alloc = base + k as u32;
                         let at = if op.pos() == OperandPos::Late || after_tie(k, op) {
@@ -310,7 +312,7 @@ impl Ra {
     }
 
     /// Values computed again, and the groups of parameters and arguments.
-    fn group<I: TargetInst>(&mut self, f: &VCode<I>, span: &mut [(u32, u32)], uoff: &[u32]) {
+    fn group(&mut self, f: &VCode, span: &mut [(u32, u32)], uoff: &[u32]) {
         let nv = self.vregs.len();
         // A value computed again from another only where that one is live
         // (always holding it at the gap before a reload, or in its slot),
@@ -343,7 +345,7 @@ impl Ra {
         self.rep.extend(0..nv as u32);
         for k in 0..self.ties.len() {
             let (t, d, _) = self.ties[k];
-            let v = |o: u32| f.operands[o as usize].vreg().vreg() as u32;
+            let v = |o: u32| f.operand_at(&self.env.c, o).vreg().vreg() as u32;
             self.join(f, span, uoff, v(t), v(d));
         }
         for bi in 0..self.order.len() {
@@ -368,14 +370,7 @@ impl Ra {
 
     /// Make the groups of `q` and `a` one, `q`'s its representative, when
     /// their ranges stay clear of each other; whether they are one.
-    fn join<I: TargetInst>(
-        &mut self,
-        f: &VCode<I>,
-        span: &mut [(u32, u32)],
-        uoff: &[u32],
-        q: u32,
-        a: u32,
-    ) -> bool {
+    fn join(&mut self, f: &VCode, span: &mut [(u32, u32)], uoff: &[u32], q: u32, a: u32) -> bool {
         let (gq, ga) = (self.find(q), self.find(a));
         if gq == ga {
             return true;
@@ -444,7 +439,7 @@ impl Ra {
 
     /// Each group's uses and first piece, its fixed definitions' pieces,
     /// and the queue.
-    fn make_pieces<I: TargetInst>(&mut self, f: &VCode<I>, w: &mut Build) {
+    fn make_pieces(&mut self, f: &VCode, w: &mut Build) {
         let nv = self.vregs.len();
         let Build {
             fixed_def,
@@ -566,7 +561,7 @@ impl Ra {
 
     /// Fixed operands' reservations per class by point, and each clobbering
     /// instruction's registers, in point order.
-    fn reservations<I: TargetInst>(&mut self, f: &VCode<I>, w: &mut Build) {
+    fn reservations(&mut self, f: &VCode, w: &mut Build) {
         let Build {
             fixtmp, keys, seen, ..
         } = w;
@@ -589,7 +584,7 @@ impl Ra {
         }
         // Calls clobber one of a few sets: each translated once.
         for (l, &i) in self.at_lin.iter().enumerate() {
-            let set = f.inst_clobbers(i);
+            let set = f.inst_clobbers(&self.env.c, i);
             if set == PRegSet::empty() {
                 continue;
             }
@@ -695,16 +690,17 @@ fn need_reg_at_def(uses: &mut [Use], uoff: &[u32], def: Pos, v: usize) {
 
 /// The definition of `ops` reusing an input and that input, by operand: one
 /// at most, a late register definition of an early register use.
-fn tie_of(ops: &[Operand]) -> Result<Option<(usize, usize)>, String> {
+fn tie_of(n: usize, op_at: impl Fn(usize) -> Operand) -> Result<Option<(usize, usize)>, String> {
     let mut tie = None;
-    for (d, op) in ops.iter().enumerate() {
+    for d in 0..n {
+        let op = op_at(d);
         let OperandConstraint::Reuse(t) = op.constraint() else {
             continue;
         };
         let fits = tie.is_none()
             && op.kind() == OperandKind::Def
             && op.pos() == OperandPos::Late
-            && ops.get(t).is_some_and(|i| {
+            && (t < n).then(|| op_at(t)).is_some_and(|i| {
                 i.kind() == OperandKind::Use
                     && i.pos() == OperandPos::Early
                     && i.constraint() == OperandConstraint::Reg
