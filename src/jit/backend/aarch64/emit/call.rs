@@ -4,9 +4,9 @@
 
 use crate::env::value::{NIL, PAYLOAD_MASK as PTR_MASK};
 use crate::jit::backend::aarch64::abi::{self, BASE, CLOSURE, INSN, PC, RT, THREAD, X16, X17};
-use crate::jit::backend::aarch64::asm::{Cond, Gpr, LR, Label, SP, Sz, ZR};
+use crate::jit::backend::aarch64::asm::{Asm, Cond, Gpr, LR, Label, SP, Shift, Sz, ZR};
 use crate::jit::backend::aarch64::emit::Em;
-use crate::jit::backend::emit::{SiteOut, Src};
+use crate::jit::backend::emit::{FastEntry, SiteOut, Src};
 use crate::jit::bug;
 use crate::jit::layout::{self, FUNCTION_TAG};
 use crate::jit::region::{Loc, SnapEntry};
@@ -50,7 +50,89 @@ pub(super) enum Ool {
     },
 }
 
+/// A fast entry's labels: the entry, its arity check passed, the arity
+/// fixup, and the miss.
+#[derive(Clone, Copy)]
+pub(super) struct Entries {
+    pub(super) fast: Label,
+    budget: Label,
+    fixup: Label,
+    miss: Label,
+}
+
 impl<'a> Em<'a> {
+    /// The fast entry, ahead of the entry block, which follows it when
+    /// `falls`. A compiled caller has written the header's first words, set
+    /// the base and `insn` (the argument count), and its `blr` left the
+    /// return address in x30; what `enter` would check of a Lua callee is
+    /// checked here, and a miss goes to the caller's slow path
+    /// (`abi::direct_miss`). Missing arguments are filled in.
+    pub(super) fn fast_entry(&mut self, fe: FastEntry, falls: bool) -> Entries {
+        let e = Entries {
+            fast: self.a.new_label(),
+            budget: self.a.new_label(),
+            fixup: self.a.new_label(),
+            miss: self.a.new_label(),
+        };
+        self.a.bind(e.fast);
+        self.a.cmp_imm(Sz::X, INSN, fe.num_params as u64);
+        self.a.b_cond(Cond::Lo, e.fixup);
+        self.a.bind(e.budget);
+        self.a.mov_sp(X16, SP);
+        self.a.ldr(X17, THREAD, layout::NATIVE_LIMIT as i32);
+        self.a.cmp(Sz::X, X16, X17);
+        self.a.b_cond(Cond::Lo, e.miss);
+        let known = self.a.new_label();
+        self.a.bind(known);
+        let off = self.a.label_offset(known) - self.a.label_offset(e.fast);
+        if off != super::known_offset(false, fe.num_params) {
+            bug!("the known entry is {off} bytes past the fast one");
+        }
+        self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
+        self.window_end(fe.max_stack);
+        self.a.cmp(Sz::X, X17, X16);
+        self.a.b_cond(Cond::Hi, e.miss);
+        if !falls {
+            self.a.b(self.labels[0]);
+        }
+        e
+    }
+
+    /// The fast entry's arity fixup and miss.
+    pub(super) fn fast_stubs(&mut self, fe: FastEntry, e: Entries) {
+        // The arguments short of the parameters are nil, once the window
+        // fits; then on to the checks past the arity one.
+        self.a.bind(e.fixup);
+        self.a.ldr(X16, THREAD, layout::THREAD_STACK_END as i32);
+        self.window_end(fe.max_stack);
+        self.a.cmp(Sz::X, X17, X16);
+        self.a.b_cond(Cond::Hi, e.miss);
+        self.a.add_shift(Sz::X, X17, BASE, INSN, Shift::Lsl, 3);
+        self.a
+            .add_imm(Sz::X, Gpr(9), BASE, fe.num_params as u64 * 8);
+        self.a.mov_imm(X16, NIL);
+        let fill = self.a.new_label();
+        self.a.bind(fill);
+        self.a.str(X16, X17, 0);
+        self.a.add_imm(Sz::X, X17, X17, 8);
+        self.a.cmp(Sz::X, X17, Gpr(9));
+        self.a.b_cond(Cond::Lo, fill);
+        self.a.b(e.budget);
+        self.a.bind(e.miss);
+        self.a.b_far(addr!(abi::direct_miss));
+    }
+
+    /// `x17 = BASE + 8 * slots`, the end of a window to check.
+    fn window_end(&mut self, slots: u16) {
+        let off = slots as u64 * 8;
+        if Asm::addsub_imm(off).is_some() {
+            self.a.add_imm(Sz::X, X17, BASE, off);
+        } else {
+            self.a.mov_imm(X17, off);
+            self.a.add(Sz::X, X17, BASE, X17);
+        }
+    }
+
     pub(super) fn resume_labels(&mut self) -> ResumeLabels {
         ResumeLabels {
             fast: self.a.new_label(),

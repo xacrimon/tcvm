@@ -339,11 +339,20 @@ pub(crate) fn compile<'gc>(
     }
     mark!(3);
     let rt = crate::jit::layout::rt_word(ctx) as u64;
-    let mut em = target::emit::emit(sel, out, rt, closure.code as u64)?;
+    // A function region of a prototype without varargs is what a compiled
+    // caller's `blr` can enter.
+    let enterable =
+        cfg.code[pc as usize].op() == crate::instruction::Op::FUNC && !closure.proto.is_vararg;
+    let fast = enterable.then_some(crate::jit::backend::emit::FastEntry {
+        num_params: closure.proto.num_params,
+        max_stack: closure.proto.max_stack_size as u16,
+    });
+    let mut em = target::emit::emit(sel, out, rt, closure.code as u64, fast)?;
     let alloc = ctx.jit().code_alloc();
     let mut block = alloc.reserve(em.asm.max_len())?;
     let start = block.rx();
     let entry = start.wrapping_add(em.entry as usize);
+    let fast_entry = (em.fast).map_or(std::ptr::null(), |at| start.wrapping_add(at as usize));
     let code = (em.asm)
         .finish(start as usize)
         .unwrap_or_else(|e| crate::jit::bug!("assembler: {e:?}"));
@@ -456,7 +465,7 @@ pub(crate) fn compile<'gc>(
             code: block,
             _alloc: alloc,
             entry,
-            fast_entry: std::ptr::null(),
+            fast_entry,
             // SAFETY: the words of values the builder read from live objects.
             pool: (pool.words.iter())
                 .map(|&w| unsafe { Value::from_raw(w) })

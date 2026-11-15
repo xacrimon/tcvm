@@ -592,8 +592,7 @@ fn set_fast<'gc>(ctx: Context<'gc>, proto: &Prototype<'gc>, st: &mut JitState<'g
 /// The known entry (the target's `known_offset`) of a prototype of
 /// `nparams` parameters whose fast entry is `fast`, none without one.
 pub(crate) fn direct_target(fast: usize, regs: bool, nparams: u8) -> Option<usize> {
-    let _ = (regs, nparams);
-    (fast != 0).then(|| crate::jit::bug!("a fast entry before stage 3 brings direct calls back"))
+    (fast != 0).then(|| fast + crate::jit::backend::target::emit::known_offset(regs, nparams))
 }
 
 /// Where a direct tail call branches while its callee has no fast entry.

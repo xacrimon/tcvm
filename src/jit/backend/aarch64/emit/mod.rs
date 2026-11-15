@@ -11,7 +11,7 @@ use crate::jit::backend::aarch64::asm::{
 };
 use crate::jit::backend::aarch64::inst::{MInst, MOp};
 use crate::jit::backend::emit::{
-    Emitted, ExitOut, Selected, SiteOut, Src, rotate_loops, thread_jumps,
+    Emitted, ExitOut, FastEntry, Selected, SiteOut, Src, rotate_loops, thread_jumps,
 };
 use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
 use crate::jit::backend::reg::{Allocation, Block, Inst, PReg, RegClass};
@@ -70,9 +70,26 @@ fn spill_off(slot: usize) -> i32 {
     (FRAME_SPILLS + 8 * slot) as i32
 }
 
+/// The fast entry past its arity and native stack checks, for a caller that
+/// proved them.
+const KNOWN_ENTRY: usize = 24;
+
+/// A fast entry's known entry, from it. Parameters are not passed in
+/// registers yet, so the entry for a call that would is the same.
+pub(crate) fn known_offset(regs: bool, nparams: u8) -> usize {
+    let _ = (regs, nparams);
+    KNOWN_ENTRY
+}
+
 /// `rt` is the runtime's address, which helpers take, and `code` that of
 /// the function's bytecode.
-pub(crate) fn emit(s: &Selected, out: &Output, rt: u64, code: u64) -> Result<Emitted, Bail> {
+pub(crate) fn emit(
+    s: &Selected,
+    out: &Output,
+    rt: u64,
+    code: u64,
+    fast: Option<FastEntry>,
+) -> Result<Emitted, Bail> {
     if out.num_spillslots > MAX_SPILLS {
         return Err(Bail::TooLarge);
     }
@@ -112,6 +129,7 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64, code: u64) -> Result<Emi
         .count();
     let loops = &s.layout.loops;
     let tops = rotate_loops(&s.vcode, loops, &em.labels, &em.dest, &mut laid, hot);
+    let entries = fast.map(|fe| em.fast_entry(fe, laid.first() == Some(&0)));
     for (at, &b) in laid.iter().enumerate() {
         let next = laid.get(at + 1).map(|&x| em.labels[x as usize]);
         // A rotated loop's top, past the jump into its header: padding
@@ -143,6 +161,9 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64, code: u64) -> Result<Emi
     for o in std::mem::take(&mut em.ool) {
         em.out_of_line(o);
     }
+    if let (Some(fe), Some(e)) = (fast, entries) {
+        em.fast_stubs(fe, e);
+    }
     // Where dispatch enters: through `level_enter`, which returns to
     // `level_land`, on to the entry block.
     let dispatch = em.a.new_label();
@@ -172,6 +193,7 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64, code: u64) -> Result<Emi
         .collect();
     Ok(Emitted {
         sites,
+        fast: entries.map(|e| at(e.fast)),
         entry: at(dispatch),
         num_spills: out.num_spillslots as u32,
         frame_size: em.frame,

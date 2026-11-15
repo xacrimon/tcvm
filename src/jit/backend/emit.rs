@@ -88,12 +88,22 @@ pub(crate) struct ExitOut {
     pub(crate) consts: Vec<u64>,
 }
 
+/// What a function region's fast entry checks: its prototype's parameter
+/// count and stack window.
+#[derive(Clone, Copy)]
+pub(crate) struct FastEntry {
+    pub(crate) num_params: u8,
+    pub(crate) max_stack: u16,
+}
+
 /// The machine code of a region, before its address is known. Places are
 /// byte offsets into it.
 pub(crate) struct Emitted {
     pub(crate) asm: Asm,
     /// Where the interpreter enters (`JIT_ENTRY`/`JIT_LOOP`).
     pub(crate) entry: u32,
+    /// Where a compiled caller enters, for a region with a fast entry.
+    pub(crate) fast: Option<u32>,
     pub(crate) num_spills: u32,
     /// Bytes of the native frame.
     pub(crate) frame_size: u32,
