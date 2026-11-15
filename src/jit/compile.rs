@@ -243,7 +243,7 @@ pub(crate) fn compile<'gc>(
     let config = &ctx.jit().config;
     note_upvalues_offset(closure);
     #[cfg(feature = "tcvm-dev")]
-    let mut clock = (std::time::Instant::now(), [0u128; 5]);
+    let mut clock = (std::time::Instant::now(), [0u128; 6]);
     // The time since the last mark, as stage `k`'s.
     macro_rules! mark {
         ($k:expr) => {
@@ -260,6 +260,7 @@ pub(crate) fn compile<'gc>(
         .collect();
     canonical_back_edges(&closure.proto, &mut code);
     let cfg = Cfg::build(&closure.proto, code, pc, Vec::new())?;
+    mark!(5);
     let scratch = &mut *ctx.jit().scratch.borrow_mut();
     let high = &mut scratch.high;
     high.reset(false);
@@ -351,10 +352,10 @@ pub(crate) fn compile<'gc>(
             crate::jit::backend::code::disassemble(start as usize, &code, &[]);
         }
         if config.dev.time {
-            let [build, lower, select, regalloc, emit] = clock.1;
+            let [build, lower, select, regalloc, emit, cfg] = clock.1;
             eprintln!(
                 "jit time {} pc{pc}: {} high insts, {} low insts, {} machine insts, {} bytes; \
-                 build {build}ns, lower {lower}ns, select {select}ns, regalloc {regalloc}ns, emit {emit}ns",
+                 cfg {cfg}ns, build {build}ns, lower {lower}ns, select {select}ns, regalloc {regalloc}ns, emit {emit}ns",
                 chunk_name(closure),
                 high.g.insts.len(),
                 low.g.insts.len(),
