@@ -16,12 +16,12 @@ use crate::env::value::Value;
 use crate::instruction::{ArithKind, Family, Instruction, Op as Bc};
 use crate::jit::compile::Bail;
 use crate::jit::feedback as fb;
-use crate::jit::ir::arith;
 use crate::jit::ir::emit::Emitter;
 use crate::jit::ir::ops::{Cc, ExitKind, ExitTag, Heaps, Helper, Op};
 use crate::jit::ir::table::{self, Key};
 use crate::jit::ir::types::{Fact, FactFlags, Rep, TypeSet};
 use crate::jit::ir::{Block, BlockFlags, HOME, Loop, Pool, Val};
+use crate::jit::ir::{arith, compare};
 
 /// The number kind a generic op takes an operand as where its fact does not
 /// say: what the site's form or feedback saw. In the op's `aux`, three bits
@@ -58,10 +58,6 @@ impl Spec {
         }
     }
 }
-
-/// A generic op's `aux`: its low four bits (an `ArithKind`, a `Cc`), then
-/// each operand's speculated kind.
-pub(crate) const SPEC_SHIFT: [u32; 2] = [4, 7];
 
 /// A loop of the region's control flow, which is the function's from the
 /// region's entry: a loop region's entry heads everything that comes back
@@ -478,37 +474,22 @@ impl Builder<'_, '_> {
 
     // --- instructions -------------------------------------------------------
 
-    /// The kind the site at `pc` takes each operand as, by its quickened
-    /// form or else its feedback; none where the slice has no code for what
-    /// it saw.
-    fn spec(&self, pc: u32, i: Instruction) -> Option<[Spec; 2]> {
+    /// What the compare site at `pc` saw, as `Compare`'s `aux` above its
+    /// condition: by its quickened form (two small integers, or a float
+    /// register) while no compiled code left it on kinds; else what its
+    /// slow path and the exits recorded, with the small integers and floats
+    /// its fast path leaves no record of.
+    fn compared(&self, pc: u32, i: Instruction) -> u16 {
         let bits = self.proto.feedback.bits(pc as usize);
-        let kinds = bits & fb::KINDS;
         let (op, generic) = (i.op(), i.generic_op());
-        let info = generic.info();
-        if bits & (fb::MM | fb::OVERFLOW) != 0 || kinds & !(fb::SMALL | fb::FLOAT) != 0 {
-            return None;
-        }
-        use Spec::*;
-        if op != generic && bits & fb::KIND_EXIT == 0 {
-            let form = info.forms.iter().position(|f| *f == Some(op))?;
-            let imm = matches!(info.family, Family::ImmArith | Family::ImmBit);
-            return match (info.family, form) {
-                (Family::CmpReg, _) => Some([I32, I32]),
-                (Family::CmpImm, _) => Some([F64, F64]),
-                (_, 0) => Some([I32, I32]),
-                (_, 1) => Some([F64, F64]),
-                (_, 2) if imm => Some([I32, I32]),
-                (_, 2) => Some([I32, F64]),
-                (_, 3) => Some([F64, I32]),
-                _ => None,
-            };
-        }
-        match (kinds & fb::SMALL != 0, kinds & fb::FLOAT != 0) {
-            (true, false) => Some([I32, I32]),
-            (false, true) => Some([F64, F64]),
-            _ => None,
-        }
+        let form = op != generic && bits & fb::KIND_EXIT == 0;
+        let kinds = match generic.info().family {
+            Family::CmpReg if form => fb::SMALL,
+            Family::CmpImm if form => fb::FLOAT,
+            _ => bits & fb::KINDS | fb::SMALL | fb::FLOAT,
+        };
+        let mm = if bits & fb::MM != 0 { arith::MM } else { 0 };
+        (kinds as u16) << compare::SEEN_SHIFT | mm
     }
 
     /// The kinds the arithmetic site at `pc` saw for each of its operands,
@@ -582,28 +563,6 @@ impl Builder<'_, '_> {
             aux |= arith::MM;
         }
         Some(aux)
-    }
-
-    /// A generic op on `x` and `y`, or a deopt where neither their facts
-    /// nor the site's speculation give both a kind.
-    fn generic(&mut self, op: Op, rep: Rep, low: u16, x: Val, y: Val) -> Option<Val> {
-        let spec = self.spec(self.pc, self.cfg.code[self.pc as usize]);
-        let mut aux = low;
-        let own = [x, y].map(|v| Spec::by_fact(self.e.fact(v)));
-        // An equality nothing says is of numbers is of anything.
-        if op == Op::Compare && low == Cc::Eq as u16 && spec.is_none() && own == [None; 2] {
-            return Some(self.equal(x, y));
-        }
-        for k in 0..2 {
-            // A site that recorded nothing takes an operand as the other is.
-            let Some(s) = own[k].or(spec.map(|s| s[k])).or(own[1 - k]) else {
-                self.deopt(ExitTag::Unsupported);
-                return None;
-            };
-            aux |= (s as u16) << SPEC_SHIFT[k];
-        }
-        let s = self.state();
-        Some(self.e.emit(op, rep, aux, x.0, y.0, s.0))
     }
 
     fn inst(&mut self, pc: u32, i: Instruction) {
@@ -832,27 +791,6 @@ impl Builder<'_, '_> {
                 {
                     let x = self.reg(a);
                     let (fall, jump) = (fall.unwrap(), jump.unwrap());
-                    if matches!(i.generic_op(), JEQ | JNEQ) {
-                        // Nil, booleans, strings, functions and threads are
-                        // equal only to themselves.
-                        let y = self.reg(b);
-                        let bits = TypeSet::NIL
-                            | TypeSet::BOOL
-                            | TypeSet::STR
-                            | TypeSet::FUN
-                            | TypeSet::THR;
-                        let by_bits = [x, y].iter().any(|&v| {
-                            let f = self.e.fact(v);
-                            !f.pending() && bits.contains(f.set)
-                        });
-                        if by_bits {
-                            let c = self.e.cmp(Op::Cmp, Cc::Eq, x, y);
-                            return match i.generic_op() {
-                                JEQ => self.br(c, jump, fall),
-                                _ => self.br(c, fall, jump),
-                            };
-                        }
-                    }
                     let (cc, y) = match i.generic_op() {
                         JLT | JNLT => (Cc::Lt, self.reg(b)),
                         JLE | JNLE => (Cc::Le, self.reg(b)),
@@ -878,9 +816,13 @@ impl Builder<'_, '_> {
                             }
                         }
                     };
-                    let Some(c) = self.generic(Op::Compare, Rep::B1, cc as u16, x, y) else {
+                    let aux = cc as u16 | self.compared(pc, i);
+                    let s = self.state();
+                    let c = self.e.emit(Op::Compare, Rep::B1, aux, x.0, y.0, s.0);
+                    // No kind the site saw is possible here: it left.
+                    if self.e.cur.is_none() {
                         return;
-                    };
+                    }
                     match i.generic_op().branch_sense() {
                         Some(false) => self.br(c, fall, jump),
                         _ => self.br(c, jump, fall),

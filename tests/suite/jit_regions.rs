@@ -5273,3 +5273,153 @@ fn arithmetic_errors_reach_the_interpreter() {
     compiles_cleanly(src, false);
     compiles_at_first_count(src, false);
 }
+
+/// Compares by the kinds their operands take: integers, floats and both
+/// per iteration, 64-bit integers against integers and against floats on
+/// both sides of 2^53, strings in order by their bytes, and equality of
+/// anything, `__eq` only between two tables.
+#[test]
+fn compares_of_each_kind_in_loops() {
+    let src = r#"-- compares of each kind, in loops
+        local out = {}
+        local big = math.maxinteger
+        local nums = {1, 2, 2.0, 2.5, -1, 0, -0.0, 0/0, 1e300, 2^53, 2^53 + 1, (1 << 53) + 1, 1 << 53,
+          -(1 << 53) - 1, big, math.mininteger, 2^63, -2^63, big - 1, 9007199254740993, 1/0, -1/0,
+          2147483647, 2147483648, -2147483649}
+        local function mix(n, i, j) return (n * 31 + i * 7 + j) % 1000003 end
+        -- every pair, under each operator
+        local lt, le, gt, ge, eq, ne = 0, 0, 0, 0, 0, 0
+        for r = 1, 4 do
+          for i = 1, #nums do
+            local a = nums[i]
+            for j = 1, #nums do
+              local b = nums[j]
+              if a < b then lt = mix(lt, i, j) end
+              if a <= b then le = mix(le, i, j) end
+              if a > b then gt = mix(gt, i, j) end
+              if not (a >= b) then ge = mix(ge, i, j) end
+              if a == b then eq = mix(eq, i, j) end
+              if a ~= b then ne = mix(ne, i, j) end
+            end
+          end
+        end
+        out[#out + 1] = table.concat({lt, le, gt, ge, eq, ne}, ':')
+        -- against constants
+        local k = 0
+        for r = 1, 40 do
+          for i = 1, #nums do
+            local a = nums[i]
+            if a < 10 then k = k + 1 end
+            if a >= 3 then k = k + 2 end
+            if a == 2 then k = k + 4 end
+            if a <= 2.5 then k = k + 8 end
+            if a ~= 0 then k = k + 16 end
+          end
+        end
+        out[#out + 1] = k
+        -- strings in order
+        local strs = {'', 'a', 'ab', 'abc', 'abd', 'b', 'a\0b', 'a\0', '\255', '\127', '\128x',
+          'abcdefghijklmnop', 'abcdefghijklmnoq', 'abcdefghijklmno'}
+        local s = 0
+        for r = 1, 4 do
+          for i = 1, #strs do
+            local a = strs[i]
+            for j = 1, #strs do
+              local b = strs[j]
+              if a < b then s = mix(s, i, j) end
+              if a <= b then s = mix(s, j, i) end
+              if a > b then s = mix(s, i, i) end
+              if a >= b then s = mix(s, j, j) end
+              if a == b then s = s + 1 end
+            end
+          end
+        end
+        out[#out + 1] = s
+        -- equality of anything
+        local calls = 0
+        local mt = {__eq = function(a, b) calls = calls + 1 return a.k == b.k end}
+        local t1, t2, t3 = setmetatable({k = 1}, mt), setmetatable({k = 1}, mt), setmetatable({k = 2}, mt)
+        local any = {false, true, 1, 1.0, 2, 'a', 'b', t1, t2, t3, {}, print, big, big + 0, 2^63, 0/0,
+          io.stdout, io.stderr, {}}
+        local e, z = 0, 0
+        for r = 1, 6 do
+          for i = 1, #any do
+            local a = any[i]
+            for j = 1, #any do
+              local b = any[j]
+              if a == b then e = mix(e, i, j) end
+              if a ~= b then z = z + 1 end
+              if a == nil then z = z + 1000 end
+              if a == 'a' then z = z + 3 end
+              if a == true then z = z + 5 end
+            end
+          end
+        end
+        out[#out + 1] = e .. ':' .. z .. ':' .. calls
+        -- a table with __eq against what is no table: no call
+        local n = 0
+        for i = 1, 300 do
+          if t1 == i then n = n + 1 end
+          if t1 == 'x' then n = n + 1 end
+          if i == t1 then n = n + 1 end
+        end
+        out[#out + 1] = n .. ':' .. calls
+        -- plain objects
+        local objs = {{}, {}, {}}
+        local o = 0
+        for i = 1, 3000 do if objs[i % 3 + 1] == objs[i % 2 + 1] then o = o + 1 end end
+        out[#out + 1] = o
+        -- a loop-carried 64-bit integer under compares
+        local x, c = 1 << 40, 0
+        for i = 1, 300 do
+          x = x * 3 + i
+          if x < 0 then c = c + 1 end
+          if x > 1e18 then c = c + 2 end
+          if x == i then c = c + 100 end
+          if x <= 2^62 then c = c + 4 end
+          if x >= -9007199254740993 then c = c + 8 end
+        end
+        out[#out + 1] = x .. ':' .. c
+        -- order metamethods
+        local m = setmetatable({}, {__lt = function() return true end, __le = function() return false end})
+        local q = 0
+        for i = 1, 300 do
+          if m < m then q = q + 1 end
+          if m <= m then q = q + 10 end
+        end
+        out[#out + 1] = q
+        return table.concat(out, ' ')"#;
+    assert_eq!(
+        result(src, false),
+        "902775:828221:496578:678705:808484:763060 20320 823448 622220:2934:216 0:216 1000 535061725297581118:2545 300"
+    );
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}
+
+/// What an ordered compare raises (a string against a number, two tables,
+/// nil) is raised by the interpreter after compiled code leaves.
+#[test]
+fn compare_errors_reach_the_interpreter() {
+    let src = r#"-- the errors: each raised by the interpreter after compiled code leaves
+        local out = {}
+        local function try(f, ...)
+          local ok, err = pcall(f, ...)
+          out[#out + 1] = ok and tostring(err) or (tostring(err):gsub('^.-:%d+: ', ''))
+        end
+        local function lt(a, b) local s = 0 for i = 1, 200 do if a < b then s = s + 1 end end return s end
+        local function le(a, b) local s = 0 for i = 1, 200 do if a <= b then s = s + 1 end end return s end
+        local function lti(a) local s = 0 for i = 1, 200 do if a < 10 then s = s + 1 end end return s end
+        for r = 1, 2 do
+          try(lt, 1, 2) try(lt, 'a', 'b') try(lt, 'a', 1) try(lt, 1, 'a') try(lt, {}, {})
+          try(le, 2.5, 3) try(le, 'b', 'a') try(le, {}, 1) try(le, nil, 1)
+          try(lti, 3) try(lti, 3.5) try(lti, 1 << 40) try(lti, 'x') try(lti, nil)
+        end
+        return table.concat(out, ' | ')"#;
+    assert_eq!(
+        result(src, false),
+        "200 | 200 | attempt to compare string with number | attempt to compare number with string | attempt to compare two table values | 200 | 0 | attempt to compare table with number | attempt to compare nil with number | 200 | 200 | 0 | attempt to compare string with number | attempt to compare nil with number | 200 | 200 | attempt to compare string with number | attempt to compare number with string | attempt to compare two table values | 200 | 0 | attempt to compare table with number | attempt to compare nil with number | 200 | 200 | 0 | attempt to compare string with number | attempt to compare nil with number"
+    );
+    compiles_cleanly(src, false);
+    compiles_at_first_count(src, false);
+}

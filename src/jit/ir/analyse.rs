@@ -3,11 +3,11 @@
 //! and representations of the high-level graph's parameters.
 
 use super::access::ARRAY;
-use super::arith;
 use super::ops::{Flags, Op};
 use super::types::{Rep, TypeSet};
 use super::{Block, BlockFlags, Graph, Inst, Val};
-use crate::jit::build::{SPEC_SHIFT, Spec};
+use super::{arith, compare};
+use crate::jit::build::Spec;
 
 #[derive(Default)]
 pub(crate) struct Analysis {
@@ -143,8 +143,9 @@ impl Analysis {
             match i.op {
                 Op::CheckType => want(i.a, TypeSet::from_bits_retain(i.aux & TypeSet::ANY.bits())),
                 Op::Compare => {
-                    for (k, shift) in SPEC_SHIFT.into_iter().enumerate() {
-                        want(i.args()[k], Spec::of(i.aux >> shift).set());
+                    if let Some(set) = compare::demand(i.aux) {
+                        want(i.a, set);
+                        want(i.b, set);
                     }
                 }
                 // An operand the site saw as one kind is held as it; one it

@@ -10,6 +10,7 @@
 pub(crate) mod access;
 pub(crate) mod analyse;
 pub(crate) mod arith;
+pub(crate) mod compare;
 pub(crate) mod copy;
 pub(crate) mod emit;
 pub(crate) mod fields;

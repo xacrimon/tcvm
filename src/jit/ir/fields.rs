@@ -56,6 +56,9 @@ fields! {
     AuxInts  layout::AUX_INTS, 8 I64 ANY ARR_SIZE  false;
     // A string's length in bytes, from its payload.
     StrLen   crate::env::LuaString::LEN_OFFSET, 8 I64 ANY IMMUTABLE false;
+    // A string's byte, from its payload by the byte's offset in it
+    // (`LoadIdx`, unscaled).
+    StrByte  0,                1 I32 ANY IMMUTABLE false;
     // A named slot in the table, and one in its spill array (from that).
     Inline   layout::T_INLINE, 8 Val ANY FIELD     true;
     Spilled  0,                8 Val ANY FIELD     true;

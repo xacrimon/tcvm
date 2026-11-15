@@ -412,6 +412,10 @@ impl Sel<'_> {
                     },
                     _ => self.reg(Val(i.c)),
                 };
+                if Field::info(i.aux).width == 1 {
+                    let (base, index) = (self.reg(a), self.reg(b));
+                    return self.push(MOp::LdrbIdx, Sz::W, Cond::Eq, &[t, base, index], &[]);
+                }
                 // A zero-extended index is the 32-bit register, extended by
                 // the access.
                 let x = *self.g.inst(b);

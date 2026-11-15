@@ -74,7 +74,7 @@ fn heap_of(i: &Inst) -> (Heaps, Option<u32>) {
 }
 
 /// How many arms one join takes.
-const MAX_ARMS: usize = 4;
+const MAX_ARMS: usize = 8;
 
 /// A block a branch leads to, before it is opened (`Emitter::arm`).
 #[derive(Clone, Copy)]
@@ -521,6 +521,7 @@ impl Emitter {
             Op::GetField | Op::SetField => self.field(&i),
             Op::Len => self.len_rewrite(&i),
             Op::Arith | Op::Unm => self.arith_rewrite(&i),
+            Op::Compare => self.compare_rewrite(&i),
             Op::Barrier => self.barrier_rewrite(&i),
             Op::BoxI64 => self.box_rewrite(&i),
             Op::UnboxI64 => self.unbox_rewrite(&i),
@@ -540,7 +541,6 @@ impl Emitter {
             | Op::AbsOvf
             | Op::FIDiv
             | Op::FMod
-            | Op::Compare
             | Op::Concat
             | Op::ForStart
             | Op::ForStep

@@ -112,13 +112,16 @@ impl Graph {
                 }
             }
         }
-        // A compare's speculated operand kinds.
+        // The kinds a compare's site saw, then `m` where a metamethod ran.
         if i.op == Op::Compare {
-            for shift in crate::jit::build::SPEC_SHIFT {
-                o.push_str(match crate::jit::build::Spec::of(i.aux >> shift) {
-                    crate::jit::build::Spec::I32 => ".i",
-                    crate::jit::build::Spec::F64 => ".f",
-                });
+            o.push('.');
+            for (k, c) in "sbfSto".chars().enumerate() {
+                if super::compare::seen(i.aux) >> k & 1 != 0 {
+                    o.push(c);
+                }
+            }
+            if i.aux & super::arith::MM != 0 {
+                o.push('m');
             }
         }
         match i.op {

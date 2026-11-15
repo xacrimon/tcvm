@@ -681,7 +681,7 @@ ops! {
     // Generic ops: the frame state's pc is the feedback site.
     Arith       H    Kind   (Any Any Fs)      Val      Leaves No        [] [] [EXITS CALLS ALLOCS GENERIC];
     Unm         H    No     (Any Fs No)       Val      Leaves No        [] [] [EXITS CALLS ALLOCS GENERIC];
-    Compare     H    Cc     (Val Val Fs)      B1       Rep    No        [ALL] [ALL] [EXITS CALLS GENERIC PLAIN];
+    Compare     H    Cc     (Any Any Fs)      B1       Rep    No        [SHAPE META] [] [EXITS GENERIC];
     Truthy      H    No     (Val No No)       B1       Rep    No        [] [] [GENERIC PLAIN];
     // Their result is no number to wait for: it is final under a pending key.
     GetIndex    H    Array  (Val Val Fs)      Val      Rep    No        [ALL] [ALL] [EXITS CALLS PLAIN];
@@ -855,7 +855,6 @@ helpers! {
     SetMetatable RT     0 (Val Val)     Val  ANY [TABLE] [TABLE] [ALLOCS];
     RawGet       NONE   0 (Val Val)     Val  ANY [FIELD ARR SHAPE] [] [];
     RawSet       RT     0 (Val Val Val) Val  ANY [TABLE] [TABLE] [ALLOCS];
-    RawEqual     NONE   0 (Val Val)     I32  ANY [] [] [];
     RawLen       RT     0 (Val)         Val  INT [FIELD ARR] [] [ALLOCS];
     ToString     RT     0 (Val)         Val  ANY [LOOKUP] [LOOKUP] [ALLOCS];
     ToNumber     RT     0 (Val)         Val  ANY [] [] [ALLOCS];

@@ -140,31 +140,31 @@ pub(crate) fn result(aux: u16, a: TypeSet, b: Option<TypeSet>) -> TypeSet {
 
 /// One operand at a site.
 #[derive(Clone, Copy)]
-struct Side {
-    v: Val,
+pub(super) struct Side {
+    pub(super) v: Val,
     /// The kinds it gets arms for.
-    armed: u8,
+    pub(super) armed: u8,
     /// Whether its fact allows anything else: its last test then fails to
     /// an exit.
-    rest: bool,
+    pub(super) rest: bool,
 }
 
 /// What a site's leaves share.
 #[derive(Clone, Copy)]
-struct Site {
-    low: u16,
-    wide: bool,
+pub(super) struct Site {
+    pub(super) low: u16,
+    pub(super) wide: bool,
     /// The exit of a value that is no kind.
-    tag: ExitTag,
-    fs: Val,
-    unary: bool,
+    pub(super) tag: ExitTag,
+    pub(super) fs: Val,
+    pub(super) unary: bool,
     /// Every leaf gives a 64-bit integer: the result stays an `I64`, which
     /// what takes it boxed boxes, and the next integer op takes as it is.
-    raw: bool,
+    pub(super) raw: bool,
 }
 
 impl Emitter {
-    fn side(&self, v: Val, seen: u8, low: u16) -> Side {
+    pub(super) fn side(&self, v: Val, seen: u8, low: u16) -> Side {
         // An integer the copy hands over unboxed.
         if self.g.rep(v) == Rep::I64 {
             return Side {
@@ -350,7 +350,7 @@ impl Emitter {
     /// one nothing else is possible past: `arm` gets the kind and the value
     /// typed as it, and ends its block. Where the fact allows more, what is
     /// no armed kind leaves.
-    fn by_kind(&mut self, x: Side, s: Site, arm: &mut dyn FnMut(&mut Self, u8, Val)) {
+    pub(super) fn by_kind(&mut self, x: Side, s: Site, arm: &mut dyn FnMut(&mut Self, u8, Val)) {
         if self.g.rep(x.v) == Rep::I64 {
             return arm(self, BIG, x.v);
         }
@@ -384,7 +384,7 @@ impl Emitter {
 
     /// The integer of `p`, typed as integer kind `kind` (or an `I64`
     /// already): `I64` at a wide site, else `I32`.
-    fn as_int(&mut self, kind: u8, p: Val, s: Site) -> Val {
+    pub(super) fn as_int(&mut self, kind: u8, p: Val, s: Site) -> Val {
         use Op::*;
         if self.g.rep(p) == Rep::I64 {
             return p;
@@ -403,7 +403,7 @@ impl Emitter {
 
     /// The payload of `p`, known here a boxed integer: read through what
     /// types it, which is the check again where a fact alone does.
-    fn big(&mut self, p: Val, s: Site) -> Val {
+    pub(super) fn big(&mut self, p: Val, s: Site) -> Val {
         self.check_type(p, TypeSet::BIGINT, s.tag, s.fs);
         match self.typed(p, TypeSet::BIGINT) {
             Some(t) => self.boxed_int(t),
@@ -412,7 +412,7 @@ impl Emitter {
     }
 
     /// The float of `p`, typed as number kind `kind`.
-    fn as_f64(&mut self, kind: u8, p: Val, s: Site) -> Val {
+    pub(super) fn as_f64(&mut self, kind: u8, p: Val, s: Site) -> Val {
         use Op::*;
         if self.g.rep(p) == Rep::I64 {
             return self.op1(LToF, Rep::F64, p);

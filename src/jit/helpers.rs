@@ -70,7 +70,6 @@ pub(crate) fn address(h: Helper) -> usize {
         Helper::SetMetatable => jit_setmetatable as _,
         Helper::RawGet => jit_rawget as _,
         Helper::RawSet => jit_rawset as _,
-        Helper::RawEqual => jit_rawequal as _,
         Helper::RawLen => jit_rawlen as _,
         Helper::ToString => jit_tostring as _,
         Helper::ToNumber => jit_tonumber as _,
@@ -967,12 +966,6 @@ pub(crate) extern "C" fn jit_rawset(rt: *const State<'static>, t: u64, k: u64, v
     }
     t.raw_set_keyed(ctx, k, v);
     tv.to_raw()
-}
-
-/// `rawequal(a, b)`: 1 or 0.
-pub(crate) extern "C" fn jit_rawequal(a: u64, b: u64) -> u64 {
-    let (a, b) = unsafe { (Value::from_raw(a), Value::from_raw(b)) };
-    num::raw_eq(a, b) as u64
 }
 
 /// `rawlen(v)` of a table or string.

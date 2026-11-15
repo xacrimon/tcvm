@@ -55,6 +55,7 @@ impl Em<'_> {
                     _ => self.a.str_idx(t, n, x, ext, true),
                 }
             }
+            MOp::LdrbIdx => self.a.ldrb_reg(self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::MovBase => self.a.mov(self.r(i, 0), BASE),
             MOp::MovThread => self.a.mov(self.r(i, 0), THREAD),
             MOp::Uxtw => self.a.mov_w(self.r(i, 0), self.r(i, 1)),

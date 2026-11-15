@@ -78,56 +78,6 @@ impl<'gc> Builder<'_, 'gc> {
         }
     }
 
-    /// Whether `x == y` for values of any kind. The same word is equal
-    /// unless it is a NaN; different words, in a cold block, go to the helper,
-    /// which compares numbers and big integers by value, after leaving for
-    /// what `__eq` may answer: either operand's, of two tables or userdata.
-    pub(super) fn equal(&mut self, x: Val, y: Val) -> Val {
-        let same = self.e.cmp(Op::Cmp, Cc::Eq, x, y);
-        if self.e.known(same).is_some() {
-            return same;
-        }
-        let yes = self.e.k32(Rep::B1, 1);
-        self.state();
-        let lp = self.e.g.block(self.e.cur).lp;
-        let [word, float, differ, on] = [(); 4].map(|_| self.e.new_block());
-        self.e.br(same, word, differ);
-        self.e.begin(word, lp, 0, BlockFlags::empty());
-        let boxes = self.e.k64(Rep::I64, crate::env::value::BOX);
-        let is_float = self.e.cmp(Op::Cmp, Cc::Lo, x, boxes);
-        self.e.br(is_float, float, on);
-        // A float is a NaN where, its sign shifted out, it is past infinity.
-        self.e.begin(float, lp, 0, BlockFlags::COLD);
-        let one = self.e.k64(Rep::I64, 1);
-        let unsigned = self.e.op2(Op::Shl, Rep::I64, x, one);
-        let infinity = self.e.k64(Rep::I64, 0xffe0_0000_0000_0000);
-        let number = self.e.cmp(Op::Cmp, Cc::Ls, unsigned, infinity);
-        self.e.jump(on);
-        self.e.begin(differ, lp, 0, BlockFlags::COLD);
-        for v in [x, y] {
-            let table = self
-                .e
-                .emit(Op::IsType, Rep::B1, TypeSet::TAB.bits(), v.0, 0, 0);
-            let s = self.state();
-            self.e.unless(table, |e| {
-                let t = e.unboxed(v, TypeSet::TAB);
-                e.no_mm(t, MetamethodBits::EQ, ExitTag::Slow, s);
-            });
-            let udata = self
-                .e
-                .emit(Op::IsType, Rep::B1, TypeSet::UDATA.bits(), v.0, 0, 0);
-            let s = self.state();
-            let tag = ExitTag::Slow as u16;
-            (self.e).emit(Op::GuardNot, Rep::None, tag, udata.0, s.0, u32::MAX);
-        }
-        let r = self.e.call(Helper::RawEqual, 0, &[x, y]);
-        let zero = self.e.k32(Rep::I32, 0);
-        let equal = self.e.cmp(Op::Cmp, Cc::Ne, r, zero);
-        self.e.jump(on);
-        self.e.begin(on, lp, 0, BlockFlags::empty());
-        self.e.param(Rep::B1, None, &[yes, number, equal])
-    }
-
     /// `SETLIST`: the items, in their slots, into the table in `R[a]`.
     pub(super) fn setlist(&mut self, i: Instruction) {
         let (a, n) = (i.a(), i.b());

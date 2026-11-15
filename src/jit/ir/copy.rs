@@ -5,11 +5,11 @@
 //! or its rewrite (`Emitter::lower`).
 
 use super::analyse::Analysis;
-use super::arith;
 use super::emit::Emitter;
 use super::ops::{Arg, Dialect, ExitKind, ExitTag, Flags, Op};
 use super::types::{Fact, Rep, TypeSet};
 use super::{Block, BlockFlags, Graph, Inst, Val};
+use super::{arith, compare};
 use crate::jit::bug;
 
 const NONE: u32 = u32::MAX;
@@ -229,14 +229,17 @@ impl Copy {
                     }
                     // An integer held as `I64` goes to its op as it is:
                     // boxed, it would be tested and unboxed again.
-                    Op::Arith | Op::Unm => {
+                    Op::Arith | Op::Unm | Op::Compare => {
                         let mut w = i.args();
                         let n = if i.op == Op::Unm { 1 } else { 2 };
                         let fs = self.map[w[n] as usize];
                         w[n] = fs.0;
                         for (k, x) in w[..n].iter_mut().enumerate() {
                             let v = self.map[*x as usize];
-                            let wide = arith::takes_i64(i.aux, k);
+                            let wide = match i.op {
+                                Op::Compare => compare::takes_i64(i.aux),
+                                _ => arith::takes_i64(i.aux, k),
+                            };
                             *x = match e.g.rep(v) {
                                 Rep::I64 if wide => v.0,
                                 // The site saw this operand small: an

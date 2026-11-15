@@ -10,7 +10,6 @@ use super::types::{Rep, TypeSet};
 use super::{Inst, Val};
 use crate::env::value::{SMALL_INT, Value};
 use crate::jit::bug;
-use crate::jit::build::{SPEC_SHIFT, Spec};
 
 const NONE: u32 = u32::MAX;
 
@@ -410,7 +409,7 @@ impl Emitter {
                 Some(self.op1(FFloor, Rep::F64, q))
             }
             Arith | Unm => self.arith_rule(i),
-            Compare => self.specialise(i),
+            Compare => self.compare_rule(i),
             // It folds where its branch is gone: on a constant condition, a
             // folded branch's, and on one known here though no branch on
             // it stands above (a copy folds a branch on a condition a guard
@@ -642,43 +641,6 @@ impl Emitter {
             (self.op2(Add, rep, r, y), r)
         };
         self.emit(Select, rep, 0, down.0, stepped.0, plain.0)
-    }
-
-    /// A `Compare` whose operands' facts are final: each operand has a kind,
-    /// its fact's or the one the site speculates, which is checked.
-    fn specialise(&mut self, i: &Inst) -> Option<Val> {
-        use Op::*;
-        let (a, b, fs) = (Val(i.a), Val(i.b), Val(i.c));
-        if self.fact(a).pending() || self.fact(b).pending() {
-            return None;
-        }
-        // Copy 1 goes by definitions alone, as the analysis that typed the
-        // parameters did.
-        let kind = |e: &Self, v: Val, k: usize| {
-            let f = if e.lowered {
-                e.g.facts[v.idx()]
-            } else {
-                e.fact(v)
-            };
-            Spec::by_fact(f).unwrap_or(Spec::of(i.aux >> SPEC_SHIFT[k]))
-        };
-        let small = |e: &mut Self, v: Val| e.check_type(v, TypeSet::SMALL, ExitTag::Type, fs);
-        let float = |e: &mut Self, v: Val, k: Spec| {
-            let x = e.check_type(v, k.set(), ExitTag::Type, fs);
-            match k {
-                Spec::I32 => e.op1(IToF, Rep::F64, x),
-                Spec::F64 => x,
-            }
-        };
-        let (ka, kb) = (kind(self, a, 0), kind(self, b, 1));
-        let low = i.aux & 15;
-        Some(if ka == Spec::I32 && kb == Spec::I32 {
-            let (x, y) = (small(self, a), small(self, b));
-            self.emit(Cmp, Rep::B1, low, x.0, y.0, 0)
-        } else {
-            let (x, y) = (float(self, a, ka), float(self, b, kb));
-            self.emit(FCmp, Rep::B1, low, x.0, y.0, 0)
-        })
     }
 
     /// Whether the `Val` is neither nil nor false, once its fact is final:

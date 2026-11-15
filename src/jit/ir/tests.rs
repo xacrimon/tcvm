@@ -831,6 +831,7 @@ fn table_columns() {
             "CallHelper",
             "Arith",
             "Unm",
+            "Compare",
             "SetIndex",
             "ForLimit",
             "ForSkip",
@@ -1874,5 +1875,261 @@ mod arithmetic {
                 panic!("{why}\n{}", low.g.print());
             }
         }
+    }
+}
+
+mod compares {
+    use super::super::arith::{BIG, FLOAT, MM, SMALL, STR};
+    use super::super::compare::{self, OTHER, SEEN_SHIFT, TAB};
+    use super::super::fields::Field;
+    use super::*;
+    use crate::env::value::{NIL, Value};
+
+    fn aux(cc: Cc, seen: u8) -> u16 {
+        cc as u16 | (seen as u16) << SEEN_SHIFT
+    }
+
+    fn compare(t: &T, aux: u16, a: Val, b: Val) -> Val {
+        t.e().lower(Op::Compare, Rep::B1, aux, a.0, b.0, t.fs.0)
+    }
+
+    fn small(t: &T, r: u16) -> Val {
+        let s = t.small(r);
+        t.op1(Op::BoxI32, Rep::Val, s)
+    }
+
+    fn float(t: &T, r: u16) -> Val {
+        let f = t.check(t.slot(r), TypeSet::FLOAT, ExitTag::Type);
+        t.op1(Op::BoxF64, Rep::Val, f)
+    }
+
+    /// Register `r` as a value known a small integer or a float.
+    fn number(t: &T, r: u16) -> Val {
+        let (s, f) = (small(t, r), float(t, r + 8));
+        let c = t.cmp(Op::Cmp, Cc::Eq, t.slot(r + 4), t.slot(r + 5));
+        t.emit(Op::Select, Rep::Val, 0, c, s, f)
+    }
+
+    fn nil(t: &T) -> Val {
+        t.e().k64(Rep::Val, NIL)
+    }
+
+    fn loads(t: &T, f: Field) -> usize {
+        let e = t.e();
+        (e.g.insts.iter())
+            .filter(|i| matches!(i.op, Op::Load | Op::LoadIdx) && i.aux == f as u16)
+            .count()
+    }
+
+    fn exits(t: &T, tag: ExitTag) -> usize {
+        let e = t.e();
+        (e.g.insts.iter())
+            .filter(|i| i.op == Op::Deopt && i.aux == tag as u16)
+            .count()
+    }
+
+    /// What one compare decides has no branch.
+    #[test]
+    fn one_leaf_is_one_compare() {
+        use Op::*;
+        let either = SMALL | FLOAT;
+        // Typed operands, whatever the site saw.
+        for (cc, a, b, op, conv) in [
+            (Cc::Lt, 0, 0, Cmp, 0),
+            (Cc::Le, 1, 1, FCmp, 0),
+            (Cc::Lt, 0, 1, FCmp, 1),
+            (Cc::Eq, 0, 0, Cmp, 0),
+            (Cc::Eq, 1, 1, FCmp, 0),
+            (Cc::Eq, 1, 0, FCmp, 1),
+        ] {
+            let t = start(true);
+            let v = |k: i32, r: u16| if k == 0 { small(&t, r) } else { float(&t, r) };
+            let (x, y) = (v(a, 0), v(b, 1));
+            let r = compare(&t, aux(cc, either), x, y);
+            assert_eq!(
+                (t.op(r), count(&t, Br), count(&t, IToF)),
+                (op, 0, conv),
+                "{cc:?} {a} {b}"
+            );
+            t.done();
+        }
+        // Untyped operands at a site that saw one kind: checked, compared.
+        for (cc, seen, op) in [
+            (Cc::Lt, SMALL, Cmp),
+            (Cc::Ge, FLOAT, FCmp),
+            (Cc::Eq, SMALL, Cmp),
+        ] {
+            let t = start(true);
+            let r = compare(&t, aux(cc, seen), t.slot(0), t.slot(1));
+            assert_eq!(
+                (t.op(r), count(&t, Br), count(&t, Guard)),
+                (op, 0, 2),
+                "{cc:?}"
+            );
+            t.done();
+        }
+        // No pair of the types is equal: no code.
+        let t = start(true);
+        let r = compare(&t, aux(Cc::Eq, either), small(&t, 0), nil(&t));
+        assert_eq!(t.known(r), Some(false));
+        t.done();
+        // One side no number: the words decide.
+        let t = start(true);
+        let r = compare(&t, aux(Cc::Eq, either | TAB | OTHER), t.slot(0), nil(&t));
+        assert_eq!((t.op(r), count(&t, Br), count(&t, Cmp)), (Cmp, 0, 1));
+        t.done();
+    }
+
+    #[test]
+    fn order_by_kinds() {
+        use Op::*;
+        let either = SMALL | FLOAT;
+        // Either kind on both sides: a test of each on a path, one integer
+        // compare and one float compare, joined.
+        let t = start(true);
+        let (a, b) = (number(&t, 0), number(&t, 1));
+        let brs = count(&t, Br);
+        let r = compare(&t, aux(Cc::Lt, either), a, b);
+        let ordered = (t.e().g.insts.iter())
+            .filter(|i| i.op == Cmp && i.aux == Cc::Lt as u16)
+            .count();
+        assert_eq!((ordered, count(&t, FCmp), count(&t, Br) - brs), (1, 1, 3));
+        assert_eq!(
+            (t.op(r), t.inst(r).rep, count(&t, Deopt)),
+            (Param, Rep::B1, 0)
+        );
+        t.done();
+        // One side always an integer: one test.
+        let t = start(true);
+        let (a, b) = (small(&t, 0), number(&t, 1));
+        let brs = count(&t, Br);
+        compare(&t, aux(Cc::Le, either), a, b);
+        assert_eq!((count(&t, FCmp), count(&t, Br) - brs), (1, 1));
+        t.done();
+        // A kind the site did not see leaves; a metamethod site with `Mm`.
+        for (flags, tag) in [(0, ExitTag::Type), (MM, ExitTag::Mm)] {
+            let t = start(true);
+            compare(&t, aux(Cc::Lt, either) | flags, t.slot(0), t.slot(1));
+            assert_eq!((exits(&t, tag), count(&t, Deopt)), (3, 3));
+            t.done();
+        }
+    }
+
+    /// A 64-bit integer is compared as one, and against a float exactly:
+    /// as floats where it converts, else against the float truncated, a
+    /// float out of range by its sign.
+    #[test]
+    fn wide_integers() {
+        use Op::*;
+        let t = start(true);
+        let r = compare(&t, aux(Cc::Lt, SMALL | BIG | FLOAT), t.slot(0), t.slot(1));
+        assert_eq!(t.op(r), Param);
+        // An integer under a float and a float under an integer.
+        assert_eq!((count(&t, LToF), count(&t, FToL)), (2, 2));
+        // Either operand's payload, the right one's on both paths.
+        assert_eq!((loads(&t, Field::BoxedInt), count(&t, SExt32)), (3, 2));
+        assert_eq!((count(&t, FToLExact), count(&t, CallHelper)), (0, 0));
+        t.done();
+        // An integer held unboxed is taken as it is.
+        for cc in [Cc::Lt, Cc::Eq] {
+            let t = start(true);
+            let x = t.op1(SExt32, Rep::I64, t.small(0));
+            let r = compare(&t, aux(cc, SMALL | BIG), x, t.slot(1));
+            assert_eq!((count(&t, BoxI64), count(&t, CallHelper)), (0, 0), "{cc:?}");
+            assert_ne!(r, Val::NONE);
+            t.done();
+        }
+        assert_eq!(compare::demand(aux(Cc::Lt, SMALL)), Some(TypeSet::SMALL));
+        assert_eq!(compare::demand(aux(Cc::Lt, FLOAT)), Some(TypeSet::FLOAT));
+        assert_eq!(
+            compare::demand(aux(Cc::Lt, SMALL | BIG)),
+            Some(TypeSet::INT)
+        );
+        assert_eq!(compare::demand(aux(Cc::Lt, BIG)), Some(TypeSet::INT));
+        assert_eq!(compare::demand(aux(Cc::Lt, SMALL | FLOAT)), None);
+        assert_eq!(compare::demand(aux(Cc::Eq, SMALL | BIG | TAB)), None);
+        assert!(compare::takes_i64(aux(Cc::Lt, BIG | FLOAT)));
+        assert!(!compare::takes_i64(aux(Cc::Lt, SMALL | FLOAT)));
+    }
+
+    /// Two strings in order: a loop over their bytes, of one parameter, with
+    /// no call and no exit of its own.
+    #[test]
+    fn strings_in_order() {
+        use Op::*;
+        for cc in [Cc::Lt, Cc::Le] {
+            let t = start(true);
+            let r = compare(&t, aux(cc, STR), t.slot(0), t.slot(1));
+            assert_eq!(t.op(r), Param);
+            assert_eq!(
+                (loads(&t, Field::StrByte), loads(&t, Field::StrLen)),
+                (2, 2)
+            );
+            assert_eq!((count(&t, Select), count(&t, CallHelper)), (1, 0));
+            {
+                let e = t.e();
+                assert_eq!(e.g.loops.len(), 1);
+                let head = e.g.block(e.g.loops[0].header);
+                assert_eq!((head.npreds, head.nfwd), (2, 1));
+                let params = (e.g.insts[head.start as usize..head.end as usize].iter())
+                    .filter(|i| i.op == Param)
+                    .map(|i| i.rep)
+                    .collect::<Vec<_>>();
+                assert_eq!(params, [Rep::I64]);
+            }
+            // What is no string leaves: each operand's check.
+            assert_eq!((count(&t, Deopt), count(&t, Guard)), (1, 1));
+            t.done();
+        }
+        // A string against a number is the interpreter's.
+        let t = start(true);
+        compare(&t, aux(Cc::Lt, STR), t.slot(0), small(&t, 1));
+        assert_eq!((loads(&t, Field::StrByte), count(&t, Deopt)), (0, 2));
+        assert!(t.e().cur.is_none());
+    }
+
+    #[test]
+    fn equality_of_anything() {
+        use Op::*;
+        let unrecorded = SMALL | FLOAT;
+        // Nothing recorded: the words, a float against itself and against a
+        // float or a small integer; what was not seen leaves.
+        let t = start(true);
+        let r = compare(&t, aux(Cc::Eq, unrecorded), t.slot(0), t.slot(1));
+        assert_eq!(t.op(r), Param);
+        assert_eq!((count(&t, FCmp), count(&t, IToF)), (2, 2));
+        assert_eq!((exits(&t, ExitTag::Type), count(&t, Deopt)), (4, 4));
+        assert_eq!((count(&t, CallHelper), loads(&t, Field::BoxedInt)), (0, 0));
+        t.done();
+        // Tables seen: neither may have `__eq`.
+        let t = start(true);
+        compare(&t, aux(Cc::Eq, unrecorded | TAB), t.slot(0), t.slot(1));
+        assert_eq!(
+            (loads(&t, Field::ShapeClass), exits(&t, ExitTag::Type)),
+            (2, 3)
+        );
+        t.done();
+        // 64-bit integers seen: their payloads, and against a float.
+        let t = start(true);
+        compare(&t, aux(Cc::Eq, unrecorded | BIG), t.slot(0), t.slot(1));
+        assert_eq!((loads(&t, Field::BoxedInt), count(&t, FToL)), (3, 1));
+        assert_eq!(exits(&t, ExitTag::Type), 2);
+        t.done();
+        // Userdata seen: two of them leave for `__eq`.
+        let t = start(true);
+        compare(&t, aux(Cc::Eq, unrecorded | OTHER), t.slot(0), t.slot(1));
+        assert_eq!((exits(&t, ExitTag::Mm), exits(&t, ExitTag::Type)), (1, 3));
+        t.done();
+        // A small constant: a small integer by its word, a float converted,
+        // anything else unequal; nothing leaves.
+        let t = start(true);
+        let five = t.e().k64(Rep::Val, Value::small(5).to_raw());
+        let brs = count(&t, Br);
+        compare(&t, aux(Cc::Eq, unrecorded), t.slot(0), five);
+        assert_eq!(
+            (count(&t, Br) - brs, count(&t, FCmp), count(&t, Deopt)),
+            (2, 1, 0)
+        );
+        t.done();
     }
 }

@@ -43,7 +43,7 @@ const HELPER_LIST: &str = "\
     ArithCoerce Unm BNot Len Concat UpvalBarrier Barrier Closure ClosureOf \
     Close BoxInt NewTable SetList VarargGet VarargTable TforNext TforIpairs TopArgs \
     VarargAll Mm IndexFn NewIndexFn Index GetStr SetStr NewIndex Type \
-    GetMetatable SetMetatable RawGet RawSet RawEqual RawLen ToString \
+    GetMetatable SetMetatable RawGet RawSet RawLen ToString \
     ToNumber StrSub StrByte TInsert TRemove";
 
 #[test]
@@ -61,7 +61,7 @@ mod aarch64 {
     /// one of selection's and the encoder's agreed cases (section 8.3).
     const PSEUDO: &str = "Entry Ret";
     const MOP_LIST: &str = "\
-        Entry MovImm MovWide FImm LdrSlot StrSlot Ldr Str LdrIdx StrIdx MovBase \
+        Entry MovImm MovWide FImm LdrSlot StrSlot Ldr Str LdrIdx StrIdx LdrbIdx MovBase \
         MovThread Uxtw Cset Csel AndRR EorRR SdivRR Sxtw NegR MvnR NegsR FNeg Frintm \
         OrrRR AndImm AndWide OrrImm OrrWide TstImm TstWide AddRR SubRR MulRR \
         AddImm SubImm AddsRR SubsRR AddsImm SubsImm CmpRR CmpImm CmnImm CmpSxtw \

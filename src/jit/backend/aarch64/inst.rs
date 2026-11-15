@@ -102,6 +102,8 @@ mops! {
     // zero-extended (`uxtw`).
     LdrIdx    [D U U]          None None Fall false false;
     StrIdx    [U U U]          None None Fall false false;
+    // A byte at the base plus an index of bytes, zero-extended.
+    LdrbIdx   [D U U]          None None Fall false false;
     // A pinned register's value.
     MovBase   [D NO NO]        None None Fall true false;
     MovThread [D NO NO]        None None Fall true false;
