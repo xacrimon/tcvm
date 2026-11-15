@@ -10,7 +10,7 @@ use crate::jit::backend::aarch64::asm::{
     Asm, Cond, Extend, FP, Fpr, Gpr, LR, Label, SP, Shift, Sz, ZR,
 };
 use crate::jit::backend::aarch64::inst::{MInst, MOp};
-use crate::jit::backend::emit::{Emitted, ExitOut, Selected, Src};
+use crate::jit::backend::emit::{Emitted, ExitOut, Selected, Src, rotate_loops, thread_jumps};
 use crate::jit::backend::ra::{Edit, InstOrEdit, Output};
 use crate::jit::backend::reg::{Allocation, Block, Inst, PReg, RegClass};
 use crate::jit::backend::vcode::{Remat, VCode};
@@ -32,6 +32,8 @@ struct Em<'a> {
     out: &'a Output,
     frame: u32,
     labels: Vec<Label>,
+    /// Where a branch to each block goes (`thread_jumps`).
+    dest: Vec<Label>,
     exit_labels: Vec<Label>,
     /// The code's first word, the region pointer (`Region::of_return`).
     region_word: Label,
@@ -62,9 +64,13 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail>
         return Err(Bail::TooLarge);
     }
     let mut a = Asm::new();
+    let labels: Vec<Label> = (0..s.vcode.blocks.len()).map(|_| a.new_label()).collect();
+    let exit_labels: Vec<Label> = (0..s.exits.len()).map(|_| a.new_label()).collect();
+    let (dest, skip) = thread_jumps(&s.vcode, out, &labels, |e| exit_labels[e as usize]);
     let mut em = Em {
-        labels: (0..s.vcode.blocks.len()).map(|_| a.new_label()).collect(),
-        exit_labels: (0..s.exits.len()).map(|_| a.new_label()).collect(),
+        labels,
+        dest,
+        exit_labels,
         region_word: a.new_label(),
         frame: ((FRAME_SPILLS + 8 * out.num_spillslots) as u32).next_multiple_of(16),
         stubs: Vec::new(),
@@ -76,9 +82,20 @@ pub(crate) fn emit(s: &Selected, out: &Output, rt: u64) -> Result<Emitted, Bail>
     em.a.bind(em.region_word);
     em.a.emit(0);
     em.a.emit(0);
-    let order = &s.layout.emit;
-    for (at, &b) in order.iter().enumerate() {
-        let next = order.get(at + 1).map(|&x| em.labels[x as usize]);
+    // Only blocks that end in a deopt or are cold are left out, so the hot
+    // ones keep their count.
+    let mut laid: Vec<u32> = (s.layout.emit.iter().copied())
+        .filter(|&b| !skip[b as usize])
+        .collect();
+    let (loops, hot) = (&s.layout.loops, s.layout.hot);
+    let tops = rotate_loops(&s.vcode, loops, &em.labels, &em.dest, &mut laid, hot);
+    for (at, &b) in laid.iter().enumerate() {
+        let next = laid.get(at + 1).map(|&x| em.labels[x as usize]);
+        // A rotated loop's top, past the jump into its header: padding
+        // there never runs.
+        if tops.contains(&b) && em.a.after_jump() {
+            em.a.align(16);
+        }
         em.a.bind(em.labels[b as usize]);
         for ie in out.block_insts_and_edits(&s.vcode, Block::new(b as usize)) {
             match ie {
@@ -237,7 +254,7 @@ impl<'a> Em<'a> {
         next: Option<Label>,
     ) -> ([Label; 2], &'a [(Inst, u8, Edit)]) {
         let succs = self.v.succs(block);
-        let mut labels = [self.labels[succs[0].index()], self.labels[succs[1].index()]];
+        let mut labels = [self.dest[succs[0].index()], self.dest[succs[1].index()]];
         let mut inline: &'a [(Inst, u8, Edit)] = &[];
         for (k, l) in labels.iter_mut().enumerate() {
             let edits = self.out.edge_edits(Inst::new(i), k);
@@ -333,7 +350,7 @@ impl<'a> Em<'a> {
             MOp::FMul => self.a.fmul(self.fr(i, 0), self.fr(i, 1), self.fr(i, 2)),
             MOp::FDiv => self.a.fdiv(self.fr(i, 0), self.fr(i, 1), self.fr(i, 2)),
             MOp::B => {
-                let to = self.labels[self.v.succs(block)[0].index()];
+                let to = self.dest[self.v.succs(block)[0].index()];
                 if Some(to) != next {
                     self.a.b(to);
                 }
