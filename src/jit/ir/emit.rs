@@ -121,8 +121,10 @@ pub(crate) struct Emitter {
     /// Sticky: once set, `emit` appends nothing and its results mean
     /// nothing; the caller stops at its next block.
     pub(crate) bail: Option<Bail>,
-    /// The runtime's address, which helpers take (`call`).
+    /// The runtime's address, which helpers take (`call`), and that of
+    /// the arena's metrics, where the collector's counters are.
     pub(crate) rt: u64,
+    pub(crate) metrics: u64,
     scratch: Vec<Snap>,
     /// A call's operand list while `call` builds it.
     list: Vec<Val>,
@@ -513,12 +515,15 @@ impl Emitter {
         }
         match i.op {
             Op::GetIndex | Op::SetIndex => self.index(&i),
+            Op::Barrier => self.barrier_rewrite(&i),
+            Op::BoxI64 => self.box_rewrite(&i),
+            Op::UnboxI64 => self.unbox_rewrite(&i),
+            Op::ToF64 => self.float_rewrite(&i),
             // No rewrite: a rule lowers each, or it is not lowered yet.
             Op::CheckType
             | Op::IsType
-            | Op::BoxI64
-            | Op::UnboxI64
-            | Op::ToF64
+            | Op::NewTable
+            | Op::GcCheck
             | Op::DivFloor
             | Op::ModFloor
             | Op::LuaShl
@@ -638,6 +643,8 @@ impl Emitter {
                 Heaps::empty()
             };
             self.kill(h.writes | gc);
+        } else if info.flags.contains(Flags::ALLOCS) {
+            self.kill(Heaps::GC);
         }
         if numbered && let Err(s) = self.number(&i) {
             slot = s;
@@ -738,6 +745,9 @@ impl Emitter {
             | Op::AbsOvf
             | Op::FIDiv
             | Op::FMod
+            | Op::Barrier
+            | Op::NewTable
+            | Op::GcCheck
             | Op::Arith
             | Op::Unm
             | Op::Compare
@@ -779,6 +789,7 @@ impl Emitter {
             FactOf::Small => Fact::of(TypeSet::SMALL),
             FactOf::Float => Fact::of(TypeSet::FLOAT),
             FactOf::IntSet => Fact::of(TypeSet::INT),
+            FactOf::Tab => Fact::of(TypeSet::TAB),
             FactOf::AuxSet => Fact::of(aux_set),
             FactOf::Field if i.rep == Rep::Val => Fact::of(Field::info(i.aux).set),
             FactOf::Field => by_rep,
@@ -793,7 +804,8 @@ impl Emitter {
             FactOf::Konst => by_rep,
             FactOf::Helper => match Helper::of(i.aux).info().fact {
                 HelperFact::Tab if i.rep == Rep::Val => Fact::of(TypeSet::TAB),
-                HelperFact::Tab | HelperFact::Rep => by_rep,
+                HelperFact::Int if i.rep == Rep::Val => Fact::of(TypeSet::INT),
+                HelperFact::Tab | HelperFact::Int | HelperFact::Rep => by_rep,
             },
         };
         // A generic op's result is as unresolved as its operands.
@@ -874,7 +886,13 @@ impl Emitter {
     /// anything else, and for memory nothing writes.
     fn versions(&self, i: &Inst) -> (u32, u32) {
         if mem_key(i).is_none() {
-            return (0, 0);
+            let info = i.op.info();
+            return if info.flags.contains(Flags::VERSIONED) {
+                let class = info.reads.bits().trailing_zeros();
+                (self.table.get(Key::heap(class)), 0)
+            } else {
+                (0, 0)
+            };
         }
         let (heap, key) = heap_of(i);
         if heap.is_empty() {

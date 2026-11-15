@@ -794,6 +794,7 @@ fn table_columns() {
             ("CallHelper", FactOf::Helper),
             ("CheckType", FactOf::AuxSet),
             ("BoxI64", FactOf::IntSet),
+            ("NewTable", FactOf::Tab),
         ]
     );
     let mem: Vec<(&str, Mem)> = (OPS.iter())
@@ -831,7 +832,191 @@ fn table_columns() {
         .filter(|h| h.fact != super::ops::HelperFact::Rep)
         .map(|h| h.name)
         .collect();
-    assert_eq!(tab, ["NewTable"]);
+    assert_eq!(tab, ["BoxInt", "NewTable"]);
+}
+
+/// How many instructions of `op` the graph has.
+fn count(t: &T, op: Op) -> usize {
+    t.e().g.insts.iter().filter(|i| i.op == op).count()
+}
+
+/// The unit ops with no blocks, each as the sequence its rule gives in a
+/// low-level graph.
+#[test]
+fn unit_ops_lower_in_line() {
+    use Op::*;
+    let t = start(true);
+    let tag = ExitTag::Type as u16;
+    let none = Val(0);
+    let x = t.check(t.slot(0), TypeSet::FLOAT, ExitTag::Type);
+    let y = t.check(t.slot(1), TypeSet::FLOAT, ExitTag::Type);
+    // An exact conversion: the conversion, checked by converting back.
+    let i = t.emit(FToIExact, Rep::I32, tag, x, t.fs, none);
+    let (g, n) = (t.inst(i), t.inst(Val(t.inst(i).c)));
+    assert_eq!((g.op, g.rep, n.op, n.a), (Guard, Rep::I32, FToI, x.0));
+    let same = t.inst(Val(g.a));
+    assert_eq!((same.op, t.op(Val(same.a)), same.b), (FCmp, IToF, x.0));
+    // To 64 bits, also below 2^63.
+    let l = t.emit(FToLExact, Rep::I64, tag, y, t.fs, none);
+    let both = t.inst(Val(t.inst(l).a));
+    assert_eq!(
+        (t.op(l), both.op, t.op(Val(t.inst(l).c))),
+        (Guard, And, FToL)
+    );
+    let below = t.inst(Val(both.b));
+    assert_eq!(
+        (below.op, t.e().kf(Val(below.b))),
+        (FCmp, Some(2f64.powi(63)))
+    );
+    // A 64-bit integer that is its low half extended.
+    let l = Val(t.inst(l).c);
+    let narrow = t.emit(LToI, Rep::I32, tag, l, t.fs, none);
+    let (g, low) = (t.inst(narrow), t.inst(Val(t.inst(narrow).c)));
+    assert_eq!((g.op, low.op, low.a), (Guard, Trunc32, l.0));
+    let fits = t.inst(Val(g.a));
+    assert_eq!((fits.op, t.op(Val(fits.a)), fits.b), (Cmp, SExt32, l.0));
+    // The absolute value: the minimum leaves, the rest is a select.
+    let s = t.small(2);
+    let abs = t.emit(AbsOvf, Rep::I32, ExitTag::Overflow as u16, s, t.fs, none);
+    let sel = t.inst(abs);
+    assert_eq!(
+        (sel.op, t.op(Val(sel.b)), t.op(Val(sel.c))),
+        (Select, Neg, Guard)
+    );
+    // Float floor division and modulo.
+    let q = t.f64(FIDiv, x, y);
+    assert_eq!((t.op(q), t.op(Val(t.inst(q).a))), (FFloor, FDiv));
+    let m = t.f64(FMod, x, y);
+    let call = t.inst(m);
+    assert_eq!(
+        (call.op, call.aux),
+        (CallHelper, super::ops::Helper::FMod as u16)
+    );
+    // Lua's shifts: each way where its count is in range, else zero; the
+    // `I32` form over the 64-bit one, leaving where the result is wider.
+    let by = t.small(3);
+    let (shl, shr) = (count(&t, Shl), count(&t, Shr));
+    let wide = t.emit(LuaShl, Rep::I64, tag, l, l, Val::NONE);
+    let (outer, inner) = (t.inst(wide), t.inst(Val(t.inst(wide).c)));
+    assert_eq!(
+        (outer.op, t.op(Val(outer.b)), inner.op),
+        (Select, Shl, Select)
+    );
+    assert_eq!((t.op(Val(inner.b)), t.ki(Val(inner.c))), (Shr, Some(0)));
+    let right = t.emit(LuaShr, Rep::I64, tag, l, l, Val::NONE);
+    assert_eq!(t.op(Val(t.inst(right).b)), Shr);
+    let small = t.emit(LuaShl, Rep::I32, tag, s, by, t.fs);
+    assert_eq!((t.op(small), t.inst(small).rep), (Guard, Rep::I32));
+    assert_eq!((count(&t, Shl) - shl, count(&t, Shr) - shr), (3, 3));
+    // A table from its template, and the collector's check.
+    let template = t.e().k64(Rep::I64, 0x1000);
+    let table = t.op1(NewTable, Rep::Val, template);
+    assert_eq!((t.op(table), t.set(table)), (CallHelper, TypeSet::TAB));
+    let check = t.emit(GcCheck, Rep::None, ExitTag::Gc as u16, t.fs, none, none);
+    let below = t.inst(Val(t.inst(check).a));
+    assert_eq!(
+        (t.op(check), below.op, t.op(Val(below.a))),
+        (Guard, Cmp, Load)
+    );
+    // A boxed integer's payload.
+    let big = t.check(t.slot(4), TypeSet::BIGINT, ExitTag::Type);
+    assert_eq!(t.op(big), UnboxPtr);
+    let boxed = t.emit(BoxPtr, Rep::Val, TypeSet::BIGINT.bits(), big, none, none);
+    let payload = t.op1(UnboxI64, Rep::I64, boxed);
+    let load = t.inst(payload);
+    assert_eq!(
+        (load.op, load.aux),
+        (Load, super::fields::Field::BoxedInt as u16)
+    );
+    t.done();
+}
+
+/// The unit ops that take arms, through `lower`.
+#[test]
+fn unit_ops_rewrite() {
+    use Op::*;
+    let lower =
+        |t: &T, op: Op, rep: Rep, aux: u16, a: Val, b: Val| t.e().lower(op, rep, aux, a.0, b.0, 0);
+    let none = Val(0);
+    // The barrier: the header's test, and the helper in a cold arm.
+    let t = start(true);
+    let table = t.check(t.slot(0), TypeSet::TAB, ExitTag::Type);
+    lower(&t, Barrier, Rep::None, 0, table, none);
+    assert_eq!((count(&t, Br), count(&t, CallHelper)), (1, 1));
+    t.done();
+    // A 64-bit integer boxed: small where it fits, else the helper.
+    let t = start(true);
+    let x = t.check(t.slot(0), TypeSet::FLOAT, ExitTag::Type);
+    let l = t.op1(FToL, Rep::I64, x);
+    let boxed = lower(&t, BoxI64, Rep::Val, 0, l, none);
+    let ins = t.e().g.inputs(boxed).to_vec();
+    let ins: Vec<Op> = ins.iter().map(|&v| t.op(Val(v))).collect();
+    assert_eq!((t.op(boxed), ins), (Param, vec![BoxI32, CallHelper]));
+    assert_eq!(t.set(boxed), TypeSet::INT);
+    // An integer unboxed: each kind in its arm, read as what the branch
+    // proved.
+    let (brs, proved) = (count(&t, Br), count(&t, Proved));
+    let wide = lower(&t, UnboxI64, Rep::I64, 0, boxed, none);
+    let ins = t.e().g.inputs(wide).to_vec();
+    let ins: Vec<Op> = ins.iter().map(|&v| t.op(Val(v))).collect();
+    assert_eq!((t.op(wide), ins), (Param, vec![SExt32, Load]));
+    assert_eq!((count(&t, Br) - brs, count(&t, Proved) - proved), (1, 2));
+    // A number as a float: an arm per kind, the last one untested.
+    let float = t.op1(BoxF64, Rep::Val, x);
+    let which = t.cmp(FCmp, Cc::Lt, x, x);
+    let v = t.emit(Select, Rep::Val, 0, which, boxed, float);
+    assert_eq!(t.set(v), TypeSet::NUM);
+    let (brs, proved) = (count(&t, Br), count(&t, Proved));
+    let aux = TypeSet::NUM.bits() | (ExitTag::Type as u16) << TypeSet::BITS;
+    let f = lower(&t, ToF64, Rep::F64, aux, v, t.fs);
+    let ins = t.e().g.inputs(f).to_vec();
+    let ins: Vec<Op> = ins.iter().map(|&v| t.op(Val(v))).collect();
+    assert_eq!((t.op(f), ins), (Param, vec![UnboxF64, IToF, LToF]));
+    assert_eq!((count(&t, Br) - brs, count(&t, Proved) - proved), (2, 3));
+    assert_eq!(count(&t, Deopt), 0);
+    t.done();
+    // Only the kinds the set takes, and a last arm that leaves for a value
+    // the fact still allows outside it.
+    let t = start(true);
+    let v = t.slot(0);
+    let ints = TypeSet::INT.bits() | (ExitTag::Type as u16) << TypeSet::BITS;
+    let f = lower(&t, ToF64, Rep::F64, ints, v, t.fs);
+    assert_eq!(t.e().g.inputs(f).len(), 2);
+    assert_eq!((count(&t, Br), count(&t, Deopt)), (2, 1));
+    t.done();
+}
+
+/// A repeat of a barrier or of the collector's check, with no allocation
+/// between, is the first one.
+#[test]
+fn barriers_and_checks_repeat() {
+    use Op::*;
+    let t = start(false);
+    let table = t.check(t.slot(0), TypeSet::TAB, ExitTag::Type);
+    let (heap, number) = (t.slot(1), t.op1(BoxI32, Rep::Val, t.small(2)));
+    t.e().barrier(table, number);
+    assert_eq!(count(&t, Barrier), 0);
+    t.e().barrier(table, heap);
+    t.e().barrier(table, heap);
+    assert_eq!(count(&t, Barrier), 1);
+    let check = |t: &T| t.emit(GcCheck, Rep::None, ExitTag::Gc as u16, t.fs, Val(0), Val(0));
+    check(&t);
+    check(&t);
+    assert_eq!(count(&t, GcCheck), 1);
+    let template = t.e().k64(Rep::I64, 0x1000);
+    t.op1(NewTable, Rep::Val, template);
+    t.e().barrier(table, heap);
+    check(&t);
+    assert_eq!((count(&t, Barrier), count(&t, GcCheck)), (2, 2));
+    t.done();
+}
+
+#[test]
+#[should_panic(expected = "high-level")]
+fn a_rewrite_is_not_a_rule() {
+    let t = start(true);
+    let table = t.check(t.slot(0), TypeSet::TAB, ExitTag::Type);
+    t.emit(Op::Barrier, Rep::None, 0, table, Val(0), Val(0));
 }
 
 /// An array access through its rewrite: the table and key checks, the

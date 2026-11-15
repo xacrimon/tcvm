@@ -530,17 +530,19 @@ impl Sel<'_> {
             }
             Shl | Shr | Sar => {
                 let Some(d) = self.def(v) else { return };
-                let Some(k) = self.imm(b) else {
-                    self.s.bail = Some(Bail::Unsupported("a variable shift"));
-                    return;
-                };
-                let op = match i.op {
-                    Shl => MOp::LslImm,
-                    Shr => MOp::LsrImm,
-                    _ => MOp::AsrImm,
+                let (by_imm, by_reg) = match i.op {
+                    Shl => (MOp::LslImm, MOp::LslRR),
+                    Shr => (MOp::LsrImm, MOp::LsrRR),
+                    _ => (MOp::AsrImm, MOp::AsrRR),
                 };
                 let x = self.reg(a);
-                self.imm_op(op, w, k as u32 & (w.bits() - 1), &[d, x]);
+                match self.imm(b) {
+                    Some(k) => self.imm_op(by_imm, w, k as u32 & (w.bits() - 1), &[d, x]),
+                    None => {
+                        let n = self.reg(b);
+                        self.op(by_reg, w, &[d, x, n])
+                    }
+                }
             }
             AddOvf | SubOvf => {
                 self.exit(MOp::BCondExit, Cond::Vs, Val(i.c), i.aux);
@@ -609,13 +611,16 @@ impl Sel<'_> {
                 let x = self.reg(a);
                 self.const_op(MOp::OrrImm, MOp::OrrWide, Sz::X, SMALL_INT, &[d, x]);
             }
-            BoxF64 | UnboxF64 | IToF => {
+            BoxF64 | UnboxF64 | IToF | LToF | FToI | FToL => {
                 let Some(d) = self.def(v) else { return };
                 let x = self.reg(a);
                 let (op, sz) = match i.op {
                     BoxF64 => (MOp::FmovToGpr, Sz::X),
                     UnboxF64 => (MOp::FmovFromGpr, Sz::X),
-                    _ => (MOp::Scvtf, Sz::W),
+                    IToF => (MOp::Scvtf, Sz::W),
+                    LToF => (MOp::Scvtf, Sz::X),
+                    FToI => (MOp::Fcvtzs, Sz::W),
+                    _ => (MOp::Fcvtzs, Sz::X),
                 };
                 self.op(op, sz, &[d, x]);
             }

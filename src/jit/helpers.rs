@@ -49,6 +49,7 @@ pub(crate) fn address(h: Helper) -> usize {
         Helper::Closure => jit_closure as _,
         Helper::ClosureOf => jit_closure_of as _,
         Helper::Close => jit_close as _,
+        Helper::BoxInt => jit_box_i64 as _,
         Helper::NewTable => jit_newtable as _,
         Helper::SetList => jit_setlist as _,
         Helper::VarargGet => jit_varargget as _,

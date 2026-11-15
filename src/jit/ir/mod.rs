@@ -20,6 +20,7 @@ pub(crate) mod table;
 #[cfg(test)]
 mod tests;
 pub(crate) mod types;
+mod units;
 #[cfg(feature = "tcvm-dev")]
 pub(crate) mod verify;
 

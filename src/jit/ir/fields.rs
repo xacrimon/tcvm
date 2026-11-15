@@ -53,6 +53,8 @@ fields! {
     Item     0,                8 Val ANY ARR_ITEMS false;
     // A table's collector header: bit 0 set while no barrier is due.
     GcHeader layout::T_HEADER, 8 I64 ANY GC        false;
+    // A boxed integer's payload, from its pointer.
+    BoxedInt crate::dmm::Gc::<'static, i64>::VALUE_OFFSET, 8 I64 ANY IMMUTABLE false;
     // A shape's class (null for none), and the class's metamethod bits.
     ShapeClass crate::env::Shape::MT_CACHE_OFFSET, 8 Ptr ANY IMMUTABLE false;
     ClassBits crate::env::MtCache::BITS_OFFSET, 4 I32 ANY META false;

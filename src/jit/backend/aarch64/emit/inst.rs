@@ -109,6 +109,10 @@ impl Em<'_> {
                 self.a.orr_imm(sz, self.r(i, 0), self.r(i, 1), k)
             }
             MOp::Scvtf => self.a.scvtf(sz, self.fr(i, 0), self.r(i, 1)),
+            MOp::Fcvtzs => self.a.fcvtzs(sz, self.r(i, 0), self.fr(i, 1)),
+            MOp::LslRR => self.a.lslv(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::LsrRR => self.a.lsrv(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
+            MOp::AsrRR => self.a.asrv(sz, self.r(i, 0), self.r(i, 1), self.r(i, 2)),
             MOp::FmovToGpr => self.a.fmov_to_gpr(self.r(i, 0), self.fr(i, 1)),
             MOp::FmovFromGpr => self.a.fmov_from_gpr(self.fr(i, 0), self.r(i, 1)),
             MOp::FAdd => self.a.fadd(self.fr(i, 0), self.fr(i, 1), self.fr(i, 2)),

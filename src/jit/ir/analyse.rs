@@ -29,7 +29,7 @@ pub(crate) fn has_effect(i: &Inst) -> bool {
     !info.writes.is_empty()
         || info
             .flags
-            .intersects(Flags::EXITS | Flags::TERMINATOR | Flags::CALLS)
+            .intersects(Flags::EXITS | Flags::TERMINATOR | Flags::CALLS | Flags::KEPT)
 }
 
 impl Analysis {
@@ -212,6 +212,9 @@ impl Analysis {
                 | Op::AbsOvf
                 | Op::FIDiv
                 | Op::FMod
+                | Op::Barrier
+                | Op::NewTable
+                | Op::GcCheck
                 | Op::Truthy => {}
             }
         }
@@ -321,6 +324,9 @@ impl Analysis {
                     | Op::AbsOvf
                     | Op::FIDiv
                     | Op::FMod
+                    | Op::Barrier
+                    | Op::NewTable
+                    | Op::GcCheck
                     | Op::Compare
                     | Op::Truthy
                     | Op::GetIndex

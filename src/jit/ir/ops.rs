@@ -279,7 +279,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-    pub(crate) struct Flags: u8 {
+    pub(crate) struct Flags: u16 {
         /// Takes a frame state.
         const EXITS = 1;
         const CALLS = 2;
@@ -292,6 +292,12 @@ bitflags::bitflags! {
         /// A copy emits it again operand by operand; an op without this has
         /// an arm of its own in the copy.
         const PLAIN = 128;
+        /// Numbered though it reads a heap: while that heap's version
+        /// stands, a dominating equal one stands for it.
+        const VERSIONED = 256;
+        /// Runs for what it does, though it has no result, writes no heap
+        /// and may not leave: kept when nothing uses it.
+        const KEPT = 512;
         /// One bytecode meaning on boxed values, which may run a metamethod:
         /// kept until its operands' facts are final, never numbered.
         const GENERIC = 64;
@@ -413,6 +419,7 @@ pub(crate) enum FactOf {
     Small,
     Float,
     IntSet,
+    Tab,
     /// The type set in `aux`.
     AuxSet,
     /// Its field's set.
@@ -447,6 +454,7 @@ pub(crate) enum Mem {
 pub(crate) enum HelperFact {
     Rep,
     Tab,
+    Int,
 }
 
 pub(crate) struct OpInfo {
@@ -631,6 +639,15 @@ ops! {
     AbsOvf      H    Tag    (Int Fs No)       Int      Rep    No        [] [] [EXITS PLAIN];
     FIDiv       H    No     (F64 F64 No)      F64      Rep    No        [] [] [PLAIN];
     FMod        H    No     (F64 F64 No)      F64      Rep    No        [] [] [PLAIN];
+    // A store's barrier on table `a`: nothing where one stood with no
+    // collector step since (`Emitter::barrier` drops it for a value that is
+    // no heap object).
+    Barrier     H    No     (Ptr No No)       None     Rep    No        [GC] [] [VERSIONED KEPT PLAIN];
+    // A table from the template whose address is `a`.
+    NewTable    H    No     (I64 No No)       Val      Tab    No        [] [] [ALLOCS PLAIN];
+    // Leave, for the interpreter to collect, past the collector's
+    // threshold: nothing where one stood with no allocation since.
+    GcCheck     H    Tag    (Fs No No)        None     Rep    No        [GC] [] [EXITS VERSIONED PLAIN];
 
     // Generic ops: the frame state's pc is the feedback site.
     Arith       H    Kind   (Val Val Fs)      Val      Rep    No        [ALL] [ALL] [EXITS CALLS GENERIC PLAIN];
@@ -664,7 +681,9 @@ impl Op {
             .union(Flags::TERMINATOR)
             .union(Flags::PINNED)
             .union(Flags::GENERIC);
-        !i.flags.intersects(NO) && i.reads.is_empty() && i.writes.is_empty()
+        !i.flags.intersects(NO)
+            && (i.reads.is_empty() || i.flags.contains(Flags::VERSIONED))
+            && i.writes.is_empty()
     }
 }
 
@@ -759,6 +778,8 @@ helpers! {
     Closure      FRAME  1 ()            Val  Rep [SLOT] [FRAME] [ALLOCS];
     ClosureOf    FRAME  1 (Ptr)         Val  Rep [SLOT] [] [ALLOCS];
     Close        FRAME  1 ()            None Rep [SLOT FRAME] [UPVAL FRAME] [];
+    // An integer outside 32 bits, boxed.
+    BoxInt       RT     0 (I64)         Val  Int [] [] [ALLOCS];
     NewTable     RT     0 (I64)         Val  Tab [] [] [ALLOCS];
     SetList      FRAME  1 ()            None Rep [SLOT FRAME] [FIELD ARR GC] [ALLOCS];
     VarargGet    BASE   0 (Val)         Val  Rep [] [] [ALLOCS];

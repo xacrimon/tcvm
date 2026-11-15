@@ -110,9 +110,6 @@ struct Builder<'a, 'gc> {
     state: Val,
     /// The shapes the code compares with, which the region keeps alive.
     shapes: Vec<crate::env::Shape<'gc>>,
-    /// The address of the arena's metrics, where the collector's counters
-    /// are.
-    metrics: u64,
     /// The instructions compiled as a deopt for want of code.
     missing: Vec<Bc>,
 }
@@ -125,7 +122,6 @@ pub(crate) fn build<'gc>(
     cfg: &Cfg,
     proto: Gc<'gc, Prototype<'gc>>,
     entry_pc: u32,
-    metrics: u64,
 ) -> (Vec<crate::env::Shape<'gc>>, Vec<Bc>) {
     let nb = cfg.blocks.len();
     let root = cfg.block_of[entry_pc as usize];
@@ -143,7 +139,6 @@ pub(crate) fn build<'gc>(
         pc: entry_pc,
         state: Val::NONE,
         shapes: Vec::new(),
-        metrics,
         missing: Vec::new(),
     };
     // A captured register lives in its slot, which the closures holding it

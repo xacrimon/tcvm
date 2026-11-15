@@ -91,22 +91,6 @@ impl Emitter {
         self.unless(nil, |e| e.no_mm(t, bit, tag, state));
     }
 
-    /// The store's barrier, unless the value is never a heap object: the
-    /// helper where the table is not gray.
-    pub(crate) fn barrier(&mut self, t: Val, v: Val) {
-        if !self.fact(v).set.intersects(TypeSet::HEAP) {
-            return;
-        }
-        let header = self.load(Field::GcHeader, t, 0);
-        let one = self.k64(Rep::I64, 1);
-        let gray = self.op2(Op::And, Rep::I64, header, one);
-        let zero = self.k64(Rep::I64, 0);
-        let due = self.cmp(Op::Cmp, Cc::Eq, gray, zero);
-        self.unless(due, |e| {
-            e.call(Helper::Barrier, 0, &[t]);
-        });
-    }
-
     /// `recv[key] = v`, generic.
     pub(crate) fn set_index(&mut self, recv: Val, key: Val, v: Val, aux: u16, state: Val) {
         let at = self.g.extra.len() as u32;

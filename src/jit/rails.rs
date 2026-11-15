@@ -17,7 +17,7 @@ const OPS_BOTH: &str = "\
     Param Jump Br Ret CallHelper";
 const OPS_HIGH: &str = "\
     CheckType IsType BoxI64 UnboxI64 ToF64 DivFloor ModFloor LuaShl LuaShr \
-    FToIExact FToLExact LToI AbsOvf FIDiv FMod Arith Unm Compare Truthy \
+    FToIExact FToLExact LToI AbsOvf FIDiv FMod Barrier NewTable GcCheck Arith Unm Compare Truthy \
     GetIndex SetIndex";
 const OPS_LOW: &str = "";
 
@@ -40,7 +40,7 @@ fn ir_ops_are_the_listed_ones() {
 const HELPER_LIST: &str = "\
     FMod Sin Cos Tan Asin Acos Exp Log Log2 Log10 Pow Atan2 LibmFmod \
     ArithCoerce Unm BNot Len Concat UpvalBarrier Barrier Closure ClosureOf \
-    Close NewTable SetList VarargGet VarargTable TforNext TforIpairs TopArgs \
+    Close BoxInt NewTable SetList VarargGet VarargTable TforNext TforIpairs TopArgs \
     VarargAll Mm IndexFn NewIndexFn Index GetStr SetStr NewIndex Type \
     GetMetatable SetMetatable RawGet RawSet RawEqual RawLen ToString \
     ToNumber StrSub StrByte TInsert TRemove";
@@ -64,7 +64,7 @@ mod aarch64 {
         MovThread Uxtw Cset Csel AndRR EorRR SdivRR Sxtw NegR NegsR FNeg Frintm \
         OrrRR AndImm AndWide OrrImm OrrWide TstImm TstWide AddRR SubRR MulRR \
         AddImm SubImm AddsRR SubsRR AddsImm SubsImm CmpRR CmpImm CmnImm CmpSxtw \
-        Fcmp LslImm LsrImm AsrImm Smull Scvtf FmovToGpr FmovFromGpr FAdd FSub \
+        Fcmp LslRR LsrRR AsrRR LslImm LsrImm AsrImm Smull Scvtf Fcvtzs FmovToGpr FmovFromGpr FAdd FSub \
         FMul FDiv B BCond BCondExit BExit Call Ret";
 
     #[test]

@@ -339,6 +339,10 @@ impl Emitter {
                         let x = self.unboxed(a, TypeSet::SMALL);
                         Some(self.op1(SExt32, Rep::I64, x))
                     }
+                    _ if self.lowered && self.fact(a).set == TypeSet::BIGINT => {
+                        let t = self.typed(a, TypeSet::BIGINT)?;
+                        Some(self.boxed_int(t))
+                    }
                     _ => None,
                 }
             }
@@ -356,6 +360,11 @@ impl Emitter {
                         let x = self.unboxed(a, set);
                         Some(self.op1(IToF, Rep::F64, x))
                     }
+                    _ if self.lowered && set == TypeSet::BIGINT => {
+                        let t = self.typed(a, set)?;
+                        let x = self.boxed_int(t);
+                        Some(self.op1(LToF, Rep::F64, x))
+                    }
                     _ => None,
                 }
             }
@@ -371,6 +380,7 @@ impl Emitter {
                 match (d.op, i.op) {
                     (IToF, FToIExact) => Some(Val(d.a)),
                     (IToF, _) => Some(self.op1(SExt32, Rep::I64, Val(d.a))),
+                    _ if self.lowered => Some(self.exact_lower(i)),
                     _ => None,
                 }
             }
@@ -379,21 +389,26 @@ impl Emitter {
                     return (x == x as i32 as i64).then(|| self.k32(Rep::I32, x as u32));
                 }
                 let d = self.g.inst(a);
-                (d.op == SExt32).then_some(Val(d.a))
+                if d.op == SExt32 {
+                    return Some(Val(d.a));
+                }
+                self.lowered.then(|| self.narrow(a, i.aux, i.b))
             }
             DivFloor | ModFloor => match self.floor_const(i) {
                 None if self.lowered => Some(self.floor_lower(i)),
                 r => r,
             },
             FIDiv => {
-                let y = self.kf(b)?;
-                let r = 1.0 / y;
                 let pow2 = |z: f64| z.is_normal() && z.to_bits() << 12 == 0;
-                (pow2(y) && pow2(r)).then(|| {
-                    let r = self.kf64(r);
-                    let q = self.op2(FMul, Rep::F64, a, r);
-                    self.op1(FFloor, Rep::F64, q)
-                })
+                let q = match self.kf(b).map(|y| (y, 1.0 / y)) {
+                    Some((y, r)) if pow2(y) && pow2(r) => {
+                        let r = self.kf64(r);
+                        self.op2(FMul, Rep::F64, a, r)
+                    }
+                    _ if self.lowered => self.op2(FDiv, Rep::F64, a, b),
+                    _ => return None,
+                };
+                Some(self.op1(FFloor, Rep::F64, q))
             }
             Arith | Compare | Unm => self.specialise(i),
             // Only a constant condition folds: a folded branch's. In its arm
@@ -420,7 +435,12 @@ impl Emitter {
             }
             K32 | K64 | KF64 | KObj | Base | Thread | Load | Store | LoadIdx | StoreIdx
             | SlotLoad | SlotStore | Deopt | LazyExit | FrameState | Param | Jump | Ret
-            | LuaShl | LuaShr | AbsOvf | FMod | CallHelper | GetIndex | SetIndex => None,
+            | CallHelper | GetIndex | SetIndex | Barrier => None,
+            AbsOvf => self.lowered.then(|| self.abs_lower(i)),
+            LuaShl | LuaShr => self.lowered.then(|| self.shift_lower(i)),
+            FMod => (self.lowered).then(|| self.call(Helper::FMod, 0, &[a, b])),
+            NewTable => (self.lowered).then(|| self.call(Helper::NewTable, 0, &[a])),
+            GcCheck => self.lowered.then(|| self.gc_check_lower(i)),
             Truthy => self.truthy(a),
         }
     }
@@ -683,10 +703,9 @@ impl Emitter {
         } else if is(ArithKind::Div) {
             self.op2(FDiv, Rep::F64, x, y)
         } else if is(ArithKind::IDiv) {
-            let q = self.op2(FDiv, Rep::F64, x, y);
-            self.op1(FFloor, Rep::F64, q)
+            self.op2(FIDiv, Rep::F64, x, y)
         } else if is(ArithKind::Mod) {
-            self.call(Helper::FMod, 0, &[x, y])
+            self.op2(FMod, Rep::F64, x, y)
         } else if self.kf(y) == Some(2.0) {
             self.op2(FMul, Rep::F64, x, x)
         } else {

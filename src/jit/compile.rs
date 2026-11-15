@@ -268,10 +268,8 @@ pub(crate) fn compile<'gc>(
     high.rt = crate::jit::layout::rt_word(ctx) as u64;
     let pool = &mut scratch.pool;
     pool.words.clear();
-    let (shapes, missing) = {
-        let metrics = crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64;
-        crate::jit::build::build(high, pool, &cfg, closure.proto, pc, metrics)
-    };
+    high.metrics = crate::jit::layout::rt_read(ctx, crate::jit::layout::METRICS) as u64;
+    let (shapes, missing) = crate::jit::build::build(high, pool, &cfg, closure.proto, pc);
     #[cfg(feature = "tcvm-dev")]
     for op in missing {
         (ctx.runtime().stats).count(1, || format!("jit unsupported {}", op.name()));
@@ -289,6 +287,7 @@ pub(crate) fn compile<'gc>(
     analysis.types(&high.g);
     low.reset(true);
     low.rt = high.rt;
+    low.metrics = high.metrics;
     scratch.copy.run(&high.g, analysis, low);
     stage(config, closure, pc, "lower", low);
     if let Some(why) = low.bail {

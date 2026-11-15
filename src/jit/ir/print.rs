@@ -182,6 +182,9 @@ impl Graph {
             | Op::AbsOvf
             | Op::FIDiv
             | Op::FMod
+            | Op::Barrier
+            | Op::NewTable
+            | Op::GcCheck
             | Op::Arith
             | Op::Unm
             | Op::Compare

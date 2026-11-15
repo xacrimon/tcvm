@@ -145,11 +145,17 @@ mops! {
     // `cmp xn, wm, sxtw`: whether a product fits 32 bits.
     CmpSxtw   [U U NO]         None None Fall false false;
     Fcmp      [FU FU NO]       None None Fall false false;
+    // A shift by a register's low bits.
+    LslRR     [D U U]          None None Fall false false;
+    LsrRR     [D U U]          None None Fall false false;
+    AsrRR     [D U U]          None None Fall false false;
     LslImm    [D U IMM]        None None Fall false false;
     LsrImm    [D U IMM]        None None Fall false false;
     AsrImm    [D U IMM]        None None Fall false false;
     Smull     [D U U]          None None Fall false false;
     Scvtf     [FD U NO]        None None Fall false false;
+    // A float to an integer of `sz`, toward zero.
+    Fcvtzs    [D FU NO]        None None Fall false false;
     FmovToGpr [D FU NO]        None None Fall false false;
     FmovFromGpr [FD U NO]      None None Fall false false;
     FAdd      [FD FU FU]       None None Fall false false;
